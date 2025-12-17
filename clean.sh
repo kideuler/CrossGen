@@ -1,4 +1,4 @@
 #!/bin/bash
 
 rm -rf data/geometry/*.msh
-rm -rf data/meshes/*.msh
+rm -rf data/meshes/*.obj

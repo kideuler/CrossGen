@@ -2,7 +2,3 @@
 //+
 SetFactory("OpenCASCADE");
 Disk(1) = {0, 0, 0, 0.5, 0.5};
-//+
-Curve Loop(3) = {1};
-//+
-Plane Surface(3) = {3};
