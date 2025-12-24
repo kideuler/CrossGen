@@ -15,7 +15,7 @@ export CROSSGEN_DIR="$(pwd)"
 rm -rf build
 mkdir build
 cd build
-cmake -DCMAKE_BUILD_TYPE=Release ../
+cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_OPENGL_VIEWER=ON ../
 make -j
 cd ..
 

@@ -1,5 +1,6 @@
 // Mesh.cxx
 #include "Mesh.hxx"
+#include "VertexTriangleCSR.hxx"
 
 
 // Helper struct for hashing an undirected edge (min,max)
@@ -153,5 +154,8 @@ Mesh::Mesh(const std::string &filename) {
 			cornerTriangles.push_back(std::array<int,3>{t, bEdges[0], bEdges[1]});
 		}
 	}
+
+	// Build CSR mapping of vertex -> incident triangles (CCW order)
+	vertexTriangles = VertexTriangleCSR::buildFromMesh(*this);
 }
 

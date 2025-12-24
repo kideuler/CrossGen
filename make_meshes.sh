@@ -3,7 +3,7 @@
 source clean.sh
 source build.sh --all
 
-export NP=50
+export NP=100
 
 # Create output directory
 OUT_DIR="$(pwd)/data/meshes"
@@ -28,3 +28,4 @@ done
 shopt -u nullglob
 
 echo "All done. Meshes are in $OUT_DIR"
+cd build

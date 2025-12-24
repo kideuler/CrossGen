@@ -19,6 +19,8 @@ add_executable(Mesh2Dgmsh src/Mesh2Dgmsh.cxx)
 target_link_libraries(Mesh2Dgmsh PRIVATE Gmsh::gmsh)
 
 add_library(PolyVector SHARED
+    src/polyvec/VertexTriangleCSR.hxx
+    src/polyvec/VertexTriangleCSR.cxx
     src/polyvec/Mesh.cxx
     src/polyvec/Mesh.hxx
     src/polyvec/PolyVectors.hxx
@@ -32,7 +34,7 @@ add_executable(LoadMesh src/LoadMesh.cxx)
 target_link_libraries(LoadMesh PRIVATE PolyVector)
 
 # Optional OpenGL viewer
-option(BUILD_OPENGL_VIEWER "Build the OpenGL mesh/field viewer" ON)
+option(BUILD_OPENGL_VIEWER "Build the OpenGL mesh/field viewer" OFF)
 if (BUILD_OPENGL_VIEWER)
     if(APPLE)
         find_package(OpenGL REQUIRED)

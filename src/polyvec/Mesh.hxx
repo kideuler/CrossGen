@@ -11,6 +11,8 @@
 #include <algorithm>
 #include <cctype>
 #include <stdexcept>
+#include "VertexTriangleCSR.hxx"
+
 
 typedef std::array<double, 2> Point;
 typedef std::array<int, 3> Triangle;
@@ -22,6 +24,9 @@ class Mesh {
     std::vector<std::array<int, 3>> triangleAdjacency; // Adjacency info for triangles (0: left, 1: right, 2: below, -1 indicates boundary)
     std::vector<std::array<int, 2>> boundaryTriangles; // List of boundary triangle indices and their corresponding edge (0,1,2)
     std::vector<std::array<int,3>> cornerTriangles; // List of corner triangle indices and their corresponding boundary edges
+
+    // CSR mapping: vertex -> incident triangles in CCW order
+    VertexTriangleCSR vertexTriangles;
 
     Mesh() = default;
 
