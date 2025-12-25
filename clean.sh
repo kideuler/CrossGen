@@ -2,3 +2,4 @@
 
 rm -rf data/geometry/*.msh
 rm -rf data/meshes/*.obj
+rm -rf build

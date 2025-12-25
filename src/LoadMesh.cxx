@@ -41,6 +41,14 @@ static void printFieldVectors(const PolyField &field, const Mesh &mesh) {
         const auto &vec = field.field[i];
         std::cout << "Triangle " << i << " Field Vectors: u = (" << vec.u[0] << ", " << vec.u[1] << "), v = (" << vec.v[0] << ", " << vec.v[1] << ")\n";
     }
+
+	// Print the computed singularities
+	std::cout << "Detected u-singularities:\n";
+	for (const auto &singularity : field.uSingularities) {
+		int vertexId = singularity.first;
+		int index4 = singularity.second;
+		std::cout << "  Vertex " << vertexId << ": index4 = " << index4 << "\n";
+	}
 }
 
 int main(int argc, char **argv) {
@@ -58,6 +66,7 @@ int main(int argc, char **argv) {
         printPolyField(field, m);
 
         field.convertToFieldVectors();
+		field.computeUSingularities();
         printFieldVectors(field, m);
         field.writeVTK("output.vtk");
 	} catch (const std::exception &e) {

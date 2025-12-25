@@ -3,6 +3,7 @@
 
 #include <complex>
 #include <cmath>
+#include <utility>
 
 // eigen includes
 #include <Eigen/Dense>
@@ -82,6 +83,16 @@ PolyCoeffs computePolyCoeffsFromTangentVector(const Point &tangent) {
 class PolyField {
  public:
     std::vector<Field> field; // per-triangle field vectors
+
+    // Detected singularities in the 4-RoSy (cross) field induced by `field[t].u`.
+    // Each entry is (vertexId, index4) where index = index4 / 4.0.
+    //
+    // index4 == 0: regular vertex
+    // index4 == 1: +1/4 singularity, index4 == -1: -1/4 singularity, etc.
+    //
+    // Note: Boundary vertices are handled by closing the one-ring with the two
+    // incident boundary edges (tangent directions).
+    std::vector<std::pair<int,int>> uSingularities;
     PolyField() = default;
 
     PolyField(Mesh &mesh); // Initialize field on the given mesh
@@ -93,6 +104,9 @@ class PolyField {
     }
 
     void convertToFieldVectors(); // Convert polynomial coefficients to field vectors
+
+    // Compute `uSingularities` from the current `field` using mesh.vertexTriangles.
+    void computeUSingularities();
 
     // Write mesh and per-triangle field vectors to a VTK legacy unstructured grid file
     // - filename: path to .vtk file

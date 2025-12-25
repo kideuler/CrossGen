@@ -112,6 +112,55 @@ static void drawField(const Mesh &m, const PolyField &field, double scale) {
     }
 }
 
+// Draw a filled disk with simple spherical shading to look 3D
+static void drawDisk3D(const Point &center, double radius, float baseR, float baseG, float baseB, int segments = 96) {
+    // Fake light direction in view space (towards viewer, slightly to top-right)
+    Eigen::Vector3d L = Eigen::Vector3d(0.4, 0.4, 0.8).normalized();
+
+    // Inner center vertex color slightly brighter
+    {
+        glBegin(GL_TRIANGLE_FAN);
+            // Center normal pointing out of screen (0,0,1)
+            double ndotl_center = std::max(0.0, L[2]);
+            double shade_center = 0.3 + 0.7 * ndotl_center; // base ambient + diffuse
+            glColor3f(baseR * shade_center, baseG * shade_center, baseB * shade_center);
+            glVertex2d(center[0], center[1]);
+
+            // Rim vertices: compute per-vertex shading by mapping disk to sphere cap
+            for (int i = 0; i <= segments; ++i) {
+                double ang = (static_cast<double>(i) / segments) * 2.0 * M_PI;
+                double dx = std::cos(ang);
+                double dy = std::sin(ang);
+                double x = center[0] + radius * dx;
+                double y = center[1] + radius * dy;
+
+                // Map (dx,dy) on unit disk to hemisphere normal: z = sqrt(max(0, 1 - r^2))
+                double r2 = dx*dx + dy*dy; // equals 1 on rim
+                double z = std::sqrt(std::max(0.0, 1.0 - r2));
+                Eigen::Vector3d N(dx, dy, z);
+                N.normalize();
+                double ndotl = std::max(0.0, N.dot(L));
+                double shade = 0.25 + 0.75 * ndotl; // ambient + diffuse
+                glColor3f(baseR * shade, baseG * shade, baseB * shade);
+                glVertex2d(x, y);
+            }
+        glEnd();
+    }
+
+    // Optional subtle outline to enhance 3D look
+    glLineWidth(1.0f);
+    glBegin(GL_LINE_LOOP);
+        for (int i = 0; i < segments; ++i) {
+            double ang = (static_cast<double>(i) / segments) * 2.0 * M_PI;
+            double x = center[0] + radius * std::cos(ang);
+            double y = center[1] + radius * std::sin(ang);
+            // Darker outline
+            glColor3f(baseR * 0.5f, baseG * 0.5f, baseB * 0.5f);
+            glVertex2d(x, y);
+        }
+    glEnd();
+}
+
 static double averageTriangleEdgeLength(const Mesh &m) {
     if (m.triangles.empty()) return 1.0;
     auto elen = [&](const Point &p, const Point &q){
@@ -150,6 +199,8 @@ int main(int argc, char** argv) {
     PolyField field(mesh);
     field.solveForPolyCoeffs();
     field.convertToFieldVectors();
+    // compute singularities for the u-direction cross field
+    field.computeUSingularities();
 
     if (!glfwInit()) {
         std::cerr << "Failed to initialize GLFW\n";
@@ -352,6 +403,7 @@ int main(int argc, char** argv) {
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glEnable(GL_LINE_SMOOTH);
     glHint(GL_LINE_SMOOTH_HINT, GL_NICEST);
+    glShadeModel(GL_SMOOTH);
 
     while (!glfwWindowShouldClose(window)) {
         glClearColor(0.1f, 0.1f, 0.12f, 1.0f);
@@ -361,6 +413,21 @@ int main(int argc, char** argv) {
 
     drawMesh(mesh);
     drawField(mesh, field, scale);
+
+        // Draw large balls at singularities: blue for index = +1, red for index = -1
+        double ballRadius = 0.85 * avgEdge; // large, relative to mesh scale
+        for (const auto &sig : field.uSingularities) {
+            int vid = sig.first;
+            int index4 = sig.second; // index = index4 / 4
+            if (vid < 0 || vid >= static_cast<int>(mesh.vertices.size())) continue;
+            const Point &c = mesh.vertices[vid];
+            // Color by index4 == +1 or -1 as requested
+            if (index4 == 1) {
+                drawDisk3D(c, ballRadius, 0.2f, 0.2f, 0.95f); // blue
+            } else if (index4 == -1) {
+                drawDisk3D(c, ballRadius, 0.95f, 0.2f, 0.2f); // red
+            }
+        }
 
         glfwSwapBuffers(window);
         glfwPollEvents();
