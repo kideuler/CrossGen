@@ -6,17 +6,21 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
-find_package(Gmsh REQUIRED)
-message(STATUS "Gmsh found: ${GMSH_LIBRARY}")
-
 # Eigen (header-only)
 find_package(Eigen3 3.3 REQUIRED NO_MODULE)
 message(STATUS "Eigen3 include dir: ${EIGEN3_INCLUDE_DIR}")
 
+option(BUILD_MESH2GMSH "Build the Mesh2Dgmsh utility" ON)
 
-add_executable(Mesh2Dgmsh src/Mesh2Dgmsh.cxx)
-target_link_libraries(Mesh2Dgmsh PRIVATE Gmsh::gmsh)
+if (BUILD_MESH2GMSH)
+    list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+    find_package(Gmsh REQUIRED)
+    message(STATUS "Gmsh found: ${GMSH_LIBRARY}")
+    add_executable(Mesh2Dgmsh src/Mesh2Dgmsh.cxx)
+    target_link_libraries(Mesh2Dgmsh PRIVATE Gmsh::gmsh)
+else()
+    message(STATUS "Skipping Mesh2Dgmsh utility")
+endif()
 
 add_library(PolyVector SHARED
     src/polyvec/VertexTriangleCSR.hxx
