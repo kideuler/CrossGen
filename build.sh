@@ -15,6 +15,10 @@ export CROSSGEN_DIR="$(pwd)"
 rm -rf build
 mkdir build
 cd build
+(
+    # Ensure submodules are available (e.g., bundled Eigen)
+    cd .. && git submodule update --init --recursive >/dev/null 2>&1 || true
+)
 cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_OPENGL_VIEWER=ON ../
 make -j
 cd ..

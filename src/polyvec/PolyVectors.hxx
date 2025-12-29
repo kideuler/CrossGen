@@ -18,7 +18,7 @@ struct Field {
     Point v;
 };
 
-std::pair<Point, Point> extract_two_directions(const std::array<std::complex<double>, 4>& roots) {
+inline std::pair<Point, Point> extract_two_directions(const std::array<std::complex<double>, 4>& roots) {
     // Convert roots to 2D unit vectors (Points)
     std::array<Point, 4> vecs;
     for (int k = 0; k < 4; ++k) {
@@ -65,7 +65,7 @@ std::pair<Point, Point> extract_two_directions(const std::array<std::complex<dou
 }
 
 
-PolyCoeffs computePolyCoeffsFromTangentVector(const Point &tangent) {
+inline PolyCoeffs computePolyCoeffsFromTangentVector(const Point &tangent) {
     // normalize tangent
     double len = std::sqrt(tangent[0]*tangent[0] + tangent[1]*tangent[1]);
     std::complex<double> tx(tangent[0]/len, tangent[1]/len);
