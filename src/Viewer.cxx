@@ -12,6 +12,7 @@
 #include <Eigen/Dense>
 
 #include "polyvec/PolyVectors.hxx"
+#include "polyvec/CutMesh.hxx"
 
 // GLFW header: do not include GL headers before it when using GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
@@ -60,6 +61,26 @@ static void drawMesh(const Mesh &m) {
         glVertex2d(a[0], a[1]); glVertex2d(b[0], b[1]);
         glVertex2d(b[0], b[1]); glVertex2d(c[0], c[1]);
         glVertex2d(c[0], c[1]); glVertex2d(a[0], a[1]);
+    }
+    glEnd();
+}
+
+// Draw a set of (undirected) edges on the original mesh.
+static void drawEdgeSetOnMesh(const Mesh &m,
+                              const std::unordered_set<CutMesh::EdgeKey, CutMesh::EdgeKeyHash> &edges,
+                              float r, float g, float b,
+                              float lineWidth) {
+    glColor3f(r, g, b);
+    glLineWidth(lineWidth);
+    glBegin(GL_LINES);
+    for (const auto &e : edges) {
+        if (e.a < 0 || e.b < 0 || e.a >= static_cast<int>(m.vertices.size()) || e.b >= static_cast<int>(m.vertices.size())) {
+            continue;
+        }
+        const Point &pa = m.vertices[e.a];
+        const Point &pb = m.vertices[e.b];
+        glVertex2d(pa[0], pa[1]);
+        glVertex2d(pb[0], pb[1]);
     }
     glEnd();
 }
@@ -201,6 +222,23 @@ int main(int argc, char** argv) {
     field.convertToFieldVectors();
     // compute singularities for the u-direction cross field
     field.computeUSingularities();
+
+    // Build the MIQ-style cut mesh so we can visualize the singularity-to-boundary cuts.
+    CutMesh cutMesh(field);
+
+    // Debug stats: helps diagnose when there are no orange lines (e.g., no singularities
+    // or all singularities already lie on the boundary).
+    std::cerr << "[Viewer] #tri=" << mesh.triangles.size()
+              << " #vtx=" << mesh.vertices.size()
+              << " | uSingularities=" << field.uSingularities.size()
+              << " | cutEdges=" << cutMesh.getCutEdges().size()
+              << " | singularityPathCutEdges=" << cutMesh.getSingularityPathCutEdges().size()
+              << "\n";
+
+    if (!field.uSingularities.empty() && cutMesh.getSingularityPathCutEdges().empty()) {
+        std::cerr << "[Viewer] Note: no singularity->boundary path cuts were added (they may already lie on the boundary/cut graph)."
+                  << " Falling back to showing all cut edges.\n";
+    }
 
     if (!glfwInit()) {
         std::cerr << "Failed to initialize GLFW\n";
@@ -411,11 +449,21 @@ int main(int argc, char** argv) {
 
         glDisable(GL_DEPTH_TEST);
 
-    drawMesh(mesh);
-    drawField(mesh, field, scale);
+        drawMesh(mesh);
+        drawField(mesh, field, scale);
+
+        // Highlight only the cuts introduced to connect singularities to the boundary.
+        // (This excludes the initial dual spanning-tree cuts.)
+        if (!cutMesh.getSingularityPathCutEdges().empty()) {
+            // Orange: singularity-to-boundary paths
+            drawEdgeSetOnMesh(mesh, cutMesh.getSingularityPathCutEdges(), 1.0f, 0.75f, 0.1f, 4.0f);
+        } else {
+            // Magenta: all cut edges (fallback so the user still sees seams)
+            drawEdgeSetOnMesh(mesh, cutMesh.getCutEdges(), 1.0f, 0.2f, 0.9f, 3.5f);
+        }
 
         // Draw large balls at singularities: blue for index = +1, red for index = -1
-        double ballRadius = 0.85 * avgEdge; // large, relative to mesh scale
+        double ballRadius = 0.5 * avgEdge; // large, relative to mesh scale
         for (const auto &sig : field.uSingularities) {
             int vid = sig.first;
             int index4 = sig.second; // index = index4 / 4

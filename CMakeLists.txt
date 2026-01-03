@@ -27,6 +27,8 @@ add_library(PolyVector SHARED
     src/polyvec/VertexTriangleCSR.cxx
     src/polyvec/Mesh.cxx
     src/polyvec/Mesh.hxx
+    src/polyvec/CutMesh.hxx
+    src/polyvec/CutMesh.cxx
     src/polyvec/PolyVectors.hxx
     src/polyvec/PolyVectors.cxx
 )
@@ -36,6 +38,10 @@ target_link_libraries(PolyVector PUBLIC Eigen3::Eigen)
 # Small utility to load and print mesh data
 add_executable(LoadMesh src/LoadMesh.cxx)
 target_link_libraries(LoadMesh PRIVATE PolyVector)
+
+# Utility to cut a mesh into a disk and run sanity checks
+add_executable(TestCutMesh src/TestCutMesh.cxx)
+target_link_libraries(TestCutMesh PRIVATE PolyVector)
 
 # Optional OpenGL viewer
 option(BUILD_OPENGL_VIEWER "Build the OpenGL mesh/field viewer" OFF)

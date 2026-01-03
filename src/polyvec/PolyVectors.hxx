@@ -113,6 +113,11 @@ class PolyField {
     // Returns true on success, false on failure
     bool writeVTK(const std::string &filename) const;
 
+    // Access the underlying mesh (a copy of the mesh passed to the constructor).
+    // This is useful for downstream processing (e.g., cutting the mesh into a topological disk).
+    const Mesh& getMesh() const { return mesh; }
+    Mesh& getMesh() { return mesh; }
+
 private:
     Mesh mesh;
     std::vector<PolyCoeffs> polyCoeffs; // per-triangle polynomial coefficients
