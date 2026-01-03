@@ -70,7 +70,13 @@ if (BUILD_OPENGL_VIEWER)
 
         if (GLFW_TARGET)
             message(STATUS "Building OpenGL viewer with target ${GLFW_TARGET}")
-            add_executable(Viewer src/Viewer.cxx)
+            add_executable(Viewer
+                src/viewer/ViewerMain.cxx
+                src/viewer/Geometry.cxx
+                src/viewer/Render.cxx
+                src/viewer/Interaction.cxx
+            )
+            target_include_directories(Viewer PRIVATE src)
             target_link_libraries(Viewer PRIVATE PolyVector OpenGL::GL ${GLFW_TARGET})
             target_compile_definitions(Viewer PRIVATE GL_SILENCE_DEPRECATION GLFW_INCLUDE_NONE)
             # Prefer a modern C++ standard for the viewer too
