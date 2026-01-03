@@ -285,7 +285,7 @@ void CutMesh::buildExplicitCutMesh() {
 
             const int a = tri[e];
             const int b = tri[(e + 1) % 3];
-            if (cutEdges.find(EdgeKey(a, b)) != cutEdges.end()) continue;
+            if (singularityPathCutEdges.find(EdgeKey(a, b)) != singularityPathCutEdges.end()) continue;
 
             // Find the local indices of a and b in the neighbor triangle.
             const Triangle &triN = orig.triangles[nb];
