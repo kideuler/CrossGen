@@ -107,7 +107,7 @@ CutMesh::CutMesh(const PolyField &field) {
     singularities = field.uSingularities;
 
     buildEdgeCuts();
-    connectSingularitiesWithShortestPaths();
+    //connectSingularitiesWithShortestPaths();
     buildExplicitCutMesh();
 }
 
@@ -671,7 +671,7 @@ void CutMesh::buildEdgeCuts() {
     // 8) Store cut edges
     // -----------------------
     for (int eid = 0; eid < nE; ++eid) {
-        if (inCut[eid]) {
+        if (inCut[eid] && edges[eid].f1 != -1) { // only stores cuts not on boundary
             cutEdges.insert(EdgeKey(edges[eid].u, edges[eid].v));
         }
     }
