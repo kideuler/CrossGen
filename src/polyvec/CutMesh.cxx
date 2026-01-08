@@ -2,10 +2,13 @@
 
 #include <algorithm>
 #include <cmath>
+#include <deque>
 #include <fstream>
+#include <iostream>
 #include <limits>
 #include <numeric>
 #include <queue>
+#include <set>
 #include <sstream>
 
 #include "PolyVectors.hxx" // PolyField
@@ -103,56 +106,574 @@ CutMesh::CutMesh(const PolyField &field) {
     orig = field.getMesh();
     singularities = field.uSingularities;
 
-    buildDualSpanningTreeCuts();
+    buildEdgeCuts();
     connectSingularitiesWithShortestPaths();
     buildExplicitCutMesh();
 }
 
-void CutMesh::buildDualSpanningTreeCuts() {
+void CutMesh::buildEdgeCuts() {
     cutEdges.clear();
     singularityPathCutEdges.clear();
-    const int nT = static_cast<int>(orig.triangles.size());
-    if (nT == 0) return;
 
-    std::unordered_set<EdgeKey, EdgeKeyHash> interiorEdges;
-    interiorEdges.reserve(static_cast<size_t>(nT) * 3);
-    for (int t = 0; t < nT; ++t) {
-        const Triangle &tri = orig.triangles[t];
-        for (int e = 0; e < 3; ++e) {
-            if (orig.triangleAdjacency[t][e] == -1) continue;
-            interiorEdges.insert(EdgeKey(tri[e], tri[(e + 1) % 3]));
+    const int nV = static_cast<int>(orig.vertices.size());
+    const int nT = static_cast<int>(orig.triangles.size());
+    if (nV == 0 || nT == 0) return;
+
+    // Internal edge structure
+    struct InternalEdge {
+        int u = -1, v = -1;   // endpoints (u < v)
+        int f0 = -1, f1 = -1; // incident faces (f1 == -1 => boundary)
+        int bc = -1;          // boundary component id for boundary edges
+    };
+    struct DualArc { int to; int eid; };
+
+    // -----------------------
+    // 1) Build unique undirected edge table (+ incident faces)
+    // -----------------------
+    std::unordered_map<EdgeKey, int, EdgeKeyHash> edgeMap;
+    edgeMap.reserve(static_cast<size_t>(nT) * 3);
+
+    std::vector<InternalEdge> edges;
+    edges.reserve(static_cast<size_t>(nT * 3 / 2));
+
+    auto addEdge = [&](int a, int b, int fidx) {
+        EdgeKey k(a, b);
+        auto it = edgeMap.find(k);
+        if (it == edgeMap.end()) {
+            int eid = static_cast<int>(edges.size());
+            edgeMap.emplace(k, eid);
+            InternalEdge e;
+            e.u = k.a; e.v = k.b;
+            e.f0 = fidx; e.f1 = -1;
+            edges.push_back(e);
+        } else {
+            InternalEdge& e = edges[it->second];
+            if (e.f1 == -1) e.f1 = fidx;
+        }
+    };
+
+    for (int f = 0; f < nT; ++f) {
+        const Triangle& t = orig.triangles[f];
+        addEdge(t[0], t[1], f);
+        addEdge(t[1], t[2], f);
+        addEdge(t[2], t[0], f);
+    }
+
+    const int nE = static_cast<int>(edges.size());
+
+    // Vertex -> incident edges
+    std::vector<std::vector<int>> v2e(nV);
+    for (int eid = 0; eid < nE; ++eid) {
+        v2e[edges[eid].u].push_back(eid);
+        v2e[edges[eid].v].push_back(eid);
+    }
+
+    // Track used vertices
+    std::vector<uint8_t> usedV(nV, 0);
+    for (const auto& t : orig.triangles) {
+        usedV[t[0]] = 1; usedV[t[1]] = 1; usedV[t[2]] = 1;
+    }
+    int Vused = 0;
+    for (auto b : usedV) if (b) Vused++;
+
+    // -----------------------
+    // 2) Identify boundary components
+    // -----------------------
+    DSU dsuB(nV);
+    for (int eid = 0; eid < nE; ++eid) {
+        if (edges[eid].f1 == -1) dsuB.unite(edges[eid].u, edges[eid].v);
+    }
+
+    std::vector<int> rootToBC(nV, -1);
+    int bCount = 0;
+    for (int eid = 0; eid < nE; ++eid) {
+        if (edges[eid].f1 != -1) continue;
+        int r = dsuB.find(edges[eid].u);
+        if (rootToBC[r] == -1) rootToBC[r] = bCount++;
+        edges[eid].bc = rootToBC[r];
+    }
+
+    std::vector<int> bcRep(bCount, -1);
+    for (int eid = 0; eid < nE; ++eid) {
+        if (edges[eid].f1 != -1) continue;
+        int bc = edges[eid].bc;
+        if (bc >= 0 && bc < bCount && bcRep[bc] == -1) bcRep[bc] = edges[eid].u;
+    }
+    
+    // Terminal vertices: one representative per boundary component (for pruning protection)
+    std::vector<uint8_t> terminal(nV, 0);
+    for (int bc = 0; bc < bCount; ++bc) {
+        if (bcRep[bc] >= 0 && bcRep[bc] < nV) terminal[bcRep[bc]] = 1;
+    }
+
+    // Compute Euler characteristic
+    const int chi = Vused - nE + nT;
+    const double g_est = (2.0 - static_cast<double>(bCount) - static_cast<double>(chi)) / 2.0;
+
+    // If already a disk, no cuts needed
+    if (bCount == 1 && std::abs(g_est) < 1e-6) {
+        return;
+    }
+
+    // -----------------------
+    // 3) Build augmented dual graph (faces + boundary component nodes)
+    // -----------------------
+    const int nD = nT + bCount;
+    std::vector<std::vector<DualArc>> dualAdj(nD);
+
+    for (int eid = 0; eid < nE; ++eid) {
+        const InternalEdge& e = edges[eid];
+        if (e.f1 != -1) {
+            // Interior edge: connects two faces
+            dualAdj[e.f0].push_back({e.f1, eid});
+            dualAdj[e.f1].push_back({e.f0, eid});
+        } else {
+            // Boundary edge: connects face to its boundary component node
+            int bd = nT + e.bc;
+            dualAdj[e.f0].push_back({bd, eid});
+            dualAdj[bd].push_back({e.f0, eid});
         }
     }
 
-    // Dual spanning forest: triangles are nodes, adjacency across interior edges are dual edges.
-    std::unordered_set<EdgeKey, EdgeKeyHash> treeEdges;
-    treeEdges.reserve(static_cast<size_t>(nT) * 2);
-    std::vector<char> visited(nT, false);
-    std::queue<int> q;
-    for (int start = 0; start < nT; ++start) {
-        if (visited[start]) continue;
-        visited[start] = true;
-        q.push(start);
-        while (!q.empty()) {
-            const int t = q.front();
-            q.pop();
-            const Triangle &tri = orig.triangles[t];
-            for (int e = 0; e < 3; ++e) {
-                const int nb = orig.triangleAdjacency[t][e];
-                if (nb == -1) continue;
-                if (!visited[nb]) {
-                    visited[nb] = true;
-                    q.push(nb);
-                    treeEdges.insert(EdgeKey(tri[e], tri[(e + 1) % 3]));
+    // -----------------------
+    // 4) Primal spanning tree T 
+    //    Strategy: MAXIMIZE boundary edge usage to leave interior edges for C*
+    //    Phase 1: Use boundary edges to create spanning forest on boundary vertices
+    //    Phase 2: Connect interior vertices with interior edges
+    //    Phase 3: Connect boundary forest to interior tree
+    // -----------------------
+    std::vector<uint8_t> inT(nE, 0);
+    std::vector<uint8_t> visV(nV, 0);
+    
+    // Track which boundary component each vertex belongs to (-1 for interior)
+    std::vector<int> vBC(nV, -1);
+    for (int eid = 0; eid < nE; ++eid) {
+        if (edges[eid].f1 != -1) continue;
+        int bc = edges[eid].bc;
+        vBC[edges[eid].u] = bc;
+        vBC[edges[eid].v] = bc;
+    }
+    
+    // Phase 1: Span boundary vertices using boundary edges (one tree per boundary component)
+    // For each boundary component, do BFS using only boundary edges
+    for (int bc = 0; bc < bCount; ++bc) {
+        // Find a starting vertex on this boundary
+        int startV = -1;
+        for (int v = 0; v < nV; ++v) {
+            if (vBC[v] == bc && !visV[v]) { startV = v; break; }
+        }
+        if (startV == -1) continue;
+        
+        visV[startV] = 1;
+        std::deque<int> qb;
+        qb.push_back(startV);
+        
+        while (!qb.empty()) {
+            int v = qb.front(); qb.pop_front();
+            for (int eid : v2e[v]) {
+                if (edges[eid].f1 != -1) continue; // Only boundary edges
+                int a = edges[eid].u, b = edges[eid].v;
+                int other = (v == a) ? b : a;
+                if (!visV[other] && vBC[other] == bc) { // Same boundary component
+                    visV[other] = 1;
+                    inT[eid] = 1;
+                    qb.push_back(other);
+                }
+            }
+        }
+    }
+    
+    // Phase 2 & 3: Connect remaining vertices (interior) using BFS from visited vertices
+    std::deque<int> qv;
+    for (int v = 0; v < nV; ++v) {
+        if (visV[v] && usedV[v]) qv.push_back(v);
+    }
+
+    while (!qv.empty()) {
+        int v = qv.front(); qv.pop_front();
+        for (int eid : v2e[v]) {
+            int a = edges[eid].u, b = edges[eid].v;
+            int other = (v == a) ? b : a;
+            if (!visV[other]) {
+                visV[other] = 1;
+                inT[eid] = 1;
+                qv.push_back(other);
+            }
+        }
+    }
+    
+    // Check how many vertices were visited
+    int visitedCount = 0;
+    for (int v = 0; v < nV; ++v) if (visV[v]) visitedCount++;
+    
+    if (visitedCount != Vused) {
+        std::cerr << "WARNING: BFS only reached " << visitedCount << "/" << Vused << " vertices!\n";
+    }
+
+    // -----------------------
+    // 5) Dual spanning tree C* avoiding T edges (BFS on augmented dual)
+    //    IMPORTANT: We must be careful with boundary edges. Using too many
+    //    boundary edges in C* will disconnect faces from each other.
+    //    Strategy: First BFS through face-to-face edges, then add minimal
+    //    boundary edges to reach boundary nodes.
+    // -----------------------
+    std::vector<uint8_t> inC(nE, 0);
+    std::vector<uint8_t> visD(nD, 0);
+    std::deque<int> qd;
+
+    // Phase 1: BFS through interior (face-to-face) edges only
+    int rootD = 0;
+    visD[rootD] = 1;
+    qd.push_back(rootD);
+
+    while (!qd.empty()) {
+        int d = qd.front(); qd.pop_front();
+        if (d >= nT) continue; // Skip if we somehow queued a boundary node
+        
+        for (const auto& arc : dualAdj[d]) {
+            if (inT[arc.eid]) continue; // Edge-disjoint from primal tree
+            if (arc.to >= nT) continue;  // Skip boundary nodes in phase 1
+            if (!visD[arc.to]) {
+                visD[arc.to] = 1;
+                inC[arc.eid] = 1;
+                qd.push_back(arc.to);
+            }
+        }
+    }
+    
+    // Count how many faces were reached in phase 1
+    int facesReached = 0;
+    for (int f = 0; f < nT; ++f) if (visD[f]) facesReached++;
+    
+    // Phase 2: Add boundary edges to reach boundary nodes
+    // For each boundary node, find ONE edge from a visited face
+    for (int bc = 0; bc < bCount; ++bc) {
+        int bdNode = nT + bc;
+        if (visD[bdNode]) continue; // Already reached (shouldn't happen)
+        
+        // Find a face-to-boundary edge where the face is visited
+        for (const auto& arc : dualAdj[bdNode]) {
+            if (inT[arc.eid]) continue;
+            if (arc.to < nT && visD[arc.to]) {
+                // This edge connects a visited face to this boundary node
+                inC[arc.eid] = 1;
+                visD[bdNode] = 1;
+                break;
+            }
+        }
+    }
+    
+    // Check if all dual nodes were reached
+    int reachedD = 0;
+    for (int i = 0; i < nD; ++i) if (visD[i]) reachedD++;
+    
+    if (reachedD != nD) {
+        std::cerr << "WARNING: Dual tree incomplete (" << reachedD << "/" << nD 
+                  << "). Topology may not be disk.\n";
+    }
+
+    // -----------------------
+    // 6) Cut graph = T ∪ L where L = edges not in T and not in C*
+    // -----------------------
+    std::vector<uint8_t> inCut(nE, 0);
+    for (int eid = 0; eid < nE; ++eid) {
+        bool leftover = (!inT[eid] && !inC[eid]);
+        if (inT[eid] || leftover) {
+            inCut[eid] = 1;
+        }
+    }
+
+    // -----------------------
+    // 7) Prune dangling branches (protect terminal vertices)
+    // -----------------------
+    std::vector<int> deg(nV, 0);
+    for (int eid = 0; eid < nE; ++eid) {
+        if (!inCut[eid]) continue;
+        deg[edges[eid].u]++;
+        deg[edges[eid].v]++;
+    }
+
+    std::deque<int> st;
+    for (int v = 0; v < nV; ++v) {
+        if (usedV[v] && deg[v] == 1 && !terminal[v]) {
+            st.push_back(v);
+        }
+    }
+
+    while (!st.empty()) {
+        int v = st.front(); st.pop_front();
+        if (deg[v] != 1) continue;
+        if (terminal[v]) continue;
+
+        int found = -1;
+        for (int eid : v2e[v]) {
+            if (inCut[eid]) { found = eid; break; }
+        }
+        if (found == -1) continue;
+
+        int a = edges[found].u;
+        int b = edges[found].v;
+        int other = (v == a) ? b : a;
+
+        inCut[found] = 0;
+        deg[a]--;
+        deg[b]--;
+
+        if (usedV[other] && deg[other] == 1 && !terminal[other]) {
+            st.push_back(other);
+        }
+    }
+    
+    // Verify cut graph doesn't disconnect the mesh
+    DSU faceDsu(nT);
+    for (int eid = 0; eid < nE; ++eid) {
+        if (inCut[eid]) continue;
+        const InternalEdge& e = edges[eid];
+        if (e.f1 == -1) continue;
+        faceDsu.unite(e.f0, e.f1);
+    }
+    std::set<int> faceComponents;
+    for (int f = 0; f < nT; ++f) {
+        faceComponents.insert(faceDsu.find(f));
+    }
+    
+    if (faceComponents.size() > 1) {
+        std::cerr << "WARNING: Cuts disconnect the mesh into " << faceComponents.size() << " pieces!\n";
+    }
+    
+    // Check connectivity of cut graph via DSU on vertices
+    DSU dsuCut(nV);
+    for (int eid = 0; eid < nE; ++eid) {
+        if (!inCut[eid]) continue;
+        dsuCut.unite(edges[eid].u, edges[eid].v);
+    }
+    
+    // Check if all boundary components the cut reaches are in the SAME connected component
+    std::vector<int> bcCutRoot(bCount, -1);
+    for (int v = 0; v < nV; ++v) {
+        if (vBC[v] >= 0) {
+            for (int eid : v2e[v]) {
+                if (inCut[eid]) {
+                    if (bcCutRoot[vBC[v]] == -1) {
+                        bcCutRoot[vBC[v]] = dsuCut.find(v);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    
+    std::set<int> cutComponents;
+    for (int bc = 0; bc < bCount; ++bc) {
+        if (bcCutRoot[bc] >= 0) {
+            cutComponents.insert(dsuCut.find(bcCutRoot[bc]));
+        }
+    }
+    
+    // If cut graph components are disconnected, add connecting paths
+    if (cutComponents.size() > 1 && bCount > 1) {
+        
+        // Build adjacency for shortest paths
+        std::vector<std::vector<std::pair<int, double>>> wadj(nV);
+        for (int eid = 0; eid < nE; ++eid) {
+            if (!usedV[edges[eid].u] || !usedV[edges[eid].v]) continue;
+            double w = edgeLength(orig, edges[eid].u, edges[eid].v);
+            wadj[edges[eid].u].emplace_back(edges[eid].v, w);
+            wadj[edges[eid].v].emplace_back(edges[eid].u, w);
+        }
+        
+        // Get representatives of each cut component
+        std::vector<int> compReps(cutComponents.begin(), cutComponents.end());
+        
+        struct PQItem { double d; int v; bool operator>(const PQItem& o) const { return d > o.d; } };
+        
+        // Connect component 0 to all other components
+        for (size_t i = 1; i < compReps.size(); ++i) {
+            // Find vertices in each component
+            std::vector<int> srcVerts, dstVerts;
+            for (int v = 0; v < nV; ++v) {
+                if (!usedV[v]) continue;
+                // Check if this vertex is on the cut graph
+                bool onCut = false;
+                for (int eid : v2e[v]) {
+                    if (inCut[eid]) { onCut = true; break; }
+                }
+                if (!onCut) continue;
+                
+                if (dsuCut.find(v) == dsuCut.find(compReps[0])) srcVerts.push_back(v);
+                if (dsuCut.find(v) == dsuCut.find(compReps[i])) dstVerts.push_back(v);
+            }
+            
+            if (srcVerts.empty() || dstVerts.empty()) continue;
+            
+            // Dijkstra from all srcVerts to find closest dstVert
+            std::vector<double> dist(nV, std::numeric_limits<double>::infinity());
+            std::vector<int> prev(nV, -1);
+            std::priority_queue<PQItem, std::vector<PQItem>, std::greater<PQItem>> pq;
+            
+            for (int v : srcVerts) {
+                dist[v] = 0.0;
+                pq.push({0.0, v});
+            }
+            std::set<int> dstSet(dstVerts.begin(), dstVerts.end());
+            
+            int target = -1;
+            while (!pq.empty()) {
+                auto [d, u] = pq.top();
+                pq.pop();
+                if (d != dist[u]) continue;
+                
+                if (dstSet.count(u)) {
+                    target = u;
+                    break;
+                }
+                
+                for (const auto& [to, w] : wadj[u]) {
+                    if (dist[to] > d + w) {
+                        dist[to] = d + w;
+                        prev[to] = u;
+                        pq.push({dist[to], to});
+                    }
+                }
+            }
+            
+            if (target != -1) {
+                // Add path edges to cut
+                int curr = target;
+                while (prev[curr] != -1) {
+                    int p = prev[curr];
+                    EdgeKey ek(p, curr);
+                    auto it = edgeMap.find(ek);
+                    if (it != edgeMap.end()) {
+                        inCut[it->second] = 1;
+                        dsuCut.unite(p, curr);
+                    }
+                    curr = p;
+                }
+            }
+        }
+    }
+    
+    // -----------------------
+    // POST-PROCESSING: Ensure all boundary components will merge
+    // -----------------------
+    // For boundaries to merge, cut paths must connect them THROUGH the mesh
+    // Build a DSU where boundary vertices merge if connected by cut edges OR by boundary edges
+    if (bCount > 1) {
+        DSU dsuBoundary(nV);
+        
+        // First, unite all boundary vertices on the same boundary component
+        for (int eid = 0; eid < nE; ++eid) {
+            if (edges[eid].f1 == -1) {  // Boundary edge
+                dsuBoundary.unite(edges[eid].u, edges[eid].v);
+            }
+        }
+        
+        // Now unite vertices connected by cut edges
+        for (int eid = 0; eid < nE; ++eid) {
+            if (inCut[eid]) {
+                dsuBoundary.unite(edges[eid].u, edges[eid].v);
+            }
+        }
+        
+        // Check how many distinct boundary "super-components" we have
+        std::set<int> boundaryRoots;
+        for (int bc = 0; bc < bCount; ++bc) {
+            if (bcRep[bc] >= 0) {
+                boundaryRoots.insert(dsuBoundary.find(bcRep[bc]));
+            }
+        }
+        
+        // If we have more than one, we need to add connecting paths
+        if (boundaryRoots.size() > 1) {
+            
+            std::vector<std::vector<std::pair<int, double>>> wadj(nV);
+            for (int eid = 0; eid < nE; ++eid) {
+                if (!usedV[edges[eid].u] || !usedV[edges[eid].v]) continue;
+                double w = edgeLength(orig, edges[eid].u, edges[eid].v);
+                wadj[edges[eid].u].emplace_back(edges[eid].v, w);
+                wadj[edges[eid].v].emplace_back(edges[eid].u, w);
+            }
+            
+            struct PQItem2 { double d; int v; bool operator>(const PQItem2& o) const { return d > o.d; } };
+            
+            std::vector<int> breps(boundaryRoots.begin(), boundaryRoots.end());
+            
+            for (size_t i = 1; i < breps.size(); ++i) {
+                // Find boundary vertices in each super-component
+                std::vector<int> srcBV, dstBV;
+                for (int bc = 0; bc < bCount; ++bc) {
+                    if (bcRep[bc] < 0) continue;
+                    if (dsuBoundary.find(bcRep[bc]) == dsuBoundary.find(breps[0])) {
+                        // Add all boundary vertices from this BC
+                        for (int v = 0; v < nV; ++v) {
+                            if (vBC[v] == bc) srcBV.push_back(v);
+                        }
+                    }
+                    if (dsuBoundary.find(bcRep[bc]) == dsuBoundary.find(breps[i])) {
+                        for (int v = 0; v < nV; ++v) {
+                            if (vBC[v] == bc) dstBV.push_back(v);
+                        }
+                    }
+                }
+                
+                if (srcBV.empty() || dstBV.empty()) continue;
+                
+                // Dijkstra from srcBV to dstBV
+                std::vector<double> dist(nV, std::numeric_limits<double>::infinity());
+                std::vector<int> prev(nV, -1);
+                std::priority_queue<PQItem2, std::vector<PQItem2>, std::greater<PQItem2>> pq;
+                
+                for (int v : srcBV) {
+                    dist[v] = 0.0;
+                    pq.push({0.0, v});
+                }
+                std::set<int> dstSet(dstBV.begin(), dstBV.end());
+                
+                int target = -1;
+                while (!pq.empty()) {
+                    auto [d, u] = pq.top();
+                    pq.pop();
+                    if (d != dist[u]) continue;
+                    
+                    if (dstSet.count(u)) {
+                        target = u;
+                        break;
+                    }
+                    
+                    for (const auto& [to, w] : wadj[u]) {
+                        if (dist[to] > d + w) {
+                            dist[to] = d + w;
+                            prev[to] = u;
+                            pq.push({dist[to], to});
+                        }
+                    }
+                }
+                
+                if (target != -1) {
+                    int curr = target;
+                    while (prev[curr] != -1) {
+                        int p = prev[curr];
+                        EdgeKey ek(p, curr);
+                        auto it = edgeMap.find(ek);
+                        if (it != edgeMap.end()) {
+                            inCut[it->second] = 1;
+                        }
+                        dsuBoundary.unite(p, curr);
+                        curr = p;
+                    }
                 }
             }
         }
     }
 
-    // Cut all interior edges not in the dual spanning forest.
-    cutEdges = std::move(interiorEdges);
-    for (const auto &e : treeEdges) {
-        cutEdges.erase(e);
+    // -----------------------
+    // 8) Store cut edges
+    // -----------------------
+    for (int eid = 0; eid < nE; ++eid) {
+        if (inCut[eid]) {
+            cutEdges.insert(EdgeKey(edges[eid].u, edges[eid].v));
+        }
     }
 }
 
@@ -274,55 +795,102 @@ void CutMesh::buildExplicitCutMesh() {
 
     if (nT == 0 || nV == 0) return;
 
-    DSU dsu(nT * 3);
+    // Build edge table with incident faces (same approach as CutMeshDisk.cxx)
+    struct InternalEdge {
+        int u = -1, v = -1;   // endpoints (u < v)
+        int f0 = -1, f1 = -1; // incident faces (f1 == -1 => boundary)
+    };
+    
+    std::unordered_map<EdgeKey, int, EdgeKeyHash> edgeMap;
+    edgeMap.reserve(static_cast<size_t>(nT) * 3);
+    std::vector<InternalEdge> edges;
+    edges.reserve(static_cast<size_t>(nT * 3 / 2));
 
-    // Glue triangles across non-cut interior edges by unifying the corresponding corners.
-    for (int t = 0; t < nT; ++t) {
-        const Triangle &tri = orig.triangles[t];
-        for (int e = 0; e < 3; ++e) {
-            const int nb = orig.triangleAdjacency[t][e];
-            if (nb == -1) continue; // original boundary
-
-            const int a = tri[e];
-            const int b = tri[(e + 1) % 3];
-            if (singularityPathCutEdges.find(EdgeKey(a, b)) != singularityPathCutEdges.end()) continue;
-
-            // Find the local indices of a and b in the neighbor triangle.
-            const Triangle &triN = orig.triangles[nb];
-            int ia = -1, ib = -1;
-            for (int lv = 0; lv < 3; ++lv) {
-                if (triN[lv] == a) ia = lv;
-                if (triN[lv] == b) ib = lv;
-            }
-            if (ia == -1 || ib == -1) continue;
-
-            dsu.unite(3 * t + e, 3 * nb + ia);
-            dsu.unite(3 * t + ((e + 1) % 3), 3 * nb + ib);
+    auto addEdge = [&](int a, int b, int fidx) {
+        EdgeKey k(a, b);
+        auto it = edgeMap.find(k);
+        if (it == edgeMap.end()) {
+            int eid = static_cast<int>(edges.size());
+            edgeMap.emplace(k, eid);
+            InternalEdge e;
+            e.u = k.a; e.v = k.b;
+            e.f0 = fidx; e.f1 = -1;
+            edges.push_back(e);
+        } else {
+            InternalEdge& e = edges[it->second];
+            if (e.f1 == -1) e.f1 = fidx;
         }
+    };
+
+    for (int f = 0; f < nT; ++f) {
+        const Triangle& t = orig.triangles[f];
+        addEdge(t[0], t[1], f);
+        addEdge(t[1], t[2], f);
+        addEdge(t[2], t[0], f);
     }
 
-    // Assign new vertex ids to DSU roots.
+    const int nE = static_cast<int>(edges.size());
+
+    // Helper to find local index of vertex v in triangle t
+    auto localIndex = [&](int f, int v) -> int {
+        const Triangle& t = orig.triangles[f];
+        if (t[0] == v) return 0;
+        if (t[1] == v) return 1;
+        if (t[2] == v) return 2;
+        return -1;
+    };
+
+    // DSU over corners (3 per face). Corners are glued across *uncut* interior edges.
+    DSU dsu(nT * 3);
+
+    for (int eid = 0; eid < nE; ++eid) {
+        const InternalEdge& e = edges[eid];
+        if (e.f1 == -1) continue;     // boundary edge: nothing to glue
+        
+        // Check if this edge is in the cut set
+        EdgeKey ek(e.u, e.v);
+        if (cutEdges.find(ek) != cutEdges.end()) continue;  // seam edge: do not glue
+
+        int f0 = e.f0, f1 = e.f1;
+
+        int i0u = localIndex(f0, e.u);
+        int i1u = localIndex(f1, e.u);
+        int i0v = localIndex(f0, e.v);
+        int i1v = localIndex(f1, e.v);
+
+        if (i0u < 0 || i1u < 0 || i0v < 0 || i1v < 0) continue;
+
+        dsu.unite(3*f0 + i0u, 3*f1 + i1u);
+        dsu.unite(3*f0 + i0v, 3*f1 + i1v);
+    }
+
+    // Build new vertex list (one per corner-component)
     std::unordered_map<int, int> rootToNew;
     rootToNew.reserve(static_cast<size_t>(nT) * 3);
 
-    cut.triangles.resize(nT);
-    for (int t = 0; t < nT; ++t) {
-        for (int lv = 0; lv < 3; ++lv) {
-            const int corner = 3 * t + lv;
-            const int root = dsu.find(corner);
-            auto it = rootToNew.find(root);
-            int newV = -1;
-            if (it == rootToNew.end()) {
-                newV = static_cast<int>(cut.vertices.size());
-                rootToNew.emplace(root, newV);
-                const int origV = orig.triangles[t][lv];
-                cut.vertices.push_back(orig.vertices[origV]);
-                cutVertToOrig.push_back(origV);
-            } else {
-                newV = it->second;
-            }
-            cut.triangles[t][lv] = newV;
+    std::vector<int> cornerNew(3 * nT, -1);
+
+    for (int c = 0; c < 3 * nT; ++c) {
+        int r = dsu.find(c);
+        auto it = rootToNew.find(r);
+        if (it == rootToNew.end()) {
+            int f = c / 3;
+            int i = c % 3;
+            int origV = orig.triangles[f][i];
+            int newId = static_cast<int>(cut.vertices.size());
+            rootToNew.emplace(r, newId);
+            cut.vertices.push_back(orig.vertices[origV]);
+            cutVertToOrig.push_back(origV);
+            cornerNew[c] = newId;
+        } else {
+            cornerNew[c] = it->second;
         }
+    }
+
+    // Build cut faces with new vertex ids
+    cut.triangles.resize(nT);
+    for (int f = 0; f < nT; ++f) {
+        cut.triangles[f] = { cornerNew[3*f + 0], cornerNew[3*f + 1], cornerNew[3*f + 2] };
     }
 
     // Build inverse mapping.

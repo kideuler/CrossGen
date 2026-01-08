@@ -39,6 +39,9 @@ target_link_libraries(PolyVector PUBLIC Eigen3::Eigen)
 add_executable(LoadMesh src/LoadMesh.cxx)
 target_link_libraries(LoadMesh PRIVATE PolyVector)
 
+# small executable that cuts a mesh into a disk
+add_executable(CutMeshDisk src/CutMeshDisk.cxx)
+
 # Utility to cut a mesh into a disk and run sanity checks
 add_executable(TestCutMesh src/TestCutMesh.cxx)
 target_link_libraries(TestCutMesh PRIVATE PolyVector)

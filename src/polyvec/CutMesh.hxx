@@ -90,7 +90,7 @@ private:
     std::vector<int> cutVertToOrig;
     std::vector<std::vector<int>> origToCutVerts;
 
-    void buildDualSpanningTreeCuts();
+    void buildEdgeCuts();
     void connectSingularitiesWithShortestPaths();
     void buildExplicitCutMesh();
 };

@@ -188,7 +188,7 @@ int main(int argc, char **argv) {
         // Phase 4: seam cuts
         if (phase >= Phase::CutSeams && cutMesh.has_value()) {
             if (!cutMesh->getSingularityPathCutEdges().empty()) {
-                viewer::drawEdgeSetOnMesh(mesh, cutMesh->getSingularityPathCutEdges(), 1.0f, 0.75f, 0.1f, 4.0f);
+                viewer::drawEdgeSetOnMesh(mesh, cutMesh->getCutEdges(), 1.0f, 0.75f, 0.1f, 4.0f);
             } else {
                 viewer::drawEdgeSetOnMesh(mesh, cutMesh->getCutEdges(), 1.0f, 0.2f, 0.9f, 3.5f);
             }
