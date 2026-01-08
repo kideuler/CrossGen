@@ -194,6 +194,9 @@ int main(int argc, char **argv) {
             }
         }
 
+        // Draw help text overlay
+        viewer::drawTextOverlay(window, "press 'c' to continue\npress 'q' to quit", 10.0f, 20.0f, 0.8f, 0.8f, 0.8f);
+
         glfwSwapBuffers(window);
         glfwPollEvents();
 
