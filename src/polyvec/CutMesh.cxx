@@ -107,7 +107,7 @@ CutMesh::CutMesh(const PolyField &field) {
     singularities = field.uSingularities;
 
     buildEdgeCuts();
-    //connectSingularitiesWithShortestPaths();
+    connectSingularitiesWithShortestPaths();
     buildExplicitCutMesh();
 }
 
@@ -712,28 +712,32 @@ void CutMesh::connectSingularitiesWithShortestPaths() {
         }
     }
 
-    // Boundary markers: ONLY the original mesh boundary.
-    //
-    // Important: We want paths that truly connect each singularity to the external
-    // boundary of the input mesh. If we also treat the current cut graph as
-    // boundary, Dijkstra may terminate immediately (or very early), producing no
-    // singularity-to-boundary path cuts.
-    std::vector<char> isBoundary(nV, false);
-    auto markBoundaryEdge = [&](int a, int b) {
-        if (a >= 0 && a < nV) isBoundary[a] = true;
-        if (b >= 0 && b < nV) isBoundary[b] = true;
-    };
+    // Target markers: boundary vertices OR vertices incident to cutEdges.
+    // A singularity is considered "connected" if it lies on the boundary or
+    // is an endpoint of an edge in cutEdges.
+    std::vector<char> isTarget(nV, false);
+
+    // Mark boundary vertices
     for (int t = 0; t < nT; ++t) {
         const Triangle &tri = orig.triangles[t];
         for (int e = 0; e < 3; ++e) {
             if (orig.triangleAdjacency[t][e] != -1) continue;
-            markBoundaryEdge(tri[e], tri[(e + 1) % 3]);
+            int a = tri[e];
+            int b = tri[(e + 1) % 3];
+            if (a >= 0 && a < nV) isTarget[a] = true;
+            if (b >= 0 && b < nV) isTarget[b] = true;
         }
     }
 
-    // Dijkstra from each singularity to the original boundary.
+    // Mark vertices incident to cutEdges
+    for (const auto &ek : cutEdges) {
+        if (ek.a >= 0 && ek.a < nV) isTarget[ek.a] = true;
+        if (ek.b >= 0 && ek.b < nV) isTarget[ek.b] = true;
+    }
+
+    // Dijkstra from each singularity to the nearest target (boundary or cut edge).
     using QItem = std::pair<double, int>;
-    auto runDijkstra = [&](int source, const std::vector<char> &isB, std::vector<int> &prev) -> int {
+    auto runDijkstra = [&](int source, const std::vector<char> &isT, std::vector<int> &prev) -> int {
         prev.assign(nV, -1);
         std::vector<double> dist(nV, std::numeric_limits<double>::infinity());
         std::priority_queue<QItem, std::vector<QItem>, std::greater<QItem>> pq;
@@ -743,7 +747,7 @@ void CutMesh::connectSingularitiesWithShortestPaths() {
             const auto [d, v] = pq.top();
             pq.pop();
             if (d != dist[v]) continue;
-            if (isB[v]) return v;
+            if (isT[v] && v != source) return v;
             for (const auto &nw : adj[v]) {
                 const int to = nw.first;
                 const double w = nw.second;
@@ -761,9 +765,11 @@ void CutMesh::connectSingularitiesWithShortestPaths() {
     for (const auto &s : singularities) {
         const int vSing = s.first;
         if (vSing < 0 || vSing >= nV) continue;
-        if (isBoundary[vSing]) continue;
 
-        const int target = runDijkstra(vSing, isBoundary, prev);
+        // Skip if singularity is already on boundary or connected to a cut edge
+        if (isTarget[vSing]) continue;
+
+        const int target = runDijkstra(vSing, isTarget, prev);
         if (target < 0) {
             // Disconnected graph; can't connect this singularity.
             continue;
@@ -779,8 +785,17 @@ void CutMesh::connectSingularitiesWithShortestPaths() {
             singularityPathCutEdges.insert(ek);
             cur = p;
         }
-        // Note: we intentionally don't augment the boundary target set with the
-        // newly cut path. Each singularity should connect to the true boundary.
+
+        // Update isTarget to include vertices on the newly added path
+        // so subsequent singularities can connect to this path as well.
+        cur = target;
+        while (cur != vSing) {
+            if (cur >= 0 && cur < nV) isTarget[cur] = true;
+            const int p = prev[cur];
+            if (p < 0) break;
+            cur = p;
+        }
+        if (vSing >= 0 && vSing < nV) isTarget[vSing] = true;
     }
 }
 

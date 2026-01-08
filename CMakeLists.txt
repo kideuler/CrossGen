@@ -39,12 +39,36 @@ target_link_libraries(PolyVector PUBLIC Eigen3::Eigen)
 add_executable(LoadMesh src/LoadMesh.cxx)
 target_link_libraries(LoadMesh PRIVATE PolyVector)
 
-# small executable that cuts a mesh into a disk
-add_executable(CutMeshDisk src/CutMeshDisk.cxx)
-
 # Utility to cut a mesh into a disk and run sanity checks
 add_executable(TestCutMesh src/TestCutMesh.cxx)
-target_link_libraries(TestCutMesh PRIVATE PolyVector)
+target_link_libraries(TestCutMesh PRIVATE PolyVector) 
+
+# copy all meshes to build directory for easy access
+file(GLOB MESH_FILES "${CMAKE_CURRENT_SOURCE_DIR}/data/meshes/*")
+foreach(MESH_FILE ${MESH_FILES})
+    get_filename_component(MESH_NAME ${MESH_FILE} NAME)
+    configure_file(${MESH_FILE} ${CMAKE_CURRENT_BINARY_DIR}/data/meshes/${MESH_NAME} COPYONLY)
+endforeach()
+
+# Custom target to run TestCutMesh on all meshes
+file(GLOB MESH_OBJ_FILES "${CMAKE_CURRENT_BINARY_DIR}/data/meshes/*.obj")
+set(CUT_COMMANDS "")
+foreach(MESH_FILE ${MESH_OBJ_FILES})
+    get_filename_component(MESH_NAME ${MESH_FILE} NAME)
+    list(APPEND CUT_COMMANDS 
+        COMMAND ${CMAKE_COMMAND} -E echo "Processing ${MESH_NAME}..."
+        COMMAND $<TARGET_FILE:TestCutMesh> ${CMAKE_CURRENT_BINARY_DIR}/data/meshes/${MESH_NAME}
+    )
+endforeach()
+
+add_custom_target(cut
+    ${CUT_COMMANDS}
+    DEPENDS TestCutMesh
+    COMMENT "Running TestCutMesh on all meshes in data/meshes"
+    VERBATIM
+)
+
+
 
 # Optional OpenGL viewer
 option(BUILD_OPENGL_VIEWER "Build the OpenGL mesh/field viewer" OFF)

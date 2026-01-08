@@ -20,6 +20,13 @@ static void printReport(const CutMesh::SanityReport &rep) {
             std::cout << "  - " << m << "\n";
         }
     }
+
+    // print overall green pass or red fail
+    if (rep.looksLikeDisk && rep.allSingularitiesOnBoundary) {
+        std::cout << "\033[32m[PASS]\033[0m\n";
+    } else {
+        std::cout << "\033[31m[FAIL]\033[0m\n";
+    }
 }
 
 int main(int argc, char **argv) {
