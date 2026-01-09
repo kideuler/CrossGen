@@ -3,12 +3,34 @@
 #include "viewer/ViewerTypes.hxx"
 #include "viewer/GL.hxx"
 
+#include <string>
+#include <vector>
 #include <unordered_set>
 
 #include "polyvec/CutMesh.hxx"
 #include "polyvec/PolyVectors.hxx"
 
 namespace viewer {
+
+// Simple on-screen console for displaying log messages
+class Console {
+public:
+    // Add a message to the console
+    void log(const std::string &msg);
+
+    // Clear all messages
+    void clear();
+
+    // Draw the console at the top of the screen
+    void draw(GLFWwindow *window, float startY = 50.0f) const;
+
+    // Set maximum number of lines to display (default 10)
+    void setMaxLines(int n) { maxLines_ = n; }
+
+private:
+    std::vector<std::string> lines_;
+    int maxLines_ = 10;
+};
 
 void drawMesh(const Mesh &m);
 

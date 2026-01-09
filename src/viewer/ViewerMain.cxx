@@ -1,8 +1,11 @@
 // Viewer executable entry point (split out from the old monolithic Viewer.cxx).
 
 #include <algorithm>
+#include <chrono>
+#include <iomanip>
 #include <iostream>
 #include <optional>
+#include <sstream>
 #include <string>
 
 #include "viewer/Geometry.hxx"
@@ -41,6 +44,13 @@ const char *phaseName(Phase p) {
     return "?";
 }
 
+// Format duration in milliseconds with 2 decimal places
+std::string formatMs(double ms) {
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(2) << ms << " ms";
+    return oss.str();
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -62,6 +72,19 @@ int main(int argc, char **argv) {
     std::optional<CutMesh> cutMesh;
     Phase phase = Phase::MeshOnly;
     bool cWasDown = false;
+    bool singularitiesLogged = false;
+    
+    // Console for timing output
+    viewer::Console console;
+    console.setMaxLines(8);
+
+    // Log initial mesh info
+    {
+        std::ostringstream oss;
+        oss << "Loaded mesh: " << mesh.triangles.size() << " triangles, " 
+            << mesh.vertices.size() << " vertices";
+        console.log(oss.str());
+    }
 
     if (!glfwInit()) {
         std::cerr << "Failed to initialize GLFW\n";
@@ -117,6 +140,8 @@ int main(int argc, char **argv) {
     glHint(GL_LINE_SMOOTH_HINT, GL_NICEST);
     glShadeModel(GL_SMOOTH);
 
+    using Clock = std::chrono::high_resolution_clock;
+
     while (!glfwWindowShouldClose(window)) {
         // Phase progression (edge-triggered)
         bool cDown = (glfwGetKey(window, GLFW_KEY_C) == GLFW_PRESS);
@@ -129,17 +154,42 @@ int main(int argc, char **argv) {
         }
         cWasDown = cDown;
 
-        // Lazily compute data when entering phases.
+        // Lazily compute data when entering phases (with timing).
         if (phase >= Phase::CrossField && !field.has_value()) {
+            auto t0 = Clock::now();
             field.emplace(mesh);
             field->solveForPolyCoeffs();
+            auto t1 = Clock::now();
+            // convertToFieldVectors() also computes singularities internally
             field->convertToFieldVectors();
+            auto t2 = Clock::now();
+            double msCoeffs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            double msField = std::chrono::duration<double, std::milli>(t2 - t1).count();
+            console.log("[CrossField] Solved poly-coeffs: " + formatMs(msCoeffs));
+            console.log("[CrossField] Converted to field vectors: " + formatMs(msField));
         }
-        if (phase >= Phase::Singularities && field.has_value() && field->uSingularities.empty()) {
+        if (phase >= Phase::Singularities && field.has_value() && !singularitiesLogged) {
+            // Re-compute singularities to get accurate timing (they were computed in convertToFieldVectors)
+            auto t0 = Clock::now();
             field->computeUSingularities();
+            auto t1 = Clock::now();
+            double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            std::ostringstream oss;
+            oss << "[Singularities] Found " << field->uSingularities.size() 
+                << " singularities: " << formatMs(ms);
+            console.log(oss.str());
+            singularitiesLogged = true;
         }
         if (phase >= Phase::CutSeams && field.has_value() && !cutMesh.has_value()) {
+            auto t0 = Clock::now();
             cutMesh.emplace(*field);
+            auto t1 = Clock::now();
+            double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+            std::ostringstream oss;
+            oss << "[CutSeams] Generated " << cutMesh->getCutEdges().size() 
+                << " cut edges: " << formatMs(ms);
+            console.log(oss.str());
 
             std::cerr << "[Viewer] #tri=" << mesh.triangles.size() << " #vtx=" << mesh.vertices.size()
                       << " | uSingularities=" << field->uSingularities.size() << " | cutEdges="
@@ -193,6 +243,9 @@ int main(int argc, char **argv) {
                 viewer::drawEdgeSetOnMesh(mesh, cutMesh->getCutEdges(), 1.0f, 0.2f, 0.9f, 3.5f);
             }
         }
+
+        // Draw console at top (below help text)
+        console.draw(window, 55.0f);
 
         // Draw help text overlay
         viewer::drawTextOverlay(window, "press 'c' to continue\npress 'q' to quit", 10.0f, 20.0f, 0.8f, 0.8f, 0.8f);

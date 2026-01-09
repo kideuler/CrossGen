@@ -10,6 +10,84 @@
 
 namespace viewer {
 
+// ============================================================================
+// Console implementation
+// ============================================================================
+
+void Console::log(const std::string &msg) {
+    lines_.push_back(msg);
+    // Keep only the last maxLines_ entries
+    if (static_cast<int>(lines_.size()) > maxLines_) {
+        lines_.erase(lines_.begin());
+    }
+}
+
+void Console::clear() {
+    lines_.clear();
+}
+
+void Console::draw(GLFWwindow *window, float startY) const {
+    if (lines_.empty()) return;
+
+    int fbw, fbh;
+    glfwGetFramebufferSize(window, &fbw, &fbh);
+
+    // Save current projection/modelview and set up screen-space orthographic
+    glMatrixMode(GL_PROJECTION);
+    glPushMatrix();
+    glLoadIdentity();
+    glOrtho(0, fbw, fbh, 0, -1, 1); // top-left origin
+
+    glMatrixMode(GL_MODELVIEW);
+    glPushMatrix();
+    glLoadIdentity();
+
+    float scale = 2.0f;
+    float charH = 8.0f * scale;
+    float padding = 8.0f;
+    float lineSpacing = charH + 2.0f;
+    
+    // Calculate console dimensions
+    float consoleHeight = lines_.size() * lineSpacing + padding * 2;
+    float consoleWidth = fbw - 20.0f;  // nearly full width with margins
+    
+    // Draw semi-transparent background
+    glColor4f(0.0f, 0.0f, 0.0f, 0.6f);
+    glBegin(GL_QUADS);
+    glVertex2f(10.0f, startY - padding);
+    glVertex2f(10.0f + consoleWidth, startY - padding);
+    glVertex2f(10.0f + consoleWidth, startY + consoleHeight - padding);
+    glVertex2f(10.0f, startY + consoleHeight - padding);
+    glEnd();
+
+    // Draw border
+    glColor3f(0.3f, 0.6f, 0.3f);
+    glLineWidth(1.0f);
+    glBegin(GL_LINE_LOOP);
+    glVertex2f(10.0f, startY - padding);
+    glVertex2f(10.0f + consoleWidth, startY - padding);
+    glVertex2f(10.0f + consoleWidth, startY + consoleHeight - padding);
+    glVertex2f(10.0f, startY + consoleHeight - padding);
+    glEnd();
+
+    // Restore matrices for text drawing
+    glMatrixMode(GL_MODELVIEW);
+    glPopMatrix();
+    glMatrixMode(GL_PROJECTION);
+    glPopMatrix();
+
+    // Draw each line using drawTextOverlay (it sets up its own projection)
+    float y = startY;
+    for (const auto &line : lines_) {
+        drawTextOverlay(window, line.c_str(), 18.0f, y, 0.4f, 0.9f, 0.4f);
+        y += lineSpacing;
+    }
+}
+
+// ============================================================================
+// Mesh drawing
+// ============================================================================
+
 void drawMesh(const Mesh &m) {
     glColor3f(0.85f, 0.85f, 0.85f);
     glLineWidth(1.25f);
