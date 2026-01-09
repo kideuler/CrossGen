@@ -73,6 +73,9 @@ public:
     // Singularities (original vertex id, index4)
     const std::vector<std::pair<int,int>>& getSingularities() const { return singularities; }
 
+    // Per-triangle u field direction (from the PolyField).
+    const std::vector<Point>& getUField() const { return uField; }
+
     // Write the cut mesh as an OBJ file (z=0).
     bool writeOBJ(const std::string &filename) const;
 
@@ -86,6 +89,8 @@ private:
     std::vector<std::pair<int,int>> singularities;
     std::unordered_set<EdgeKey, EdgeKeyHash> cutEdges;
     std::unordered_set<EdgeKey, EdgeKeyHash> singularityPathCutEdges;
+
+    std::vector<Point> uField;  // per-triangle u direction from PolyField
 
     std::vector<int> cutVertToOrig;
     std::vector<std::vector<int>> origToCutVerts;

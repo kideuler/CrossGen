@@ -106,6 +106,13 @@ CutMesh::CutMesh(const PolyField &field) {
     orig = field.getMesh();
     singularities = field.uSingularities;
 
+    // Copy the per-triangle u field directions
+    const auto& fieldVecs = field.field;
+    uField.resize(fieldVecs.size());
+    for (size_t i = 0; i < fieldVecs.size(); ++i) {
+        uField[i] = fieldVecs[i].u;
+    }
+
     buildEdgeCuts();
     connectSingularitiesWithShortestPaths();
     buildExplicitCutMesh();
