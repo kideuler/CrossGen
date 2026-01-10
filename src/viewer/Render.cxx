@@ -369,7 +369,7 @@ void drawTextOverlay(GLFWwindow *window, const char *text, float x, float y, flo
                 }
             }
         }
-        curX += charW;
+            curX += charW;
     }
     glEnd();
 
@@ -378,6 +378,29 @@ void drawTextOverlay(GLFWwindow *window, const char *text, float x, float y, flo
     glPopMatrix();
     glMatrixMode(GL_PROJECTION);
     glPopMatrix();
+}
+
+void drawUVMesh(const IntegerGridMap &igm, float r, float g, float b, float lineWidth) {
+    const Mesh &cut = igm.getMesh();
+    const std::vector<Point> &uv = igm.uv();
+
+    if (uv.size() != cut.vertices.size()) return;
+
+    glColor3f(r, g, b);
+    glLineWidth(lineWidth);
+    glBegin(GL_LINES);
+    for (const auto &tri : cut.triangles) {
+        const Point &a = uv[tri[0]];
+        const Point &b = uv[tri[1]];
+        const Point &c = uv[tri[2]];
+        glVertex2d(a[0], a[1]);
+        glVertex2d(b[0], b[1]);
+        glVertex2d(b[0], b[1]);
+        glVertex2d(c[0], c[1]);
+        glVertex2d(c[0], c[1]);
+        glVertex2d(a[0], a[1]);
+    }
+    glEnd();
 }
 
 } // namespace viewer
