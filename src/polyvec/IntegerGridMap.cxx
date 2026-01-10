@@ -831,6 +831,201 @@ bool IntegerGridMap::untangleUV(Eigen::VectorXd &x,
 }
 
 
+void IntegerGridMap::computeTriangleJacobians(const Eigen::VectorXd &x,
+                                             std::vector<double> &detJ,
+                                             std::vector<double> &areas) const {
+    const int T = static_cast<int>(cut.triangles.size());
+    const int V = static_cast<int>(cut.vertices.size());
+    
+    detJ.resize(T);
+    areas.resize(T);
+    
+    for (int t = 0; t < T; ++t) {
+        const auto tri = cut.triangles[t];
+        const int i0 = tri[0], i1 = tri[1], i2 = tri[2];
+        const Point &p0 = cut.vertices[i0];
+        const Point &p1 = cut.vertices[i1];
+        const Point &p2 = cut.vertices[i2];
+
+        Eigen::Matrix<double,2,3> G;
+        if (!tri_grad_matrix(p0, p1, p2, G, areas[t]) || areas[t] <= 0.0) {
+            detJ[t] = 0.0;
+            continue;
+        }
+
+        const double u0 = x[i0], u1 = x[i1], u2 = x[i2];
+        const double v0 = x[i0 + V], v1 = x[i1 + V], v2 = x[i2 + V];
+
+        const Eigen::Vector2d gradu = G.col(0) * u0 + G.col(1) * u1 + G.col(2) * u2;
+        const Eigen::Vector2d gradv = G.col(0) * v0 + G.col(1) * v1 + G.col(2) * v2;
+
+        Eigen::Matrix2d J;
+        J.row(0) = gradu.transpose();
+        J.row(1) = gradv.transpose();
+        detJ[t] = J.determinant();
+    }
+}
+
+
+bool IntegerGridMap::solveWithBarrier(const Options &opt,
+                                      double h,
+                                      const std::vector<std::pair<int,double>> &fixed,
+                                      std::vector<double> &weights,
+                                      Eigen::VectorXd &x) {
+    const int V = static_cast<int>(cut.vertices.size());
+    const int T = static_cast<int>(cut.triangles.size());
+    const int S = static_cast<int>(seams.size());
+    const int N = 2 * V + 2 * S;
+    
+    // Initialize x with standard solve if not provided
+    if (x.size() != N) {
+        Eigen::SparseMatrix<double> H;
+        Eigen::VectorXd g;
+        assembleEnergy(h, weights, opt.translation_regularization, opt.soft_seam_weight, H, g);
+        Eigen::SparseMatrix<double> C;
+        Eigen::VectorXd d;
+        assembleConstraints(fixed, opt.soft_seam_weight, C, d);
+        if (!solveKKT(H, g, C, d, x)) return false;
+    }
+    
+    // Check initial state
+    std::vector<double> detJ, areas;
+    computeTriangleJacobians(x, detJ, areas);
+    
+    int initialFlips = 0;
+    double minDetJ = std::numeric_limits<double>::max();
+    for (int t = 0; t < T; ++t) {
+        if (detJ[t] <= 0.0) ++initialFlips;
+        minDetJ = std::min(minDetJ, detJ[t]);
+    }
+    
+    if (initialFlips == 0) return true;  // Already locally injective
+    
+    // Barrier-augmented iterative reweighted least squares (IRLS)
+    // The idea: add weights to triangles based on their Jacobian determinant
+    // to penalize near-degenerate configurations.
+    //
+    // Energy = sum_t w_t * A_t * |grad(u,v) - target|^2 + mu * sum_t -log(det(J_t) / A_t)
+    //
+    // We approximate the barrier term using IRLS:
+    // The gradient of -log(d) is -1/d, and Hessian is 1/d^2
+    // We add a quadratic proxy: (1/d^2) * (d - d_current)^2
+    
+    double mu = opt.barrier_weight;
+    const double eps = opt.barrier_eps;
+    
+    std::vector<double> barrierWeights(T, 1.0);
+    
+    for (int iter = 0; iter < opt.barrier_iterations; ++iter) {
+        // Compute current Jacobians
+        computeTriangleJacobians(x, detJ, areas);
+        
+        // Update barrier weights based on current det(J)
+        // For the log-barrier: weight = 1 / (det(J))^2
+        // We use a smoothed version to handle negative det(J)
+        for (int t = 0; t < T; ++t) {
+            const double d = detJ[t];
+            const double areaRatio = (areas[t] > 0) ? d / areas[t] : d;
+            
+            if (areaRatio > eps) {
+                // Standard barrier weight
+                barrierWeights[t] = mu / (areaRatio * areaRatio);
+            } else {
+                // Strong penalty for flipped/degenerate triangles
+                // Use a smoothed extension that encourages positive area
+                barrierWeights[t] = mu / (eps * eps) * (1.0 + 10.0 * (eps - areaRatio));
+            }
+            
+            // Clamp to reasonable range
+            barrierWeights[t] = std::min(barrierWeights[t], 1e6);
+        }
+        
+        // Combine with distortion weights: total = base + barrier
+        std::vector<double> totalWeights(T);
+        for (int t = 0; t < T; ++t) {
+            totalWeights[t] = weights[t] + barrierWeights[t];
+        }
+        
+        // Assemble and solve with updated weights
+        Eigen::SparseMatrix<double> H;
+        Eigen::VectorXd g;
+        assembleEnergy(h, totalWeights, opt.translation_regularization, opt.soft_seam_weight, H, g);
+        
+        Eigen::SparseMatrix<double> C;
+        Eigen::VectorXd d;
+        assembleConstraints(fixed, opt.soft_seam_weight, C, d);
+        
+        Eigen::VectorXd xNew;
+        if (!solveKKT(H, g, C, d, xNew)) {
+            std::cerr << "[Barrier] KKT solve failed at iteration " << iter << std::endl;
+            return false;
+        }
+        
+        // Line search to ensure we don't flip any more triangles
+        double alpha = 1.0;
+        Eigen::VectorXd xTest = xNew;
+        
+        for (int ls = 0; ls < 20; ++ls) {
+            xTest = (1.0 - alpha) * x + alpha * xNew;
+            
+            std::vector<double> detJTest, areasTest;
+            computeTriangleJacobians(xTest, detJTest, areasTest);
+            
+            int newFlips = 0;
+            double newMinDetJ = std::numeric_limits<double>::max();
+            for (int t = 0; t < T; ++t) {
+                if (detJTest[t] <= 0.0) ++newFlips;
+                newMinDetJ = std::min(newMinDetJ, detJTest[t]);
+            }
+            
+            // Accept if we reduced flips or maintained/improved min det(J)
+            if (newFlips < initialFlips || 
+                (newFlips == initialFlips && newMinDetJ >= minDetJ - 1e-10)) {
+                break;
+            }
+            
+            alpha *= 0.5;
+        }
+        
+        x = xTest;
+        
+        // Update statistics
+        computeTriangleJacobians(x, detJ, areas);
+        int currentFlips = 0;
+        minDetJ = std::numeric_limits<double>::max();
+        for (int t = 0; t < T; ++t) {
+            if (detJ[t] <= 0.0) ++currentFlips;
+            minDetJ = std::min(minDetJ, detJ[t]);
+        }
+        
+        if (currentFlips == 0) {
+            return true;  // Success!
+        }
+        
+        // Increase barrier weight if not making progress
+        if (currentFlips >= initialFlips) {
+            mu *= 2.0;
+        }
+        initialFlips = currentFlips;
+        
+        // Update base weights too (local stiffening)
+        if (iter % 3 == 0) {
+            updateStiffeningWeights(x, h, opt.stiffening_c, opt.stiffening_d, 
+                                   opt.stiffening_smooth_steps, weights);
+        }
+    }
+    
+    // Final check
+    computeTriangleJacobians(x, detJ, areas);
+    int finalFlips = 0;
+    for (int t = 0; t < T; ++t) {
+        if (detJ[t] <= 0.0) ++finalFlips;
+    }
+    
+    return finalFlips == 0;
+}
+
+
 void IntegerGridMap::extractUVFromX(const Eigen::VectorXd &x) {
     const int V = static_cast<int>(cut.vertices.size());
     uvCoords.resize(V);
@@ -899,6 +1094,19 @@ bool IntegerGridMap::solve(const Options &opt) {
         }
         // Early out if already orientation-preserving.
         if (st.flipped_triangles == 0 && it >= 1) break;
+    }
+
+    // --- Barrier optimization for local injectivity ---
+    // If there are still flipped triangles, use barrier-augmented optimization
+    if (opt.use_barrier) {
+        Stats st = computeStatsFromX(x, h);
+        if (st.flipped_triangles > 0) {
+            std::vector<std::pair<int,double>> emptyFixed;
+            if (!solveWithBarrier(opt, h, emptyFixed, weights, x)) {
+                std::cerr << "[IntegerGridMap] Barrier optimization failed to achieve injectivity." << std::endl;
+                // Continue anyway - might still get acceptable result
+            }
+        }
     }
 
     // --- Mixed-integer rounding (greedy with quality check) ---
@@ -1135,15 +1343,24 @@ bool IntegerGridMap::solve(const Options &opt) {
         // If still have flips after stiffening, try untangling with gradient descent
         Stats finalStats = computeStatsFromX(x, h);
         if (finalStats.flipped_triangles > 0) {
-            // Build fixed list for UV variables only (exclude seam translations)
-            std::vector<std::pair<int,double>> uvFixed;
-            const int V = static_cast<int>(cut.vertices.size());
-            for (const auto &fv : fixed) {
-                if (fv.first < 2 * V) {  // Only UV variables, not seam translations
-                    uvFixed.push_back(fv);
-                }
+            // First try barrier-augmented optimization with the fixed constraints
+            if (opt.use_barrier) {
+                solveWithBarrier(opt, h, fixed, weights, x);
+                finalStats = computeStatsFromX(x, h);
             }
-            untangleUV(x, uvFixed, h, 1000);
+            
+            // If still have flips, try gradient descent untangling
+            if (finalStats.flipped_triangles > 0) {
+                // Build fixed list for UV variables only (exclude seam translations)
+                std::vector<std::pair<int,double>> uvFixed;
+                const int V = static_cast<int>(cut.vertices.size());
+                for (const auto &fv : fixed) {
+                    if (fv.first < 2 * V) {  // Only UV variables, not seam translations
+                        uvFixed.push_back(fv);
+                    }
+                }
+                untangleUV(x, uvFixed, h, 1000);
+            }
         }
     }
 

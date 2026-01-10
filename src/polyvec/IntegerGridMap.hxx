@@ -50,6 +50,15 @@ public:
         //   near singularities.
         double soft_seam_weight = 0.1;  // Default: soft constraints for robustness
 
+        // Barrier-based local injectivity enforcement:
+        // Uses a log-barrier term to prevent triangle flips during optimization.
+        // The energy becomes: E_total = E_dirichlet + barrier_weight * sum(-log(det(J)))
+        // Higher values enforce injectivity more strongly but may increase distortion.
+        bool use_barrier = true;
+        double barrier_weight = 1.0;       // Weight for barrier term
+        int barrier_iterations = 20;       // Max iterations for barrier optimization
+        double barrier_eps = 1e-6;         // Minimum allowed triangle area ratio
+
         // Mixed-integer rounding.
         // For performance, we round in batches (smallest errors first), rather
         // than strictly one-by-one.
@@ -187,6 +196,19 @@ private:
                     const std::vector<std::pair<int,double>> &fixed,
                     double h,
                     int maxIter) const;
+
+    // Barrier-augmented optimization for local injectivity.
+    // Uses iterative reweighted least squares with a log-barrier term.
+    bool solveWithBarrier(const Options &opt,
+                          double h,
+                          const std::vector<std::pair<int,double>> &fixed,
+                          std::vector<double> &weights,
+                          Eigen::VectorXd &x);
+    
+    // Compute per-triangle Jacobian determinant from current solution.
+    void computeTriangleJacobians(const Eigen::VectorXd &x,
+                                  std::vector<double> &detJ,
+                                  std::vector<double> &areas) const;
 
     void extractUVFromX(const Eigen::VectorXd &x);
 };
