@@ -7,33 +7,19 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Eigen (header-only)
-# Eigen: prefer a system installation, but fall back to the vendored copy.
-find_package(Eigen3 3.3 QUIET NO_MODULE)
-if (NOT Eigen3_FOUND)
-    message(STATUS "Eigen3 not found on system - using vendored Eigen in extern/eigen")
-    add_library(Eigen3::Eigen INTERFACE IMPORTED)
-    set_target_properties(Eigen3::Eigen PROPERTIES
-        INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/extern/eigen"
-    )
-endif()
+find_package(Eigen3 3.3 REQUIRED NO_MODULE)
 message(STATUS "Eigen3 include dir: ${EIGEN3_INCLUDE_DIR}")
 
 option(BUILD_MESH2GMSH "Build the Mesh2Dgmsh utility" ON)
 
 if (BUILD_MESH2GMSH)
     list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
-    # Gmsh is only required for the Mesh2Dgmsh utility. Make it optional so the
-    # core polyvec / cutting / integer-grid-map tooling can build without it.
-    find_package(Gmsh QUIET)
-    if (Gmsh_FOUND)
-        message(STATUS "Gmsh found - building Mesh2Dgmsh")
-        add_executable(Mesh2Dgmsh src/Mesh2Dgmsh.cxx)
-        target_link_libraries(Mesh2Dgmsh PRIVATE Gmsh::gmsh)
-    else()
-        message(STATUS "Gmsh not found - skipping Mesh2Dgmsh (set BUILD_MESH2GMSH=OFF to silence)")
-    endif()
+    find_package(Gmsh REQUIRED)
+    message(STATUS "Gmsh found: ${GMSH_LIBRARY}")
+    add_executable(Mesh2Dgmsh src/Mesh2Dgmsh.cxx)
+    target_link_libraries(Mesh2Dgmsh PRIVATE Gmsh::gmsh)
 else()
-    message(STATUS "Skipping Mesh2Dgmsh utility (BUILD_MESH2GMSH=OFF)")
+    message(STATUS "Skipping Mesh2Dgmsh utility")
 endif()
 
 add_library(PolyVector SHARED
@@ -45,12 +31,8 @@ add_library(PolyVector SHARED
     src/polyvec/CutMesh.cxx
     src/polyvec/PolyVectors.hxx
     src/polyvec/PolyVectors.cxx
-    src/polyvec/IntegerGridMap.hxx
-    src/polyvec/IntegerGridMap.cxx
-    src/polyvec/QuadMeshValidation.hxx
-    src/polyvec/QuadMeshValidation.cxx
 )
-target_include_directories(PolyVector PUBLIC src src/polyvec)
+target_include_directories(PolyVector PUBLIC src/polyvec)
 target_link_libraries(PolyVector PUBLIC Eigen3::Eigen)
 
 # Small utility to load and print mesh data
@@ -60,10 +42,6 @@ target_link_libraries(LoadMesh PRIVATE PolyVector)
 # Utility to cut a mesh into a disk and run sanity checks
 add_executable(TestCutMesh src/TestCutMesh.cxx)
 target_link_libraries(TestCutMesh PRIVATE PolyVector) 
-
-# Utility to construct an integer grid map (MIQ-style parameterization)
-add_executable(TestIntegerGridMap src/TestIntegerGridMap.cxx)
-target_link_libraries(TestIntegerGridMap PRIVATE PolyVector)
 
 # copy all meshes to build directory for easy access
 file(GLOB MESH_FILES "${CMAKE_CURRENT_SOURCE_DIR}/data/meshes/*")
@@ -91,22 +69,6 @@ add_custom_target(cut
 )
 
 
-# Custom target to run TestIntegerGridMap on all meshes
-set(IGM_COMMANDS "")
-foreach(MESH_FILE ${MESH_OBJ_FILES})
-    get_filename_component(MESH_NAME ${MESH_FILE} NAME)
-    list(APPEND IGM_COMMANDS
-        COMMAND ${CMAKE_COMMAND} -E echo "Processing ${MESH_NAME}..."
-        COMMAND $<TARGET_FILE:TestIntegerGridMap> ${CMAKE_CURRENT_BINARY_DIR}/data/meshes/${MESH_NAME}
-    )
-endforeach()
-
-add_custom_target(igm
-    ${IGM_COMMANDS}
-    DEPENDS TestIntegerGridMap
-    COMMENT "Running TestIntegerGridMap on all meshes in data/meshes"
-    VERBATIM
-)
 
 # Optional OpenGL viewer
 option(BUILD_OPENGL_VIEWER "Build the OpenGL mesh/field viewer" OFF)

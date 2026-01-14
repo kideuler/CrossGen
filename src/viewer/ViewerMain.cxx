@@ -13,7 +13,6 @@
 #include "viewer/Render.hxx"
 
 #include "polyvec/CutMesh.hxx"
-#include "polyvec/IntegerGridMap.hxx"
 #include "polyvec/PolyVectors.hxx"
 
 namespace {
@@ -23,7 +22,6 @@ enum class Phase {
     CrossField = 2,
     Singularities = 3,
     CutSeams = 4,
-    UVMesh = 5,
 };
 
 Phase nextPhase(Phase p) {
@@ -31,10 +29,9 @@ Phase nextPhase(Phase p) {
         case Phase::MeshOnly: return Phase::CrossField;
         case Phase::CrossField: return Phase::Singularities;
         case Phase::Singularities: return Phase::CutSeams;
-        case Phase::CutSeams: return Phase::UVMesh;
-        case Phase::UVMesh: return Phase::UVMesh;
+        case Phase::CutSeams: return Phase::CutSeams;
     }
-    return Phase::UVMesh;
+    return Phase::CutSeams;
 }
 
 const char *phaseName(Phase p) {
@@ -43,7 +40,6 @@ const char *phaseName(Phase p) {
         case Phase::CrossField: return "2) crossfield";
         case Phase::Singularities: return "3) singularities";
         case Phase::CutSeams: return "4) cut seams";
-        case Phase::UVMesh: return "5) uv mesh";
     }
     return "?";
 }
@@ -74,7 +70,6 @@ int main(int argc, char **argv) {
 
     std::optional<PolyField> field;
     std::optional<CutMesh> cutMesh;
-    std::optional<IntegerGridMap> igm;
     Phase phase = Phase::MeshOnly;
     bool cWasDown = false;
     bool singularitiesLogged = false;
@@ -207,114 +202,45 @@ int main(int argc, char **argv) {
                     << " Falling back to showing all cut edges.\n";
             }
         }
-        if (phase >= Phase::UVMesh && cutMesh.has_value() && !igm.has_value()) {
-            auto t0 = Clock::now();
-            igm.emplace(*cutMesh);
-            IntegerGridMap::Options opt;
-            opt.h = 1.0;
-            opt.stiffening_iterations = 10;
-            opt.do_rounding = true;
-            bool success = igm->solve(opt);
-            auto t1 = Clock::now();
-            double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-
-            if (success) {
-                auto st = igm->computeStats(opt.h);
-                std::ostringstream oss;
-                oss << "[UVMesh] Solved IGM: " << formatMs(ms) 
-                    << " (flipped=" << st.flipped_triangles << ")";
-                console.log(oss.str());
-            } else {
-                console.log("[UVMesh] IGM solve failed: " + formatMs(ms));
-            }
-        }
 
         glClearColor(0.1f, 0.1f, 0.12f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
         glDisable(GL_DEPTH_TEST);
 
-        // Phase 5: UV mesh (clears everything and shows only UV coordinates)
-        if (phase == Phase::UVMesh && igm.has_value()) {
-            // Compute bounds of UV coordinates for proper view
-            const auto &uvCoords = igm->uv();
-            if (!uvCoords.empty()) {
-                double uvMinX = uvCoords[0][0], uvMaxX = uvCoords[0][0];
-                double uvMinY = uvCoords[0][1], uvMaxY = uvCoords[0][1];
-                for (const auto &uv : uvCoords) {
-                    uvMinX = std::min(uvMinX, uv[0]);
-                    uvMaxX = std::max(uvMaxX, uv[0]);
-                    uvMinY = std::min(uvMinY, uv[1]);
-                    uvMaxY = std::max(uvMaxY, uv[1]);
-                }
-                double uvDx = uvMaxX - uvMinX;
-                double uvDy = uvMaxY - uvMinY;
-                double uvExt = std::max(uvDx, uvDy);
-                if (uvExt <= 0) uvExt = 1.0;
-                double uvPad = 0.1 * uvExt;
+        // Phase 1: mesh
+        if (phase >= Phase::MeshOnly) {
+            viewer::drawMesh(mesh);
+        }
 
-                // Set up orthographic projection for UV space
-                glMatrixMode(GL_PROJECTION);
-                glLoadIdentity();
-                int fbw, fbh;
-                glfwGetFramebufferSize(window, &fbw, &fbh);
-                double aspect = static_cast<double>(fbw) / static_cast<double>(fbh);
-                double uvCx = 0.5 * (uvMinX + uvMaxX);
-                double uvCy = 0.5 * (uvMinY + uvMaxY);
-                double uvW = (uvDx + 2.0 * uvPad);
-                double uvH = (uvDy + 2.0 * uvPad);
-                if (uvW <= 0.0) uvW = 1.0;
-                if (uvH <= 0.0) uvH = 1.0;
-                double halfW, halfH;
-                if (aspect > uvW / uvH) {
-                    halfH = uvH / 2.0;
-                    halfW = halfH * aspect;
-                } else {
-                    halfW = uvW / 2.0;
-                    halfH = halfW / aspect;
-                }
-                glOrtho(uvCx - halfW, uvCx + halfW, uvCy - halfH, uvCy + halfH, -1.0, 1.0);
-                glMatrixMode(GL_MODELVIEW);
-                glLoadIdentity();
+        // Phase 2: crossfield
+        if (phase >= Phase::CrossField && field.has_value()) {
+            viewer::drawField(mesh, *field, scale);
+        }
 
-                viewer::drawUVMesh(*igm, 0.3f, 0.85f, 0.95f, 1.25f);
-            }
-        } else {
-            // Phases 1-4: draw on original mesh
-            // Phase 1: mesh
-            if (phase >= Phase::MeshOnly) {
-                viewer::drawMesh(mesh);
-            }
+        // Phase 3: singularities
+        if (phase >= Phase::Singularities && field.has_value()) {
+            double ballRadius = 0.5 * avgEdge; // large, relative to mesh scale
+            for (const auto &sig : field->uSingularities) {
+                int vid = sig.first;
+                int index4 = sig.second;
+                if (vid < 0 || vid >= static_cast<int>(mesh.vertices.size())) continue;
+                const Point &c = mesh.vertices[vid];
 
-            // Phase 2: crossfield
-            if (phase >= Phase::CrossField && field.has_value()) {
-                viewer::drawField(mesh, *field, scale);
-            }
-
-            // Phase 3: singularities
-            if (phase >= Phase::Singularities && field.has_value()) {
-                double ballRadius = 0.5 * avgEdge; // large, relative to mesh scale
-                for (const auto &sig : field->uSingularities) {
-                    int vid = sig.first;
-                    int index4 = sig.second;
-                    if (vid < 0 || vid >= static_cast<int>(mesh.vertices.size())) continue;
-                    const Point &c = mesh.vertices[vid];
-
-                    if (index4 == 1) {
-                        viewer::drawDisk3D(c, ballRadius, 0.2f, 0.2f, 0.95f);
-                    } else if (index4 == -1) {
-                        viewer::drawDisk3D(c, ballRadius, 0.95f, 0.2f, 0.2f);
-                    }
+                if (index4 == 1) {
+                    viewer::drawDisk3D(c, ballRadius, 0.2f, 0.2f, 0.95f);
+                } else if (index4 == -1) {
+                    viewer::drawDisk3D(c, ballRadius, 0.95f, 0.2f, 0.2f);
                 }
             }
+        }
 
-            // Phase 4: seam cuts
-            if (phase >= Phase::CutSeams && cutMesh.has_value()) {
-                if (!cutMesh->getSingularityPathCutEdges().empty()) {
-                    viewer::drawEdgeSetOnMesh(mesh, cutMesh->getCutEdges(), 1.0f, 0.75f, 0.1f, 4.0f);
-                } else {
-                    viewer::drawEdgeSetOnMesh(mesh, cutMesh->getCutEdges(), 1.0f, 0.2f, 0.9f, 3.5f);
-                }
+        // Phase 4: seam cuts
+        if (phase >= Phase::CutSeams && cutMesh.has_value()) {
+            if (!cutMesh->getSingularityPathCutEdges().empty()) {
+                viewer::drawEdgeSetOnMesh(mesh, cutMesh->getCutEdges(), 1.0f, 0.75f, 0.1f, 4.0f);
+            } else {
+                viewer::drawEdgeSetOnMesh(mesh, cutMesh->getCutEdges(), 1.0f, 0.2f, 0.9f, 3.5f);
             }
         }
 
