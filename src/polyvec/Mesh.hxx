@@ -17,6 +17,44 @@
 typedef std::array<double, 2> Point;
 typedef std::array<int, 3> Triangle;
 
+// compute angle from vector (Point)
+inline double computeAngle(const Point &p) {
+    return std::atan2(p[1], p[0]);
+}
+
+// simple wrap to (-pi, pi]
+inline double wrap_pi(double a) {
+  a = std::fmod(a + M_PI, 2.0*M_PI);
+  if (a < 0) a += 2.0*M_PI;
+  return a - M_PI; // now in (-pi, pi]
+}
+
+// find rotation matrix index k in {0,1,2,3} that minimizes |(theta_new + k*pi/2) - theta_old|
+inline int find_rotation_matrix(double theta_new, double theta_old) {
+    int k = -1;
+    double max = 1e34;
+    for (int i = 0; i < 4; ++i) {
+        double angle = i * M_PI_2;
+        double diff = std::fabs(wrap_pi((theta_new + angle) - theta_old));
+        if (diff < max) {
+            max = diff;
+            k = i;
+        }
+    }
+    return k;
+}
+
+inline Point rotateVector(const Point &u, int k) {
+    switch (k) {
+        case 0: return u;
+        case 1: return Point{ -u[1], u[0] };
+        case 2: return Point{ -u[0], -u[1] };
+        case 3: return Point{ u[1], -u[0] };
+        default: return u;
+    }
+}
+
+
 class Mesh {
  public:
     std::vector<Point> vertices; // List of 2D points

@@ -76,6 +76,9 @@ public:
     // Per-triangle u field direction (from the PolyField).
     const std::vector<Point>& getUField() const { return uField; }
 
+    // Per-triangle v field direction (from the PolyField).
+    const std::vector<Point>& getVField() const { return vField; }
+
     // Write the cut mesh as an OBJ file (z=0).
     bool writeOBJ(const std::string &filename) const;
 
@@ -85,12 +88,14 @@ public:
 private:
     Mesh orig;
     Mesh cut;
+    SanityReport sanityInfo;
 
     std::vector<std::pair<int,int>> singularities;
     std::unordered_set<EdgeKey, EdgeKeyHash> cutEdges;
     std::unordered_set<EdgeKey, EdgeKeyHash> singularityPathCutEdges;
 
     std::vector<Point> uField;  // per-triangle u direction from PolyField
+    std::vector<Point> vField;  // per-triangle v direction from PolyField
 
     std::vector<int> cutVertToOrig;
     std::vector<std::vector<int>> origToCutVerts;
@@ -98,6 +103,8 @@ private:
     void buildEdgeCuts();
     void connectSingularitiesWithShortestPaths();
     void buildExplicitCutMesh();
+    void combFieldDirections();
+    void makeVFieldFromUField();
 };
 
 #endif // __CUTMESH_HXX__

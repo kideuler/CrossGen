@@ -43,6 +43,12 @@ void drawArrow(const Point &p, const Point &dir, double scale, float r, float g,
 
 void drawField(const Mesh &m, const PolyField &field, double scale);
 
+// Draw only the U field (single direction per triangle) from a CutMesh
+void drawUField(const Mesh &m, const std::vector<Point> &uField, double scale);
+
+// Draw only the V field (single direction per triangle) from a CutMesh
+void drawVField(const Mesh &m, const std::vector<Point> &vField, double scale);
+
 void drawDisk3D(const Point &center, double radius, float baseR, float baseG, float baseB, int segments = 96);
 
 // Draw simple text overlay in screen coordinates (top-left origin).

@@ -138,6 +138,33 @@ PolyField::PolyField(Mesh &mesh) : mesh(mesh) {
         
     }
 
+    // Also handle corner triangles (triangles with 2 boundary edges)
+    // Use the first boundary edge's tangent as the constraint
+    for (const auto &ct : mesh.cornerTriangles) {
+        int t = ct[0];
+        int e = ct[1]; // first boundary edge
+
+        const Triangle &tri = mesh.triangles[t];
+        int v0 = tri[e];
+        int v1 = tri[(e + 1) % 3];
+        Point p0 = mesh.vertices[v0];
+        Point p1 = mesh.vertices[v1];
+
+        Point tangent = { p1[0] - p0[0], p1[1] - p0[1] };
+        polyCoeffs[t] = computePolyCoeffsFromTangentVector(tangent);
+
+        // Set Dirichlet condition
+        for (int col = 0; col < L.outerSize(); ++col) {
+            for (Eigen::SparseMatrix<double>::InnerIterator it(L, col); it; ++it) {
+                if (it.row() == t) {
+                    it.valueRef() = 0.0;
+                }
+            }
+        }
+        L.prune(0.0);
+        L.coeffRef(t, t) = 1.0;
+    }
+
     // factorize L after all modifications
     solver.compute(L);
     if(solver.info() != Eigen::Success) {
@@ -155,8 +182,14 @@ void PolyField::solveForPolyCoeffs() {
 
         // Set rhs for boundary triangles based on polynomial coefficients
         for (int i = 0; i < static_cast<int>(mesh.boundaryTriangles.size()); ++i) {
-            int t = mesh.boundaryTriangles[i][m];
-            // For simplicity, set rhs to real part of x_0 coefficient
+            int t = mesh.boundaryTriangles[i][0]; // triangle index
+            b_re(t) = polyCoeffs[t][m].real();
+            b_im(t) = polyCoeffs[t][m].imag();
+        }
+
+        // Also set rhs for corner triangles
+        for (const auto &ct : mesh.cornerTriangles) {
+            int t = ct[0]; // triangle index
             b_re(t) = polyCoeffs[t][m].real();
             b_im(t) = polyCoeffs[t][m].imag();
         }

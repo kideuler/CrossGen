@@ -116,6 +116,12 @@ CutMesh::CutMesh(const PolyField &field) {
     buildEdgeCuts();
     connectSingularitiesWithShortestPaths();
     buildExplicitCutMesh();
+    sanityInfo = sanityCheck();
+
+    if (sanityInfo.looksLikeDisk) {
+        combFieldDirections();
+    }
+    makeVFieldFromUField();
 }
 
 void CutMesh::buildEdgeCuts() {
@@ -926,6 +932,47 @@ void CutMesh::buildExplicitCutMesh() {
 
     // Recompute topology on the explicit cut mesh.
     computeTopology(cut);
+}
+
+void CutMesh::combFieldDirections() {
+    const int nT = static_cast<int>(cut.triangles.size());
+    if (nT == 0) return;
+
+    // Perform breadth-first traversal of triangles to align directions.
+    std::vector<bool> visT(nT, false); 
+    std::deque<int> q;
+
+    // start at triangle 0 and align adjacent triangles accordingly
+    visT[0] = true;
+    q.push_back(0);
+
+    while (!q.empty()) {
+        int curr = q.front();
+        q.pop_front();
+        double theta_curr = computeAngle(uField[curr]);
+
+        // for each neighbor triangle
+        for (int e = 0; e < 3; ++e) {
+            int nb = cut.triangleAdjacency[curr][e];
+            if (nb == -1 || visT[nb]) continue;
+            visT[nb] = true;
+            q.push_back(nb);
+
+            // align nb u directions to curr
+            double theta_nb = computeAngle(uField[nb]);
+            int k = find_rotation_matrix(theta_nb, theta_curr);
+
+            uField[nb] = rotateVector(uField[nb], k);
+        }
+    }
+}
+
+void CutMesh::makeVFieldFromUField() {
+    const int nT = static_cast<int>(uField.size());
+    vField.resize(nT);
+    for (int t = 0; t < nT; ++t) {
+        vField[t] = rotateVector(uField[t], 1); // 90 degrees CCW
+    }
 }
 
 bool CutMesh::writeOBJ(const std::string &filename) const {

@@ -213,8 +213,8 @@ int main(int argc, char **argv) {
             viewer::drawMesh(mesh);
         }
 
-        // Phase 2: crossfield
-        if (phase >= Phase::CrossField && field.has_value()) {
+        // Phase 2: crossfield (only in phases 2 and 3, not in phase 4)
+        if (phase >= Phase::CrossField && phase < Phase::CutSeams && field.has_value()) {
             viewer::drawField(mesh, *field, scale);
         }
 
@@ -237,6 +237,10 @@ int main(int argc, char **argv) {
 
         // Phase 4: seam cuts
         if (phase >= Phase::CutSeams && cutMesh.has_value()) {
+            // Draw U field (green) and V field (red) - single direction per triangle
+            viewer::drawUField(mesh, cutMesh->getUField(), scale);
+            viewer::drawVField(mesh, cutMesh->getVField(), scale);
+
             if (!cutMesh->getSingularityPathCutEdges().empty()) {
                 viewer::drawEdgeSetOnMesh(mesh, cutMesh->getCutEdges(), 1.0f, 0.75f, 0.1f, 4.0f);
             } else {

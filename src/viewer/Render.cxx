@@ -154,7 +154,7 @@ void drawArrow(const Point &p, const Point &dir, double scale, float r, float g,
 }
 
 void drawField(const Mesh &m, const PolyField &field, double scale) {
-    glLineWidth(1.5f);
+    glLineWidth(2.5f);
     const float br = 0.2f, bg = 0.2f, bb = 0.95f; // unified blue color
 
     for (size_t i = 0; i < m.triangles.size(); ++i) {
@@ -172,6 +172,32 @@ void drawField(const Mesh &m, const PolyField &field, double scale) {
             drawArrow(c, v, scale, br, bg, bb);
             Point vopp{-v[0], -v[1]};
             drawArrow(c, vopp, scale, br, bg, bb);
+        }
+    }
+}
+
+void drawUField(const Mesh &m, const std::vector<Point> &uField, double scale) {
+    glLineWidth(2.5f);
+    const float br = 0.2f, bg = 0.7f, bb = 0.2f; // green color for U field
+
+    for (size_t i = 0; i < m.triangles.size(); ++i) {
+        Point c = triangleCentroid(m, m.triangles[i]);
+        if (i < uField.size()) {
+            const Point &u = uField[i];
+            drawArrow(c, u, scale, br, bg, bb);
+        }
+    }
+}
+
+void drawVField(const Mesh &m, const std::vector<Point> &vField, double scale) {
+    glLineWidth(2.5f);
+    const float vr = 0.9f, vg = 0.2f, vb = 0.2f; // red color for V field
+
+    for (size_t i = 0; i < m.triangles.size(); ++i) {
+        Point c = triangleCentroid(m, m.triangles[i]);
+        if (i < vField.size()) {
+            const Point &v = vField[i];
+            drawArrow(c, v, scale, vr, vg, vb);
         }
     }
 }

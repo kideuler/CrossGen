@@ -52,14 +52,9 @@ inline std::pair<Point, Point> extract_two_directions(const std::array<std::comp
     // First direction from the best opposite pair
     Point d1 = vecs[i0];
 
-    // Second direction: one of the remaining two (the other should be ~ -d2)
-    int k1 = -1, k2 = -1;
-    for (int k = 0; k < 4; ++k) {
-        if (k != i0 && k != j0) {
-            if (k1 < 0) k1 = k; else k2 = k;
-        }
-    }
-    Point d2 = (k1 >= 0) ? vecs[k1] : Point{0.0, 0.0};
+    // Second direction: perpendicular to d1 (90° CCW rotation)
+    // This ensures the cross-field is truly orthogonal
+    Point d2 = {-d1[1], d1[0]};
 
     return {d1, d2};
 }
