@@ -6,9 +6,18 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Eigen (header-only)
-find_package(Eigen3 3.3 REQUIRED NO_MODULE)
-message(STATUS "Eigen3 include dir: ${EIGEN3_INCLUDE_DIR}")
+# Eigen (header-only) - use local submodule
+set(EIGEN3_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/extern/eigen")
+add_library(Eigen3::Eigen INTERFACE IMPORTED)
+set_target_properties(Eigen3::Eigen PROPERTIES
+    INTERFACE_INCLUDE_DIRECTORIES "${EIGEN3_INCLUDE_DIR}"
+)
+message(STATUS "Using local Eigen3 from: ${EIGEN3_INCLUDE_DIR}")
+
+# CoMiSo library - use local submodule
+set(COMISO_ENABLE_DEFAULT OFF CACHE BOOL "" FORCE)
+add_subdirectory(extern/CoMiSo)
+message(STATUS "Using local CoMiSo from: ${CMAKE_CURRENT_SOURCE_DIR}/extern/CoMiSo")
 
 option(BUILD_MESH2GMSH "Build the Mesh2Dgmsh utility" ON)
 
@@ -31,9 +40,12 @@ add_library(PolyVector SHARED
     src/polyvec/CutMesh.cxx
     src/polyvec/PolyVectors.hxx
     src/polyvec/PolyVectors.cxx
+    src/polyvec/MIQ.hxx
+    src/polyvec/MIQ.cxx
 )
 target_include_directories(PolyVector PUBLIC src/polyvec)
 target_link_libraries(PolyVector PUBLIC Eigen3::Eigen)
+target_link_libraries(PolyVector PUBLIC CoMISo::CoMISo)
 
 # Small utility to load and print mesh data
 add_executable(LoadMesh src/LoadMesh.cxx)
