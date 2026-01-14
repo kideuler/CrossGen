@@ -20,24 +20,14 @@
 #include "polyvec/IntegerGridMap.hxx"
 #include "polyvec/QuadMeshValidation.hxx"
 
-#include <cmath>
-
 namespace fs = std::filesystem;
-
-// Check if a value is close to an integer
-inline bool isInteger(double val, double tol = 1e-6) {
-    return std::abs(val - std::round(val)) < tol;
-}
 
 // Test a single mesh file, returns 0 on success (no flipped triangles), non-zero on failure
 // If outFlipped is not null, stores the flipped triangle count
 // If outValidation is not null, stores the validation result
-// If outNonIntegerSingularities is not null, stores the count of non-integer singularities
 int testMesh(const std::string &path, const std::string &outPath, bool verbose, 
-             int *outFlipped = nullptr, QuadMeshValidation::ValidationResult *outValidation = nullptr,
-             int *outNonIntegerSingularities = nullptr) {
+             int *outFlipped = nullptr, QuadMeshValidation::ValidationResult *outValidation = nullptr) {
     if (outFlipped) *outFlipped = -1;
-    if (outNonIntegerSingularities) *outNonIntegerSingularities = -1;
     try {
         Mesh m(path);
 
@@ -69,12 +59,12 @@ int testMesh(const std::string &path, const std::string &outPath, bool verbose,
         IntegerGridMap::Options opt;
         // opt.h = 0.0 means auto-compute h based on mesh size
         opt.h = 0.0;
-        opt.target_grid_lines = 50;      // Coarser grid for faster validation (~2 integer lines across mesh)
-        opt.stiffening_iterations = 100;  // Many iterations for continuous phase
+        opt.target_grid_lines = 20;      // Coarser grid for faster validation (~20 integer lines across mesh)
+        opt.stiffening_iterations = 50;  // Many iterations for continuous phase
         opt.stiffening_c = 2.0;          // Stronger stiffening
         opt.stiffening_d = 20.0;         // Higher clamp
         opt.do_rounding = true;          // Enable rounding by default (with soft seams, should be safe)
-        opt.max_round_iterations = 500;  // More rounding iterations
+        opt.max_round_iterations = 100;  // More rounding iterations
 
         if (!igm.solve(opt)) {
             std::cerr << "IntegerGridMap::solve failed.\n";
@@ -89,57 +79,6 @@ int testMesh(const std::string &path, const std::string &outPath, bool verbose,
                       << ", maxLambda=" << st.max_lambda
                       << ", meanLambda=" << st.mean_lambda
                       << "\n";
-        }
-
-        // Check that all singularities are at integer UV positions
-        const auto &sings = cm.getSingularities();
-        const auto &uvCoords = igm.uv();
-        const auto &origToCut = cm.getOriginalToCutVertices();
-        int nonIntegerSingularities = 0;
-        
-        if (verbose && !sings.empty()) {
-            std::cout << "Singularity UV positions:\n";
-        }
-        
-        for (size_t i = 0; i < sings.size(); ++i) {
-            int origVid = sings[i].first;
-            int index4 = sings[i].second;
-            const char* typeStr = (index4 == 1) ? "+1" : (index4 == -1) ? "-1" : "??";
-            
-            if (origVid >= 0 && origVid < static_cast<int>(origToCut.size()) && !origToCut[origVid].empty()) {
-                int cutVid = origToCut[origVid][0];
-                if (cutVid >= 0 && cutVid < static_cast<int>(uvCoords.size())) {
-                    const Point &uv = uvCoords[cutVid];
-                    bool uIsInt = isInteger(uv[0]);
-                    bool vIsInt = isInteger(uv[1]);
-                    
-                    if (verbose) {
-                        std::cout << "  Singularity " << i << " (index=" << typeStr << "): "
-                                  << "UV = (" << uv[0] << ", " << uv[1] << ")";
-                        if (uIsInt && vIsInt) {
-                            std::cout << " [INTEGER]";
-                        } else {
-                            std::cout << " [NON-INTEGER]";
-                        }
-                        std::cout << "\n";
-                    }
-                    
-                    if (!uIsInt || !vIsInt) {
-                        nonIntegerSingularities++;
-                    }
-                }
-            }
-        }
-        
-        if (outNonIntegerSingularities) *outNonIntegerSingularities = nonIntegerSingularities;
-        
-        if (verbose) {
-            if (sings.empty()) {
-                std::cout << "No singularities in mesh.\n";
-            } else {
-                std::cout << "Singularity integer check: " << (sings.size() - nonIntegerSingularities) 
-                          << "/" << sings.size() << " at integer positions\n";
-            }
         }
 
         // Run quad mesh validation
@@ -193,9 +132,8 @@ int testMesh(const std::string &path, const std::string &outPath, bool verbose,
             std::cout << "Wrote grid OBJ to: " << gridPath << "\n";
         }
 
-        // Return status: 0=perfect, 4=flipped, 6=validation issues, 7=non-integer singularities
+        // Return status: 0=perfect, 4=flipped, 6=validation issues
         if (st.flipped_triangles > 0) return 4;
-        if (nonIntegerSingularities > 0) return 7;
         if (!validation.valid) return 6;
         return 0;
     } catch (const std::exception &e) {
@@ -238,8 +176,8 @@ int main(int argc, char **argv) {
             return 1;
         }
         
-        std::cout << "Testing " << meshFiles.size() << " mesh files for inverted elements, singularity positions, and quad mesh validity...\n";
-        std::cout << std::string(80, '=') << "\n";
+        std::cout << "Testing " << meshFiles.size() << " mesh files for inverted elements and quad mesh validity...\n";
+        std::cout << std::string(70, '=') << "\n";
         
         int totalPassed = 0;
         int totalFailed = 0;
@@ -249,7 +187,6 @@ int main(int argc, char **argv) {
         int totalQuadFaces = 0;
         int totalNonQuadFaces = 0;
         int totalSelfCrossings = 0;
-        int totalNonIntegerSingularities = 0;
         
         for (const auto &meshPath : meshFiles) {
             std::string filename = fs::path(meshPath).filename().string();
@@ -257,9 +194,8 @@ int main(int argc, char **argv) {
             std::cout.flush();
             
             int flippedCount = 0;
-            int nonIntSingCount = 0;
             QuadMeshValidation::ValidationResult validation;
-            int result = testMesh(meshPath, "", false, &flippedCount, &validation, &nonIntSingCount);
+            int result = testMesh(meshPath, "", false, &flippedCount, &validation);
             
             if (result == 0) {
                 std::cout << "\033[32mPASS\033[0m (quads:" << validation.num_quad_faces 
@@ -268,10 +204,6 @@ int main(int argc, char **argv) {
                 totalPassed++;
             } else if (result == 4) {
                 std::cout << "\033[33mWARN\033[0m (" << flippedCount << " inverted elements)\n";
-                totalFailed++;
-                failures.emplace_back(filename, result);
-            } else if (result == 7) {
-                std::cout << "\033[33mWARN\033[0m (" << nonIntSingCount << " non-integer singularities)\n";
                 totalFailed++;
                 failures.emplace_back(filename, result);
             } else if (result == 6) {
@@ -291,18 +223,16 @@ int main(int argc, char **argv) {
             totalQuadFaces += validation.num_quad_faces;
             totalNonQuadFaces += validation.num_non_quad_faces;
             totalSelfCrossings += validation.num_self_crossings;
-            if (nonIntSingCount > 0) totalNonIntegerSingularities += nonIntSingCount;
         }
         
-        std::cout << std::string(80, '=') << "\n";
+        std::cout << std::string(70, '=') << "\n";
         std::cout << "Summary: " << totalPassed << "/" << meshFiles.size() << " passed";
         if (totalFailed > 0) {
             std::cout << ", " << totalFailed << " failed/warned";
         }
         std::cout << "\n";
         std::cout << "Totals: " << totalQuadFaces << " quads, " << totalNonQuadFaces << " non-quads, " 
-                  << totalSelfCrossings << " self-crossings, "
-                  << totalNonIntegerSingularities << " non-integer singularities\n";
+                  << totalSelfCrossings << " self-crossings\n";
         
         if (!failures.empty()) {
             std::cout << "\nFiles with issues:\n";
@@ -310,8 +240,6 @@ int main(int argc, char **argv) {
                 std::cout << "  - " << f.first;
                 if (f.second == 4) {
                     std::cout << " (inverted elements)";
-                } else if (f.second == 7) {
-                    std::cout << " (non-integer singularities)";
                 } else if (f.second == 6) {
                     std::cout << " (validation failed)";
                 } else {

@@ -211,11 +211,7 @@ int main(int argc, char **argv) {
             auto t0 = Clock::now();
             igm.emplace(*cutMesh);
             IntegerGridMap::Options opt;
-            // Use auto-computed h: set h=0 to let it be computed based on mesh size.
-            // target_grid_lines=100 means UV coordinates will span roughly [-50, 50],
-            // giving many integer positions for singularity snapping.
-            opt.h = 0.0;  // auto-compute based on target_grid_lines
-            opt.target_grid_lines = 100;
+            opt.h = 1.0;
             opt.stiffening_iterations = 10;
             opt.do_rounding = true;
             bool success = igm->solve(opt);
@@ -223,37 +219,11 @@ int main(int argc, char **argv) {
             double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
             if (success) {
-                auto st = igm->computeStats();  // uses effective h from solve
+                auto st = igm->computeStats(opt.h);
                 std::ostringstream oss;
                 oss << "[UVMesh] Solved IGM: " << formatMs(ms) 
                     << " (flipped=" << st.flipped_triangles << ")";
                 console.log(oss.str());
-
-                // Print UV coordinates of singularities to terminal
-                const auto &sings = cutMesh->getSingularities();
-                const auto &uvCoords = igm->uv();
-                const auto &origToCut = cutMesh->getOriginalToCutVertices();
-                
-                if (!sings.empty()) {
-                    std::cerr << "\n[UVMesh] Singularity UV coordinates:\n";
-                    std::cerr << std::fixed << std::setprecision(4);
-                    for (size_t i = 0; i < sings.size(); ++i) {
-                        int origVid = sings[i].first;
-                        int index4 = sings[i].second;
-                        const char* typeStr = (index4 == 1) ? "+1" : (index4 == -1) ? "-1" : "??";
-                        
-                        // Get UV from first cut vertex mapping to this original vertex
-                        if (origVid >= 0 && origVid < static_cast<int>(origToCut.size()) && !origToCut[origVid].empty()) {
-                            int cutVid = origToCut[origVid][0];
-                            if (cutVid >= 0 && cutVid < static_cast<int>(uvCoords.size())) {
-                                const Point &uv = uvCoords[cutVid];
-                                std::cerr << "  Singularity " << i << " (index=" << typeStr << "): "
-                                          << "UV = (" << uv[0] << ", " << uv[1] << ")\n";
-                            }
-                        }
-                    }
-                    std::cerr << std::endl;
-                }
             } else {
                 console.log("[UVMesh] IGM solve failed: " + formatMs(ms));
             }

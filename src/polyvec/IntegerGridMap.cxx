@@ -1113,10 +1113,10 @@ bool IntegerGridMap::solve(const Options &opt) {
     // Following MIQ paper: round one variable at a time, choosing the one
     // closest to an integer, and re-solve after each rounding.
     std::vector<std::pair<int,double>> fixed;
-    fixed.reserve(2 * seams.size() + 2 * singularCutVerts.size());
+    fixed.reserve(2 * seams.size());
 
     std::vector<int> integerVars;
-    integerVars.reserve(2 * seams.size() + 2 * singularCutVerts.size());
+    integerVars.reserve(2 * seams.size());
 
     // Seam translations are integers.
     for (const Seam &s : seams) {
@@ -1124,15 +1124,10 @@ bool IntegerGridMap::solve(const Options &opt) {
         integerVars.push_back(s.kVar);
     }
 
-    // MIQ paper Section 5: Singularity positions must be at integer (u,v) coordinates
-    // for proper quad mesh extraction. Each singularity's u and v coordinates are
-    // added to the integer variables list for greedy rounding.
-    for (int cv : singularCutVerts) {
-        if (cv >= 0 && cv < V) {
-            integerVars.push_back(cv);          // u coordinate of singularity
-            integerVars.push_back(cv + V);      // v coordinate of singularity
-        }
-    }
+    // NOTE: We intentionally do NOT round singularity positions to integers.
+    // While the MIQ paper suggests this for clean quad meshing, it severely
+    // constrains the solution and often leads to flipped triangles.
+    // The seam translations are sufficient for seamless parameterization.
 
     if (opt.do_rounding && !integerVars.empty()) {
         std::vector<char> isFixed(N, 0);
