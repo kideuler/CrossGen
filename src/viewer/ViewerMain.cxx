@@ -13,6 +13,7 @@
 #include "viewer/Render.hxx"
 
 #include "polyvec/CutMesh.hxx"
+#include "polyvec/MIQ.hxx"
 #include "polyvec/PolyVectors.hxx"
 
 namespace {
@@ -22,6 +23,7 @@ enum class Phase {
     CrossField = 2,
     Singularities = 3,
     CutSeams = 4,
+    UVMesh = 5,
 };
 
 Phase nextPhase(Phase p) {
@@ -29,9 +31,10 @@ Phase nextPhase(Phase p) {
         case Phase::MeshOnly: return Phase::CrossField;
         case Phase::CrossField: return Phase::Singularities;
         case Phase::Singularities: return Phase::CutSeams;
-        case Phase::CutSeams: return Phase::CutSeams;
+        case Phase::CutSeams: return Phase::UVMesh;
+        case Phase::UVMesh: return Phase::UVMesh;
     }
-    return Phase::CutSeams;
+    return Phase::UVMesh;
 }
 
 const char *phaseName(Phase p) {
@@ -40,6 +43,7 @@ const char *phaseName(Phase p) {
         case Phase::CrossField: return "2) crossfield";
         case Phase::Singularities: return "3) singularities";
         case Phase::CutSeams: return "4) cut seams";
+        case Phase::UVMesh: return "5) UV mesh (MIQ)";
     }
     return "?";
 }
@@ -70,6 +74,7 @@ int main(int argc, char **argv) {
 
     std::optional<PolyField> field;
     std::optional<CutMesh> cutMesh;
+    std::optional<MIQSolver> miqSolver;
     Phase phase = Phase::MeshOnly;
     bool cWasDown = false;
     bool singularitiesLogged = false;
@@ -202,49 +207,84 @@ int main(int argc, char **argv) {
                     << " Falling back to showing all cut edges.\n";
             }
         }
+        if (phase >= Phase::UVMesh && cutMesh.has_value() && !miqSolver.has_value()) {
+            auto t0 = Clock::now();
+            miqSolver.emplace(*cutMesh);
+            // Parameters: gradientSize, stiffness, directRound, iter, localIter, doRound, singularityRound, boundaryFeatures
+            miqSolver->solve(500.0, 5.0, false, 10, 5000, true, true, true);
+            auto t1 = Clock::now();
+            double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+            int flips = miqSolver->numFlips();
+            const auto &UV = miqSolver->getUV();
+
+            std::ostringstream oss;
+            oss << "[MIQ] Computed UV mesh: " << UV.rows() << " vertices, "
+                << flips << " flips: " << formatMs(ms);
+            console.log(oss.str());
+
+            std::cerr << "[Viewer] MIQ parametrization: " << UV.rows() << " UV vertices, "
+                      << flips << " flipped triangles\n";
+
+            // Initialize view for UV space (reset pan/zoom for new coordinate system)
+            viewer::computeUVMeshBounds(*miqSolver, view.cx, view.cy, view.baseW, view.baseH);
+            view.zoom = 1.0;
+            viewer::applyOrtho(view);
+        }
 
         glClearColor(0.1f, 0.1f, 0.12f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
         glDisable(GL_DEPTH_TEST);
 
-        // Phase 1: mesh
-        if (phase >= Phase::MeshOnly) {
-            viewer::drawMesh(mesh);
-        }
+        // Phase 5: UV mesh (MIQ) - special case: clear and draw only UV mesh
+        if (phase == Phase::UVMesh && miqSolver.has_value()) {
+            viewer::drawUVMesh(*miqSolver);
+            // Draw singularities on UV mesh with same coloring
+            if (field.has_value() && cutMesh.has_value()) {
+                // Use a radius proportional to the UV mesh extent
+                double uvRadius = 0.8; // fixed size that looks good on integer grid
+                viewer::drawSingularitiesOnUV(*miqSolver, *cutMesh, *field, uvRadius);
+            }
+        } else {
+            // Phase 1: mesh
+            if (phase >= Phase::MeshOnly) {
+                viewer::drawMesh(mesh);
+            }
 
-        // Phase 2: crossfield (only in phases 2 and 3, not in phase 4)
-        if (phase >= Phase::CrossField && phase < Phase::CutSeams && field.has_value()) {
-            viewer::drawField(mesh, *field, scale);
-        }
+            // Phase 2: crossfield (only in phases 2 and 3, not in phase 4)
+            if (phase >= Phase::CrossField && phase < Phase::CutSeams && field.has_value()) {
+                viewer::drawField(mesh, *field, scale);
+            }
 
-        // Phase 3: singularities
-        if (phase >= Phase::Singularities && field.has_value()) {
-            double ballRadius = 0.5 * avgEdge; // large, relative to mesh scale
-            for (const auto &sig : field->uSingularities) {
-                int vid = sig.first;
-                int index4 = sig.second;
-                if (vid < 0 || vid >= static_cast<int>(mesh.vertices.size())) continue;
-                const Point &c = mesh.vertices[vid];
+            // Phase 3: singularities
+            if (phase >= Phase::Singularities && field.has_value()) {
+                double ballRadius = 0.5 * avgEdge; // large, relative to mesh scale
+                for (const auto &sig : field->uSingularities) {
+                    int vid = sig.first;
+                    int index4 = sig.second;
+                    if (vid < 0 || vid >= static_cast<int>(mesh.vertices.size())) continue;
+                    const Point &c = mesh.vertices[vid];
 
-                if (index4 == 1) {
-                    viewer::drawDisk3D(c, ballRadius, 0.2f, 0.2f, 0.95f);
-                } else if (index4 == -1) {
-                    viewer::drawDisk3D(c, ballRadius, 0.95f, 0.2f, 0.2f);
+                    if (index4 == 1) {
+                        viewer::drawDisk3D(c, ballRadius, 0.2f, 0.2f, 0.95f);
+                    } else if (index4 == -1) {
+                        viewer::drawDisk3D(c, ballRadius, 0.95f, 0.2f, 0.2f);
+                    }
                 }
             }
-        }
 
-        // Phase 4: seam cuts
-        if (phase >= Phase::CutSeams && cutMesh.has_value()) {
-            // Draw U field (green) and V field (red) - single direction per triangle
-            viewer::drawUField(mesh, cutMesh->getUField(), scale);
-            viewer::drawVField(mesh, cutMesh->getVField(), scale);
+            // Phase 4: seam cuts
+            if (phase >= Phase::CutSeams && cutMesh.has_value()) {
+                // Draw U field (green) and V field (red) - single direction per triangle
+                viewer::drawUField(mesh, cutMesh->getUField(), scale);
+                viewer::drawVField(mesh, cutMesh->getVField(), scale);
 
-            if (!cutMesh->getSingularityPathCutEdges().empty()) {
-                viewer::drawEdgeSetOnMesh(mesh, cutMesh->getCutEdges(), 1.0f, 0.75f, 0.1f, 4.0f);
-            } else {
-                viewer::drawEdgeSetOnMesh(mesh, cutMesh->getCutEdges(), 1.0f, 0.2f, 0.9f, 3.5f);
+                if (!cutMesh->getSingularityPathCutEdges().empty()) {
+                    viewer::drawEdgeSetOnMesh(mesh, cutMesh->getCutEdges(), 1.0f, 0.75f, 0.1f, 4.0f);
+                } else {
+                    viewer::drawEdgeSetOnMesh(mesh, cutMesh->getCutEdges(), 1.0f, 0.2f, 0.9f, 3.5f);
+                }
             }
         }
 

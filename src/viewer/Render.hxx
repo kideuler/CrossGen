@@ -8,6 +8,7 @@
 #include <unordered_set>
 
 #include "polyvec/CutMesh.hxx"
+#include "polyvec/MIQ.hxx"
 #include "polyvec/PolyVectors.hxx"
 
 namespace viewer {
@@ -54,5 +55,17 @@ void drawDisk3D(const Point &center, double radius, float baseR, float baseG, fl
 // Draw simple text overlay in screen coordinates (top-left origin).
 // Must be called with proper orthographic projection set up for screen space.
 void drawTextOverlay(GLFWwindow *window, const char *text, float x, float y, float r, float g, float b);
+
+// Compute view bounds for a UV mesh (for initializing the view state once).
+void computeUVMeshBounds(const MIQSolver &miq, double &cx, double &cy, double &baseW, double &baseH);
+
+// Draw UV mesh from MIQ parametrization (2D view of UV coordinates).
+// Does not modify the view state - call computeUVMeshBounds first to set up the view.
+void drawUVMesh(const MIQSolver &miq);
+
+// Draw singularities on the UV mesh using the same coloring as the 3D view.
+// Uses the origToCutVerts mapping from CutMesh to find UV coordinates.
+void drawSingularitiesOnUV(const MIQSolver &miq, const CutMesh &cutMesh, 
+                           const PolyField &field, double radius);
 
 } // namespace viewer

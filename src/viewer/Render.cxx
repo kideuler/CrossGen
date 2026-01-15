@@ -2,6 +2,7 @@
 
 #include "viewer/GL.hxx"
 #include "viewer/Geometry.hxx"
+#include "viewer/Interaction.hxx"
 
 #include <algorithm>
 #include <cmath>
@@ -404,6 +405,145 @@ void drawTextOverlay(GLFWwindow *window, const char *text, float x, float y, flo
     glPopMatrix();
     glMatrixMode(GL_PROJECTION);
     glPopMatrix();
+}
+
+void computeUVMeshBounds(const MIQSolver &miq, double &cx, double &cy, double &baseW, double &baseH) {
+    const Eigen::MatrixXd &UV = miq.getUV();
+
+    if (UV.rows() == 0) {
+        cx = 0.0;
+        cy = 0.0;
+        baseW = 1.0;
+        baseH = 1.0;
+        return;
+    }
+
+    // Compute UV bounds
+    double minU = UV.col(0).minCoeff();
+    double maxU = UV.col(0).maxCoeff();
+    double minV = UV.col(1).minCoeff();
+    double maxV = UV.col(1).maxCoeff();
+
+    double du = maxU - minU;
+    double dv = maxV - minV;
+    double ext = std::max(du, dv);
+    if (ext <= 0) ext = 1.0;
+    double pad = 0.1 * ext;
+
+    cx = 0.5 * (minU + maxU);
+    cy = 0.5 * (minV + maxV);
+    baseW = du + 2.0 * pad;
+    baseH = dv + 2.0 * pad;
+    if (baseW <= 0.0) baseW = 1.0;
+    if (baseH <= 0.0) baseH = 1.0;
+}
+
+void drawUVMesh(const MIQSolver &miq) {
+    const Eigen::MatrixXd &UV = miq.getUV();
+    const Eigen::MatrixXi &FUV = miq.getFUV();
+
+    if (UV.rows() == 0 || FUV.rows() == 0) return;
+
+    // Compute UV bounds for grid drawing
+    double minU = UV.col(0).minCoeff();
+    double maxU = UV.col(0).maxCoeff();
+    double minV = UV.col(1).minCoeff();
+    double maxV = UV.col(1).maxCoeff();
+
+    double du = maxU - minU;
+    double dv = maxV - minV;
+    double ext = std::max(du, dv);
+    if (ext <= 0) ext = 1.0;
+    double pad = 0.1 * ext;
+
+    // Draw UV mesh edges
+    glColor3f(0.3f, 0.8f, 0.9f); // cyan color for UV mesh
+    glLineWidth(1.5f);
+    glBegin(GL_LINES);
+    for (int i = 0; i < FUV.rows(); ++i) {
+        int v0 = FUV(i, 0);
+        int v1 = FUV(i, 1);
+        int v2 = FUV(i, 2);
+
+        if (v0 < 0 || v0 >= UV.rows() ||
+            v1 < 0 || v1 >= UV.rows() ||
+            v2 < 0 || v2 >= UV.rows()) {
+            continue;
+        }
+
+        double u0 = UV(v0, 0), w0 = UV(v0, 1);
+        double u1 = UV(v1, 0), w1 = UV(v1, 1);
+        double u2 = UV(v2, 0), w2 = UV(v2, 1);
+
+        // Edge 0-1
+        glVertex2d(u0, w0);
+        glVertex2d(u1, w1);
+        // Edge 1-2
+        glVertex2d(u1, w1);
+        glVertex2d(u2, w2);
+        // Edge 2-0
+        glVertex2d(u2, w2);
+        glVertex2d(u0, w0);
+    }
+    glEnd();
+
+    // Draw integer grid lines for reference
+    int gridMinU = static_cast<int>(std::floor(minU));
+    int gridMaxU = static_cast<int>(std::ceil(maxU));
+    int gridMinV = static_cast<int>(std::floor(minV));
+    int gridMaxV = static_cast<int>(std::ceil(maxV));
+
+    glColor4f(0.4f, 0.4f, 0.4f, 0.5f);
+    glLineWidth(1.0f);
+    glBegin(GL_LINES);
+    // Vertical lines (constant U)
+    for (int u = gridMinU; u <= gridMaxU; ++u) {
+        glVertex2d(static_cast<double>(u), minV - pad);
+        glVertex2d(static_cast<double>(u), maxV + pad);
+    }
+    // Horizontal lines (constant V)
+    for (int v = gridMinV; v <= gridMaxV; ++v) {
+        glVertex2d(minU - pad, static_cast<double>(v));
+        glVertex2d(maxU + pad, static_cast<double>(v));
+    }
+    glEnd();
+}
+
+void drawSingularitiesOnUV(const MIQSolver &miq, const CutMesh &cutMesh,
+                           const PolyField &field, double radius) {
+    const Eigen::MatrixXd &UV = miq.getUV();
+    const auto &origToCut = cutMesh.getOriginalToCutVertices();
+    const auto &singularities = field.uSingularities;
+
+    if (UV.rows() == 0) return;
+
+    for (const auto &sig : singularities) {
+        int origVid = sig.first;
+        int index4 = sig.second;
+
+        // Skip if original vertex index is out of range
+        if (origVid < 0 || origVid >= static_cast<int>(origToCut.size())) continue;
+
+        // Get all cut mesh vertices corresponding to this original vertex
+        const auto &cutVerts = origToCut[origVid];
+        if (cutVerts.empty()) continue;
+
+        // Use the first cut vertex to get UV coordinates
+        // (all copies of a singularity should map to the same UV location in a valid parametrization)
+        int cutVid = cutVerts[0];
+        if (cutVid < 0 || cutVid >= UV.rows()) continue;
+
+        double u = UV(cutVid, 0);
+        double v = UV(cutVid, 1);
+        Point center{u, v};
+
+        // Draw with same coloring as 3D view: blue for +1, red for -1
+        if (index4 == 1) {
+            drawDisk3D(center, radius, 0.2f, 0.2f, 0.95f);
+        } else if (index4 == -1) {
+            drawDisk3D(center, radius, 0.95f, 0.2f, 0.2f);
+        }
+    }
 }
 
 } // namespace viewer
