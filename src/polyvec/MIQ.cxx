@@ -442,11 +442,12 @@ void MIQSolver::solve(
     unsigned int iter,
     unsigned int localIter,
     bool doRound,
-    bool singularityRound)
+    bool singularityRound,
+    bool boundaryFeatures)
 {
-    // Store stiffness weight for use in updateStiffening
-    // This is the maximum stiffness delta per iteration (default 5.0 as in libigl)
+    // Store parameters for use in solvePoisson and updateStiffening
     stiffnessWeight_ = stiffness;
+    boundaryFeatures_ = boundaryFeatures;
 
     // Normalize gradient size by mesh diameter
     Eigen::Vector2d minCorner = Vcut_.colwise().minCoeff();
@@ -505,17 +506,21 @@ void MIQSolver::solvePoisson(
     numCutConstraint_ = static_cast<int>(systemInfo_.edgeSeamInfo.size());
 
     // Count boundary edges (true boundary, not seam cuts)
-    // These will get hard feature constraints
+    // These will get hard feature constraints if enabled
     numBoundaryConstraints_ = 0;
-    const int nF = static_cast<int>(Fcut_.rows());
-    for (int f = 0; f < nF; ++f) {
-        for (int e = 0; e < 3; ++e) {
-            if (TT_(f, e) == -1) {  // True boundary edge
-                numBoundaryConstraints_++;
+    if (boundaryFeatures_) {
+        const int nF = static_cast<int>(Fcut_.rows());
+        for (int f = 0; f < nF; ++f) {
+            for (int e = 0; e < 3; ++e) {
+                if (TT_(f, e) == -1) {  // True boundary edge
+                    numBoundaryConstraints_++;
+                }
             }
         }
+        std::cout << "Found " << numBoundaryConstraints_ << " boundary edges for hard feature constraints" << std::endl;
+    } else {
+        std::cout << "Boundary feature constraints disabled" << std::endl;
     }
-    std::cout << "Found " << numBoundaryConstraints_ << " boundary edges for hard feature constraints" << std::endl;
 
     // Find a vertex to fix (preferably a singularity)
     nFixedVars_ = 0;
@@ -550,7 +555,9 @@ void MIQSolver::solvePoisson(
     buildSeamConstraints();
 
     // Add boundary feature constraints (hard edges snap to grid lines)
-    addBoundaryFeatureConstraints();
+    if (boundaryFeatures_) {
+        addBoundaryFeatureConstraints();
+    }
 
     // Fix blocked vertices
     fixBlockedVertex();
@@ -1131,6 +1138,51 @@ bool MIQSolver::writeUVMesh(const std::string& filename) const {
     // Write faces
     for (int f = 0; f < static_cast<int>(FUV.rows()); ++f) {
         out << "f " << (FUV(f, 0) + 1) << " " << (FUV(f, 1) + 1) << " " << (FUV(f, 2) + 1) << "\n";
+    }
+
+    return true;
+}
+
+bool MIQSolver::writeTexturedMesh(const std::string& filename) const {
+    std::ofstream out(filename);
+    if (!out) return false;
+
+    // Get original mesh data from cutMesh
+    const Mesh& origMesh = cutMesh_.getOriginalMesh();
+    const auto& origVerts = origMesh.vertices;      // Original vertex positions
+    const auto& origTris = origMesh.triangles;      // Original triangle connectivity
+    
+    // Write original mesh vertices (v lines)
+    // These are the original 3D positions (though z=0 for 2D meshes)
+    for (size_t i = 0; i < origVerts.size(); ++i) {
+        out << "v " << origVerts[i][0] << " " << origVerts[i][1] << " 0\n";
+    }
+
+    // Write texture coordinates (vt lines)
+    // We use per-wedge UV coordinates (WUV) which has one UV per face corner
+    // WUV is nF x 6, storing [u0,v0, u1,v1, u2,v2] per triangle
+    const int nF = static_cast<int>(WUV.rows());
+    for (int f = 0; f < nF; ++f) {
+        out << "vt " << WUV(f, 0) << " " << WUV(f, 1) << "\n";  // corner 0
+        out << "vt " << WUV(f, 2) << " " << WUV(f, 3) << "\n";  // corner 1
+        out << "vt " << WUV(f, 4) << " " << WUV(f, 5) << "\n";  // corner 2
+    }
+
+    // Write faces with vertex/texture indices (f v/vt lines)
+    // Each face references original vertices and per-wedge texture coords
+    for (int f = 0; f < nF; ++f) {
+        int v0 = origTris[f][0] + 1;  // OBJ is 1-indexed
+        int v1 = origTris[f][1] + 1;
+        int v2 = origTris[f][2] + 1;
+        
+        // Texture coordinate indices (3 per face, sequential)
+        int vt0 = f * 3 + 1;
+        int vt1 = f * 3 + 2;
+        int vt2 = f * 3 + 3;
+        
+        out << "f " << v0 << "/" << vt0 << " " 
+                    << v1 << "/" << vt1 << " " 
+                    << v2 << "/" << vt2 << "\n";
     }
 
     return true;

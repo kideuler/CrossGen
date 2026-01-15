@@ -794,21 +794,14 @@ void CutMesh::connectSingularitiesWithShortestPaths() {
             const int p = prev[cur];
             if (p < 0) break;
             const EdgeKey ek(cur, p);
-            cutEdges.insert(ek);
             singularityPathCutEdges.insert(ek);
             cur = p;
         }
+    }
 
-        // Update isTarget to include vertices on the newly added path
-        // so subsequent singularities can connect to this path as well.
-        cur = target;
-        while (cur != vSing) {
-            if (cur >= 0 && cur < nV) isTarget[cur] = true;
-            const int p = prev[cur];
-            if (p < 0) break;
-            cur = p;
-        }
-        if (vSing >= 0 && vSing < nV) isTarget[vSing] = true;
+    // add all singularity path cut edges to the main cutEdges set
+    for (const auto &ek : singularityPathCutEdges) {
+        cutEdges.insert(ek);
     }
 }
 

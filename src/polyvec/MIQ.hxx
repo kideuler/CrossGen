@@ -53,14 +53,16 @@ public:
     explicit MIQSolver(const CutMesh& cutMesh);
 
     // Solve the MIQ parametrization problem.
-    // @param gradientSize     Global scaling for the UV gradient (controls quad resolution).
-    //                         Larger values -> finer quads.
-    // @param stiffness        Weight for stiffness iterations (reserved, currently unused).
-    // @param directRound      If true, greedily round all integers at once (faster but lower quality).
-    // @param iter             Number of stiffness iterations (0 = no stiffening).
-    // @param localIter        Number of local iterations for integer rounding.
-    // @param doRound          Enable integer rounding (set false for debugging).
-    // @param singularityRound If true, round singularity coordinates to integers.
+    // @param gradientSize         Global scaling for the UV gradient (controls quad resolution).
+    //                             Larger values -> finer quads.
+    // @param stiffness            Weight for stiffness iterations (max delta per iteration).
+    // @param directRound          If true, greedily round all integers at once (faster but lower quality).
+    // @param iter                 Number of stiffness iterations (0 = no stiffening).
+    // @param localIter            Number of local iterations for integer rounding.
+    // @param doRound              Enable integer rounding (set false for debugging).
+    // @param singularityRound     If true, round singularity coordinates to integers.
+    // @param boundaryFeatures     If true, add boundary edges as hard feature constraints.
+    //                             For curved 2D boundaries, setting this to false may reduce flips.
     void solve(
         double gradientSize = 30.0,
         double stiffness = 5.0,
@@ -68,7 +70,8 @@ public:
         unsigned int iter = 5,
         unsigned int localIter = 5000,
         bool doRound = true,
-        bool singularityRound = true
+        bool singularityRound = true,
+        bool boundaryFeatures = true
     );
 
     // Per cut-mesh vertex UV coordinates (Vcut x 2).
@@ -85,6 +88,10 @@ public:
 
     // Write UV mesh to an OBJ file (z=0).
     bool writeUVMesh(const std::string& filename) const;
+
+    // Write the original (uncut) mesh with UV texture coordinates.
+    // This outputs: v (3D positions), vt (UV coords per wedge), f (with v/vt indices).
+    bool writeTexturedMesh(const std::string& filename) const;
 
     // Extract coarse quad mesh by tracing integer isolines.
     // Returns true if successful, false otherwise.
@@ -129,6 +136,9 @@ private:
     // Maximum stiffness delta per iteration (the 'd' parameter in stiffening).
     // This is controlled by the 'stiffness' parameter passed to solve().
     double stiffnessWeight_ = 5.0;
+
+    // Whether to add boundary edges as hard feature constraints.
+    bool boundaryFeatures_ = true;
 
     // System info for Poisson solver.
     MeshSystemInfo systemInfo_;
