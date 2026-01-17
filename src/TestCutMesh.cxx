@@ -33,11 +33,14 @@ static void printReport(const CutMesh::SanityReport &rep) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <mesh.obj> [--miq [uv_mesh_out.obj]] [--cut cut_mesh_out.obj] [--quad quad_mesh_out.obj] [--resolution N]\n";
-        std::cerr << "  --miq [file.obj]: Compute MIQ parametrization, optionally write UV mesh to file\n";
-        std::cerr << "  --cut <file.obj>: Write cut mesh to file\n";
-        std::cerr << "  --quad <file.obj>: Extract and write coarse quad mesh (requires --miq)\n";
-        std::cerr << "  --resolution N: Set quad mesh resolution (default: 50, higher = finer mesh)\n";
+        std::cerr << "Usage: " << argv[0] << " <mesh.obj> [options]\n";
+        std::cerr << "Options:\n";
+        std::cerr << "  --miq [file.obj]     Compute MIQ parametrization, optionally write UV mesh\n";
+        std::cerr << "  --cut <file.obj>     Write cut mesh to file\n";
+        std::cerr << "  --quad <file.obj>    Extract and write coarse quad mesh (requires --miq)\n";
+        std::cerr << "  --qex <basename>     Output files for QEx: <basename>.obj (textured mesh)\n";
+        std::cerr << "                       and <basename>.vval (vertex valences). Requires --miq.\n";
+        std::cerr << "  --resolution N       Set quad mesh resolution (default: 200, higher = finer)\n";
         return 1;
     }
 
@@ -46,6 +49,7 @@ int main(int argc, char **argv) {
     bool runMIQ = false;
     std::string uvOutPath;
     std::string quadOutPath;
+    std::string qexBasename;
     double resolution = 200.0;  // Default resolution (gradientSize)
 
     // Parse arguments
@@ -64,6 +68,11 @@ int main(int argc, char **argv) {
         } else if (arg == "--quad") {
             if (i + 1 < argc) {
                 quadOutPath = argv[++i];
+            }
+        } else if (arg == "--qex") {
+            if (i + 1 < argc) {
+                qexBasename = argv[++i];
+                runMIQ = true;  // QEx output requires MIQ
             }
         } else if (arg == "--resolution") {
             if (i + 1 < argc) {
@@ -116,6 +125,28 @@ int main(int argc, char **argv) {
                 } else {
                     std::cerr << "Failed to write UV mesh OBJ: " << uvOutPath << "\n";
                 }
+            }
+            
+            // Output files for QEx if requested
+            if (!qexBasename.empty()) {
+                std::cout << "\n--- QEx Output ---\n";
+                
+                std::string texturedPath = qexBasename + ".obj";
+                std::string vvalPath = qexBasename + ".vval";
+                
+                if (miq.writeTexturedMesh(texturedPath)) {
+                    std::cout << "Wrote textured mesh to: " << texturedPath << "\n";
+                } else {
+                    std::cerr << "Failed to write textured mesh: " << texturedPath << "\n";
+                }
+                
+                if (miq.writeVertexValences(vvalPath)) {
+                    std::cout << "Wrote vertex valences to: " << vvalPath << "\n";
+                } else {
+                    std::cerr << "Failed to write vertex valences: " << vvalPath << "\n";
+                }
+                
+                std::cout << "To run QEx: cmdline_tool " << texturedPath << " output_quads.obj " << vvalPath << "\n";
             }
             
             // Extract and write quad mesh if requested

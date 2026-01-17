@@ -1188,6 +1188,76 @@ bool MIQSolver::writeTexturedMesh(const std::string& filename) const {
     return true;
 }
 
+bool MIQSolver::writeVertexValences(const std::string& filename) const {
+    // Write vertex valences in VVAL format for QEx.
+    // Format:
+    //   {"file_format":"VVAL","version":1}
+    //   <number_of_vertices>
+    //   <valence_0>
+    //   <valence_1>
+    //   ...
+    //
+    // For a cross-field parametrization:
+    //   - Regular interior vertices have valence 4
+    //   - Boundary vertices have valence 2 (corner) or more
+    //   - Singularities have valence = 4 + singularity_index
+    //     (index +1 means valence 5, index -1 means valence 3, etc.)
+    
+    std::ofstream out(filename);
+    if (!out) return false;
+    
+    const Mesh& origMesh = cutMesh_.getOriginalMesh();
+    const int nV = static_cast<int>(origMesh.vertices.size());
+    
+    // Write header
+    out << "{\"file_format\":\"VVAL\",\"version\":1}\n";
+    out << nV << "\n";
+    
+    // Get singularity info
+    const auto& singularities = cutMesh_.getSingularities();
+    std::map<int, int> singularityIndex;  // vertex -> singularity index
+    for (const auto& s : singularities) {
+        singularityIndex[s.first] = s.second;
+    }
+    
+    // Determine which vertices are on the boundary
+    std::set<int> boundaryVertices;
+    const int nF = static_cast<int>(F_.rows());
+    for (int f = 0; f < nF; ++f) {
+        for (int e = 0; e < 3; ++e) {
+            if (TT_(f, e) == -1) {  // Boundary edge
+                int v0 = F_(f, e);
+                int v1 = F_(f, (e + 1) % 3);
+                boundaryVertices.insert(v0);
+                boundaryVertices.insert(v1);
+            }
+        }
+    }
+    
+    // Write valences
+    for (int v = 0; v < nV; ++v) {
+        int valence = 4;  // Default: regular interior vertex
+        
+        auto singIt = singularityIndex.find(v);
+        if (singIt != singularityIndex.end()) {
+            // Singularity: valence = 4 + index
+            // index is typically -1, 0, or +1 for cross-fields
+            // A +1 singularity (5-valent) has index +1
+            // A -1 singularity (3-valent) has index -1
+            valence = 4 + singIt->second;
+        } else if (boundaryVertices.count(v)) {
+            // Boundary vertex: default to valence 2 (will be adjusted by QEx)
+            // Actually for QEx, boundary vertices should typically be 0 or omitted
+            // to let QEx determine them automatically
+            valence = 0;  // Let QEx handle boundary valences
+        }
+        
+        out << valence << "\n";
+    }
+    
+    return true;
+}
+
 // ============================================================================
 // Integer Isoline Tracing for Quad Mesh Extraction
 // ============================================================================

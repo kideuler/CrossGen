@@ -91,7 +91,13 @@ public:
 
     // Write the original (uncut) mesh with UV texture coordinates.
     // This outputs: v (3D positions), vt (UV coords per wedge), f (with v/vt indices).
+    // This format is compatible with QEx for quad extraction.
     bool writeTexturedMesh(const std::string& filename) const;
+
+    // Write vertex valences in VVAL format for QEx.
+    // The VVAL file contains expected vertex valences (4 for regular, different for singularities).
+    // Format: JSON header, vertex count, then one valence per line.
+    bool writeVertexValences(const std::string& filename) const;
 
     // Extract coarse quad mesh by tracing integer isolines.
     // Returns true if successful, false otherwise.
