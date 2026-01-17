@@ -623,7 +623,7 @@ void MIQSolver::buildLaplacianMatrix(double vfscale) {
             double cross = ea[0] * eb[1] - ea[1] * eb[0];
             double dot = ea.dot(eb);
             if (std::abs(cross) < 1e-12) return 0.0;
-            return dot / cross;
+            return dot / std::abs(cross);
         };
 
         double c0 = cotWeight(-e1, e2);   // angle at vertex 0
