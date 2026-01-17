@@ -124,8 +124,8 @@ void MIQSolver::computeTriangleTriangleAdjacency() {
 
     for (int f = 0; f < nF; ++f) {
         for (int e = 0; e < 3; ++e) {
-            int v0 = Fcut_(f, e);
-            int v1 = Fcut_(f, (e + 1) % 3);
+            int v0 = F_(f, e);
+            int v1 = F_(f, (e + 1) % 3);
             CutMesh::EdgeKey key(v0, v1);
 
             auto it = edgeMap.find(key);
@@ -173,6 +173,7 @@ void MIQSolver::computeMismatch() {
         for (int e = 0; e < 3; ++e) {
             int f1 = TT_(f0, e);
             if (f1 == -1) continue;  // boundary edge
+            if (f0 > f1) continue; // process each undirected edge once
 
             double theta1 = angle(PD1_(f1, 0), PD1_(f1, 1));
 
@@ -187,6 +188,11 @@ void MIQSolver::computeMismatch() {
                 }
             }
             mismatch_(f0, e) = bestK;
+            // rotation to apply to face f1 to align with face f0:
+            int k = find_rotation_matrix(theta1, theta0);
+            mismatch_(f0, e) = k;
+            int e1 = TTi_(f0, e);
+            mismatch_(f1, e1) = (4 - k) % 4;
         }
     }
 }
@@ -626,9 +632,9 @@ void MIQSolver::buildLaplacianMatrix(double vfscale) {
             return dot / std::abs(cross);
         };
 
-        double c0 = cotWeight(-e1, e2);   // angle at vertex 0
-        double c1 = cotWeight(-e2, e0);   // angle at vertex 1
-        double c2 = cotWeight(-e0, e1);   // angle at vertex 2
+        double c0 = 0.5 *cotWeight(-e1, e2);   // angle at vertex 0
+        double c1 = 0.5 * cotWeight(-e2, e0);   // angle at vertex 1
+        double c2 = 0.5 *cotWeight(-e0, e1);   // angle at vertex 2
 
         // Scale by stiffness
         c0 *= stiff;
@@ -689,7 +695,7 @@ void MIQSolver::buildLaplacianMatrix(double vfscale) {
         Eigen::Vector2d g1 = Eigen::Vector2d(-e1[1], e1[0]) / area2;
         Eigen::Vector2d g2 = Eigen::Vector2d(-e2[1], e2[0]) / area2;
 
-        double scale = area * stiff * vfscale * 0.5;
+        double scale = area * stiff * vfscale;
 
         // u-component RHS (align with PD1)
         rhsU(i0) += scale * g0.dot(pd1);

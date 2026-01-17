@@ -211,7 +211,7 @@ int main(int argc, char **argv) {
             auto t0 = Clock::now();
             miqSolver.emplace(*cutMesh);
             // Parameters: gradientSize, stiffness, directRound, iter, localIter, doRound, singularityRound, boundaryFeatures
-            miqSolver->solve(500.0, 5.0, false, 10, 5000, true, true, true);
+            miqSolver->solve(100.0, 5.0, false, 10, 5000, true, true, true);
             auto t1 = Clock::now();
             double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
