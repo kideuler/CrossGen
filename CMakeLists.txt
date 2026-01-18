@@ -53,7 +53,11 @@ target_link_libraries(LoadMesh PRIVATE PolyVector)
 
 # Utility to cut a mesh into a disk and run sanity checks
 add_executable(TestCutMesh src/TestCutMesh.cxx)
-target_link_libraries(TestCutMesh PRIVATE PolyVector) 
+target_link_libraries(TestCutMesh PRIVATE PolyVector)
+
+# Test UV parametrization quality
+add_executable(TestUVParametrization src/TestUVParametrization.cxx)
+target_link_libraries(TestUVParametrization PRIVATE PolyVector)
 
 # copy all meshes to build directory for easy access
 file(GLOB MESH_FILES "${CMAKE_CURRENT_SOURCE_DIR}/data/meshes/*")

@@ -189,10 +189,10 @@ void MIQSolver::computeMismatch() {
             }
             mismatch_(f0, e) = bestK;
             // rotation to apply to face f1 to align with face f0:
-            int k = find_rotation_matrix(theta1, theta0);
-            mismatch_(f0, e) = k;
+            //int k = find_rotation_matrix(theta1, theta0);
+            //mismatch_(f0, e) = k;
             int e1 = TTi_(f0, e);
-            mismatch_(f1, e1) = (4 - k) % 4;
+            mismatch_(f1, e1) = (4 - bestK) % 4;
         }
     }
 }
@@ -702,10 +702,10 @@ void MIQSolver::buildLaplacianMatrix(double vfscale) {
         rhsU(i1) += scale * g1.dot(pd1);
         rhsU(i2) += scale * g2.dot(pd1);
 
-        // v-component RHS (align with -PD2 for proper orientation)
-        rhsV(i0) -= scale * g0.dot(pd2);
-        rhsV(i1) -= scale * g1.dot(pd2);
-        rhsV(i2) -= scale * g2.dot(pd2);
+        // v-component RHS (align with PD2 for proper orientation)
+        rhsV(i0) += scale * g0.dot(pd2);
+        rhsV(i1) += scale * g1.dot(pd2);
+        rhsV(i2) += scale * g2.dot(pd2);
     }
 
     Lhs_.setFromTriplets(triplets.begin(), triplets.end());
