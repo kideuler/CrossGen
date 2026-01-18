@@ -55,9 +55,9 @@ target_link_libraries(LoadMesh PRIVATE PolyVector)
 add_executable(TestCutMesh src/TestCutMesh.cxx)
 target_link_libraries(TestCutMesh PRIVATE PolyVector)
 
-# Test UV parametrization quality
-add_executable(TestUVParametrization src/TestUVParametrization.cxx)
-target_link_libraries(TestUVParametrization PRIVATE PolyVector)
+# Test MIQ parametrization quality
+add_executable(TestMIQ src/TestMIQ.cxx)
+target_link_libraries(TestMIQ PRIVATE PolyVector)
 
 # copy all meshes to build directory for easy access
 file(GLOB MESH_FILES "${CMAKE_CURRENT_SOURCE_DIR}/data/meshes/*")
@@ -81,6 +81,23 @@ add_custom_target(cut
     ${CUT_COMMANDS}
     DEPENDS TestCutMesh
     COMMENT "Running TestCutMesh on all meshes in data/meshes"
+    VERBATIM
+)
+
+# Custom target to run TestMIQ on all meshes
+set(MIQ_COMMANDS "")
+foreach(MESH_FILE ${MESH_OBJ_FILES})
+    get_filename_component(MESH_NAME ${MESH_FILE} NAME)
+    list(APPEND MIQ_COMMANDS 
+        COMMAND ${CMAKE_COMMAND} -E echo "Processing ${MESH_NAME}..."
+        COMMAND $<TARGET_FILE:TestMIQ> ${CMAKE_CURRENT_BINARY_DIR}/data/meshes/${MESH_NAME} || ${CMAKE_COMMAND} -E true
+    )
+endforeach()
+
+add_custom_target(miq
+    ${MIQ_COMMANDS}
+    DEPENDS TestMIQ
+    COMMENT "Running TestMIQ on all meshes in data/meshes"
     VERBATIM
 )
 

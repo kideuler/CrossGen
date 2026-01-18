@@ -9,7 +9,32 @@
 #include <list>
 #include <map>
 #include <set>
+#include <sstream>
 #include <tuple>
+
+// Helper class to temporarily suppress cout/cerr output
+class ScopedOutputSuppressor {
+public:
+    ScopedOutputSuppressor(bool suppress) : suppress_(suppress) {
+        if (suppress_) {
+            coutBuf_ = std::cout.rdbuf();
+            cerrBuf_ = std::cerr.rdbuf();
+            std::cout.rdbuf(nullStream_.rdbuf());
+            std::cerr.rdbuf(nullStream_.rdbuf());
+        }
+    }
+    ~ScopedOutputSuppressor() {
+        if (suppress_) {
+            std::cout.rdbuf(coutBuf_);
+            std::cerr.rdbuf(cerrBuf_);
+        }
+    }
+private:
+    bool suppress_;
+    std::streambuf* coutBuf_ = nullptr;
+    std::streambuf* cerrBuf_ = nullptr;
+    std::ostringstream nullStream_;
+};
 
 // ============================================================================
 // Construction
@@ -477,7 +502,7 @@ void MIQSolver::solve(
         for (unsigned int i = 0; i < iter; ++i) {
             solvePoisson(gradientSize, 1.0, directRound, localIter, doRound, singularityRound);
             int nflips = numFlips();
-            std::cout << "ITERATION " << i << " FLIPS " << nflips << std::endl;
+            if (verbose_) std::cout << "ITERATION " << i << " FLIPS " << nflips << std::endl;
 
             bool folded = updateStiffening(gradientSize);
             if (!folded) break;
@@ -487,7 +512,7 @@ void MIQSolver::solve(
     }
 
     int nflips = numFlips();
-    std::cout << "**** END OPTIMIZING #FLIPS " << nflips << " ****" << std::endl;
+    if (verbose_) std::cout << "**** END OPTIMIZING #FLIPS " << nflips << " ****" << std::endl;
 }
 
 // ============================================================================
@@ -523,9 +548,9 @@ void MIQSolver::solvePoisson(
                 }
             }
         }
-        std::cout << "Found " << numBoundaryConstraints_ << " boundary edges for hard feature constraints" << std::endl;
+        if (verbose_) std::cout << "Found " << numBoundaryConstraints_ << " boundary edges for hard feature constraints" << std::endl;
     } else {
-        std::cout << "Boundary feature constraints disabled" << std::endl;
+        if (verbose_) std::cout << "Boundary feature constraints disabled" << std::endl;
     }
 
     // Find a vertex to fix (preferably a singularity)
@@ -936,8 +961,9 @@ void MIQSolver::mixedIntegerSolve(double coneGridRes, bool directRound, unsigned
     auto newEnd = std::unique(idsToRound_.begin(), idsToRound_.end());
     idsToRound_.resize(std::distance(idsToRound_.begin(), newEnd));
 
-    // Solve
+    // Solve (suppress CoMISo output unless verbose)
     COMISO::ConstrainedSolver solver;
+    solver.misolver().set_multiple_rounding_threshold(0.1);
     solver.misolver().set_local_iters(localIter);
 
     if (directRound) {
@@ -945,7 +971,10 @@ void MIQSolver::mixedIntegerSolve(double coneGridRes, bool directRound, unsigned
     }
 
     COMISO::ConstrainedSolver::Vector _X(sizeMatrix);
-    solver.solve(C, A, _X, B, idsToRound_, 0.0, false);
+    {
+        ScopedOutputSuppressor suppressor(!verbose_);
+        solver.solve(C, A, _X, B, idsToRound_, 1e-10, false);
+    }
 
     // Copy solution back
     for (int i = 0; i < sizeMatrix; ++i) {
@@ -1009,18 +1038,30 @@ int MIQSolver::getFirstVertexIndex(int origV) const {
 // Flip detection and distortion
 // ============================================================================
 
-bool MIQSolver::isFlipped(const Eigen::Vector2d& uv0, const Eigen::Vector2d& uv1, const Eigen::Vector2d& uv2) {
-    Eigen::Vector2d e0 = uv1 - uv0;
-    Eigen::Vector2d e1 = uv2 - uv0;
-    double area = e0(0) * e1(1) - e0(1) * e1(0);
-    return area <= 0;
+double MIQSolver::signedArea(const Eigen::Vector2d& p0, const Eigen::Vector2d& p1, const Eigen::Vector2d& p2) {
+    Eigen::Vector2d e0 = p1 - p0;
+    Eigen::Vector2d e1 = p2 - p0;
+    return e0(0) * e1(1) - e0(1) * e1(0);
 }
 
 bool MIQSolver::isFlipped(int f) const {
+    // Get UV triangle
     Eigen::Vector2d uv0(WUV(f, 0), WUV(f, 1));
     Eigen::Vector2d uv1(WUV(f, 2), WUV(f, 3));
     Eigen::Vector2d uv2(WUV(f, 4), WUV(f, 5));
-    return isFlipped(uv0, uv1, uv2);
+    double uvArea = signedArea(uv0, uv1, uv2);
+
+    // Get original mesh triangle
+    int i0 = F_(f, 0);
+    int i1 = F_(f, 1);
+    int i2 = F_(f, 2);
+    Eigen::Vector2d p0(V_(i0, 0), V_(i0, 1));
+    Eigen::Vector2d p1(V_(i1, 0), V_(i1, 1));
+    Eigen::Vector2d p2(V_(i2, 0), V_(i2, 1));
+    double origArea = signedArea(p0, p1, p2);
+
+    // A triangle is flipped if the UV winding differs from the original mesh winding
+    return (uvArea > 0) != (origArea > 0);
 }
 
 int MIQSolver::numFlips() const {
@@ -1122,8 +1163,10 @@ bool MIQSolver::updateStiffening(double grad_size) {
         stiffnessVector_(i) += stiffDelta;
     }
 
-    std::cout << "Maximum Distortion " << maxD << std::endl;
-    std::cout << "Maximum Laplacian " << maxL << std::endl;
+    if (verbose_) {
+        std::cout << "Maximum Distortion " << maxD << std::endl;
+        std::cout << "Maximum Laplacian " << maxL << std::endl;
+    }
 
     return flipped;
 }
@@ -1305,8 +1348,10 @@ bool MIQSolver::extractQuadMesh() {
     int vIntMin = static_cast<int>(std::floor(vMin));
     int vIntMax = static_cast<int>(std::ceil(vMax));
     
-    std::cout << "UV range: U=[" << uMin << "," << uMax << "], V=[" << vMin << "," << vMax << "]\n";
-    std::cout << "Integer grid: U=[" << uIntMin << "," << uIntMax << "], V=[" << vIntMin << "," << vIntMax << "]\n";
+    if (verbose_) {
+        std::cout << "UV range: U=[" << uMin << "," << uMax << "], V=[" << vMin << "," << vMax << "]\n";
+        std::cout << "Integer grid: U=[" << uIntMin << "," << uIntMax << "], V=[" << vIntMin << "," << vIntMax << "]\n";
+    }
     
     // Map from (intU, intV) -> quad vertex index
     // A quad corner exists at every integer (u,v) point that lies inside the domain
@@ -1435,8 +1480,10 @@ bool MIQSolver::extractQuadMesh() {
         }
     }
     
-    std::cout << "Found " << uIsolines.size() << " U-isoline segments, " 
-              << vIsolines.size() << " V-isoline segments\n";
+    if (verbose_) {
+        std::cout << "Found " << uIsolines.size() << " U-isoline segments, " 
+                  << vIsolines.size() << " V-isoline segments\n";
+    }
     
     // Now find intersection points between U and V isolines within each triangle
     // These are the quad vertices
@@ -1505,7 +1552,7 @@ bool MIQSolver::extractQuadMesh() {
         }
     }
     
-    std::cout << "Found " << quadVerts.size() << " quad vertices (integer grid points)\n";
+    if (verbose_) std::cout << "Found " << quadVerts.size() << " quad vertices (integer grid points)\n";
     
     if (quadVerts.empty()) {
         std::cerr << "extractQuadMesh: No quad vertices found\n";
@@ -1549,7 +1596,7 @@ bool MIQSolver::extractQuadMesh() {
         }
     }
     
-    std::cout << "Built " << quads.size() << " quad faces\n";
+    if (verbose_) std::cout << "Built " << quads.size() << " quad faces\n";
     
     // Convert to Eigen matrices
     quadVertices_.resize(quadVerts.size(), 2);

@@ -52,6 +52,10 @@ public:
 
     explicit MIQSolver(const CutMesh& cutMesh);
 
+    // Enable or disable verbose output (default: off).
+    void setVerbose(bool v) { verbose_ = v; }
+    bool isVerbose() const { return verbose_; }
+
     // Solve the MIQ parametrization problem.
     // @param gradientSize         Global scaling for the UV gradient (controls quad resolution).
     //                             Larger values -> finer quads.
@@ -154,6 +158,9 @@ private:
     Eigen::MatrixXi FUV;      // face indices (same as Fcut_)
     Eigen::MatrixXd WUV;      // per-wedge UV, #F x 6
 
+    // Verbose output flag (default: off)
+    bool verbose_ = false;
+
     // ------------------------------------------
     // Setup / preprocessing
     // ------------------------------------------
@@ -190,7 +197,7 @@ private:
     double laplaceDistortion(int f, double h) const;
     bool updateStiffening(double grad_size);
     bool isFlipped(int f) const;
-    static bool isFlipped(const Eigen::Vector2d& uv0, const Eigen::Vector2d& uv1, const Eigen::Vector2d& uv2);
+    static double signedArea(const Eigen::Vector2d& p0, const Eigen::Vector2d& p1, const Eigen::Vector2d& p2);
 
     // ------------------------------------------
     // Helper functions

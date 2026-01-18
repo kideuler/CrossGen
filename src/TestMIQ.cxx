@@ -88,8 +88,8 @@ int main(int argc, char **argv) {
     std::string uvOutPath;
     std::string quadOutPath;
     std::string qexBasename;
-    double resolution = 500.0;
-    double stiffness = 100.0;
+    double resolution = 100.0;
+    double stiffness = 5.0;
     int iterations = 10;
 
     // Parse arguments
