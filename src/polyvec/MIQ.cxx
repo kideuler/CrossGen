@@ -643,7 +643,7 @@ void MIQSolver::buildLaplacianMatrix(double vfscale) {
         Eigen::Vector2d e2 = p1 - p0;
 
         double area2 = std::abs(e2[0] * e1[1] - e2[1] * e1[0]);
-        if (area2 < 1e-12) continue;
+        area2 = std::max(area2, 1e-12);
 
         double area = 0.5 * area2;
         double stiff = stiffnessVector_(f);
@@ -845,6 +845,11 @@ void MIQSolver::addBoundaryFeatureConstraints() {
             // using absolute dot product (direction doesn't matter)
             double alignWithU = std::abs(edgeDir.dot(pd1));  // alignment with u-direction
             double alignWithV = std::abs(edgeDir.dot(pd2));  // alignment with v-direction
+
+            double maxAlign = std::max(alignWithU, alignWithV);
+            if (maxAlign < 0.9) continue; // skip weakly aligned edges
+
+
 
             // offset = 0 means constrain U coordinates, offset = 1 means constrain V
             // If edge aligns with pd1 (u-dir), we want v1-v2 same V coord (offset=1)
@@ -1141,7 +1146,7 @@ double MIQSolver::laplaceDistortion(int f, double h) const {
 
 bool MIQSolver::updateStiffening(double grad_size) {
     bool flipped = numFlips() > 0;
-    if (!flipped) return false;
+    //if (!flipped) return false;
 
     double maxL = 0;
     double maxD = 0;
@@ -1153,13 +1158,22 @@ bool MIQSolver::updateStiffening(double grad_size) {
     const double d = stiffnessWeight_;
 
     for (int i = 0; i < static_cast<int>(Fcut_.rows()); ++i) {
-        double dist = distortion(i, grad_size);
-        if (dist > maxD) maxD = dist;
 
-        double absLap = std::abs(laplaceDistortion(i, grad_size));
-        if (absLap > maxL) maxL = absLap;
+        bool flip = isFlipped(i);
+        double stiffDelta;
+        if (flip) {
+            double absLap = std::abs(laplaceDistortion(i, grad_size));
+            stiffDelta = std::min(stiffnessWeight_ * absLap, stiffnessWeight_);
+            if (flip) stiffDelta = std::max(stiffDelta, stiffnessWeight_); // “full” update on flips
+        } else {
+            double dist = distortion(i, grad_size);
+            if (dist > maxD) maxD = dist;
 
-        double stiffDelta = std::min(c * absLap, d);
+            double absLap = std::abs(laplaceDistortion(i, grad_size));
+            if (absLap > maxL) maxL = absLap;
+
+            stiffDelta = std::min(c * absLap, d);
+        }
         stiffnessVector_(i) += stiffDelta;
     }
 

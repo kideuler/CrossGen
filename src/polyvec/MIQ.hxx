@@ -90,6 +90,9 @@ public:
     // Number of flipped triangles in the UV parametrization.
     int numFlips() const;
 
+    // Check if a specific triangle is flipped in UV space.
+    bool isFlipped(int f) const;
+
     // Write UV mesh to an OBJ file (z=0).
     bool writeUVMesh(const std::string& filename) const;
 
@@ -196,7 +199,6 @@ private:
     double distortion(int f, double h) const;
     double laplaceDistortion(int f, double h) const;
     bool updateStiffening(double grad_size);
-    bool isFlipped(int f) const;
     static double signedArea(const Eigen::Vector2d& p0, const Eigen::Vector2d& p1, const Eigen::Vector2d& p2);
 
     // ------------------------------------------

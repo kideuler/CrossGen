@@ -88,7 +88,7 @@ int main(int argc, char **argv) {
     std::string uvOutPath;
     std::string quadOutPath;
     std::string qexBasename;
-    double resolution = 100.0;
+    double resolution = 200.0;
     double stiffness = 5.0;
     int iterations = 10;
 
@@ -153,7 +153,7 @@ int main(int argc, char **argv) {
         std::cout << "Iterations: " << iterations << "\n";
         
         MIQSolver miq(cm);
-        miq.solve(resolution, stiffness, false, iterations, 5000, true, true);
+        miq.solve(resolution, stiffness, false, iterations, 10000, true, true);
         
         // Check for flipped triangles
         int numFlipped = checkForFlippedTriangles(miq, cm);

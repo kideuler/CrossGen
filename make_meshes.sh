@@ -29,3 +29,4 @@ shopt -u nullglob
 
 echo "All done. Meshes are in $OUT_DIR"
 cd build
+cmake ..

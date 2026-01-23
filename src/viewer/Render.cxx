@@ -456,6 +456,32 @@ void drawUVMesh(const MIQSolver &miq) {
     if (ext <= 0) ext = 1.0;
     double pad = 0.1 * ext;
 
+    // First pass: draw flipped triangles as filled red polygons
+    glColor4f(0.9f, 0.2f, 0.2f, 0.7f); // red with some transparency
+    glBegin(GL_TRIANGLES);
+    for (int i = 0; i < FUV.rows(); ++i) {
+        if (!miq.isFlipped(i)) continue;
+
+        int v0 = FUV(i, 0);
+        int v1 = FUV(i, 1);
+        int v2 = FUV(i, 2);
+
+        if (v0 < 0 || v0 >= UV.rows() ||
+            v1 < 0 || v1 >= UV.rows() ||
+            v2 < 0 || v2 >= UV.rows()) {
+            continue;
+        }
+
+        double u0 = UV(v0, 0), w0 = UV(v0, 1);
+        double u1 = UV(v1, 0), w1 = UV(v1, 1);
+        double u2 = UV(v2, 0), w2 = UV(v2, 1);
+
+        glVertex2d(u0, w0);
+        glVertex2d(u1, w1);
+        glVertex2d(u2, w2);
+    }
+    glEnd();
+
     // Draw UV mesh edges
     glColor3f(0.3f, 0.8f, 0.9f); // cyan color for UV mesh
     glLineWidth(1.5f);

@@ -90,7 +90,12 @@ Mesh::Mesh(const std::string &filename) {
 				int a = resolveIndex(faceIndices[0]);
 				int b = resolveIndex(faceIndices[i]);
 				int c = resolveIndex(faceIndices[i + 1]);
-				triangles.push_back(Triangle{ a, b, c });
+				const auto &pa = tempVertices[a];
+				const auto &pb = tempVertices[b];
+				const auto &pc = tempVertices[c];
+				double A2 = (pb[0]-pa[0])*(pc[1]-pa[1]) - (pb[1]-pa[1])*(pc[0]-pa[0]);
+				if (A2 < 0.0) std::swap(b, c);
+				triangles.push_back(Triangle{a,b,c});
 			}
 		}
 		// ignore other tags (vt, vn, etc.)
