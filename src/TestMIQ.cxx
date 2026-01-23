@@ -5,9 +5,9 @@
 #include <string>
 #include <cmath>
 
-#include "polyvec/PolyVectors.hxx"
-#include "polyvec/CutMesh.hxx"
-#include "polyvec/MIQ.hxx"
+#include "polyvector/PolyVectors.hxx"
+#include "IGM/CutMesh.hxx"
+#include "IGM/MIQ.hxx"
 
 // Compute signed area of a triangle in UV space using cross product
 // Positive = counter-clockwise, Negative = clockwise (flipped)

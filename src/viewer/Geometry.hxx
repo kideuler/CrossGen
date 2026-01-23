@@ -2,7 +2,7 @@
 
 #include "ViewerTypes.hxx"
 
-#include "polyvec/Mesh.hxx"
+#include "mesh/Mesh.hxx"
 
 namespace viewer {
 

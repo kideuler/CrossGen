@@ -1164,7 +1164,7 @@ bool MIQSolver::updateStiffening(double grad_size) {
         if (flip) {
             double absLap = std::abs(laplaceDistortion(i, grad_size));
             stiffDelta = std::min(stiffnessWeight_ * absLap, stiffnessWeight_);
-            if (flip) stiffDelta = std::max(stiffDelta, stiffnessWeight_); // “full” update on flips
+            if (flip) stiffDelta = std::max(stiffDelta, stiffnessWeight_); // "full" update on flips
         } else {
             double dist = distortion(i, grad_size);
             if (dist > maxD) maxD = dist;

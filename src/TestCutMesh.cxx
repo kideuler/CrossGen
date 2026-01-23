@@ -3,8 +3,8 @@
 #include <iostream>
 #include <string>
 
-#include "polyvec/PolyVectors.hxx"
-#include "polyvec/CutMesh.hxx"
+#include "polyvector/PolyVectors.hxx"
+#include "IGM/CutMesh.hxx"
 
 static void printReport(const CutMesh::SanityReport &rep) {
     std::cout << "Sanity report\n";

@@ -8,7 +8,7 @@
 #include <utility>
 #include <vector>
 
-#include "Mesh.hxx"
+#include "mesh/Mesh.hxx"
 
 // Forward declaration (definition in PolyVectors.hxx)
 class PolyField;

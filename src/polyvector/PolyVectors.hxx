@@ -9,7 +9,7 @@
 #include <Eigen/Dense>
 #include <Eigen/Sparse>
 
-#include "Mesh.hxx"
+#include "mesh/Mesh.hxx"
 
 typedef std::array<std::complex<double>, 2> PolyCoeffs; // x_0 and x_1 in Polynomial P(z) = z^4 + x_1*z^2 + x_0
 

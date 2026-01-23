@@ -12,9 +12,9 @@
 #include "viewer/Interaction.hxx"
 #include "viewer/Render.hxx"
 
-#include "polyvec/CutMesh.hxx"
-#include "polyvec/MIQ.hxx"
-#include "polyvec/PolyVectors.hxx"
+#include "IGM/CutMesh.hxx"
+#include "IGM/MIQ.hxx"
+#include "polyvector/PolyVectors.hxx"
 
 namespace {
 

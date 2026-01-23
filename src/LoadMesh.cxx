@@ -4,7 +4,7 @@
 #include <string>
 #include <cstdlib>
 
-#include "polyvec/PolyVectors.hxx"
+#include "polyvector/PolyVectors.hxx"
 
 static void printMesh(const Mesh &m) {
 	std::cout << "Vertices (" << m.vertices.size() << ")\n";

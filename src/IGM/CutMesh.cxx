@@ -11,7 +11,7 @@
 #include <set>
 #include <sstream>
 
-#include "PolyVectors.hxx" // PolyField
+#include "polyvector/PolyVectors.hxx" // PolyField
 
 namespace {
 

@@ -32,18 +32,18 @@ else()
 endif()
 
 add_library(PolyVector SHARED
-    src/polyvec/VertexTriangleCSR.hxx
-    src/polyvec/VertexTriangleCSR.cxx
-    src/polyvec/Mesh.cxx
-    src/polyvec/Mesh.hxx
-    src/polyvec/CutMesh.hxx
-    src/polyvec/CutMesh.cxx
-    src/polyvec/PolyVectors.hxx
-    src/polyvec/PolyVectors.cxx
-    src/polyvec/MIQ.hxx
-    src/polyvec/MIQ.cxx
+    src/mesh/VertexTriangleCSR.hxx
+    src/mesh/VertexTriangleCSR.cxx
+    src/mesh/Mesh.cxx
+    src/mesh/Mesh.hxx
+    src/polyvector/PolyVectors.hxx
+    src/polyvector/PolyVectors.cxx
+    src/IGM/CutMesh.hxx
+    src/IGM/CutMesh.cxx
+    src/IGM/MIQ.hxx
+    src/IGM/MIQ.cxx
 )
-target_include_directories(PolyVector PUBLIC src/polyvec)
+target_include_directories(PolyVector PUBLIC src)
 target_link_libraries(PolyVector PUBLIC Eigen3::Eigen)
 target_link_libraries(PolyVector PUBLIC CoMISo::CoMISo)
 

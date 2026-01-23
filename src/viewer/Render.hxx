@@ -7,9 +7,9 @@
 #include <vector>
 #include <unordered_set>
 
-#include "polyvec/CutMesh.hxx"
-#include "polyvec/MIQ.hxx"
-#include "polyvec/PolyVectors.hxx"
+#include "IGM/CutMesh.hxx"
+#include "IGM/MIQ.hxx"
+#include "polyvector/PolyVectors.hxx"
 
 namespace viewer {
 
