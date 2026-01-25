@@ -7,4 +7,5 @@ TODO:
 - [X] Link Comisol for Greedy mixed integer solver.
 - [X] construct UV integer grid map.
 - [X] Some basic Visualization.
-- [ ] Reformat Code to better separate different pieces. (Mesh, Polyvectors, IGM)
+- [X] Reformat Code to better separate different pieces. (Mesh, Polyvectors, IGM)
+- [ ] In polyvector store the parallel transport for each triangle (0,1,2,3) rotation matrix
