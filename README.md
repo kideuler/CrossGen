@@ -9,3 +9,6 @@ TODO:
 - [X] Some basic Visualization.
 - [X] Reformat Code to better separate different pieces. (Mesh, Polyvectors, IGM)
 - [ ] In polyvector store the parallel transport for each triangle (0,1,2,3) rotation matrix
+- [ ] Compute G from Tracing Field-Coherent Quad Layouts and robustly check
+- [ ] Compute H from Tracing Field-Coherent Quad Layouts and robustly check
+- [ ] Compute Layout and deal with boundaries.
