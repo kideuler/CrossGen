@@ -238,6 +238,9 @@ void PolyField::convertToFieldVectors() {
 
     // Keep `uSingularities` in sync with the newly computed field.
     computeUSingularities();
+
+    // Also compute triangle rotations for the new field.
+    computeTriangleRotations();
 }
 
 void PolyField::computeUSingularities() {
@@ -440,6 +443,27 @@ void PolyField::computeUSingularities() {
         const int index4 = static_cast<int>(std::lround(k));
         if (index4 != 0) {
             uSingularities.emplace_back(v, index4);
+        }
+    }
+}
+
+void PolyField::computeTriangleRotations() {
+    const int nT = static_cast<int>(mesh.triangles.size());
+    fieldTriangleRotation.resize(nT, {-1,-1,-1});
+
+    for (int t = 0; t < nT; ++t) {
+        const Triangle &tri = mesh.triangles[t];
+        for (int e = 0; e < 3; ++e) {
+            if (mesh.triangleAdjacency[t][e] == -1) {
+                // Boundary edge: no rotation
+                continue;
+            }
+            int neighbor = mesh.triangleAdjacency[t][e];
+
+            double theta_curr = computeAngle(field[t].u);
+            double theta_neigh = computeAngle(field[neighbor].u);
+            int k = find_rotation_matrix( theta_curr, theta_neigh);
+            fieldTriangleRotation[t][e] = k;
         }
     }
 }

@@ -78,6 +78,7 @@ inline PolyCoeffs computePolyCoeffsFromTangentVector(const Point &tangent) {
 class PolyField {
  public:
     std::vector<Field> field; // per-triangle field vectors
+    std::vector<std::array<int, 3>> fieldTriangleRotation; // per-triangle rotation indices (0,1,2,3) for edges (0,1,2)
 
     // Detected singularities in the 4-RoSy (cross) field induced by `field[t].u`.
     // Each entry is (vertexId, index4) where index = index4 / 4.0.
@@ -102,6 +103,8 @@ class PolyField {
 
     // Compute `uSingularities` from the current `field` using mesh.vertexTriangles.
     void computeUSingularities();
+
+    void computeTriangleRotations(); // Compute per-triangle rotation indices for edges
 
     // Write mesh and per-triangle field vectors to a VTK legacy unstructured grid file
     // - filename: path to .vtk file
