@@ -9,6 +9,6 @@ TODO:
 - [X] Some basic Visualization.
 - [X] Reformat Code to better separate different pieces. (Mesh, Polyvectors, IGM)
 - [X] In polyvector store the parallel transport for each triangle (0,1,2,3) rotation matrix
-- [ ] Compute G from Tracing Field-Coherent Quad Layouts and robustly check
-- [ ] Compute H from Tracing Field-Coherent Quad Layouts and robustly check
-- [ ] Compute Layout and deal with boundaries/ports.
+- [ ] Add operators for Point typedef
+- [ ] Reduce Polyvectors to just cross-fields instead of frame fields
+- [ ] Add options to solve MBO method using formula $(M+\tau L)u^{k+1}=Mu^k$ where M is diagonal triangle areas. L is standard laplacian. Therefore $u^{k+1} = (M+\tau L)^{-1} M u^k$
