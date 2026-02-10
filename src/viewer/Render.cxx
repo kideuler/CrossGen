@@ -203,6 +203,68 @@ void drawVField(const Mesh &m, const std::vector<Point> &vField, double scale) {
     }
 }
 
+void drawVertexCrossField(const Mesh &m, const CrossField &cf, double scale) {
+    glLineWidth(2.5f);
+    const float br = 0.2f, bg = 0.2f, bb = 0.95f; // unified blue color
+
+    const Eigen::VectorXcd &u_k_prev = cf.u_k_prev;
+    
+    for (size_t i = 0; i < m.vertices.size(); ++i) {
+        if (static_cast<int>(i) >= u_k_prev.size()) continue;
+        
+        const Point &c = m.vertices[i];
+        std::complex<double> u4 = u_k_prev[i];
+        
+        // Skip if magnitude is too small
+        if (std::abs(u4) < 1e-14) continue;
+        
+        // Compute fourth root: u = u4^(1/4)
+        // u4 = r * e^(i*theta), so u4^(1/4) = r^(1/4) * e^(i*theta/4)
+        double r = std::abs(u4);
+        double theta = std::arg(u4);
+        double r4 = std::pow(r, 0.25);
+        double theta4 = theta / 4.0;
+        
+        // The four directions are at angles: theta4, theta4 + pi/2, theta4 + pi, theta4 + 3*pi/2
+        for (int k = 0; k < 4; ++k) {
+            double angle = theta4 + k * M_PI_2;
+            Point dir{r4 * std::cos(angle), r4 * std::sin(angle)};
+            drawArrow(c, dir, scale, br, bg, bb);
+        }
+    }
+}
+
+void drawVertexCrossFieldUK(const Mesh &m, const CrossField &cf, double scale) {
+    glLineWidth(2.5f);
+    const float br = 0.2f, bg = 0.2f, bb = 0.95f; // unified blue color
+
+    const Eigen::VectorXcd &u_k = cf.u_k;
+    
+    for (size_t i = 0; i < m.vertices.size(); ++i) {
+        if (static_cast<int>(i) >= u_k.size()) continue;
+        
+        const Point &c = m.vertices[i];
+        std::complex<double> u4 = u_k[i];
+        
+        // Skip if magnitude is too small
+        if (std::abs(u4) < 1e-14) continue;
+        
+        // Compute fourth root: u = u4^(1/4)
+        // u4 = r * e^(i*theta), so u4^(1/4) = r^(1/4) * e^(i*theta/4)
+        double r = std::abs(u4);
+        double theta = std::arg(u4);
+        double r4 = std::pow(r, 0.25);
+        double theta4 = theta / 4.0;
+        
+        // The four directions are at angles: theta4, theta4 + pi/2, theta4 + pi, theta4 + 3*pi/2
+        for (int k = 0; k < 4; ++k) {
+            double angle = theta4 + k * M_PI_2;
+            Point dir{r4 * std::cos(angle), r4 * std::sin(angle)};
+            drawArrow(c, dir, scale, br, bg, bb);
+        }
+    }
+}
+
 void drawDisk3D(const Point &center, double radius, float baseR, float baseG, float baseB, int segments) {
     // Fake light direction in view space (towards viewer, slightly to top-right)
     Eigen::Vector3d L = Eigen::Vector3d(0.4, 0.4, 0.8).normalized();

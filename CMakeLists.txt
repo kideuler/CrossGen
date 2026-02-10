@@ -42,6 +42,8 @@ add_library(PolyVector SHARED
     src/IGM/CutMesh.cxx
     src/IGM/MIQ.hxx
     src/IGM/MIQ.cxx
+    src/crossfield/CrossField.hxx
+    src/crossfield/CrossField.cxx
 )
 target_include_directories(PolyVector PUBLIC src)
 target_link_libraries(PolyVector PUBLIC Eigen3::Eigen)

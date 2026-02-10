@@ -160,6 +160,25 @@ Mesh::Mesh(const std::string &filename) {
 		}
 	}
 
+	// Collect boundary vertices from boundary edges
+	std::unordered_set<int> bVertsSet;
+	for (const auto &bt : boundaryTriangles) {
+		int t = bt[0];
+		int be = bt[1];
+		const Triangle &tri = triangles[t];
+		bVertsSet.insert(tri[be]);
+		bVertsSet.insert(tri[(be + 1) % 3]);
+	}
+	boundaryVertices.assign(bVertsSet.begin(), bVertsSet.end());
+	std::sort(boundaryVertices.begin(), boundaryVertices.end());
+
+	// Create boolean flag vector for boundary vertices
+	isBoundaryVertex.assign(vertices.size(), false);
+	for (int bv : boundaryVertices) {
+		if (bv >= 0 && bv < static_cast<int>(isBoundaryVertex.size())) {
+			isBoundaryVertex[bv] = true;
+		}
+	}
 	// Build CSR mapping of vertex -> incident triangles (CCW order)
 	vertexTriangles = VertexTriangleCSR::buildFromMesh(*this);
 }

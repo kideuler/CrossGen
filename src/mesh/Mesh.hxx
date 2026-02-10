@@ -8,6 +8,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <algorithm>
 #include <cctype>
 #include <stdexcept>
@@ -62,6 +63,8 @@ class Mesh {
     std::vector<std::array<int, 3>> triangleAdjacency; // Adjacency info for triangles (0: left, 1: right, 2: below, -1 indicates boundary)
     std::vector<std::array<int, 2>> boundaryTriangles; // List of boundary triangle indices and their corresponding edge (0,1,2)
     std::vector<std::array<int,3>> cornerTriangles; // List of corner triangle indices and their corresponding boundary edges
+    std::vector<int> boundaryVertices; // List of vertex indices that lie on the boundary
+    std::vector<bool> isBoundaryVertex; // Boolean flag per vertex indicating if it's a boundary vertex
 
     // CSR mapping: vertex -> incident triangles in CCW order
     VertexTriangleCSR vertexTriangles;

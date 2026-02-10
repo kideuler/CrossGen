@@ -7,6 +7,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <thread>
 
 #include "viewer/Geometry.hxx"
 #include "viewer/Interaction.hxx"
@@ -15,8 +16,15 @@
 #include "IGM/CutMesh.hxx"
 #include "IGM/MIQ.hxx"
 #include "polyvector/PolyVectors.hxx"
+#include "crossfield/CrossField.hxx"
 
 namespace {
+
+enum class Mode {
+    Unselected = 0,
+    PolyVector = 1,
+    MBO = 2,
+};
 
 enum class Phase {
     MeshOnly = 1,
@@ -24,6 +32,12 @@ enum class Phase {
     Singularities = 3,
     CutSeams = 4,
     UVMesh = 5,
+};
+
+enum class MBOPhase {
+    MeshOnly = 1,
+    CrossField = 2,
+    Stepping = 3,
 };
 
 Phase nextPhase(Phase p) {
@@ -37,6 +51,15 @@ Phase nextPhase(Phase p) {
     return Phase::UVMesh;
 }
 
+MBOPhase nextMBOPhase(MBOPhase p) {
+    switch (p) {
+        case MBOPhase::MeshOnly: return MBOPhase::CrossField;
+        case MBOPhase::CrossField: return MBOPhase::Stepping;
+        case MBOPhase::Stepping: return MBOPhase::Stepping; // TODO: add more phases
+    }
+    return MBOPhase::Stepping;
+}
+
 const char *phaseName(Phase p) {
     switch (p) {
         case Phase::MeshOnly: return "1) mesh";
@@ -48,12 +71,33 @@ const char *phaseName(Phase p) {
     return "?";
 }
 
+const char *mboPhaseName(MBOPhase p) {
+    switch (p) {
+        case MBOPhase::MeshOnly: return "1) mesh";
+        case MBOPhase::CrossField: return "2) MBO crossfield";
+        case MBOPhase::Stepping: return "3) MBO stepping";
+    }
+    return "?";
+}
+
+const char *modeName(Mode m) {
+    switch (m) {
+        case Mode::Unselected: return "unselected";
+        case Mode::PolyVector: return "PolyVector";
+        case Mode::MBO: return "MBO";
+    }
+    return "?";
+}
+
 // Format duration in milliseconds with 2 decimal places
 std::string formatMs(double ms) {
     std::ostringstream oss;
     oss << std::fixed << std::setprecision(2) << ms << " ms";
     return oss.str();
 }
+
+// Global MBO stepping parameters
+const int MBO_MAX_STEPS = 500;
 
 } // namespace
 
@@ -75,9 +119,17 @@ int main(int argc, char **argv) {
     std::optional<PolyField> field;
     std::optional<CutMesh> cutMesh;
     std::optional<MIQSolver> miqSolver;
+    std::optional<CrossField> crossField;
+    Mode mode = Mode::Unselected;
     Phase phase = Phase::MeshOnly;
+    MBOPhase mboPhase = MBOPhase::MeshOnly;
     bool cWasDown = false;
+    bool oneWasDown = false;
+    bool twoWasDown = false;
     bool singularitiesLogged = false;
+    bool mboSteppingStarted = false;
+    bool mboConverged = false;
+    int mboStepCount = 0;
     
     // Console for timing output
     viewer::Console console;
@@ -136,7 +188,7 @@ int main(int argc, char **argv) {
     double avgEdge = viewer::averageTriangleEdgeLength(mesh);
     double scale = 0.7 * avgEdge;
 
-    std::cerr << "[Viewer] Phase " << phaseName(phase) << " (press 'c' to advance)\n";
+    std::cerr << "[Viewer] Phase " << phaseName(phase) << " (press '1' for PolyVector mode, '2' for MBO mode)\n";
 
     glEnable(GL_MULTISAMPLE);
     glEnable(GL_BLEND);
@@ -148,19 +200,129 @@ int main(int argc, char **argv) {
     using Clock = std::chrono::high_resolution_clock;
 
     while (!glfwWindowShouldClose(window)) {
-        // Phase progression (edge-triggered)
+        // Mode selection (edge-triggered) - only when mode is unselected and in MeshOnly phase
+        if (mode == Mode::Unselected && phase == Phase::MeshOnly) {
+            bool oneDown = (glfwGetKey(window, GLFW_KEY_1) == GLFW_PRESS);
+            bool twoDown = (glfwGetKey(window, GLFW_KEY_2) == GLFW_PRESS);
+            
+            if (oneDown && !oneWasDown) {
+                mode = Mode::PolyVector;
+                std::cerr << "[Viewer] Selected mode: " << modeName(mode) << " (press 'c' to advance)\n";
+                console.log("Selected mode: PolyVector");
+            }
+            if (twoDown && !twoWasDown) {
+                mode = Mode::MBO;
+                std::cerr << "[Viewer] Selected mode: " << modeName(mode) << " (press 'c' to advance)\n";
+                console.log("Selected mode: MBO");
+            }
+            
+            oneWasDown = oneDown;
+            twoWasDown = twoDown;
+        }
+
+        // Phase progression (edge-triggered) - only when mode is selected
         bool cDown = (glfwGetKey(window, GLFW_KEY_C) == GLFW_PRESS);
-        if (cDown && !cWasDown) {
-            Phase old = phase;
-            phase = nextPhase(phase);
-            if (phase != old) {
-                std::cerr << "[Viewer] Phase " << phaseName(phase) << "\n";
+        if (cDown && !cWasDown && mode != Mode::Unselected) {
+            if (mode == Mode::PolyVector) {
+                Phase old = phase;
+                phase = nextPhase(phase);
+                if (phase != old) {
+                    std::cerr << "[Viewer] Phase " << phaseName(phase) << "\n";
+                }
+            } else if (mode == Mode::MBO) {
+                MBOPhase old = mboPhase;
+                mboPhase = nextMBOPhase(mboPhase);
+                if (mboPhase != old) {
+                    std::cerr << "[Viewer] MBO Phase " << mboPhaseName(mboPhase) << "\n";
+                }
             }
         }
         cWasDown = cDown;
 
-        // Lazily compute data when entering phases (with timing).
-        if (phase >= Phase::CrossField && !field.has_value()) {
+        // MBO mode: Initialize CrossField when entering CrossField phase
+        if (mode == Mode::MBO && mboPhase >= MBOPhase::CrossField && !crossField.has_value()) {
+            auto t0 = Clock::now();
+            crossField.emplace(mesh);
+            crossField->initialize(1); // method 1: random initialization for non-boundary vertices
+            auto t1 = Clock::now();
+            double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            console.log("[MBO] Initialized CrossField: " + formatMs(ms));
+        }
+
+        // MBO mode: Run stepping iterations when in Stepping phase
+        if (mode == Mode::MBO && mboPhase == MBOPhase::Stepping && crossField.has_value() && !mboSteppingStarted) {
+            mboSteppingStarted = true;
+            mboStepCount = 0;
+            console.log("[MBO] Starting " + std::to_string(MBO_MAX_STEPS) + " iterations...");
+        }
+        
+        // Run 10 steps at a time and redraw
+        if (mode == Mode::MBO && mboPhase == MBOPhase::Stepping && mboSteppingStarted && mboStepCount < MBO_MAX_STEPS && !mboConverged) {
+            // Run 10 steps
+            double nv = static_cast<double>(crossField->u_k.size());
+            // stop if error < 2*n * 1e-4 (this is a very loose threshold just to prevent unnecessary stepping after convergence, since the viewer is not meant for precise timing/benchmarking)
+            for (int i = 0; i < 2 && mboStepCount < MBO_MAX_STEPS; ++i) {
+                crossField->step();
+                mboStepCount++;
+                if (crossField->error < 2.0 * nv * 1e-7) {
+                    console.log("[MBO] Convergence reached at step " + std::to_string(mboStepCount) + " with error " + std::to_string(crossField->error));
+                    mboConverged = true;
+                    break;
+                }
+            }
+
+            crossField->computeSingularities(); // update singularities for visualization during stepping (not just at the end)
+            
+            // Log progress
+            std::ostringstream oss;
+            oss << "[MBO] Step " << mboStepCount << "/" << MBO_MAX_STEPS;
+            console.log(oss.str());
+            
+            // Render and sleep to show progress
+            glClearColor(0.1f, 0.1f, 0.12f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+            glDisable(GL_DEPTH_TEST);
+            
+            viewer::drawMesh(mesh);
+            viewer::drawVertexCrossFieldUK(mesh, *crossField, scale);
+            
+            // Draw singularities at triangle centroids
+            double ballRadius = 0.5 * avgEdge;
+            for (const auto &sig : crossField->singularTriangles) {
+                int triIdx = sig.first;
+                double crossIndex = sig.second;
+                if (triIdx < 0 || triIdx >= static_cast<int>(mesh.triangles.size())) continue;
+                
+                // Compute triangle centroid
+                const Triangle &tri = mesh.triangles[triIdx];
+                const Point &p0 = mesh.vertices[tri[0]];
+                const Point &p1 = mesh.vertices[tri[1]];
+                const Point &p2 = mesh.vertices[tri[2]];
+                Point centroid = {(p0[0] + p1[0] + p2[0]) / 3.0,
+                                  (p0[1] + p1[1] + p2[1]) / 3.0};
+                
+                // Color based on index: blue for +1/4, red for -1/4
+                if (crossIndex > 0) {
+                    viewer::drawDisk3D(centroid, ballRadius, 0.2f, 0.2f, 0.95f);
+                } else {
+                    viewer::drawDisk3D(centroid, ballRadius, 0.95f, 0.2f, 0.2f);
+                }
+            }
+            
+            console.draw(window, 55.0f);
+            viewer::drawTextOverlay(window, "MBO stepping in progress...\npress 'q' to quit", 10.0f, 20.0f, 0.8f, 0.8f, 0.8f);
+            
+            glfwSwapBuffers(window);
+            glfwPollEvents();
+            
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            
+            // Skip normal rendering this frame
+            continue;
+        }
+
+        // PolyVector mode: Lazily compute data when entering phases (with timing).
+        if (mode == Mode::PolyVector && phase >= Phase::CrossField && !field.has_value()) {
             auto t0 = Clock::now();
             field.emplace(mesh);
             field->solveForPolyCoeffs();
@@ -173,7 +335,7 @@ int main(int argc, char **argv) {
             console.log("[CrossField] Solved poly-coeffs: " + formatMs(msCoeffs));
             console.log("[CrossField] Converted to field vectors: " + formatMs(msField));
         }
-        if (phase >= Phase::Singularities && field.has_value() && !singularitiesLogged) {
+        if (mode == Mode::PolyVector && phase >= Phase::Singularities && field.has_value() && !singularitiesLogged) {
             // Re-compute singularities to get accurate timing (they were computed in convertToFieldVectors)
             auto t0 = Clock::now();
             field->computeUSingularities();
@@ -185,7 +347,7 @@ int main(int argc, char **argv) {
             console.log(oss.str());
             singularitiesLogged = true;
         }
-        if (phase >= Phase::CutSeams && field.has_value() && !cutMesh.has_value()) {
+        if (mode == Mode::PolyVector && phase >= Phase::CutSeams && field.has_value() && !cutMesh.has_value()) {
             auto t0 = Clock::now();
             cutMesh.emplace(*field);
             auto t1 = Clock::now();
@@ -207,7 +369,7 @@ int main(int argc, char **argv) {
                     << " Falling back to showing all cut edges.\n";
             }
         }
-        if (phase >= Phase::UVMesh && cutMesh.has_value() && !miqSolver.has_value()) {
+        if (mode == Mode::PolyVector && phase >= Phase::UVMesh && cutMesh.has_value() && !miqSolver.has_value()) {
             auto t0 = Clock::now();
             miqSolver.emplace(*cutMesh);
             // Parameters: gradientSize, stiffness, directRound, iter, localIter, doRound, singularityRound, boundaryFeatures
@@ -238,7 +400,7 @@ int main(int argc, char **argv) {
         glDisable(GL_DEPTH_TEST);
 
         // Phase 5: UV mesh (MIQ) - special case: clear and draw only UV mesh
-        if (phase == Phase::UVMesh && miqSolver.has_value()) {
+        if (mode == Mode::PolyVector && phase == Phase::UVMesh && miqSolver.has_value()) {
             viewer::drawUVMesh(*miqSolver);
             // Draw singularities on UV mesh with same coloring
             if (field.has_value() && cutMesh.has_value()) {
@@ -246,7 +408,45 @@ int main(int argc, char **argv) {
                 double uvRadius = 0.8; // fixed size that looks good on integer grid
                 viewer::drawSingularitiesOnUV(*miqSolver, *cutMesh, *field, uvRadius);
             }
+        } else if (mode == Mode::MBO) {
+            // MBO mode rendering
+            viewer::drawMesh(mesh);
+            
+            // Draw crossfield on vertices if initialized
+            if (mboPhase >= MBOPhase::CrossField && crossField.has_value()) {
+                if (mboPhase == MBOPhase::Stepping && mboStepCount > 0) {
+                    // Use u_k after stepping has started
+                    viewer::drawVertexCrossFieldUK(mesh, *crossField, scale);
+                } else {
+                    // Use u_k_prev for initial display
+                    viewer::drawVertexCrossField(mesh, *crossField, scale);
+                }
+                
+                // Draw singularities at triangle centroids
+                double ballRadius = 0.5 * avgEdge;
+                for (const auto &sig : crossField->singularTriangles) {
+                    int triIdx = sig.first;
+                    double crossIndex = sig.second;
+                    if (triIdx < 0 || triIdx >= static_cast<int>(mesh.triangles.size())) continue;
+                    
+                    // Compute triangle centroid
+                    const Triangle &tri = mesh.triangles[triIdx];
+                    const Point &p0 = mesh.vertices[tri[0]];
+                    const Point &p1 = mesh.vertices[tri[1]];
+                    const Point &p2 = mesh.vertices[tri[2]];
+                    Point centroid = {(p0[0] + p1[0] + p2[0]) / 3.0,
+                                      (p0[1] + p1[1] + p2[1]) / 3.0};
+                    
+                    // Color based on index: blue for +1/4, red for -1/4
+                    if (crossIndex > 0) {
+                        viewer::drawDisk3D(centroid, ballRadius, 0.2f, 0.2f, 0.95f);
+                    } else {
+                        viewer::drawDisk3D(centroid, ballRadius, 0.95f, 0.2f, 0.2f);
+                    }
+                }
+            }
         } else {
+            // PolyVector mode rendering (phases 1-4)
             // Phase 1: mesh
             if (phase >= Phase::MeshOnly) {
                 viewer::drawMesh(mesh);
@@ -291,8 +491,12 @@ int main(int argc, char **argv) {
         // Draw console at top (below help text)
         console.draw(window, 55.0f);
 
-        // Draw help text overlay
-        viewer::drawTextOverlay(window, "press 'c' to continue\npress 'q' to quit", 10.0f, 20.0f, 0.8f, 0.8f, 0.8f);
+        // Draw help text overlay based on mode
+        if (mode == Mode::Unselected) {
+            viewer::drawTextOverlay(window, "press '1' for PolyVector mode\npress '2' for MBO mode\npress 'q' to quit", 10.0f, 20.0f, 0.8f, 0.8f, 0.8f);
+        } else {
+            viewer::drawTextOverlay(window, "press 'c' to continue\npress 'q' to quit", 10.0f, 20.0f, 0.8f, 0.8f, 0.8f);
+        }
 
         glfwSwapBuffers(window);
         glfwPollEvents();

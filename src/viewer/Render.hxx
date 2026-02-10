@@ -10,6 +10,7 @@
 #include "IGM/CutMesh.hxx"
 #include "IGM/MIQ.hxx"
 #include "polyvector/PolyVectors.hxx"
+#include "crossfield/CrossField.hxx"
 
 namespace viewer {
 
@@ -49,6 +50,14 @@ void drawUField(const Mesh &m, const std::vector<Point> &uField, double scale);
 
 // Draw only the V field (single direction per triangle) from a CutMesh
 void drawVField(const Mesh &m, const std::vector<Point> &vField, double scale);
+
+// Draw crossfield on mesh vertices from CrossField u_k_prev (MBO method)
+// Each cross direction is (u_k_prev[i])^(1/4)
+void drawVertexCrossField(const Mesh &m, const CrossField &cf, double scale);
+
+// Draw crossfield on mesh vertices from CrossField u_k (MBO method, during stepping)
+// Each cross direction is (u_k[i])^(1/4)
+void drawVertexCrossFieldUK(const Mesh &m, const CrossField &cf, double scale);
 
 void drawDisk3D(const Point &center, double radius, float baseR, float baseG, float baseB, int segments = 96);
 
