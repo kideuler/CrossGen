@@ -180,12 +180,10 @@ Mesh::Mesh(const std::string &filename) {
 
 	// Collect boundary vertices from boundary edges
 	std::unordered_set<int> bVertsSet;
-	for (const auto &bt : boundaryTriangles) {
-		int t = bt[0];
-		int be = bt[1];
-		const Triangle &tri = triangles[t];
-		bVertsSet.insert(tri[be]);
-		bVertsSet.insert(tri[(be + 1) % 3]);
+	for (int edgeIdx : boundaryEdges) {
+		const auto &edge = edges[edgeIdx];
+		bVertsSet.insert(edge[0]);
+		bVertsSet.insert(edge[1]);
 	}
 	boundaryVertices.assign(bVertsSet.begin(), bVertsSet.end());
 	std::sort(boundaryVertices.begin(), boundaryVertices.end());

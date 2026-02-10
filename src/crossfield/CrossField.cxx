@@ -23,15 +23,29 @@ void CrossField::initialize(int method) {
     std::vector<double> weights(numVertices, 0.0);
 
     // Process all boundary edges using the new edge data structures
+    // For boundary edges, we need to get the correct orientation from the triangle
     for (int edgeIdx : mesh.boundaryEdges) {
-        const auto &edge = mesh.edges[edgeIdx];
-        int v0 = edge[0];
-        int v1 = edge[1];
+        // Get the triangle that owns this boundary edge (first one, since second is -1)
+        int triIdx = mesh.edgeTriangles[edgeIdx][0];
+        const Triangle &tri = mesh.triangles[triIdx];
+        
+        // Find which local edge (0, 1, or 2) this is in the triangle
+        int localEdge = -1;
+        for (int e = 0; e < 3; ++e) {
+            if (mesh.triangleEdges[triIdx][e] == edgeIdx) {
+                localEdge = e;
+                break;
+            }
+        }
+        
+        // Get vertices in CCW order from the triangle
+        int v0 = tri[localEdge];
+        int v1 = tri[(localEdge + 1) % 3];
 
         const Point &p0 = mesh.vertices[v0];
         const Point &p1 = mesh.vertices[v1];
 
-        // Edge vector from v0 to v1
+        // Edge vector from v0 to v1 (in CCW order)
         double ex = p1[0] - p0[0];
         double ey = p1[1] - p0[1];
 
@@ -40,9 +54,9 @@ void CrossField::initialize(int method) {
         if (len < 1e-14) continue;
 
         // Outward normal: rotate edge 90 degrees clockwise (for CCW-oriented triangles)
-        // If triangle is CCW, the outward normal is (-ey, ex) normalized
-        double nx = -ey / len;
-        double ny = ex / len;
+        // For CCW triangle with edge going v0->v1, outward normal is (ey, -ex) normalized
+        double nx = ey / len;
+        double ny = -ex / len;
 
         // Accumulate weighted normal for both vertices
         normalX[v0] += nx * len;
