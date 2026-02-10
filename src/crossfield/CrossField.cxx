@@ -22,12 +22,11 @@ void CrossField::initialize(int method) {
     std::vector<double> normalY(numVertices, 0.0);
     std::vector<double> weights(numVertices, 0.0);
 
-    // Helper lambda to process a boundary edge given triangle index and edge index
-    auto processBoundaryEdge = [&](int triIdx, int edgeIdx) {
-        const Triangle &tri = mesh.triangles[triIdx];
-        // Edge edgeIdx connects vertex tri[edgeIdx] to tri[(edgeIdx+1)%3]
-        int v0 = tri[edgeIdx];
-        int v1 = tri[(edgeIdx + 1) % 3];
+    // Process all boundary edges using the new edge data structures
+    for (int edgeIdx : mesh.boundaryEdges) {
+        const auto &edge = mesh.edges[edgeIdx];
+        int v0 = edge[0];
+        int v1 = edge[1];
 
         const Point &p0 = mesh.vertices[v0];
         const Point &p1 = mesh.vertices[v1];
@@ -38,7 +37,7 @@ void CrossField::initialize(int method) {
 
         // Edge length
         double len = std::sqrt(ex * ex + ey * ey);
-        if (len < 1e-14) return;
+        if (len < 1e-14) continue;
 
         // Outward normal: rotate edge 90 degrees clockwise (for CCW-oriented triangles)
         // If triangle is CCW, the outward normal is (-ey, ex) normalized
@@ -53,20 +52,6 @@ void CrossField::initialize(int method) {
         normalX[v1] += nx * len;
         normalY[v1] += ny * len;
         weights[v1] += len;
-    };
-
-    // Process all regular boundary triangles (1 boundary edge)
-    for (const auto &bt : mesh.boundaryTriangles) {
-        int triIdx = bt[0];
-        int edgeIdx = bt[1];
-        processBoundaryEdge(triIdx, edgeIdx);
-    }
-
-    // Process all corner triangles (2+ boundary edges)
-    for (const auto &ct : mesh.cornerTriangles) {
-        int triIdx = ct[0];
-        processBoundaryEdge(triIdx, ct[1]);
-        processBoundaryEdge(triIdx, ct[2]);
     }
 
     // Now set Dirichlet BCs for boundary vertices

@@ -106,9 +106,10 @@ Mesh::Mesh(const std::string &filename) {
 
 	// Prepare adjacency; initialize with -1 for boundaries
 	triangleAdjacency.resize(triangles.size(), std::array<int,3>{-1, -1, -1});
+	triangleEdges.resize(triangles.size(), std::array<int,3>{-1, -1, -1});
 
-	// Map edges to the triangle and edge id
-	struct EdgeInfo { int tri; int edgeId; };
+	// Map edges to the triangle and edge id, and also track edge index
+	struct EdgeInfo { int tri; int edgeId; int edgeIdx; };
 	std::unordered_map<EdgeKey, EdgeInfo, EdgeKeyHash> edgeMap;
 	edgeMap.reserve(triangles.size() * 3);
 
@@ -125,22 +126,39 @@ Mesh::Mesh(const std::string &filename) {
 		EdgeKey e20 = makeKey(v2, v0);
 
 		// For each edge, check if seen; if seen, set adjacency both ways
-		auto handleEdge = [&](const EdgeKey &ek, int edgeId){
+		auto handleEdge = [&](const EdgeKey &ek, int localEdgeId, int va, int vb){
 			auto it = edgeMap.find(ek);
 			if (it == edgeMap.end()) {
-				edgeMap.emplace(ek, EdgeInfo{t, edgeId});
+				// New edge - add to edges list
+				int edgeIdx = static_cast<int>(edges.size());
+				edges.push_back(std::array<int,2>{ek.a, ek.b}); // stored as (min, max)
+				edgeTriangles.push_back(std::array<int,2>{t, -1}); // first triangle, second TBD
+				edgeMap.emplace(ek, EdgeInfo{t, localEdgeId, edgeIdx});
+				triangleEdges[t][localEdgeId] = edgeIdx;
 			} else {
 				// Found neighboring triangle
 				int ot = it->second.tri;
 				int oedge = it->second.edgeId;
-				triangleAdjacency[t][edgeId] = ot;
+				int edgeIdx = it->second.edgeIdx;
+				triangleAdjacency[t][localEdgeId] = ot;
 				triangleAdjacency[ot][oedge] = t;
+				triangleEdges[t][localEdgeId] = edgeIdx;
+				edgeTriangles[edgeIdx][1] = t; // set second triangle
 			}
 		};
 
-		handleEdge(e01, 0);
-		handleEdge(e12, 1);
-		handleEdge(e20, 2);
+		handleEdge(e01, 0, v0, v1);
+		handleEdge(e12, 1, v1, v2);
+		handleEdge(e20, 2, v2, v0);
+	}
+
+	// Build boundary edge list and isBoundaryEdge vector
+	isBoundaryEdge.assign(edges.size(), false);
+	for (int e = 0; e < static_cast<int>(edges.size()); ++e) {
+		if (edgeTriangles[e][1] == -1) {
+			isBoundaryEdge[e] = true;
+			boundaryEdges.push_back(e);
+		}
 	}
 
 	// Classify boundary edges per triangle. A triangle with exactly 1 boundary edge is a regular boundary triangle.

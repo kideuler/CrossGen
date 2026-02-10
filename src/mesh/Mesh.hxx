@@ -66,6 +66,13 @@ class Mesh {
     std::vector<int> boundaryVertices; // List of vertex indices that lie on the boundary
     std::vector<bool> isBoundaryVertex; // Boolean flag per vertex indicating if it's a boundary vertex
 
+    // Edge data structures
+    std::vector<std::array<int, 2>> edges; // Unique edges: edge index -> [v0, v1] vertex ids
+    std::vector<std::array<int, 3>> triangleEdges; // Triangle -> edge map: tri index -> [e0, e1, e2] edge indices
+    std::vector<std::array<int, 2>> edgeTriangles; // Edge -> triangle map: edge index -> [t0, t1] triangle indices (-1 for boundary)
+    std::vector<int> boundaryEdges; // List of boundary edge indices
+    std::vector<bool> isBoundaryEdge; // Boolean flag per edge indicating if it's a boundary edge
+
     // CSR mapping: vertex -> incident triangles in CCW order
     VertexTriangleCSR vertexTriangles;
 
