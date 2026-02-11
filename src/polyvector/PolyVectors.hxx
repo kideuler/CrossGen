@@ -3,6 +3,7 @@
 
 #include <complex>
 #include <cmath>
+#include <memory>
 #include <utility>
 
 // eigen includes
@@ -91,7 +92,7 @@ class PolyField {
     std::vector<std::pair<int,int>> uSingularities;
     PolyField() = default;
 
-    PolyField(Mesh &mesh); // Initialize field on the given mesh
+    PolyField(std::shared_ptr<Mesh> mesh); // Initialize field on the given mesh
 
     void solveForPolyCoeffs(); // Solve for the polynomial coefficients
 
@@ -111,13 +112,14 @@ class PolyField {
     // Returns true on success, false on failure
     bool writeVTK(const std::string &filename) const;
 
-    // Access the underlying mesh (a copy of the mesh passed to the constructor).
+    // Access the underlying mesh (shared pointer to the mesh passed to the constructor).
     // This is useful for downstream processing (e.g., cutting the mesh into a topological disk).
-    const Mesh& getMesh() const { return mesh; }
-    Mesh& getMesh() { return mesh; }
+    const Mesh& getMesh() const { return *mesh; }
+    Mesh& getMesh() { return *mesh; }
+    std::shared_ptr<Mesh> getMeshPtr() const { return mesh; }
 
 private:
-    Mesh mesh;
+    std::shared_ptr<Mesh> mesh;
     std::vector<PolyCoeffs> polyCoeffs; // per-triangle polynomial coefficients
 
     // rhs vectors for the linear system

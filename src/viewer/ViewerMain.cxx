@@ -4,6 +4,7 @@
 #include <chrono>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -103,14 +104,14 @@ const int MBO_MAX_STEPS = 500;
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        std::cerr << "Usage: Viewer <mesh.obj>\n";
+        std::cerr << "Usage: Viewer <mesh->obj>\n";
         return 1;
     }
 
     std::string path = argv[1];
-    Mesh mesh;
+    std::shared_ptr<Mesh> mesh;
     try {
-        mesh = Mesh(path);
+        mesh = std::make_shared<Mesh>(path);
     } catch (const std::exception &e) {
         std::cerr << "Failed to load mesh: " << e.what() << "\n";
         return 2;
@@ -138,8 +139,8 @@ int main(int argc, char **argv) {
     // Log initial mesh info
     {
         std::ostringstream oss;
-        oss << "Loaded mesh: " << mesh.triangles.size() << " triangles, " 
-            << mesh.vertices.size() << " vertices";
+        oss << "Loaded mesh: " << mesh->triangles.size() << " triangles, " 
+            << mesh->vertices.size() << " vertices";
         console.log(oss.str());
     }
 
@@ -164,7 +165,7 @@ int main(int argc, char **argv) {
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
 
-    viewer::Bounds B = viewer::computeBounds(mesh);
+    viewer::Bounds B = viewer::computeBounds(*mesh);
     double dx = B.maxx - B.minx;
     double dy = B.maxy - B.miny;
     double ext = std::max(dx, dy);
@@ -185,7 +186,7 @@ int main(int argc, char **argv) {
     viewer::applyOrtho(view);
     viewer::installInteractionCallbacks(window);
 
-    double avgEdge = viewer::averageTriangleEdgeLength(mesh);
+    double avgEdge = viewer::averageTriangleEdgeLength(*mesh);
     double scale = 0.7 * avgEdge;
 
     std::cerr << "[Viewer] Phase " << phaseName(phase) << " (press '1' for PolyVector mode, '2' for MBO mode)\n";
@@ -283,21 +284,21 @@ int main(int argc, char **argv) {
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
             glDisable(GL_DEPTH_TEST);
             
-            viewer::drawMesh(mesh);
-            viewer::drawVertexCrossFieldUK(mesh, *crossField, scale);
+            viewer::drawMesh(*mesh);
+            viewer::drawVertexCrossFieldUK(*mesh, *crossField, scale);
             
             // Draw singularities at triangle centroids
             double ballRadius = 0.5 * avgEdge;
             for (const auto &sig : crossField->singularTriangles) {
                 int triIdx = sig.first;
                 double crossIndex = sig.second;
-                if (triIdx < 0 || triIdx >= static_cast<int>(mesh.triangles.size())) continue;
+                if (triIdx < 0 || triIdx >= static_cast<int>(mesh->triangles.size())) continue;
                 
                 // Compute triangle centroid
-                const Triangle &tri = mesh.triangles[triIdx];
-                const Point &p0 = mesh.vertices[tri[0]];
-                const Point &p1 = mesh.vertices[tri[1]];
-                const Point &p2 = mesh.vertices[tri[2]];
+                const Triangle &tri = mesh->triangles[triIdx];
+                const Point &p0 = mesh->vertices[tri[0]];
+                const Point &p1 = mesh->vertices[tri[1]];
+                const Point &p2 = mesh->vertices[tri[2]];
                 Point centroid = {(p0[0] + p1[0] + p2[0]) / 3.0,
                                   (p0[1] + p1[1] + p2[1]) / 3.0};
                 
@@ -358,7 +359,7 @@ int main(int argc, char **argv) {
                 << " cut edges: " << formatMs(ms);
             console.log(oss.str());
 
-            std::cerr << "[Viewer] #tri=" << mesh.triangles.size() << " #vtx=" << mesh.vertices.size()
+            std::cerr << "[Viewer] #tri=" << mesh->triangles.size() << " #vtx=" << mesh->vertices.size()
                       << " | uSingularities=" << field->uSingularities.size() << " | cutEdges="
                       << cutMesh->getCutEdges().size() << " | singularityPathCutEdges="
                       << cutMesh->getSingularityPathCutEdges().size() << "\n";
@@ -410,16 +411,16 @@ int main(int argc, char **argv) {
             }
         } else if (mode == Mode::MBO) {
             // MBO mode rendering
-            viewer::drawMesh(mesh);
+            viewer::drawMesh(*mesh);
             
             // Draw crossfield on vertices if initialized
             if (mboPhase >= MBOPhase::CrossField && crossField.has_value()) {
                 if (mboPhase == MBOPhase::Stepping && mboStepCount > 0) {
                     // Use u_k after stepping has started
-                    viewer::drawVertexCrossFieldUK(mesh, *crossField, scale);
+                    viewer::drawVertexCrossFieldUK(*mesh, *crossField, scale);
                 } else {
                     // Use u_k_prev for initial display
-                    viewer::drawVertexCrossField(mesh, *crossField, scale);
+                    viewer::drawVertexCrossField(*mesh, *crossField, scale);
                 }
                 
                 // Draw singularities at triangle centroids
@@ -427,13 +428,13 @@ int main(int argc, char **argv) {
                 for (const auto &sig : crossField->singularTriangles) {
                     int triIdx = sig.first;
                     double crossIndex = sig.second;
-                    if (triIdx < 0 || triIdx >= static_cast<int>(mesh.triangles.size())) continue;
+                    if (triIdx < 0 || triIdx >= static_cast<int>(mesh->triangles.size())) continue;
                     
                     // Compute triangle centroid
-                    const Triangle &tri = mesh.triangles[triIdx];
-                    const Point &p0 = mesh.vertices[tri[0]];
-                    const Point &p1 = mesh.vertices[tri[1]];
-                    const Point &p2 = mesh.vertices[tri[2]];
+                    const Triangle &tri = mesh->triangles[triIdx];
+                    const Point &p0 = mesh->vertices[tri[0]];
+                    const Point &p1 = mesh->vertices[tri[1]];
+                    const Point &p2 = mesh->vertices[tri[2]];
                     Point centroid = {(p0[0] + p1[0] + p2[0]) / 3.0,
                                       (p0[1] + p1[1] + p2[1]) / 3.0};
                     
@@ -449,12 +450,12 @@ int main(int argc, char **argv) {
             // PolyVector mode rendering (phases 1-4)
             // Phase 1: mesh
             if (phase >= Phase::MeshOnly) {
-                viewer::drawMesh(mesh);
+                viewer::drawMesh(*mesh);
             }
 
             // Phase 2: crossfield (only in phases 2 and 3, not in phase 4)
             if (phase >= Phase::CrossField && phase < Phase::CutSeams && field.has_value()) {
-                viewer::drawField(mesh, *field, scale);
+                viewer::drawField(*mesh, *field, scale);
             }
 
             // Phase 3: singularities
@@ -463,8 +464,8 @@ int main(int argc, char **argv) {
                 for (const auto &sig : field->uSingularities) {
                     int vid = sig.first;
                     int index4 = sig.second;
-                    if (vid < 0 || vid >= static_cast<int>(mesh.vertices.size())) continue;
-                    const Point &c = mesh.vertices[vid];
+                    if (vid < 0 || vid >= static_cast<int>(mesh->vertices.size())) continue;
+                    const Point &c = mesh->vertices[vid];
 
                     if (index4 == 1) {
                         viewer::drawDisk3D(c, ballRadius, 0.2f, 0.2f, 0.95f);
@@ -477,13 +478,13 @@ int main(int argc, char **argv) {
             // Phase 4: seam cuts
             if (phase >= Phase::CutSeams && cutMesh.has_value()) {
                 // Draw U field (green) and V field (red) - single direction per triangle
-                viewer::drawUField(mesh, cutMesh->getUField(), scale);
-                viewer::drawVField(mesh, cutMesh->getVField(), scale);
+                viewer::drawUField(*mesh, cutMesh->getUField(), scale);
+                viewer::drawVField(*mesh, cutMesh->getVField(), scale);
 
                 if (!cutMesh->getSingularityPathCutEdges().empty()) {
-                    viewer::drawEdgeSetOnMesh(mesh, cutMesh->getCutEdges(), 1.0f, 0.75f, 0.1f, 4.0f);
+                    viewer::drawEdgeSetOnMesh(*mesh, cutMesh->getCutEdges(), 1.0f, 0.75f, 0.1f, 4.0f);
                 } else {
-                    viewer::drawEdgeSetOnMesh(mesh, cutMesh->getCutEdges(), 1.0f, 0.2f, 0.9f, 3.5f);
+                    viewer::drawEdgeSetOnMesh(*mesh, cutMesh->getCutEdges(), 1.0f, 0.2f, 0.9f, 3.5f);
                 }
             }
         }

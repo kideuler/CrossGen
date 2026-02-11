@@ -103,7 +103,7 @@ static void computeTopology(Mesh &m) {
 } // namespace
 
 CutMesh::CutMesh(const PolyField &field) {
-    orig = field.getMesh();
+    orig = field.getMeshPtr();
     singularities = field.uSingularities;
 
     // Copy the per-triangle u field directions
@@ -128,8 +128,8 @@ void CutMesh::buildEdgeCuts() {
     cutEdges.clear();
     singularityPathCutEdges.clear();
 
-    const int nV = static_cast<int>(orig.vertices.size());
-    const int nT = static_cast<int>(orig.triangles.size());
+    const int nV = static_cast<int>(orig->vertices.size());
+    const int nT = static_cast<int>(orig->triangles.size());
     if (nV == 0 || nT == 0) return;
 
     // Internal edge structure
@@ -166,7 +166,7 @@ void CutMesh::buildEdgeCuts() {
     };
 
     for (int f = 0; f < nT; ++f) {
-        const Triangle& t = orig.triangles[f];
+        const Triangle& t = orig->triangles[f];
         addEdge(t[0], t[1], f);
         addEdge(t[1], t[2], f);
         addEdge(t[2], t[0], f);
@@ -183,7 +183,7 @@ void CutMesh::buildEdgeCuts() {
 
     // Track used vertices
     std::vector<uint8_t> usedV(nV, 0);
-    for (const auto& t : orig.triangles) {
+    for (const auto& t : orig->triangles) {
         usedV[t[0]] = 1; usedV[t[1]] = 1; usedV[t[2]] = 1;
     }
     int Vused = 0;
@@ -490,7 +490,7 @@ void CutMesh::buildEdgeCuts() {
         std::vector<std::vector<std::pair<int, double>>> wadj(nV);
         for (int eid = 0; eid < nE; ++eid) {
             if (!usedV[edges[eid].u] || !usedV[edges[eid].v]) continue;
-            double w = edgeLength(orig, edges[eid].u, edges[eid].v);
+            double w = edgeLength(*orig, edges[eid].u, edges[eid].v);
             wadj[edges[eid].u].emplace_back(edges[eid].v, w);
             wadj[edges[eid].v].emplace_back(edges[eid].u, w);
         }
@@ -603,7 +603,7 @@ void CutMesh::buildEdgeCuts() {
             std::vector<std::vector<std::pair<int, double>>> wadj(nV);
             for (int eid = 0; eid < nE; ++eid) {
                 if (!usedV[edges[eid].u] || !usedV[edges[eid].v]) continue;
-                double w = edgeLength(orig, edges[eid].u, edges[eid].v);
+                double w = edgeLength(*orig, edges[eid].u, edges[eid].v);
                 wadj[edges[eid].u].emplace_back(edges[eid].v, w);
                 wadj[edges[eid].v].emplace_back(edges[eid].u, w);
             }
@@ -691,8 +691,8 @@ void CutMesh::buildEdgeCuts() {
 }
 
 void CutMesh::connectSingularitiesWithShortestPaths() {
-    const int nV = static_cast<int>(orig.vertices.size());
-    const int nT = static_cast<int>(orig.triangles.size());
+    const int nV = static_cast<int>(orig->vertices.size());
+    const int nT = static_cast<int>(orig->triangles.size());
     if (nV == 0 || nT == 0) return;
 
     // Record only the additional cuts introduced by the singularity-connection paths.
@@ -704,10 +704,10 @@ void CutMesh::connectSingularitiesWithShortestPaths() {
     auto addEdge = [&](int a, int b) {
         const EdgeKey key(a, b);
         if (wmap.find(key) != wmap.end()) return;
-        wmap.emplace(key, edgeLength(orig, a, b));
+        wmap.emplace(key, edgeLength(*orig, a, b));
     };
     for (int t = 0; t < nT; ++t) {
-        const Triangle &tri = orig.triangles[t];
+        const Triangle &tri = orig->triangles[t];
         addEdge(tri[0], tri[1]);
         addEdge(tri[1], tri[2]);
         addEdge(tri[2], tri[0]);
@@ -732,9 +732,9 @@ void CutMesh::connectSingularitiesWithShortestPaths() {
 
     // Mark boundary vertices
     for (int t = 0; t < nT; ++t) {
-        const Triangle &tri = orig.triangles[t];
+        const Triangle &tri = orig->triangles[t];
         for (int e = 0; e < 3; ++e) {
-            if (orig.triangleAdjacency[t][e] != -1) continue;
+            if (orig->triangleAdjacency[t][e] != -1) continue;
             int a = tri[e];
             int b = tri[(e + 1) % 3];
             if (a >= 0 && a < nV) isTarget[a] = true;
@@ -806,8 +806,8 @@ void CutMesh::connectSingularitiesWithShortestPaths() {
 }
 
 void CutMesh::buildExplicitCutMesh() {
-    const int nT = static_cast<int>(orig.triangles.size());
-    const int nV = static_cast<int>(orig.vertices.size());
+    const int nT = static_cast<int>(orig->triangles.size());
+    const int nV = static_cast<int>(orig->vertices.size());
     cut = Mesh();
     cut.vertices.clear();
     cut.triangles.clear();
@@ -844,7 +844,7 @@ void CutMesh::buildExplicitCutMesh() {
     };
 
     for (int f = 0; f < nT; ++f) {
-        const Triangle& t = orig.triangles[f];
+        const Triangle& t = orig->triangles[f];
         addEdge(t[0], t[1], f);
         addEdge(t[1], t[2], f);
         addEdge(t[2], t[0], f);
@@ -854,7 +854,7 @@ void CutMesh::buildExplicitCutMesh() {
 
     // Helper to find local index of vertex v in triangle t
     auto localIndex = [&](int f, int v) -> int {
-        const Triangle& t = orig.triangles[f];
+        const Triangle& t = orig->triangles[f];
         if (t[0] == v) return 0;
         if (t[1] == v) return 1;
         if (t[2] == v) return 2;
@@ -897,10 +897,10 @@ void CutMesh::buildExplicitCutMesh() {
         if (it == rootToNew.end()) {
             int f = c / 3;
             int i = c % 3;
-            int origV = orig.triangles[f][i];
+            int origV = orig->triangles[f][i];
             int newId = static_cast<int>(cut.vertices.size());
             rootToNew.emplace(r, newId);
-            cut.vertices.push_back(orig.vertices[origV]);
+            cut.vertices.push_back(orig->vertices[origV]);
             cutVertToOrig.push_back(origV);
             cornerNew[c] = newId;
         } else {

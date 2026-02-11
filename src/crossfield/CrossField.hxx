@@ -3,6 +3,7 @@
 
 #include <complex>
 #include <cmath>
+#include <memory>
 #include <utility>
 
 // eigen includes
@@ -18,7 +19,7 @@ public:
     double error = std::numeric_limits<double>::max(); // current error for convergence checking
     std::vector<std::pair<int, double>> singularTriangles; // (triangle index, cross-field index) pairs
 
-    CrossField(Mesh &mesh, int maxIterations = 100)
+    CrossField(std::shared_ptr<Mesh> mesh, int maxIterations = 100)
     : mesh(mesh), maxIterations(maxIterations) {}; 
 
     void initialize(int method = 0);
@@ -29,8 +30,12 @@ public:
 
     void runMBO();
 
+    // Access the underlying mesh
+    const Mesh& getMesh() const { return *mesh; }
+    std::shared_ptr<Mesh> getMeshPtr() const { return mesh; }
+
 private:
-    Mesh &mesh;
+    std::shared_ptr<Mesh> mesh;
 
 
 

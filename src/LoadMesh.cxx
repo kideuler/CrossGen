@@ -1,6 +1,7 @@
 // Simple utility to load a mesh and print its public data
 #include <iostream>
 #include <iomanip>
+#include <memory>
 #include <string>
 #include <cstdlib>
 
@@ -58,16 +59,16 @@ int main(int argc, char **argv) {
 	}
 	std::string path = argv[1];
 	try {
-		Mesh m(path);
+		auto m = std::make_shared<Mesh>(path);
 
         PolyField field(m);
 
         field.solveForPolyCoeffs();
-        printPolyField(field, m);
+        printPolyField(field, *m);
 
         field.convertToFieldVectors();
 		field.computeUSingularities();
-        printFieldVectors(field, m);
+        printFieldVectors(field, *m);
         field.writeVTK("output.vtk");
 	} catch (const std::exception &e) {
 		std::cerr << "Error: " << e.what() << "\n";

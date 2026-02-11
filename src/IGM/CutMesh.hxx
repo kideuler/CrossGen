@@ -2,6 +2,7 @@
 #define __CUTMESH_HXX__
 
 #include <array>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -55,7 +56,8 @@ public:
 
     explicit CutMesh(const PolyField &field);
 
-    const Mesh& getOriginalMesh() const { return orig; }
+    const Mesh& getOriginalMesh() const { return *orig; }
+    std::shared_ptr<Mesh> getOriginalMeshPtr() const { return orig; }
     const Mesh& getCutMesh() const { return cut; }
 
     const std::unordered_set<EdgeKey, EdgeKeyHash>& getCutEdges() const { return cutEdges; }
@@ -86,7 +88,7 @@ public:
     SanityReport sanityCheck() const;
 
 private:
-    Mesh orig;
+    std::shared_ptr<Mesh> orig;
     Mesh cut;
     SanityReport sanityInfo;
 

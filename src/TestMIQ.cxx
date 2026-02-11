@@ -2,6 +2,7 @@
 // Checks for flipped triangles (negative area in UV space).
 
 #include <iostream>
+#include <memory>
 #include <string>
 #include <cmath>
 
@@ -124,7 +125,7 @@ int main(int argc, char **argv) {
 
     try {
         std::cout << "Loading mesh: " << path << "\n";
-        Mesh m(path);
+        auto m = std::make_shared<Mesh>(path);
 
         // Build the cross field and compute singularities
         std::cout << "\n--- Cross Field Computation ---\n";

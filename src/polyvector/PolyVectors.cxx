@@ -78,10 +78,10 @@ static inline std::vector<int> boundaryNeighborsInTriangle(const Mesh &m, int tr
     return out;
 }
 
-PolyField::PolyField(Mesh &mesh) : mesh(mesh) {
+PolyField::PolyField(std::shared_ptr<Mesh> mesh) : mesh(mesh) {
     // Initialize polynomial coefficients
-    int nTriangles = static_cast<int>(mesh.triangles.size());
-    int nBdyTriangles = static_cast<int>(mesh.boundaryTriangles.size());
+    int nTriangles = static_cast<int>(mesh->triangles.size());
+    int nBdyTriangles = static_cast<int>(mesh->boundaryTriangles.size());
 
     // reserve space in sparse matrix L
     // Assuming L will be an nTriangles x nTriangles operator (e.g., Laplacian-like)
@@ -96,7 +96,7 @@ PolyField::PolyField(Mesh &mesh) : mesh(mesh) {
         // initialize matrix L
         L.insert(t, t) = 0.0;
         for (int e = 0; e < 3; ++e) {
-            int neighbor = mesh.triangleAdjacency[t][e];
+            int neighbor = mesh->triangleAdjacency[t][e];
             if (neighbor != -1) {
                 // interior edge: add connection to neighbor
                 L.insert(t, neighbor) = -1.0;
@@ -107,15 +107,15 @@ PolyField::PolyField(Mesh &mesh) : mesh(mesh) {
 
     // Loop through boundary triangles to set polynomial coefficients and dirichlet conditions
     for (int i = 0; i < nBdyTriangles; ++i) {
-        int t = mesh.boundaryTriangles[i][0];
-        int e = mesh.boundaryTriangles[i][1];
+        int t = mesh->boundaryTriangles[i][0];
+        int e = mesh->boundaryTriangles[i][1];
 
         // Get the two vertices of the boundary edge
-        const Triangle &tri = mesh.triangles[t];
+        const Triangle &tri = mesh->triangles[t];
         int v0 = tri[e];
         int v1 = tri[(e + 1) % 3];  // next vertex in CCW order 
-        Point p0 = mesh.vertices[v0];
-        Point p1 = mesh.vertices[v1];
+        Point p0 = mesh->vertices[v0];
+        Point p1 = mesh->vertices[v1];
 
         // Compute tangent vector along the edge
         Point tangent = { p1[0] - p0[0], p1[1] - p0[1] };
@@ -140,15 +140,15 @@ PolyField::PolyField(Mesh &mesh) : mesh(mesh) {
 
     // Also handle corner triangles (triangles with 2 boundary edges)
     // Use the first boundary edge's tangent as the constraint
-    for (const auto &ct : mesh.cornerTriangles) {
+    for (const auto &ct : mesh->cornerTriangles) {
         int t = ct[0];
         int e = ct[1]; // first boundary edge
 
-        const Triangle &tri = mesh.triangles[t];
+        const Triangle &tri = mesh->triangles[t];
         int v0 = tri[e];
         int v1 = tri[(e + 1) % 3];
-        Point p0 = mesh.vertices[v0];
-        Point p1 = mesh.vertices[v1];
+        Point p0 = mesh->vertices[v0];
+        Point p1 = mesh->vertices[v1];
 
         Point tangent = { p1[0] - p0[0], p1[1] - p0[1] };
         polyCoeffs[t] = computePolyCoeffsFromTangentVector(tangent);
@@ -174,21 +174,21 @@ PolyField::PolyField(Mesh &mesh) : mesh(mesh) {
 
 void PolyField::solveForPolyCoeffs() {
     // Prepare rhs vector b
-    int nTriangles = static_cast<int>(mesh.triangles.size());
+    int nTriangles = static_cast<int>(mesh->triangles.size());
     b_re = Eigen::VectorXd::Zero(nTriangles);
     b_im = Eigen::VectorXd::Zero(nTriangles);
 
     for (int m = 0; m < 2; ++m) {
 
         // Set rhs for boundary triangles based on polynomial coefficients
-        for (int i = 0; i < static_cast<int>(mesh.boundaryTriangles.size()); ++i) {
-            int t = mesh.boundaryTriangles[i][0]; // triangle index
+        for (int i = 0; i < static_cast<int>(mesh->boundaryTriangles.size()); ++i) {
+            int t = mesh->boundaryTriangles[i][0]; // triangle index
             b_re(t) = polyCoeffs[t][m].real();
             b_im(t) = polyCoeffs[t][m].imag();
         }
 
         // Also set rhs for corner triangles
-        for (const auto &ct : mesh.cornerTriangles) {
+        for (const auto &ct : mesh->cornerTriangles) {
             int t = ct[0]; // triangle index
             b_re(t) = polyCoeffs[t][m].real();
             b_im(t) = polyCoeffs[t][m].imag();
@@ -207,7 +207,7 @@ void PolyField::solveForPolyCoeffs() {
 }
 
 void PolyField::convertToFieldVectors() {
-    int nTriangles = static_cast<int>(mesh.triangles.size());
+    int nTriangles = static_cast<int>(mesh->triangles.size());
     field.resize(nTriangles);
 
     for (int t = 0; t < nTriangles; ++t) {
@@ -246,17 +246,17 @@ void PolyField::convertToFieldVectors() {
 void PolyField::computeUSingularities() {
     uSingularities.clear();
 
-    const int nV = static_cast<int>(mesh.vertices.size());
-    const int nT = static_cast<int>(mesh.triangles.size());
+    const int nV = static_cast<int>(mesh->vertices.size());
+    const int nT = static_cast<int>(mesh->triangles.size());
     if (nV == 0 || nT == 0 || static_cast<int>(field.size()) != nT) return;
 
     // Build a lightweight boundary-vertex marker and boundary adjacency (from boundary edges).
     std::vector<std::vector<int>> bNbr(nV);
     bNbr.reserve(nV);
     for (int t = 0; t < nT; ++t) {
-        const Triangle &tri = mesh.triangles[t];
+        const Triangle &tri = mesh->triangles[t];
         for (int e = 0; e < 3; ++e) {
-            if (mesh.triangleAdjacency[t][e] != -1) continue;
+            if (mesh->triangleAdjacency[t][e] != -1) continue;
             int a = tri[e];
             int b = tri[(e + 1) % 3];
             if (a >= 0 && a < nV && b >= 0 && b < nV) {
@@ -273,10 +273,10 @@ void PolyField::computeUSingularities() {
 
     // Traverse vertices using CSR one-rings.
     for (int v = 0; v < nV; ++v) {
-        const int deg = mesh.vertexTriangles.vertexDegree(v);
+        const int deg = mesh->vertexTriangles.vertexDegree(v);
         if (deg <= 0) continue;
 
-        auto [tBegin, tEnd] = mesh.vertexTriangles.trianglesForVertex(v);
+        auto [tBegin, tEnd] = mesh->vertexTriangles.trianglesForVertex(v);
         std::vector<int> tris(tBegin, tEnd);
         if (tris.empty()) continue;
 
@@ -312,9 +312,9 @@ void PolyField::computeUSingularities() {
         int gap = -1;
         std::vector<double> triAngles(tris.size(), 0.0);
         {
-            const Point &pv = mesh.vertices[v];
+            const Point &pv = mesh->vertices[v];
             for (size_t i = 0; i < tris.size(); ++i) {
-                const Point c = triCentroid(mesh, mesh.triangles[tris[i]]);
+                const Point c = triCentroid(*mesh, mesh->triangles[tris[i]]);
                 triAngles[i] = std::atan2(c[1] - pv[1], c[0] - pv[0]);
             }
         }
@@ -326,7 +326,7 @@ void PolyField::computeUSingularities() {
             for (size_t i = 0; i < tris.size(); ++i) {
                 const int ta = tris[i];
                 const int tb = tris[(i + 1) % tris.size()];
-                const int shared = otherSharedVertexBesides(mesh.triangles[ta], mesh.triangles[tb], v);
+                const int shared = otherSharedVertexBesides(mesh->triangles[ta], mesh->triangles[tb], v);
                 const bool shareEdge = (shared != -1);
                 // Angular gap between consecutive centroid directions (positive CCW).
                 double da = triAngles[(i + 1) % tris.size()] - triAngles[i];
@@ -374,12 +374,12 @@ void PolyField::computeUSingularities() {
 
         // Start side: boundary edge incident to v in the first triangle of the chain.
         {
-            const auto bn = boundaryNeighborsInTriangle(mesh, chainTris.front(), v);
+            const auto bn = boundaryNeighborsInTriangle(*mesh, chainTris.front(), v);
             if (!bn.empty()) wStart = bn[0];
         }
         // End side: boundary edge incident to v in the last triangle of the chain.
         {
-            const auto bn = boundaryNeighborsInTriangle(mesh, chainTris.back(), v);
+            const auto bn = boundaryNeighborsInTriangle(*mesh, chainTris.back(), v);
             if (!bn.empty()) wEnd = bn[0];
         }
 
@@ -389,9 +389,9 @@ void PolyField::computeUSingularities() {
             int a = bNbr[v][0];
             int b = bNbr[v][1];
 
-            const Point &pv = mesh.vertices[v];
-            const Point &pa = mesh.vertices[a];
-            const Point &pb = mesh.vertices[b];
+            const Point &pv = mesh->vertices[v];
+            const Point &pa = mesh->vertices[a];
+            const Point &pb = mesh->vertices[b];
             const double angA = std::atan2(pa[1] - pv[1], pa[0] - pv[0]);
             const double angB = std::atan2(pb[1] - pv[1], pb[0] - pv[0]);
 
@@ -421,9 +421,9 @@ void PolyField::computeUSingularities() {
             continue;
         }
 
-        const Point &pv = mesh.vertices[v];
-        const Point &pS = mesh.vertices[wStart];
-        const Point &pE = mesh.vertices[wEnd];
+        const Point &pv = mesh->vertices[v];
+        const Point &pS = mesh->vertices[wStart];
+        const Point &pE = mesh->vertices[wEnd];
         const double betaStart = betaFromDir4(subPoint(pS, pv));
         const double betaEnd = betaFromDir4(subPoint(pE, pv));
 
@@ -448,17 +448,17 @@ void PolyField::computeUSingularities() {
 }
 
 void PolyField::computeTriangleRotations() {
-    const int nT = static_cast<int>(mesh.triangles.size());
+    const int nT = static_cast<int>(mesh->triangles.size());
     fieldTriangleRotation.resize(nT, {-1,-1,-1});
 
     for (int t = 0; t < nT; ++t) {
-        const Triangle &tri = mesh.triangles[t];
+        const Triangle &tri = mesh->triangles[t];
         for (int e = 0; e < 3; ++e) {
-            if (mesh.triangleAdjacency[t][e] == -1) {
+            if (mesh->triangleAdjacency[t][e] == -1) {
                 // Boundary edge: no rotation
                 continue;
             }
-            int neighbor = mesh.triangleAdjacency[t][e];
+            int neighbor = mesh->triangleAdjacency[t][e];
 
             double theta_curr = computeAngle(field[t].u);
             double theta_neigh = computeAngle(field[neighbor].u);
@@ -473,8 +473,8 @@ bool PolyField::writeVTK(const std::string &filename) const {
     std::ofstream out(filename);
     if (!out) return false;
 
-    const auto &V = mesh.vertices;
-    const auto &T = mesh.triangles;
+    const auto &V = mesh->vertices;
+    const auto &T = mesh->triangles;
     int nPts = static_cast<int>(V.size());
     int nTri = static_cast<int>(T.size());
 

@@ -7,7 +7,7 @@
 void CrossField::initialize(int method) {
     // For all boundary vertices, set dirichlet boundary conditions to be (nx + i*ny)^4 where (nx, ny) is the outward normal of the boundary edge
 
-    int numVertices = static_cast<int>(mesh.vertices.size());
+    int numVertices = static_cast<int>(mesh->vertices.size());
     u_k_prev.resize(numVertices);
     u_k_prev.setZero();
 
@@ -24,15 +24,15 @@ void CrossField::initialize(int method) {
 
     // Process all boundary edges using the new edge data structures
     // For boundary edges, we need to get the correct orientation from the triangle
-    for (int edgeIdx : mesh.boundaryEdges) {
+    for (int edgeIdx : mesh->boundaryEdges) {
         // Get the triangle that owns this boundary edge (first one, since second is -1)
-        int triIdx = mesh.edgeTriangles[edgeIdx][0];
-        const Triangle &tri = mesh.triangles[triIdx];
+        int triIdx = mesh->edgeTriangles[edgeIdx][0];
+        const Triangle &tri = mesh->triangles[triIdx];
         
         // Find which local edge (0, 1, or 2) this is in the triangle
         int localEdge = -1;
         for (int e = 0; e < 3; ++e) {
-            if (mesh.triangleEdges[triIdx][e] == edgeIdx) {
+            if (mesh->triangleEdges[triIdx][e] == edgeIdx) {
                 localEdge = e;
                 break;
             }
@@ -42,8 +42,8 @@ void CrossField::initialize(int method) {
         int v0 = tri[localEdge];
         int v1 = tri[(localEdge + 1) % 3];
 
-        const Point &p0 = mesh.vertices[v0];
-        const Point &p1 = mesh.vertices[v1];
+        const Point &p0 = mesh->vertices[v0];
+        const Point &p1 = mesh->vertices[v1];
 
         // Edge vector from v0 to v1 (in CCW order)
         double ex = p1[0] - p0[0];
@@ -69,7 +69,7 @@ void CrossField::initialize(int method) {
     }
 
     // Now set Dirichlet BCs for boundary vertices
-    for (int v : mesh.boundaryVertices) {
+    for (int v : mesh->boundaryVertices) {
         if (weights[v] > 1e-14) {
             // Compute normalized weighted average normal
             double nx = normalX[v] / weights[v];
@@ -93,7 +93,7 @@ void CrossField::initialize(int method) {
     // initialize stiffness and mass matrices for MBO method
     // We will solve (M + tau*K) u^{k+1} = M u^k where M is the mass matrix and K is the stiffness matrix.
 
-    int numTriangles = static_cast<int>(mesh.triangles.size());
+    int numTriangles = static_cast<int>(mesh->triangles.size());
 
     // Build triplets for sparse matrix construction
     std::vector<Eigen::Triplet<std::complex<double>>> massTrips;
@@ -102,13 +102,13 @@ void CrossField::initialize(int method) {
     stiffTrips.reserve(numTriangles * 9);
 
     for (int t = 0; t < numTriangles; ++t) {
-        const Triangle &tri = mesh.triangles[t];
+        const Triangle &tri = mesh->triangles[t];
         int v0 = tri[0], v1 = tri[1], v2 = tri[2];
 
         // Get vertex coordinates
-        const Point &p0 = mesh.vertices[v0];
-        const Point &p1 = mesh.vertices[v1];
-        const Point &p2 = mesh.vertices[v2];
+        const Point &p0 = mesh->vertices[v0];
+        const Point &p1 = mesh->vertices[v1];
+        const Point &p2 = mesh->vertices[v2];
 
         // Compute edge vectors
         double x10 = p1[0] - p0[0], y10 = p1[1] - p0[1];
@@ -178,7 +178,7 @@ void CrossField::initialize(int method) {
     double maxX = std::numeric_limits<double>::lowest();
     double minY = std::numeric_limits<double>::max();
     double maxY = std::numeric_limits<double>::lowest();
-    for (const auto &p : mesh.vertices) {
+    for (const auto &p : mesh->vertices) {
         minX = std::min(minX, p[0]);
         maxX = std::max(maxX, p[0]);
         minY = std::min(minY, p[1]);
@@ -197,7 +197,7 @@ void CrossField::initialize(int method) {
     std::complex<double> zero(0.0, 0.0);
     
     // Create a set for fast boundary lookup
-    std::unordered_set<int> boundarySet(mesh.boundaryVertices.begin(), mesh.boundaryVertices.end());
+    std::unordered_set<int> boundarySet(mesh->boundaryVertices.begin(), mesh->boundaryVertices.end());
 
     // For column-major matrices, we iterate over all columns and check each entry's row
     // Zero out rows for boundary vertices in M
@@ -303,11 +303,11 @@ void CrossField::computeSingularities() {
         return std::atan2(diff_complex.imag(), diff_complex.real());
     };
 
-    int numTriangles = static_cast<int>(mesh.triangles.size());
+    int numTriangles = static_cast<int>(mesh->triangles.size());
 
     // Iterate over every triangle in the mesh
     for (int t = 0; t < numTriangles; ++t) {
-        const Triangle &tri = mesh.triangles[t];
+        const Triangle &tri = mesh->triangles[t];
 
         // Get the indices of the three vertices (assumed CCW ordered)
         int i = tri[0];
@@ -315,7 +315,7 @@ void CrossField::computeSingularities() {
         int k = tri[2];
 
         // Check if any of the vertices are boundary vertices; if so, skip this triangle
-        if (mesh.isBoundaryVertex[i] || mesh.isBoundaryVertex[j] || mesh.isBoundaryVertex[k]) {
+        if (mesh->isBoundaryVertex[i] || mesh->isBoundaryVertex[j] || mesh->isBoundaryVertex[k]) {
             continue;
         }
 

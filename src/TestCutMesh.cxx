@@ -1,6 +1,7 @@
 // Utility to cut a mesh into a topological disk (MIQ-style) and run sanity checks.
 
 #include <iostream>
+#include <memory>
 #include <string>
 
 #include "polyvector/PolyVectors.hxx"
@@ -51,9 +52,9 @@ int main(int argc, char **argv) {
     }
 
     try {
-        Mesh m(path);
+        auto m = std::make_shared<Mesh>(path);
 
-        // Build the cross field and compute singularities (PolyField stores its own mesh copy).
+        // Build the cross field and compute singularities (PolyField stores a shared_ptr to the mesh).
         PolyField field(m);
         field.solveForPolyCoeffs();
         field.convertToFieldVectors();
