@@ -3,3 +3,4 @@ data/meshes/*
 reference/*
 .DS_Store
 *.sh
+pkg/*

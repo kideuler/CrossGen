@@ -347,3 +347,12 @@ void CrossField::computeSingularities() {
         }
     }
 }
+
+void CrossField::runMBO() {
+    int iteration = 0;
+    double nverts = static_cast<double>(mesh->vertices.size());
+    while (iteration < maxIterations && error > 2 * nverts * 1e-5) {
+        step();
+        iteration++;
+    }
+}
