@@ -44,6 +44,8 @@ add_library(PolyVector SHARED
     src/IGM/MIQ.cxx
     src/crossfield/CrossField.hxx
     src/crossfield/CrossField.cxx
+    src/tracing/SeparatrixTrace.hxx
+    src/tracing/SeparatrixTrace.cxx
 )
 target_include_directories(PolyVector PUBLIC src)
 target_link_libraries(PolyVector PUBLIC Eigen3::Eigen)

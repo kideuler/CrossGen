@@ -18,6 +18,7 @@ public:
     Eigen::VectorXcd u_k_prev; // previous solution vector
     double error = std::numeric_limits<double>::max(); // current error for convergence checking
     std::vector<std::pair<int, double>> singularTriangles; // (triangle index, cross-field index) pairs
+    std::shared_ptr<Mesh> mesh;
 
     CrossField(std::shared_ptr<Mesh> mesh, int maxIterations = 100)
     : mesh(mesh), maxIterations(maxIterations) {}; 
@@ -35,9 +36,6 @@ public:
     std::shared_ptr<Mesh> getMeshPtr() const { return mesh; }
 
 private:
-    std::shared_ptr<Mesh> mesh;
-
-
 
     // sparse complex matrices for the linear system
     Eigen::SparseMatrix<std::complex<double>> M; // Mass matrix

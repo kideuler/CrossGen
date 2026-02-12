@@ -11,6 +11,7 @@
 #include "IGM/MIQ.hxx"
 #include "polyvector/PolyVectors.hxx"
 #include "crossfield/CrossField.hxx"
+#include "tracing/SeparatrixTrace.hxx"
 
 namespace viewer {
 
@@ -76,5 +77,9 @@ void drawUVMesh(const MIQSolver &miq);
 // Uses the origToCutVerts mapping from CutMesh to find UV coordinates.
 void drawSingularitiesOnUV(const MIQSolver &miq, const CutMesh &cutMesh, 
                            const PolyField &field, double radius);
+
+// Draw separatrices as line segments (initial two points per separatrix)
+// visualLength: if > 0, draw lines of this fixed length from the start point in the direction of the path
+void drawSeparatrices(const SeparatrixTrace &trace, float r, float g, float b, float lineWidth, double visualLength = 0.0);
 
 } // namespace viewer
