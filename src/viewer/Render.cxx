@@ -634,39 +634,5 @@ void drawSingularitiesOnUV(const MIQSolver &miq, const CutMesh &cutMesh,
     }
 }
 
-void drawSeparatrices(const SeparatrixTrace &trace, float r, float g, float b, float lineWidth, double visualLength) {
-    glLineWidth(lineWidth);
-    glColor3f(r, g, b);
-    
-    glBegin(GL_LINES);
-    for (const auto &sep : trace.separatrices) {
-        // Need at least 2 points to draw
-        if (sep.path.size() < 2) continue;
-        
-        const Point &p0 = sep.path[0].global_pos;
-        const Point &p1 = sep.path[1].global_pos;
-        
-        // Compute direction from p0 to p1
-        double dx = p1[0] - p0[0];
-        double dy = p1[1] - p0[1];
-        double len = std::sqrt(dx * dx + dy * dy);
-        
-        Point endPoint;
-        if (visualLength > 0.0 && len > 1e-12) {
-            // Scale to fixed visual length
-            double scale = visualLength / len;
-            endPoint = {p0[0] + dx * scale, p0[1] + dy * scale};
-        } else {
-            // Use actual path points
-            endPoint = p1;
-        }
-        
-        glVertex2d(p0[0], p0[1]);
-        glVertex2d(endPoint[0], endPoint[1]);
-    }
-    glEnd();
-    
-    glLineWidth(1.0f);
-}
-
 } // namespace viewer
+

@@ -18,7 +18,6 @@
 #include "IGM/MIQ.hxx"
 #include "polyvector/PolyVectors.hxx"
 #include "crossfield/CrossField.hxx"
-#include "tracing/SeparatrixTrace.hxx"
 
 namespace {
 
@@ -40,7 +39,6 @@ enum class MBOPhase {
     MeshOnly = 1,
     CrossField = 2,
     Stepping = 3,
-    Separatrices = 4,
 };
 
 Phase nextPhase(Phase p) {
@@ -58,10 +56,9 @@ MBOPhase nextMBOPhase(MBOPhase p) {
     switch (p) {
         case MBOPhase::MeshOnly: return MBOPhase::CrossField;
         case MBOPhase::CrossField: return MBOPhase::Stepping;
-        case MBOPhase::Stepping: return MBOPhase::Separatrices;
-        case MBOPhase::Separatrices: return MBOPhase::Separatrices;
+        case MBOPhase::Stepping: return MBOPhase::Stepping;
     }
-    return MBOPhase::Separatrices;
+    return MBOPhase::Stepping;
 }
 
 const char *phaseName(Phase p) {
@@ -80,7 +77,6 @@ const char *mboPhaseName(MBOPhase p) {
         case MBOPhase::MeshOnly: return "1) mesh";
         case MBOPhase::CrossField: return "2) MBO crossfield";
         case MBOPhase::Stepping: return "3) MBO stepping";
-        case MBOPhase::Separatrices: return "4) separatrices";
     }
     return "?";
 }
@@ -125,7 +121,6 @@ int main(int argc, char **argv) {
     std::optional<CutMesh> cutMesh;
     std::optional<MIQSolver> miqSolver;
     std::optional<CrossField> crossField;
-    std::shared_ptr<SeparatrixTrace> separatrixTrace;
     Mode mode = Mode::Unselected;
     Phase phase = Phase::MeshOnly;
     MBOPhase mboPhase = MBOPhase::MeshOnly;
@@ -135,7 +130,6 @@ int main(int argc, char **argv) {
     bool singularitiesLogged = false;
     bool mboSteppingStarted = false;
     bool mboConverged = false;
-    bool separatricesInitialized = false;
     int mboStepCount = 0;
     
     // Console for timing output
@@ -328,27 +322,6 @@ int main(int argc, char **argv) {
             continue;
         }
 
-        // MBO mode: Initialize separatrices when entering Separatrices phase
-        if (mode == Mode::MBO && mboPhase == MBOPhase::Separatrices && crossField.has_value() && !separatricesInitialized) {
-            auto t0 = Clock::now();
-            
-            // Create a shared_ptr to CrossField - need to use the address of the optional's value
-            // Note: This is safe because crossField.has_value() is checked and the optional persists
-            auto cfPtr = std::shared_ptr<CrossField>(&(*crossField), [](CrossField*){});  // non-owning shared_ptr
-            separatrixTrace = std::make_shared<SeparatrixTrace>(cfPtr);
-            separatrixTrace->initializeSeparatrices();
-            
-            auto t1 = Clock::now();
-            double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-            
-            std::ostringstream oss;
-            oss << "[Separatrices] Initialized " << separatrixTrace->separatrices.size() 
-                << " separatrices: " << formatMs(ms);
-            console.log(oss.str());
-            
-            separatricesInitialized = true;
-        }
-
         // PolyVector mode: Lazily compute data when entering phases (with timing).
         if (mode == Mode::PolyVector && phase >= Phase::CrossField && !field.has_value()) {
             auto t0 = Clock::now();
@@ -450,34 +423,27 @@ int main(int argc, char **argv) {
                     viewer::drawVertexCrossField(*mesh, *crossField, scale);
                 }
                 
-                // Draw singularities at triangle centroids (but not in Separatrices phase)
-                if (mboPhase < MBOPhase::Separatrices) {
-                    double ballRadius = 0.5 * avgEdge;
-                    for (const auto &sig : crossField->singularTriangles) {
-                        int triIdx = sig.first;
-                        double crossIndex = sig.second;
-                        if (triIdx < 0 || triIdx >= static_cast<int>(mesh->triangles.size())) continue;
-                        
-                        // Compute triangle centroid
-                        const Triangle &tri = mesh->triangles[triIdx];
-                        const Point &p0 = mesh->vertices[tri[0]];
-                        const Point &p1 = mesh->vertices[tri[1]];
-                        const Point &p2 = mesh->vertices[tri[2]];
-                        Point centroid = {(p0[0] + p1[0] + p2[0]) / 3.0,
-                                          (p0[1] + p1[1] + p2[1]) / 3.0};
-                        
-                        // Color based on index: blue for +1/4, red for -1/4
-                        if (crossIndex > 0) {
-                            viewer::drawDisk3D(centroid, ballRadius, 0.2f, 0.2f, 0.95f);
-                        } else {
-                            viewer::drawDisk3D(centroid, ballRadius, 0.95f, 0.2f, 0.2f);
-                        }
+                // Draw singularities at triangle centroids
+                double ballRadius = 0.5 * avgEdge;
+                for (const auto &sig : crossField->singularTriangles) {
+                    int triIdx = sig.first;
+                    double crossIndex = sig.second;
+                    if (triIdx < 0 || triIdx >= static_cast<int>(mesh->triangles.size())) continue;
+                    
+                    // Compute triangle centroid
+                    const Triangle &tri = mesh->triangles[triIdx];
+                    const Point &p0 = mesh->vertices[tri[0]];
+                    const Point &p1 = mesh->vertices[tri[1]];
+                    const Point &p2 = mesh->vertices[tri[2]];
+                    Point centroid = {(p0[0] + p1[0] + p2[0]) / 3.0,
+                                      (p0[1] + p1[1] + p2[1]) / 3.0};
+                    
+                    // Color based on index: blue for +1/4, red for -1/4
+                    if (crossIndex > 0) {
+                        viewer::drawDisk3D(centroid, ballRadius, 0.2f, 0.2f, 0.95f);
+                    } else {
+                        viewer::drawDisk3D(centroid, ballRadius, 0.95f, 0.2f, 0.2f);
                     }
-                }
-                
-                // Draw separatrices in red if initialized
-                if (mboPhase >= MBOPhase::Separatrices && separatrixTrace) {
-                    viewer::drawSeparatrices(*separatrixTrace, 1.0f, 0.2f, 0.2f, 3.0f, 3.0 * avgEdge);
                 }
             }
         } else {
