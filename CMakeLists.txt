@@ -105,7 +105,28 @@ add_custom_target(miq
     VERBATIM
 )
 
+# Triangle mesher library and tests
+add_library(TriangleMesher STATIC
+    src/triangle/triangle.cpp
+)
+target_include_directories(TriangleMesher PUBLIC src/triangle)
+target_compile_definitions(TriangleMesher PRIVATE TRILIBRARY ANSI_DECLARATORS)
 
+# Enable testing
+enable_testing()
+
+# Test executable for TriangleMesher
+add_executable(TestTriangleMesher src/triangle/tests/TestTriangleMesher.cxx)
+target_link_libraries(TestTriangleMesher PRIVATE TriangleMesher)
+target_include_directories(TestTriangleMesher PRIVATE src/triangle)
+
+# Add individual CTest tests
+add_test(NAME TriangleMesher_Rectangle COMMAND TestTriangleMesher 1)
+add_test(NAME TriangleMesher_Circle COMMAND TestTriangleMesher 2)
+add_test(NAME TriangleMesher_CircleWithEllipseHole COMMAND TestTriangleMesher 3)
+add_test(NAME TriangleMesher_CircleWithEllipseRegion COMMAND TestTriangleMesher 4)
+add_test(NAME TriangleMesher_CircleWithTwoEllipseHoles COMMAND TestTriangleMesher 5)
+add_test(NAME TriangleMesher_ConcentricShells COMMAND TestTriangleMesher 6)
 
 # Optional OpenGL viewer
 option(BUILD_OPENGL_VIEWER "Build the OpenGL mesh/field viewer" OFF)
