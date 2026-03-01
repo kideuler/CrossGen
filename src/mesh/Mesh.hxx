@@ -18,6 +18,41 @@
 typedef std::array<double, 2> Point;
 typedef std::array<int, 3> Triangle;
 
+// operators and functions for Point
+inline Point operator+(const Point &a, const Point &b) {
+    return {a[0] + b[0], a[1] + b[1]};
+}
+
+inline Point operator-(const Point &a, const Point &b) {
+    return {a[0] - b[0], a[1] - b[1]};
+}
+
+inline Point operator*(const Point &a, double s) {
+    return {a[0] * s, a[1] * s};
+}
+
+inline Point operator/(const Point &a, double s) {
+    return {a[0] / s, a[1] / s};
+}
+
+inline double dotP(const Point &a, const Point &b) {
+    return a[0] * b[0] + a[1] * b[1];
+}
+
+inline double cross2(const Point &a, const Point &b) {
+    return a[0] * b[1] - a[1] * b[0];
+}
+
+inline double normP(const Point &a) {
+    return std::sqrt(dotP(a, a));
+}
+
+inline Point normalizeP(const Point &a) {
+    double n = normP(a);
+    if (n <= 0.0) return {0.0, 0.0};
+    return a / n;
+}
+
 // compute angle from vector (Point)
 inline double computeAngle(const Point &p) {
     return std::atan2(p[1], p[0]);
@@ -65,6 +100,7 @@ class Mesh {
     std::vector<std::array<int,3>> cornerTriangles; // List of corner triangle indices and their corresponding boundary edges
     std::vector<int> boundaryVertices; // List of vertex indices that lie on the boundary
     std::vector<bool> isBoundaryVertex; // Boolean flag per vertex indicating if it's a boundary vertex
+    std::vector<int8_t> triangleMatId; // Material ID per triangle (optional, can be used for visualization or other purposes)
 
     // Edge data structures
     std::vector<std::array<int, 2>> edges; // Unique edges: edge index -> [v0, v1] vertex ids
@@ -79,6 +115,10 @@ class Mesh {
     Mesh() = default;
 
     Mesh(const std::string &filename); // Load mesh from an .obj file
+
+    Mesh(const std::vector<Point> &vertices, const std::vector<Triangle> &triangles); // Construct mesh from given vertices and triangles
+
+    int findTriangleContainingPoint(const Point &p) const; // Find the triangle index that contains point p, or -1 if not found
 };
 
 #endif // __MESH_HXX__

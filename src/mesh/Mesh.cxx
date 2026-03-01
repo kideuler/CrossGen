@@ -32,78 +32,9 @@ static bool parse_obj_index(const std::string &tok, int &vertexIndexOut) {
 	}
 }
 
-Mesh::Mesh(const std::string &filename) {
-	// Reset containers
-	vertices.clear();
-	triangles.clear();
-	triangleAdjacency.clear();
-	boundaryTriangles.clear();
-	cornerTriangles.clear();
-
-	std::ifstream in(filename);
-	if (!in) {
-		throw std::runtime_error("Failed to open OBJ file: " + filename);
-	}
-
-	std::string line;
-	std::vector<Point> tempVertices; // accumulate to allow negative indices if needed later
-
-	while (std::getline(in, line)) {
-		// Trim leading spaces
-		auto ltrim = [](std::string &s){ s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](int ch){ return !std::isspace(ch); })); };
-		ltrim(line);
-		if (line.empty() || line[0] == '#') continue;
-
-		std::istringstream iss(line);
-		std::string tag;
-		iss >> tag;
-		if (tag == "v") {
-			// vertex: v x y [z]
-			double x = 0.0, y = 0.0;
-			iss >> x >> y; // 2D mesh expects x,y; ignore optional z if present
-			Point p{ x, y };
-			tempVertices.push_back(p);
-		} else if (tag == "f") {
-			// face: expect triangles. If more than 3 vertices, triangulate fan-wise
-			std::vector<int> faceIndices;
-			std::string tok;
-			while (iss >> tok) {
-				int vi;
-				if (!parse_obj_index(tok, vi)) continue;
-				faceIndices.push_back(vi);
-			}
-
-			// Support negative indices (relative to end)
-			auto resolveIndex = [&](int idx) -> int {
-				int n = static_cast<int>(tempVertices.size());
-				if (idx > 0) return idx - 1; // OBJ is 1-based
-				// negative index: -1 refers to last vertex
-				return n + idx; // idx is negative
-			};
-
-			if (faceIndices.size() < 3) {
-				continue; // ignore invalid faces
-			}
-
-			// Triangulate polygon using a fan: (0,i,i+1)
-			for (size_t i = 1; i + 1 < faceIndices.size(); ++i) {
-				int a = resolveIndex(faceIndices[0]);
-				int b = resolveIndex(faceIndices[i]);
-				int c = resolveIndex(faceIndices[i + 1]);
-				const auto &pa = tempVertices[a];
-				const auto &pb = tempVertices[b];
-				const auto &pc = tempVertices[c];
-				double A2 = (pb[0]-pa[0])*(pc[1]-pa[1]) - (pb[1]-pa[1])*(pc[0]-pa[0]);
-				if (A2 < 0.0) std::swap(b, c);
-				triangles.push_back(Triangle{a,b,c});
-			}
-		}
-		// ignore other tags (vt, vn, etc.)
-	}
-
-	// Move vertices from temp to the public container
-	vertices = std::move(tempVertices);
-
+Mesh::Mesh(const std::vector<Point> &verts, const std::vector<Triangle> &tris) 
+	: vertices(verts), triangles(tris) {
+	
 	// Prepare adjacency; initialize with -1 for boundaries
 	triangleAdjacency.resize(triangles.size(), std::array<int,3>{-1, -1, -1});
 	triangleEdges.resize(triangles.size(), std::array<int,3>{-1, -1, -1});
@@ -195,7 +126,189 @@ Mesh::Mesh(const std::string &filename) {
 			isBoundaryVertex[bv] = true;
 		}
 	}
+	
 	// Build CSR mapping of vertex -> incident triangles (CCW order)
 	vertexTriangles = VertexTriangleCSR::buildFromMesh(*this);
+}
+
+Mesh::Mesh(const std::string &filename) {
+	std::ifstream in(filename);
+	if (!in) {
+		throw std::runtime_error("Failed to open OBJ file: " + filename);
+	}
+
+	std::string line;
+	std::vector<Point> tempVertices;
+	std::vector<Triangle> tempTriangles;
+
+	while (std::getline(in, line)) {
+		// Trim leading spaces
+		auto ltrim = [](std::string &s){ s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](int ch){ return !std::isspace(ch); })); };
+		ltrim(line);
+		if (line.empty() || line[0] == '#') continue;
+
+		std::istringstream iss(line);
+		std::string tag;
+		iss >> tag;
+		if (tag == "v") {
+			// vertex: v x y [z]
+			double x = 0.0, y = 0.0;
+			iss >> x >> y; // 2D mesh expects x,y; ignore optional z if present
+			Point p{ x, y };
+			tempVertices.push_back(p);
+		} else if (tag == "f") {
+			// face: expect triangles. If more than 3 vertices, triangulate fan-wise
+			std::vector<int> faceIndices;
+			std::string tok;
+			while (iss >> tok) {
+				int vi;
+				if (!parse_obj_index(tok, vi)) continue;
+				faceIndices.push_back(vi);
+			}
+
+			// Support negative indices (relative to end)
+			auto resolveIndex = [&](int idx) -> int {
+				int n = static_cast<int>(tempVertices.size());
+				if (idx > 0) return idx - 1; // OBJ is 1-based
+				// negative index: -1 refers to last vertex
+				return n + idx; // idx is negative
+			};
+
+			if (faceIndices.size() < 3) {
+				continue; // ignore invalid faces
+			}
+
+			// Triangulate polygon using a fan: (0,i,i+1)
+			for (size_t i = 1; i + 1 < faceIndices.size(); ++i) {
+				int a = resolveIndex(faceIndices[0]);
+				int b = resolveIndex(faceIndices[i]);
+				int c = resolveIndex(faceIndices[i + 1]);
+				const auto &pa = tempVertices[a];
+				const auto &pb = tempVertices[b];
+				const auto &pc = tempVertices[c];
+				double A2 = (pb[0]-pa[0])*(pc[1]-pa[1]) - (pb[1]-pa[1])*(pc[0]-pa[0]);
+				if (A2 < 0.0) std::swap(b, c);
+				tempTriangles.push_back(Triangle{a,b,c});
+			}
+		}
+		// ignore other tags (vt, vn, etc.)
+	}
+
+	// Delegate to the main constructor via placement new
+	// This is a common pattern to reuse constructor logic
+	this->~Mesh();
+	new (this) Mesh(tempVertices, tempTriangles);
+}
+
+int Mesh::findTriangleContainingPoint(const Point &p) const {
+	if (triangles.empty()) return -1;
+
+	// Start from the middle triangle (often a good starting point for balanced meshes)
+	int currentTri = static_cast<int>(triangles.size()) / 2;
+	
+	const int maxIter = static_cast<int>(triangles.size()) + 100; // prevent infinite loops
+	
+	for (int iter = 0; iter < maxIter; ++iter) {
+		const Triangle &tri = triangles[currentTri];
+		const Point &v0 = vertices[tri[0]];
+		const Point &v1 = vertices[tri[1]];
+		const Point &v2 = vertices[tri[2]];
+
+		// Compute barycentric coordinates using signed areas
+		Point v0v1 = v1 - v0;
+		Point v0v2 = v2 - v0;
+		Point v0p = p - v0;
+
+		double denom = cross2(v0v1, v0v2);
+		if (std::abs(denom) < 1e-30) {
+			// Degenerate triangle, try a neighbor or move to next triangle
+			for (int e = 0; e < 3; ++e) {
+				if (triangleAdjacency[currentTri][e] >= 0) {
+					currentTri = triangleAdjacency[currentTri][e];
+					break;
+				}
+			}
+			continue;
+		}
+
+		double l1 = cross2(v0p, v0v2) / denom; // weight for v1
+		double l2 = cross2(v0v1, v0p) / denom; // weight for v2
+		double l0 = 1.0 - l1 - l2;             // weight for v0
+
+		// Tolerance for being "inside"
+		const double eps = -1e-10;
+
+		// Check if point is inside this triangle
+		if (l0 >= eps && l1 >= eps && l2 >= eps) {
+			return currentTri;
+		}
+
+		// Point is outside - walk toward it by crossing the edge with most negative barycentric coord
+		// The edge opposite to vertex i is edge i (connecting vertices (i+1)%3 and (i+2)%3)
+		int crossEdge = -1;
+		double minBary = 0.0;
+
+		if (l0 < minBary) {
+			minBary = l0;
+			crossEdge = 0; // edge opposite v0, between v1 and v2 (local edge 1)
+		}
+		if (l1 < minBary) {
+			minBary = l1;
+			crossEdge = 1; // edge opposite v1, between v2 and v0 (local edge 2)
+		}
+		if (l2 < minBary) {
+			minBary = l2;
+			crossEdge = 2; // edge opposite v2, between v0 and v1 (local edge 0)
+		}
+
+		// Map from "opposite vertex" to actual local edge index
+		// Edge 0 connects v0-v1 (opposite v2)
+		// Edge 1 connects v1-v2 (opposite v0)
+		// Edge 2 connects v2-v0 (opposite v1)
+		int localEdge;
+		if (crossEdge == 0) localEdge = 1;      // opposite v0 -> edge v1-v2 -> local edge 1
+		else if (crossEdge == 1) localEdge = 2; // opposite v1 -> edge v2-v0 -> local edge 2
+		else localEdge = 0;                      // opposite v2 -> edge v0-v1 -> local edge 0
+
+		int neighbor = triangleAdjacency[currentTri][localEdge];
+		if (neighbor < 0) {
+			// Hit boundary - the point may be outside the mesh or exactly on this triangle's edge
+			// Do a final precise check with slightly larger tolerance
+			const double boundaryEps = 1e-9;
+			if (l0 >= -boundaryEps && l1 >= -boundaryEps && l2 >= -boundaryEps) {
+				return currentTri;
+			}
+			// Point is outside the mesh
+			return -1;
+		}
+
+		currentTri = neighbor;
+	}
+
+	// Fallback: exhaustive search if walking failed (should rarely happen)
+	for (int t = 0; t < static_cast<int>(triangles.size()); ++t) {
+		const Triangle &tri = triangles[t];
+		const Point &v0 = vertices[tri[0]];
+		const Point &v1 = vertices[tri[1]];
+		const Point &v2 = vertices[tri[2]];
+
+		Point v0v1 = v1 - v0;
+		Point v0v2 = v2 - v0;
+		Point v0p = p - v0;
+
+		double denom = cross2(v0v1, v0v2);
+		if (std::abs(denom) < 1e-30) continue;
+
+		double l1 = cross2(v0p, v0v2) / denom;
+		double l2 = cross2(v0v1, v0p) / denom;
+		double l0 = 1.0 - l1 - l2;
+
+		const double eps = -1e-9;
+		if (l0 >= eps && l1 >= eps && l2 >= eps) {
+			return t;
+		}
+	}
+
+	return -1; // Point not found in any triangle
 }
 

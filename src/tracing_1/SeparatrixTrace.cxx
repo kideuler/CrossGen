@@ -78,15 +78,6 @@ inline double wrap_2pi(double a) {
 inline Point addP(const Point &a, const Point &b) { return Point{a[0] + b[0], a[1] + b[1]}; }
 inline Point subP(const Point &a, const Point &b) { return Point{a[0] - b[0], a[1] - b[1]}; }
 inline Point mulP(const Point &a, double s) { return Point{a[0] * s, a[1] * s}; }
-inline double dotP(const Point &a, const Point &b) { return a[0] * b[0] + a[1] * b[1]; }
-inline double cross2(const Point &a, const Point &b) { return a[0] * b[1] - a[1] * b[0]; }
-inline double normP(const Point &a) { return std::sqrt(dotP(a, a)); }
-
-inline Point normalizeP(const Point &a) {
-    double n = normP(a);
-    if (n <= 0.0) return Point{0.0, 0.0};
-    return Point{a[0] / n, a[1] / n};
-}
 
 inline bool isOrthogonal(const Point &a, const Point &b) {
     double na = normP(a);

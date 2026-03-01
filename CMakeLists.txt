@@ -44,10 +44,15 @@ add_library(PolyVector SHARED
     src/IGM/MIQ.cxx
     src/crossfield/CrossField.hxx
     src/crossfield/CrossField.cxx
-    src/tracing_1/SeparatrixTrace.hxx
-    src/tracing_1/SeparatrixTrace.cxx
+    src/tracing/SeparatrixTrace.hxx
+    src/tracing/SeparatrixTrace.cxx
+    src/triangle/triangle.cpp
+    src/triangle/triangle.h
+    src/triangle/TriangleMesher.hpp
 )
 target_include_directories(PolyVector PUBLIC src)
+target_include_directories(PolyVector PUBLIC src/triangle)
+target_compile_definitions(PolyVector PRIVATE TRILIBRARY ANSI_DECLARATORS)
 target_link_libraries(PolyVector PUBLIC Eigen3::Eigen)
 target_link_libraries(PolyVector PUBLIC CoMISo::CoMISo)
 
@@ -105,20 +110,12 @@ add_custom_target(miq
     VERBATIM
 )
 
-# Triangle mesher library and tests
-add_library(TriangleMesher STATIC
-    src/triangle/triangle.cpp
-)
-target_include_directories(TriangleMesher PUBLIC src/triangle)
-target_compile_definitions(TriangleMesher PRIVATE TRILIBRARY ANSI_DECLARATORS)
-
 # Enable testing
 enable_testing()
 
 # Test executable for TriangleMesher
 add_executable(TestTriangleMesher src/triangle/tests/TestTriangleMesher.cxx)
-target_link_libraries(TestTriangleMesher PRIVATE TriangleMesher)
-target_include_directories(TestTriangleMesher PRIVATE src/triangle)
+target_link_libraries(TestTriangleMesher PRIVATE PolyVector)
 
 # Add individual CTest tests
 add_test(NAME TriangleMesher_Rectangle COMMAND TestTriangleMesher 1)
@@ -127,6 +124,15 @@ add_test(NAME TriangleMesher_CircleWithEllipseHole COMMAND TestTriangleMesher 3)
 add_test(NAME TriangleMesher_CircleWithEllipseRegion COMMAND TestTriangleMesher 4)
 add_test(NAME TriangleMesher_CircleWithTwoEllipseHoles COMMAND TestTriangleMesher 5)
 add_test(NAME TriangleMesher_ConcentricShells COMMAND TestTriangleMesher 6)
+
+# Test executable for tracing components
+add_executable(TestTracingComponents src/tracing/tests/TestTracingComponents.cxx)
+target_link_libraries(TestTracingComponents PRIVATE PolyVector)
+
+# Add individual CTest tests for tracing
+add_test(NAME Tracing_ConstantFieldTrace COMMAND TestTracingComponents 1)
+add_test(NAME Tracing_RigidBodyRotation COMMAND TestTracingComponents 2)
+add_test(NAME Tracing_ParabolicStreamline COMMAND TestTracingComponents 3)
 
 # Optional OpenGL viewer
 option(BUILD_OPENGL_VIEWER "Build the OpenGL mesh/field viewer" OFF)
