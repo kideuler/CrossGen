@@ -830,9 +830,12 @@ private:
     }
 
     // Area constraint:
+    // NOTE: Triangle's switch parser does not handle scientific notation
+    // (e.g. 1.08e-05) because it interprets the 'e' as a switch character.
+    // We must use std::fixed to emit a plain decimal representation.
     const double max_area = effectiveMaxArea_(h);
     if (max_area > 0.0) {
-      ss << "a" << std::setprecision(16) << max_area;
+      ss << "a" << std::fixed << std::setprecision(20) << max_area;
     }
 
     // Optional outputs:

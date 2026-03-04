@@ -25,7 +25,7 @@ if (BUILD_MESH2GMSH)
     list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
     find_package(Gmsh REQUIRED)
     message(STATUS "Gmsh found: ${GMSH_LIBRARY}")
-    add_executable(Mesh2Dgmsh src/Mesh2Dgmsh.cxx)
+    add_executable(Mesh2Dgmsh src/utils/Mesh2Dgmsh.cxx)
     target_link_libraries(Mesh2Dgmsh PRIVATE Gmsh::gmsh)
 else()
     message(STATUS "Skipping Mesh2Dgmsh utility")
@@ -57,16 +57,20 @@ target_link_libraries(PolyVector PUBLIC Eigen3::Eigen)
 target_link_libraries(PolyVector PUBLIC CoMISo::CoMISo)
 
 # Small utility to load and print mesh data
-add_executable(LoadMesh src/LoadMesh.cxx)
+add_executable(LoadMesh src/utils/LoadMesh.cxx)
 target_link_libraries(LoadMesh PRIVATE PolyVector)
 
 # Utility to cut a mesh into a disk and run sanity checks
-add_executable(TestCutMesh src/TestCutMesh.cxx)
+add_executable(TestCutMesh src/utils/TestCutMesh.cxx)
 target_link_libraries(TestCutMesh PRIVATE PolyVector)
 
 # Test MIQ parametrization quality
-add_executable(TestMIQ src/TestMIQ.cxx)
+add_executable(TestMIQ src/utils/TestMIQ.cxx)
 target_link_libraries(TestMIQ PRIVATE PolyVector)
+
+# Generate circle/ellipse topologies
+add_executable(GenerateCircleTopologies src/utils/GenerateCircleTopologies.cxx)
+target_link_libraries(GenerateCircleTopologies PRIVATE PolyVector)
 
 # copy all meshes to build directory for easy access
 file(GLOB MESH_FILES "${CMAKE_CURRENT_SOURCE_DIR}/data/meshes/*")

@@ -285,7 +285,6 @@ void CrossField::step() {
 
     // update error for convergence checking
     error = (u_k - u_k_prev).norm();
-    std::cout << "MBO step completed with error: " << error << std::endl;
 
     // Update for next iteration
     u_k_prev = u_k;
