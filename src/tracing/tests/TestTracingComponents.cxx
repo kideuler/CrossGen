@@ -132,7 +132,7 @@ bool test1_ConstantFieldTrace() {
         std::cout << "\n=== Test 1: Constant Field Trace ===" << std::endl;
 
         // Create a unit-disk mesh
-        auto mesh = TestHelper::createCircle(0.0, 0.0, 1.0, 0.05);
+        auto mesh = TestHelper::createEllipse(0.0, 0.0, 1.0, 1.0, 360.0, 0.05);
         std::cout << "Mesh created: " << mesh->vertices.size() << " vertices, " 
                 << mesh->triangles.size() << " triangles" << std::endl;
 
@@ -148,7 +148,7 @@ bool test1_ConstantFieldTrace() {
         }
 
         // Create tracer and trace
-        SeparatrixTrace tracer(crossField);
+        SeparatrixTrace tracer(crossField, false);
         Point startPos = {0.0, 0.0};
         double startAngle = M_PI / 4.0; // direction (1,1)
 
@@ -183,7 +183,7 @@ bool test2_RigidBodyRotation() {
     std::cout << "\n=== Test 2: Rigid Body Rotation ===" << std::endl;
 
     // Create a unit-disk mesh
-    auto mesh = TestHelper::createCircle(0.0, 0.0, 1.0, 0.05);
+    auto mesh = TestHelper::createEllipse(0.0, 0.0, 1.0, 1.0, 360.0, 0.05);
     std::cout << "Mesh created: " << mesh->vertices.size() << " vertices, " 
             << mesh->triangles.size() << " triangles" << std::endl;
 
@@ -207,7 +207,7 @@ bool test2_RigidBodyRotation() {
     }
 
     // Create tracer and trace
-    SeparatrixTrace tracer(crossField);
+    SeparatrixTrace tracer(crossField, false);
     Point startPos = {0.5, 0.0};
     // At (0.5, 0), the tangent direction is [-0, 0.5] = [0, 1], angle = pi/2
     double startAngle = M_PI / 2.0;
@@ -343,7 +343,7 @@ bool test3_ParabolicStreamline() {
     std::cout << "\n=== Test 3: Parabolic Streamline v=[1,2x], y=x^2 ===" << std::endl;
 
     // Create a unit-disk mesh using TestHelper
-    auto mesh = TestHelper::createCircle(0.0, 0.0, 1.0, 0.05);
+    auto mesh = TestHelper::createEllipse(0.0, 0.0, 1.0, 1.0, 360.0, 0.05);
     std::cout << "Mesh created: " << mesh->vertices.size() << " vertices, " 
               << mesh->triangles.size() << " triangles" << std::endl;
 
@@ -359,7 +359,7 @@ bool test3_ParabolicStreamline() {
     }
 
     // Trace from the origin; at (0,0) the field is [1,0], angle = 0
-    SeparatrixTrace tracer(crossField);
+    SeparatrixTrace tracer(crossField, false);
     Point startPos = {0.0, 0.0};
     double startAngle = 0.0;       // atan2(0,1) = 0
 

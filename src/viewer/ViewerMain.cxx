@@ -18,6 +18,7 @@
 #include "IGM/MIQ.hxx"
 #include "polyvector/PolyVectors.hxx"
 #include "crossfield/CrossField.hxx"
+#include "tracing/SeparatrixTrace.hxx"
 
 namespace {
 
@@ -39,6 +40,7 @@ enum class MBOPhase {
     MeshOnly = 1,
     CrossField = 2,
     Stepping = 3,
+    Separatrices = 4,
 };
 
 Phase nextPhase(Phase p) {
@@ -56,9 +58,10 @@ MBOPhase nextMBOPhase(MBOPhase p) {
     switch (p) {
         case MBOPhase::MeshOnly: return MBOPhase::CrossField;
         case MBOPhase::CrossField: return MBOPhase::Stepping;
-        case MBOPhase::Stepping: return MBOPhase::Stepping;
+        case MBOPhase::Stepping: return MBOPhase::Separatrices;
+        case MBOPhase::Separatrices: return MBOPhase::Separatrices;
     }
-    return MBOPhase::Stepping;
+    return MBOPhase::Separatrices;
 }
 
 const char *phaseName(Phase p) {
@@ -77,6 +80,7 @@ const char *mboPhaseName(MBOPhase p) {
         case MBOPhase::MeshOnly: return "1) mesh";
         case MBOPhase::CrossField: return "2) MBO crossfield";
         case MBOPhase::Stepping: return "3) MBO stepping";
+        case MBOPhase::Separatrices: return "4) separatrices";
     }
     return "?";
 }
@@ -121,6 +125,7 @@ int main(int argc, char **argv) {
     std::optional<CutMesh> cutMesh;
     std::optional<MIQSolver> miqSolver;
     std::optional<CrossField> crossField;
+    std::shared_ptr<SeparatrixTrace> separatrixTrace;
     Mode mode = Mode::Unselected;
     Phase phase = Phase::MeshOnly;
     MBOPhase mboPhase = MBOPhase::MeshOnly;
@@ -322,6 +327,21 @@ int main(int argc, char **argv) {
             continue;
         }
 
+        // MBO mode: Lazily construct SeparatrixTrace when entering Separatrices phase
+        if (mode == Mode::MBO && mboPhase >= MBOPhase::Separatrices && crossField.has_value() && !separatrixTrace) {
+            auto t0 = Clock::now();
+            // Wrap the existing CrossField in a shared_ptr with a no-op deleter (ownership stays with the optional)
+            auto cfPtr = std::shared_ptr<CrossField>(&*crossField, [](CrossField*){});
+            separatrixTrace = std::make_shared<SeparatrixTrace>(cfPtr, true);
+            auto t1 = Clock::now();
+            double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            std::ostringstream oss;
+            oss << "[Separatrices] Initialized " << separatrixTrace->separatrices.size()
+                << " separatrices from " << separatrixTrace->singularities.size()
+                << " singularities: " << formatMs(ms);
+            console.log(oss.str());
+        }
+
         // PolyVector mode: Lazily compute data when entering phases (with timing).
         if (mode == Mode::PolyVector && phase >= Phase::CrossField && !field.has_value()) {
             auto t0 = Clock::now();
@@ -423,7 +443,8 @@ int main(int argc, char **argv) {
                     viewer::drawVertexCrossField(*mesh, *crossField, scale);
                 }
                 
-                // Draw singularities at triangle centroids
+                // Draw singularities at triangle centroids (not in Separatrices phase)
+                if (mboPhase < MBOPhase::Separatrices) {
                 double ballRadius = 0.5 * avgEdge;
                 for (const auto &sig : crossField->singularTriangles) {
                     int triIdx = sig.first;
@@ -445,6 +466,22 @@ int main(int argc, char **argv) {
                         viewer::drawDisk3D(centroid, ballRadius, 0.95f, 0.2f, 0.2f);
                     }
                 }
+                }
+            }
+
+            // Draw initial separatrices in red
+            if (mboPhase >= MBOPhase::Separatrices && separatrixTrace) {
+                glColor3f(0.95f, 0.1f, 0.1f);
+                glLineWidth(3.0f);
+                for (const auto &sep : separatrixTrace->separatrices) {
+                    if (sep.path.size() < 2) continue;
+                    glBegin(GL_LINE_STRIP);
+                    for (const auto &tp : sep.path) {
+                        glVertex2d(tp.global_pos[0], tp.global_pos[1]);
+                    }
+                    glEnd();
+                }
+                glLineWidth(1.0f);
             }
         } else {
             // PolyVector mode rendering (phases 1-4)

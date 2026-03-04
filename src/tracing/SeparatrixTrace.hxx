@@ -28,6 +28,18 @@ struct TracePoint {
     double edge_crossing_t = 0.0; // parametric t along the edge where the crossing occurred, used for interpolation
 };
 
+// Singularity represents a singularity in the cross field, storing its triangle index, cross field index, coordinates, field anfle, and the IDs of the separatrices that originate from it.
+struct Singularity {
+    int triangleIndex; // Triangle index where the singularity is located
+    double singularityIndex; // 1/4 index of the singularity (e.g., 0.25 for a +1/4 singularity)
+    Point coordinates; // Global coordinates of the singularity (can be computed from triangle vertices and barycentrics)
+    std::array<double, 3> barycentric;
+    double refAngle; // reference angle
+    double alpha; // angle offset for the first port direction
+    std::array<int, 5> portSeparatrixIds; // IDs of the separatrices originating from this singularity, can be max 5.
+    int numPorts; // Number of valid ports (3,5 for regular singularities)
+};
+
 // TerminationReason enumerates the possible reasons for a separatrix trace to terminate, such as hitting a boundary, self-intersection, or reaching a maximum step count.
 enum class TerminationReason {
     RUNNING, // still running
@@ -36,9 +48,11 @@ enum class TerminationReason {
     CONNECT_TANGENTIAL_SECONDARY, // Connected tangentially to another separatrix and is being removed
     LIMIT_CYCLE,
     ORTHOGONAL_TO_SINGULARITY_SEPARATRIX,
-    MAX_STEPS_REACHED
+    MAX_STEPS_REACHED,
+    UNDEFINED
 };
 
+// Separatrix represents a single separatrix trace, storing its path as a sequence of TracePoints, its origin singularity, and its termination status.
 struct Separatrix {
     std::deque<TracePoint> path; // The sequence of points along the separatrix trace.
     int id; // Unique identifier for the separatrix.
@@ -46,6 +60,7 @@ struct Separatrix {
     int origin_singularity_port; // Port index at the singularity (0-4) corresponding to the initial direction.
     bool active = true; // Indicates whether the trace is still active (not terminated).
     bool in_singularity_zone = false; // Whether the trace is currently within the "singularity zone" of any singularity.
+    double A_q = -1.0; // hyperbolic trace parameter for singularity zone tracing, initialized to -1 to indicate not set.
     TerminationReason termination_reason = TerminationReason::RUNNING; // Reason for termination if not active.
 
     std::set<int> visited_edges; // Set of edge IDs visited by this separatrix, used for self-intersection detection.
@@ -54,9 +69,10 @@ struct Separatrix {
 class SeparatrixTrace {
 public:
     std::vector<Separatrix> separatrices; // List of all separatrices being traced
+    std::vector<Singularity> singularities; // List of singularities in the cross field, with their properties and associated separatrix ports
     std::shared_ptr<CrossField> crossField; // Shared pointer to the cross field 
     
-    SeparatrixTrace(std::shared_ptr<CrossField> cf);
+    SeparatrixTrace(std::shared_ptr<CrossField> cf, bool useActualSingularityCoordinates);
 
     // Convert global coordinates to barycentric coordinates for a given triangle
     std::array<double, 3> globalToBarycentric(int triangleIndex, const Point& p);
@@ -83,6 +99,7 @@ private:
     std::vector<bool> isSingularTriangle; // Precomputed lookup for whether a triangle is singular
     std::unordered_map<int, std::pair<std::vector<int>, bool>> triangleSeparatrixMap; // triangle index -> (list of separatrix IDs passing through, is an intersection present)
     std::queue<int> Intersections; // Queue of triangle indices where intersections have been detected, to be processed.
+    std::unordered_map<int,int> singularityMap; // triangle index -> singularity index for quick lookup during tracing
 };
 
 

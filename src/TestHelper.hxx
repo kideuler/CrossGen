@@ -118,6 +118,141 @@ inline std::shared_ptr<Mesh> createCircle(
     return std::make_shared<Mesh>(verts, tris);
 }
 
+/// Create a triangulated ellipse (or elliptical sector) centered at (cx,cy)
+/// with semi-axes a (x-direction) and b (y-direction).
+///
+/// @param sweep_degrees  The angular sweep in degrees, must satisfy
+///                       0 < sweep_degrees <= 360.
+///   - 360 produces a full closed ellipse.
+///   - Any value in (0, 360) produces a "pie-slice" sector: the elliptical
+///     arc from angle 0 to sweep_degrees, closed by two straight edges
+///     back to the center.
+///
+/// @param h  Target average edge length for triangulation.
+inline std::shared_ptr<Mesh> createEllipse(
+    double cx, double cy,
+    double a, double b,
+    double sweep_degrees,
+    double h)
+{
+    using namespace triangle_wrapper;
+
+    // Clamp sweep to (0, 360]
+    if (sweep_degrees <= 0.0) sweep_degrees = 1.0;
+    if (sweep_degrees > 360.0) sweep_degrees = 360.0;
+
+    double sweep_rad = sweep_degrees * M_PI / 180.0;
+    bool full = (sweep_degrees == 360.0);
+
+    // Approximate arc length of the ellipse arc to decide point count.
+    // Use the mean radius as a rough estimate for spacing.
+    double mean_r = 0.5 * (a + b);
+    double arc_len = mean_r * sweep_rad;
+    int narc = std::max(12, static_cast<int>(std::round(arc_len / h)));
+
+    TriangleMesher2D::MeshInput input;
+
+    // --- Build arc points from theta = 0 to theta = sweep_rad ---
+    double dtheta = sweep_rad / narc;
+    for (int i = 0; i < narc; ++i) {
+        double theta = i * dtheta;
+        input.vertlist.push_back({cx + a * std::cos(theta),
+                                  cy + b * std::sin(theta)});
+    }
+
+    if (full) {
+        // Closed ellipse: narc points, wrap-around segments
+        int npts = narc;
+        std::vector<std::array<int, 2>> segments;
+        for (int i = 0; i < npts; ++i)
+            segments.push_back({i, (i + 1) % npts});
+
+        input.segment_loops.push_back(segments);
+        input.type.push_back(0); // exterior
+    } else {
+        // Partial sweep: add the final arc point at exactly sweep_rad
+        input.vertlist.push_back({cx + a * std::cos(sweep_rad),
+                                  cy + b * std::sin(sweep_rad)});
+        int arc_end = static_cast<int>(input.vertlist.size()) - 1;
+
+        // Add center vertex
+        input.vertlist.push_back({cx, cy});
+        int center_idx = static_cast<int>(input.vertlist.size()) - 1;
+
+        // Add straight-line points along the two radial edges
+        // (from arc endpoints back to center) for good element quality.
+
+        // Edge from arc end back to center
+        int nrad1 = std::max(2, static_cast<int>(std::round(
+            std::hypot(input.vertlist[arc_end][0] - cx,
+                       input.vertlist[arc_end][1] - cy) / h)));
+        int first_rad1 = static_cast<int>(input.vertlist.size());
+        for (int i = 1; i < nrad1; ++i) {
+            double t = static_cast<double>(i) / nrad1;
+            double x = input.vertlist[arc_end][0] * (1.0 - t) + cx * t;
+            double y = input.vertlist[arc_end][1] * (1.0 - t) + cy * t;
+            input.vertlist.push_back({x, y});
+        }
+
+        // Edge from center back to arc start (index 0)
+        int nrad2 = std::max(2, static_cast<int>(std::round(
+            std::hypot(input.vertlist[0][0] - cx,
+                       input.vertlist[0][1] - cy) / h)));
+        int first_rad2 = static_cast<int>(input.vertlist.size());
+        for (int i = 1; i < nrad2; ++i) {
+            double t = static_cast<double>(i) / nrad2;
+            double x = cx * (1.0 - t) + input.vertlist[0][0] * t;
+            double y = cy * (1.0 - t) + input.vertlist[0][1] * t;
+            input.vertlist.push_back({x, y});
+        }
+
+        // Build segment loop: arc -> radial edge to center -> radial edge to start
+        std::vector<std::array<int, 2>> segments;
+
+        // Arc segments: 0 -> 1 -> ... -> arc_end
+        for (int i = 0; i < arc_end; ++i)
+            segments.push_back({i, i + 1});
+
+        // Radial edge: arc_end -> interior pts -> center
+        int prev = arc_end;
+        for (int i = first_rad1; i < first_rad1 + (nrad1 - 1); ++i) {
+            segments.push_back({prev, i});
+            prev = i;
+        }
+        segments.push_back({prev, center_idx});
+
+        // Radial edge: center -> interior pts -> 0
+        prev = center_idx;
+        for (int i = first_rad2; i < first_rad2 + (nrad2 - 1); ++i) {
+            segments.push_back({prev, i});
+            prev = i;
+        }
+        segments.push_back({prev, 0});
+
+        input.segment_loops.push_back(segments);
+        input.type.push_back(0); // exterior
+    }
+
+    input.h = h;
+
+    // Triangulate
+    TriangleMesher2D::Options opts;
+    opts.min_angle_degrees = 20.0;
+    TriangleMesher2D mesher(opts);
+    auto result = mesher.triangulate(input);
+
+    // Convert to Mesh
+    std::vector<Point> verts(result.verts.size());
+    for (size_t i = 0; i < result.verts.size(); ++i)
+        verts[i] = {result.verts[i][0], result.verts[i][1]};
+
+    std::vector<Triangle> tris(result.triangles.size());
+    for (size_t i = 0; i < result.triangles.size(); ++i)
+        tris[i] = {result.triangles[i][0], result.triangles[i][1], result.triangles[i][2]};
+
+    return std::make_shared<Mesh>(verts, tris);
+}
+
 } // namespace TestHelper
 
 #endif // __TEST_HELPER_HXX__

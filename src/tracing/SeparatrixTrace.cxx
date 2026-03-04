@@ -1,7 +1,140 @@
 #include "tracing/SeparatrixTrace.hxx"
 
-SeparatrixTrace::SeparatrixTrace(std::shared_ptr<CrossField> cf) : crossField(cf) {
+SeparatrixTrace::SeparatrixTrace(std::shared_ptr<CrossField> cf, bool useActualSingularityCoordinates) : crossField(cf) {
     separatrices.clear();
+    singularities.clear();
+
+    // Fill singularity vector and map from cross field data
+    for (const auto& [triIdx, cfIndex] : crossField->singularTriangles) {
+        Singularity s;
+        s.triangleIndex = triIdx;
+        s.singularityIndex = cfIndex; // Map cross field index to singularity index
+
+        s.numPorts = (cfIndex < 0.0) ? 5 : 3;
+
+        // compute coordinate as either the triangle centroid or the actual singularity center by solving the linear system
+        const Triangle &tri = crossField->mesh->triangles[triIdx];
+        if (useActualSingularityCoordinates) {
+            Eigen::Matrix2d A;
+            std::complex<double> u1 = crossField->u_k[tri[0]];
+            std::complex<double> u2 = crossField->u_k[tri[1]];
+            std::complex<double> u3 = crossField->u_k[tri[2]];
+
+            A << std::real(u1) - std::real(u3), std::real(u2) - std::real(u3),
+                std::imag(u1) - std::imag(u3), std::imag(u2) - std::imag(u3);
+
+            Eigen::Vector2d b;
+            b << -std::real(u3), -std::imag(u3);
+            // uv is solution
+            Eigen::Vector2d uv = A.colPivHouseholderQr().solve(b);
+            
+            s.barycentric = {uv[0], uv[1], 1.0 - uv[0] - uv[1]};
+
+            // find the corresponding point in the triangle
+            Point p1 = crossField->mesh->vertices[tri[0]];
+            Point p2 = crossField->mesh->vertices[tri[1]];
+            Point p3 = crossField->mesh->vertices[tri[2]];
+            
+            s.coordinates = p1 * s.barycentric[0] + p2 * s.barycentric[1] + p3 * s.barycentric[2];
+        } else {
+            // Use triangle centroid as singularity coordinate
+            Point bc{0.0, 0.0};
+            for (int i = 0; i < 3; ++i) {
+                bc[0] += crossField->mesh->vertices[tri[i]][0];
+                bc[1] += crossField->mesh->vertices[tri[i]][1];
+            }
+            bc[0] /= 3.0;
+            bc[1] /= 3.0;
+            s.coordinates = bc;
+            s.barycentric = {1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0};
+        }
+
+        // get fields angle
+        int vIdx = tri[0]; // can pick any vertex since it's a singularity
+        std::complex<double> u4 = crossField->u_k[vIdx];
+        double fieldAngle = std::arg(u4) / 4.0;
+        Point refVec = crossField->mesh->vertices[vIdx] - s.coordinates;
+        double refAngle = std::atan2(refVec[1], refVec[0]);
+        s.refAngle = refAngle;
+
+        double alpha = makeAngleSamePhase(refAngle, fieldAngle) - refAngle;
+        s.alpha = wrap_pi(alpha);
+        
+        singularities.push_back(s);
+        singularityMap[triIdx] = singularities.size() - 1;
+
+        // create a separatrix for each port emanating from this singularity
+        double dalpha = (s.numPorts == 5) ? 2.0 * M_PI / 5.0 : 2.0 * M_PI / 3.0;
+
+        for (int port = 0; port < s.numPorts; ++port) {
+            // Port direction: reference angle + field alignment offset + port spacing
+            double portAngle = wrap_pi(s.refAngle + s.alpha + port * dalpha);
+
+            // Create the origin trace point at the singularity center
+            TracePoint tp0;
+            tp0.face_id = triIdx;
+            tp0.global_pos = s.coordinates;
+            tp0.barycentric = s.barycentric;
+            tp0.field_angle = portAngle;
+            tp0.trace_direction = portAngle;
+
+            // Trace the ray from the singularity center to the triangle boundary
+            auto [exitPos, exitEdge, exitT, exitNeighbor] = rayEdgeIntersection(triIdx, s.coordinates, portAngle);
+
+            // Create the separatrix
+            Separatrix sep;
+            sep.id = static_cast<int>(separatrices.size());
+            sep.origin_singularity_id = static_cast<int>(singularities.size()) - 1;
+            sep.origin_singularity_port = port;
+            sep.active = true;
+            sep.termination_reason = TerminationReason::RUNNING;
+
+            // Add the singularity center as the first point
+            sep.path.push_back(tp0);
+
+            if (exitEdge >= 0) {
+                // Build the second trace point at the exit edge
+                TracePoint tp1;
+                tp1.global_pos = exitPos;
+                tp1.face_id = triIdx;
+                tp1.barycentric = globalToBarycentric(triIdx, exitPos);
+                tp1.edge_id = crossField->mesh->triangleEdges[triIdx][exitEdge];
+                tp1.local_edge_index = exitEdge;
+                tp1.edge_crossing_t = exitT;
+
+                // Compute the field angle at the exit point by interpolating vertex angles
+                const Triangle &exitTri = crossField->mesh->triangles[triIdx];
+                double theta0 = std::arg(crossField->u_k[exitTri[0]]) / 4.0;
+                double theta1 = std::arg(crossField->u_k[exitTri[1]]) / 4.0;
+                double theta2 = std::arg(crossField->u_k[exitTri[2]]) / 4.0;
+                theta1 = makeAngleSamePhase(theta0, theta1);
+                theta2 = makeAngleSamePhase(theta0, theta2);
+                double thetaInterp = theta0 * tp1.barycentric[0] + theta1 * tp1.barycentric[1] + theta2 * tp1.barycentric[2];
+                tp1.field_angle = makeAngleSamePhase(portAngle, thetaInterp);
+
+                // Actual trace direction from center to exit
+                Point traceVec = exitPos - s.coordinates;
+                tp1.trace_direction = std::atan2(traceVec[1], traceVec[0]);
+
+                sep.path.push_back(tp1);
+
+                // If the exit edge is on the boundary, deactivate immediately
+                if (exitNeighbor < 0) {
+                    sep.active = false;
+                    sep.termination_reason = TerminationReason::EXIT_BOUNDARY;
+                }
+            } else {
+                // Could not find an exit edge (shouldn't happen for interior singularities)
+                sep.active = false;
+                sep.termination_reason = TerminationReason::UNDEFINED;
+            }
+
+            // Record the separatrix ID in the singularity's port list
+            singularities.back().portSeparatrixIds[port] = sep.id;
+
+            separatrices.push_back(std::move(sep));
+        }
+    }
 }
 
 int SeparatrixTrace::findPhaseDifference(double referenceAngle, double angleCandidate) {
