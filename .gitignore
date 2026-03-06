@@ -4,3 +4,8 @@ reference/*
 .DS_Store
 *.sh
 pkg/*
+*.pdf
+*.avi
+*.mp4
+*.mov
+*.zip
