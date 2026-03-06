@@ -94,33 +94,25 @@ std::vector<TracePoint> traceTowardsBoundary(
         return path;
     }
 
+    // Build a temporary Separatrix to use with stepHeuns
+    Separatrix sep;
+    sep.id = -1;
+    sep.origin_singularity_id = -1;
+    sep.origin_singularity_port = -1;
+    sep.active = true;
+    sep.termination_reason = TerminationReason::RUNNING;
+    sep.path.push_back(start);
+    sep.path.push_back(firstExit);
+
     // Trace until we hit the boundary using stepHeuns
     for (int step = 0; step < maxSteps; ++step) {
-        TracePoint current = path.back();
-        
-        // Check if next step would hit boundary
-        int nextNeighbor = mesh->triangleAdjacency[current.face_id][current.local_edge_index];
-        if (nextNeighbor < 0) {
-            break;
-        }
+        if (!sep.active) break;
 
-        // Use stepHeuns to get the next trace point
-        TracePoint next = tracer.stepHeuns(current);
-
-        // Check if stepHeuns returned the same point (error or boundary)
-        if (next.face_id == current.face_id && 
-            next.global_pos[0] == current.global_pos[0] && 
-            next.global_pos[1] == current.global_pos[1]) {
-            break;
-        }
-
-        path.push_back(next);
-
-        // Check if this edge is on boundary
-        if (mesh->triangleAdjacency[next.face_id][next.local_edge_index] < 0) {
-            break;
-        }
+        tracer.stepHeuns(sep);
     }
+
+    // Copy path out of the separatrix
+    path.assign(sep.path.begin(), sep.path.end());
 
     return path;
 }
@@ -212,9 +204,7 @@ bool test2_RigidBodyRotation() {
     // At (0.5, 0), the tangent direction is [-0, 0.5] = [0, 1], angle = pi/2
     double startAngle = M_PI / 2.0;
     
-    // Manually trace to debug field angle evolution
-    std::vector<TracePoint> path;
-    
+    // Set up the initial trace points
     int startTri = mesh->findTriangleContainingPoint(startPos);
     if (startTri < 0) {
         std::cerr << "Error: Starting point is not inside any triangle!" << std::endl;
@@ -239,7 +229,6 @@ bool test2_RigidBodyRotation() {
     start.edge_id = mesh->triangleEdges[startTri][exitEdge];
     start.local_edge_index = exitEdge;
     start.edge_crossing_t = exitT;
-    path.push_back(start);
 
     // Add the first exit point
     TracePoint firstExit;
@@ -252,18 +241,24 @@ bool test2_RigidBodyRotation() {
     firstExit.edge_id = mesh->triangleEdges[startTri][exitEdge];
     firstExit.local_edge_index = exitEdge;
     firstExit.edge_crossing_t = exitT;
-    path.push_back(firstExit);
+
+    // Build a temporary Separatrix to use with stepHeuns
+    Separatrix sep;
+    sep.id = -1;
+    sep.origin_singularity_id = -1;
+    sep.origin_singularity_port = -1;
+    sep.active = true;
+    sep.termination_reason = TerminationReason::RUNNING;
+    sep.path.push_back(start);
+    sep.path.push_back(firstExit);
 
     // Trace
     int maxSteps = 10000;
     bool verbose = true;
     for (int step = 0; step < maxSteps; ++step) {
-        TracePoint current = path.back();
-        
-        int nextNeighbor = mesh->triangleAdjacency[current.face_id][current.local_edge_index];
-        if (nextNeighbor < 0) {
-            break;
-        }
+        if (!sep.active) break;
+
+        const TracePoint& current = sep.path.back();
 
         // Debug: print expected vs actual field angle
         if (verbose && step < 30) {
@@ -279,21 +274,11 @@ bool test2_RigidBodyRotation() {
                       << " diff=" << diff << std::endl;
         }
 
-        TracePoint next = tracer.stepHeuns(current);
-
-        if (next.face_id == current.face_id && 
-            next.global_pos[0] == current.global_pos[0] && 
-            next.global_pos[1] == current.global_pos[1]) {
-            std::cout << "stepHeuns returned same point at step " << step << std::endl;
-            break;
-        }
-
-        path.push_back(next);
-
-        if (mesh->triangleAdjacency[next.face_id][next.local_edge_index] < 0) {
-            break;
-        }
+        tracer.stepHeuns(sep);
     }
+
+    // Copy path out of the separatrix
+    std::vector<TracePoint> path(sep.path.begin(), sep.path.end());
     
     std::cout << "Traced " << path.size() << " points" << std::endl;
     writePathToOBJ("test2_rigid_body_rotation.obj", path);

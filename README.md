@@ -10,6 +10,7 @@ TODO:
 - [X] Reformat Code to better separate different pieces. (Mesh, Polyvectors, IGM)
 - [X] In polyvector store the parallel transport for each triangle (0,1,2,3) rotation matrix
 - [X] Add options to solve MBO method using formula $(M+\tau L)u^{k+1}=Mu^k$ where M is diagonal triangle areas. L is standard laplacian. Therefore $u^{k+1} = (M+\tau L)^{-1} M u^k$
+- [X] Make step operations on separatrix instead of on tracePoints
 - [ ] Implement separatrix tracing (no topology simplification, no edge-maps) 
 - [ ] Create separatrix graph including t-junctions.
 - [ ] Do topological simplification as listed in the viertel imr 2019 paper

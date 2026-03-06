@@ -304,20 +304,37 @@ std::tuple<Point, int, double, int> SeparatrixTrace::rayEdgeIntersection(int tri
 }
 
 
-TracePoint SeparatrixTrace::stepHeuns(const TracePoint& current) {
+void SeparatrixTrace::stepHeuns(Separatrix& sep) {
     // Heun's method step: https://en.wikipedia.org/wiki/Heun%27s_method
     // 1. Euler step to get a candidate point
     // 2. Interpolate field direction at candidate point
     // 3. Average the original and candidate directions for better accuracy
 
-    if (current.local_edge_index == -1) { std::cerr << "Warning: stepHeuns called with TracePoint that has no local_edge_index set. This may lead to incorrect behavior." << std::endl; return current; }
+    if (!sep.active) return;
+
+    if (sep.path.empty()) {
+        std::cerr << "Warning: stepHeuns called on separatrix with empty path." << std::endl;
+        sep.active = false;
+        sep.termination_reason = TerminationReason::UNDEFINED;
+        return;
+    }
+
+    const TracePoint& current = sep.path.back();
+
+    if (current.local_edge_index == -1) { 
+        std::cerr << "Warning: stepHeuns called with TracePoint that has no local_edge_index set. This may lead to incorrect behavior." << std::endl; 
+        sep.active = false;
+        sep.termination_reason = TerminationReason::UNDEFINED;
+        return; 
+    }
 
     // find next triangle and barycentric coordinates using the current local_edge_index and direction
     int nextTri = crossField->mesh->triangleAdjacency[current.face_id][current.local_edge_index];
     if (nextTri < 0) {
-        // Hit boundary, return current point as is (caller should handle termination)
-        std::cerr << "Warning: stepHeuns hit boundary edge. Returning current point." << std::endl;
-        return current;
+        // Hit boundary, deactivate the separatrix
+        sep.active = false;
+        sep.termination_reason = TerminationReason::EXIT_BOUNDARY;
+        return;
     }
 
     // use edge_crossing_t to find barycentric coordinates in next triangle
@@ -351,7 +368,9 @@ TracePoint SeparatrixTrace::stepHeuns(const TracePoint& current) {
     
     if (neighborEdge < 0) {
         std::cerr << "Error: Could not find shared edge in neighbor triangle." << std::endl;
-        return current;
+        sep.active = false;
+        sep.termination_reason = TerminationReason::UNDEFINED;
+        return;
     }
     
     // Compute barycentric coordinates in the new triangle
@@ -438,7 +457,9 @@ TracePoint SeparatrixTrace::stepHeuns(const TracePoint& current) {
         
         if (fbExitEdge < 0) {
             std::cerr << "Warning: stepHeuns fallback also failed in triangle " << nextTri << std::endl;
-            return current;
+            sep.active = false;
+            sep.termination_reason = TerminationReason::UNDEFINED;
+            return;
         }
         
         // Use fallback result
@@ -451,7 +472,15 @@ TracePoint SeparatrixTrace::stepHeuns(const TracePoint& current) {
         next.edge_id = crossField->mesh->triangleEdges[nextTri][fbExitEdge];
         next.local_edge_index = fbExitEdge;
         next.edge_crossing_t = fbExitT;
-        return next;
+        sep.path.push_back(next);
+        sep.visited_edges.insert(next.edge_id);
+
+        // Check if the exit edge is on the boundary
+        if (fbExitNeighbor < 0) {
+            sep.active = false;
+            sep.termination_reason = TerminationReason::EXIT_BOUNDARY;
+        }
+        return;
     }
 
     // Step 2: Compute field direction at the trial exit point
@@ -494,7 +523,7 @@ TracePoint SeparatrixTrace::stepHeuns(const TracePoint& current) {
     // Get the global edge ID for the exit edge
     int exitEdgeId = crossField->mesh->triangleEdges[nextTri][exitEdge];
 
-    // Build the result TracePoint
+    // Build the result TracePoint and append to the separatrix path
     TracePoint next;
     next.face_id = nextTri;
     next.barycentric = exitBary;
@@ -505,5 +534,12 @@ TracePoint SeparatrixTrace::stepHeuns(const TracePoint& current) {
     next.local_edge_index = exitEdge;
     next.edge_crossing_t = exitT;
 
-    return next;
+    sep.path.push_back(next);
+    sep.visited_edges.insert(exitEdgeId);
+
+    // Check if the exit edge is on the boundary
+    if (crossField->mesh->triangleAdjacency[nextTri][exitEdge] < 0) {
+        sep.active = false;
+        sep.termination_reason = TerminationReason::EXIT_BOUNDARY;
+    }
 }

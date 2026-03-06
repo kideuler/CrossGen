@@ -91,8 +91,9 @@ public:
     // Find phase difference between two angles and return k such that angleCandidate + k*(pi/2) is closest to referenceAngle
     int findPhaseDifference(double referenceAngle, double angleCandidate);
 
-    // Perform one tracing step using Heun's method, returning the next TracePoint
-    TracePoint stepHeuns(const TracePoint& current);
+    // Perform one tracing step using Heun's method, appending the next TracePoint to the separatrix's path.
+    // Sets sep.active = false and sep.termination_reason if the trace terminates (boundary, error, etc.).
+    void stepHeuns(Separatrix& sep);
 
 private:
     // Private members for internal use during tracing
