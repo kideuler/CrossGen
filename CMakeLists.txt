@@ -137,7 +137,10 @@ target_link_libraries(TestTracingComponents PRIVATE PolyVector)
 add_test(NAME Tracing_ConstantFieldTrace COMMAND TestTracingComponents 1)
 add_test(NAME Tracing_RigidBodyRotation COMMAND TestTracingComponents 2)
 add_test(NAME Tracing_ParabolicStreamline COMMAND TestTracingComponents 3)
-
+add_test(NAME Tracing_SingularTriangleViertelTrace_3port_center COMMAND TestTracingComponents 4)
+add_test(NAME Tracing_SingularTriangleViertelTrace_3port_offcenter COMMAND TestTracingComponents 5)
+add_test(NAME Tracing_SingularTriangleViertelTrace_5port_center COMMAND TestTracingComponents 6)
+add_test(NAME Tracing_SingularTriangleViertelTrace_5port_offcenter COMMAND TestTracingComponents 7)
 # Optional OpenGL viewer
 option(BUILD_OPENGL_VIEWER "Build the OpenGL mesh/field viewer" OFF)
 if (BUILD_OPENGL_VIEWER)

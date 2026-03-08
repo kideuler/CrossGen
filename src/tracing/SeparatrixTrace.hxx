@@ -60,7 +60,6 @@ struct Separatrix {
     int origin_singularity_port; // Port index at the singularity (0-4) corresponding to the initial direction.
     bool active = true; // Indicates whether the trace is still active (not terminated).
     bool in_singularity_zone = false; // Whether the trace is currently within the "singularity zone" of any singularity.
-    double A_q = -1.0; // hyperbolic trace parameter for singularity zone tracing, initialized to -1 to indicate not set.
     TerminationReason termination_reason = TerminationReason::RUNNING; // Reason for termination if not active.
 
     std::set<int> visited_edges; // Set of edge IDs visited by this separatrix, used for self-intersection detection.
@@ -71,6 +70,9 @@ public:
     std::vector<Separatrix> separatrices; // List of all separatrices being traced
     std::vector<Singularity> singularities; // List of singularities in the cross field, with their properties and associated separatrix ports
     std::shared_ptr<CrossField> crossField; // Shared pointer to the cross field 
+
+    double dphi_singularity_zone = 0.05; // step size in the conformal domain when tracing within the singularity zone
+    int maxStepsInSingularityZone = 1000; // maximum number of steps to take when tracing within the singularity zone before giving up
     
     SeparatrixTrace(std::shared_ptr<CrossField> cf, bool useActualSingularityCoordinates);
 
@@ -81,6 +83,10 @@ public:
     // Returns: (intersection point, local edge index, edge parameter t, neighbor triangle index)
     // excludeEdge: optional edge index to exclude (e.g., the entry edge when tracing)
     std::tuple<Point, int, double, int> rayEdgeIntersection(int triangleIndex, const Point& origin, double direction, int excludeEdge = -1);
+
+    // find the intersection edge of another edge using the barycentric coordinates of the 2 points.
+    // Returns the local edge index (0, 1, or 2) that was crossed, or -1 if no edge was crossed.
+    int findCrossedEdge(const std::array<double, 3>& b_prev, const std::array<double, 3>& b_next, double& t_exit);
 
     // sister method which takes a direction vector instead of an angle
     std::tuple<Point, int, double, int> rayEdgeIntersection(int triangleIndex, const Point& origin, const Point& direction, int excludeEdge = -1);
@@ -94,6 +100,9 @@ public:
     // Perform one tracing step using Heun's method, appending the next TracePoint to the separatrix's path.
     // Sets sep.active = false and sep.termination_reason if the trace terminates (boundary, error, etc.).
     void stepHeuns(Separatrix& sep);
+
+    // step separatrix using the Viertel IMR 2019 method, which includes special handling for singularities.
+    void stepViertel(Separatrix& sep);
 
 private:
     // Private members for internal use during tracing

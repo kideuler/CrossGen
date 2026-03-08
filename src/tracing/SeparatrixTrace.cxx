@@ -303,6 +303,29 @@ std::tuple<Point, int, double, int> SeparatrixTrace::rayEdgeIntersection(int tri
     return {bestIp, bestEdge, bestU, neighbor};
 }
 
+int SeparatrixTrace::findCrossedEdge(const std::array<double, 3>& b_prev, const std::array<double, 3>& b_next, double& t_exit) {
+    int exit_edge = -1;
+    double min_t = 2.0; // Initialize to a value strictly > 1.0
+
+    for (int i = 0; i < 3; ++i) {
+        if (b_next[i] < 0.0) {
+            // Calculate the fraction of the step where this coordinate hit exactly 0.0
+            // Denominator is guaranteed > 0 because b_prev[i] >= 0 and b_next[i] < 0
+            double t = b_prev[i] / (b_prev[i] - b_next[i]);
+            
+            if (t < min_t) {
+                min_t = t;
+                // If coordinate i goes negative, we crossed the edge opposite to vertex i.
+                // In your convention, the edge opposite vertex i is (i + 1) % 3.
+                exit_edge = (i + 1) % 3;
+            }
+        }
+    }
+    
+    t_exit = (exit_edge != -1) ? min_t : 1.0;
+    return exit_edge;
+}
+
 
 void SeparatrixTrace::stepHeuns(Separatrix& sep) {
     // Heun's method step: https://en.wikipedia.org/wiki/Heun%27s_method
@@ -542,4 +565,199 @@ void SeparatrixTrace::stepHeuns(Separatrix& sep) {
         sep.active = false;
         sep.termination_reason = TerminationReason::EXIT_BOUNDARY;
     }
+}
+
+
+void SeparatrixTrace::stepViertel(Separatrix& sep) {
+    if (!sep.active) return;
+    if (sep.path.empty()) {
+        sep.active = false;
+        sep.termination_reason = TerminationReason::UNDEFINED;
+        return;
+    }
+
+    const TracePoint& current = sep.path.back();
+    if (current.local_edge_index == -1) { 
+        sep.active = false;
+        sep.termination_reason = TerminationReason::UNDEFINED;
+        return; 
+    }
+
+    // 1. Identify upcoming triangle
+    int nextTri = crossField->mesh->triangleAdjacency[current.face_id][current.local_edge_index];
+    if (nextTri < 0) {
+        sep.active = false;
+        sep.termination_reason = TerminationReason::EXIT_BOUNDARY;
+        return;
+    }
+
+    auto sigIt = singularityMap.find(nextTri);
+
+    // 3. Find neighbor edge and entry coordinates
+    const Triangle &currentTri = crossField->mesh->triangles[current.face_id];
+    const Triangle &nextTriVerts = crossField->mesh->triangles[nextTri];
+    int v_a = currentTri[current.local_edge_index];
+    int v_b = currentTri[(current.local_edge_index + 1) % 3];
+    
+    int neighborEdge = -1;
+    bool reversed = false;
+    for (int e = 0; e < 3; ++e) {
+        int nv_a = nextTriVerts[e];
+        int nv_b = nextTriVerts[(e + 1) % 3];
+        if (nv_a == v_a && nv_b == v_b) {
+            neighborEdge = e; reversed = false; break;
+        } else if (nv_a == v_b && nv_b == v_a) {
+            neighborEdge = e; reversed = true; break;
+        }
+    }
+    
+    if (neighborEdge < 0) {
+        sep.active = false;
+        sep.termination_reason = TerminationReason::UNDEFINED;
+        return;
+    }
+    
+    double t_entry = reversed ? (1.0 - current.edge_crossing_t) : current.edge_crossing_t;
+    std::array<double, 3> bary = {0.0, 0.0, 0.0};
+    bary[neighborEdge] = 1.0 - t_entry;
+    bary[(neighborEdge + 1) % 3] = t_entry;
+    
+    Point p0 = crossField->mesh->vertices[nextTriVerts[0]];
+    Point p1 = crossField->mesh->vertices[nextTriVerts[1]];
+    Point p2 = crossField->mesh->vertices[nextTriVerts[2]];
+    Point q = p0 * bary[0] + p1 * bary[1] + p2 * bary[2];
+
+    const Singularity& s = singularities[sigIt->second];
+
+    // singularity center in global coordinates
+    Point sc = s.coordinates;
+    double d_type = s.singularityIndex*4;
+
+    double r_q = normP(q - sc); // radius 
+    double theta_raw = wrap_pi(std::atan2(q[1] - sc[1], q[0] - sc[0])); // angle of entry point around singularity
+
+    // find the port whose angle is closest to theta_q in the clockwise direction
+    // i.e., the port with the smallest positive circular distance wrap_pi(theta_q - portAngle)
+    double bestDist = std::numeric_limits<double>::infinity();
+    double dalpha = (s.numPorts == 5) ? 2.0 * M_PI / 5.0 : 2.0 * M_PI / 3.0;
+    int bestPort = -1;
+    double bestTheta = 0.0;
+    for (int port = 0; port < s.numPorts; ++port) {
+        double portAngle = wrap_pi(s.refAngle + s.alpha + port * dalpha);
+        // Circular distance: how far theta_raw is ahead of portAngle (going counterclockwise)
+        double dist = wrap_pi(theta_raw - portAngle);
+        if (dist < 0) dist += 2.0 * M_PI; // map to [0, 2*pi) so "behind" ports get large distance
+        if (dist > 1e-10 && dist < bestDist) { // exclude dist≈0 (exactly on the port)
+            bestDist = dist;
+            bestPort = port;
+            bestTheta = portAngle;
+        }
+    }
+
+    double theta_q = theta_raw - bestTheta; // angle of entry point relative to the chosen port direction, must lie in range [0, 2*pi]
+    if (theta_q < 0) theta_q += 2.0 * M_PI;
+
+    double M = (4.0 - d_type) / 8.0;
+    double M_inv = 1.0 / M;
+    double M_qr = std::pow(r_q, M); // conformally mapped radius
+    double M_qtheta = theta_q * M; // conformally mapped angle
+
+    // calculate hyperbola constant A_q
+    double A_q = M_qr*M_qr * std::sin(M_qtheta) * std::cos(M_qtheta);
+
+    // step through hyperbola, for now just take fixed step size with fixed number of steps, later can step until we exit the triangle.
+    double phi = M_qtheta;
+    double rho = M_qr;
+    Point q_current = q;
+    double phi_next = phi;
+    double rho_next = rho;
+    Point q_next = q_current;
+    double r_next, theta_next;
+    bool exitedTriangle = false;
+
+    // Calculate the physical flow vector from the incoming trace
+    Point v_flow = {std::cos(current.trace_direction), std::sin(current.trace_direction)};
+
+    // Calculate the tangential vector (counter-clockwise) at the entry point q
+    Point v_theta = {-std::sin(theta_raw), std::cos(theta_raw)};
+
+    // Dot product determines if the flow is counter-clockwise (+) or clockwise (-)
+    double flow_dir = (v_flow[0] * v_theta[0] + v_flow[1] * v_theta[1]);
+
+    // Apply the correct sign to the integration step
+    double dphi = (flow_dir >= 0) ? dphi_singularity_zone : -dphi_singularity_zone;
+
+    int i = 0;
+    while (i < maxStepsInSingularityZone && !exitedTriangle) {
+        // compute next point on hyperbola,
+        phi_next = phi + dphi;
+        rho_next = std::sqrt(A_q / (std::sin(phi_next) * std::cos(phi_next)));
+
+        // apply inverse mapping to get back to original domain
+        r_next = std::pow(rho_next, M_inv);
+        theta_next = phi_next * M_inv;
+
+        Point q_next = sc + Point{r_next * std::cos(theta_next + bestTheta), r_next * std::sin(theta_next + bestTheta)};
+
+        // determine if we have exited the triangle by checking the barycentric coordinates of q_next in nextTri
+        std::array<double, 3> bary_next = globalToBarycentric(nextTri, q_next);
+        if (bary_next[0] < 0.0 || bary_next[1] < 0.0 || bary_next[2] < 0.0) {
+            exitedTriangle = true;
+        }
+
+        // create trace point and add to path
+        if (!exitedTriangle) { // if we didnt exit the triangle, we can safely add the point
+            TracePoint tp;
+            tp.face_id = nextTri;
+            tp.global_pos = q_next;
+            tp.barycentric = globalToBarycentric(nextTri, q_next);
+            tp.field_angle = bestTheta; // use the port direction as the field angle for this point since we're following that direction
+            tp.trace_direction = std::atan2(q_next[1] - sc[1], q_next[0] - sc[0]);
+            sep.path.push_back(tp);
+
+            // update phi and rho for next iteration
+            phi = phi_next;
+            rho = rho_next;
+            q_current = q_next;
+        } else { // if we exited the triangle we need to find the inters
+            // use bary_next to find which edge we exited and the t parameter along that edge
+            double t_exit;
+            std::array<double, 3> bary_prev = globalToBarycentric(nextTri, q_current); // barycentrics of the entry point
+            int exit_edge = findCrossedEdge(bary_prev, bary_next, t_exit);
+            if (exit_edge < 0) {
+                std::cerr << "Error: Could not find exit edge in stepViertel. bary_prev=" << bary_prev[0] << " " << bary_prev[1] << " " << bary_prev[2] << " bary_next=" << bary_next[0] << " " << bary_next[1] << " " << bary_next[2] << " q_current=" << q_current[0] << " " << q_current[1] << std::endl;
+                sep.active = false;
+                sep.termination_reason = TerminationReason::UNDEFINED;
+                return;
+            }
+
+            // evaluate the exit point on the edge using t_exit
+            Point exitPos = q_current * (1.0 - t_exit) + q_next * t_exit;
+
+            // add the exit point as the final trace point
+            TracePoint tp;
+            tp.face_id = nextTri;
+            tp.global_pos = exitPos;
+            tp.barycentric = globalToBarycentric(nextTri, exitPos);
+            tp.trace_direction = std::atan2(exitPos[1] - q_current[1], exitPos[0] - q_current[0]);
+            tp.edge_id = crossField->mesh->triangleEdges[nextTri][exit_edge];
+            tp.local_edge_index = exit_edge;
+            tp.edge_crossing_t = t_exit;
+
+            // field angle at the exit point by interpolating vertex angles
+            const Triangle &exitTri = crossField->mesh->triangles[nextTri];
+            double theta0 = std::arg(crossField->u_k[exitTri[0]]) / 4.0;
+            double theta1 = std::arg(crossField->u_k[exitTri[1]]) / 4.0;
+            double theta2 = std::arg(crossField->u_k[exitTri[2]]) / 4.0;
+            theta1 = makeAngleSamePhase(theta0, theta1);
+            theta2 = makeAngleSamePhase(theta0, theta2);
+            double thetaInterp = theta0 * tp.barycentric[0] + theta1 * tp.barycentric[1] + theta2 * tp.barycentric[2];
+            tp.field_angle = thetaInterp;
+
+            sep.path.push_back(tp);
+        }
+
+        i++;
+    }
+        
 }

@@ -395,6 +395,245 @@ bool test3_ParabolicStreamline() {
 }
 
 //=============================================================================
+// Test 4: Singular Triangle Viertel Trace
+//=============================================================================
+bool test4_SingularTriangleViertelTrace(double singularityIndex, std::array<double, 3> singularityBarycenter) {
+    std::cout << "\n=== Test n: Singular Triangle Viertel Trace ===" << std::endl;
+
+    auto mesh = std::make_shared<Mesh>();
+    double R = 1.0;
+    
+    // T0 vertices (equilateral triangle)
+    Point v0 = {0.0, R};
+    Point v1 = {-R * std::sqrt(3.0) / 2.0, -R / 2.0};
+    Point v2 = { R * std::sqrt(3.0) / 2.0, -R / 2.0};
+    
+    // Outer dummy vertices to form neighbor triangles
+    Point v3 = {-R * std::sqrt(3.0), R};
+    Point v4 = {0.0, -R * 1.5};
+    Point v5 = {R * std::sqrt(3.0), R};
+
+    mesh->vertices = {v0, v1, v2, v3, v4, v5};
+    mesh->triangles = {
+        {0, 1, 2}, // T0: The singular triangle
+        {1, 0, 3}, // T1: Neighbor sharing (0,1)
+        {2, 1, 4}, // T2: Neighbor sharing (1,2)
+        {0, 2, 5}  // T3: Neighbor sharing (2,0)
+    };
+    mesh->triangleEdges = {
+        {0, 1, 2},
+        {0, 3, 4},
+        {1, 5, 6},
+        {2, 7, 8}
+    };
+    mesh->triangleAdjacency = {
+        {1, 2, 3},   // T0 adjacent to T1, T2, T3
+        {0, -1, -1}, // T1 adjacent back to T0
+        {0, -1, -1}, // T2 adjacent back to T0
+        {0, -1, -1}  // T3 adjacent back to T0
+    };
+
+    auto crossField = std::make_shared<CrossField>(mesh);
+    crossField->u_k.resize(6);
+    
+    // Field setup: choose u_k values so the linear interpolant has its zero at
+    // the desired singularityBarycenter (λ0, λ1, λ2).
+    // We need λ0*u0 + λ1*u1 + λ2*u2 = 0.
+    // Pick u0 and u1 freely, then solve for u2.
+    double lam0 = singularityBarycenter[0];
+    double lam1 = singularityBarycenter[1];
+    double lam2 = singularityBarycenter[2];
+
+    // 1. Compute the exact global coordinates of the singularity
+    Point sc;
+    sc[0] = v0[0]*lam0 + v1[0]*lam1 + v2[0]*lam2;
+    sc[1] = v0[1]*lam0 + v1[1]*lam1 + v2[1]*lam2;
+
+    // 2. Define the analytical cross field (d = 1 for +1/4, d = -1 for -1/4)
+    double d = (singularityIndex > 0) ? 1.0 : -1.0;
+
+    // Helper to compute the exact representation vector u_k for any vertex
+    auto calc_u = [&](Point v) {
+        // Find angle of vertex relative to singularity
+        double theta = std::atan2(v[1] - sc[1], v[0] - sc[0]);
+        // Analytical field angle
+        double field_angle = (d * theta) / 4.0;
+        // Convert to representation vector e^(i * 4 * field_angle)
+        return std::complex<double>(std::cos(4.0 * field_angle), std::sin(4.0 * field_angle));
+    };
+
+    crossField->u_k[0] = calc_u(v0);
+    crossField->u_k[1] = calc_u(v1);
+    crossField->u_k[2] = calc_u(v2);
+    
+    // Apply the exact analytical field to the outer boundary vertices as well!
+    crossField->u_k[3] = calc_u(v3);
+    crossField->u_k[4] = calc_u(v4);
+    crossField->u_k[5] = calc_u(v5);
+
+    // Mark T0 as singular with the given singularity index
+    crossField->singularTriangles.emplace_back(0, singularityIndex);
+
+    // Initialize tracer with useActualSingularityCoordinates=true so the
+    // constructor solves for the singularity location from u_k, landing at singularityBarycenter
+    SeparatrixTrace tracer(crossField, true);
+    tracer.dphi_singularity_zone = 0.001;
+    tracer.maxStepsInSingularityZone = 3000;
+    std::vector<std::vector<TracePoint>> allPaths;
+    std::vector<int> pathEdgeIndex; // which edge (0,1,2) each path came from, -1 for separatrices
+
+    // Save separatrices for visualization
+    for (const auto& sep : tracer.separatrices) {
+        allPaths.emplace_back(sep.path.begin(), sep.path.end());
+        pathEdgeIndex.push_back(-1); // separatrices don't belong to an entry edge
+    }
+
+    // Define the boundaries we will shoot streamlines from
+    struct EntryDef {
+        int neighborTri;
+        int localEdge; 
+        Point A; 
+        Point B; 
+    };
+    std::vector<EntryDef> entries = {
+        {1, 0, v1, v0}, // Edge 0
+        {2, 0, v2, v1}, // Edge 1
+        {3, 0, v0, v2}  // Edge 2
+    };
+
+    int successfulTraces = 0;
+    int numTracesPerEdge = 30;
+    for (int e = 0; e < 3; ++e) {
+        auto def = entries[e];
+        for (int i = 1; i <= numTracesPerEdge; ++i) {
+            double t = i / (numTracesPerEdge + 1.0);
+            Point P;
+            P[0] = def.A[0] + (def.B[0] - def.A[0]) * t;
+            P[1] = def.A[1] + (def.B[1] - def.A[1]) * t;
+
+            Separatrix sep;
+            sep.id = 100 + e * 10 + i;
+            sep.active = true;
+
+            TracePoint entry;
+            entry.face_id = def.neighborTri;
+            entry.global_pos = P;
+            entry.local_edge_index = def.localEdge;
+            entry.edge_crossing_t = t;
+            
+            // Calculate the entry field angle: orthogonal to the edge, pointing inward
+            double entryfieldAngle;
+            
+            Point edgeDir = {def.B[0] - def.A[0], def.B[1] - def.A[1]};
+            // Inward normal: rotate edge direction by -90 degrees (clockwise)
+            Point inwardNormal = {edgeDir[1], -edgeDir[0]};
+            // Check that it points inward (toward the centroid of T0 at the origin)
+            Point toCenter = {-P[0], -P[1]};
+            if (inwardNormal[0] * toCenter[0] + inwardNormal[1] * toCenter[1] < 0) {
+                // Flip if pointing outward
+                inwardNormal[0] = -inwardNormal[0];
+                inwardNormal[1] = -inwardNormal[1];
+            }
+            entryfieldAngle = std::atan2(inwardNormal[1], inwardNormal[0]);
+        
+            entry.field_angle = entryfieldAngle; 
+            entry.trace_direction = entryfieldAngle;
+
+            sep.path.push_back(entry);
+
+            // Execute the analytical hyperbolic step
+            tracer.stepViertel(sep);
+
+            if (sep.path.size() < 2) {
+                std::cerr << "FAIL: Streamline " << sep.id << " did not find an exit." << std::endl;
+                //return false;
+            }
+            
+            allPaths.emplace_back(sep.path.begin(), sep.path.end());
+            pathEdgeIndex.push_back(e);
+            successfulTraces++;
+        }
+    }
+
+    std::cout << "Successfully traced " << successfulTraces << " custom streamlines through the singular triangle." << std::endl;
+
+    // Generate VTK file for visualization (ParaView-compatible with per-line colors)
+    std::string basename = "test4_singular_triangle_idx" + std::to_string(singularityIndex) 
+                         + "_bary" + std::to_string(singularityBarycenter[0]) 
+                         + "_" + std::to_string(singularityBarycenter[1])
+                         + "_" + std::to_string(singularityBarycenter[2]);
+    std::string filename = basename + ".vtk";
+
+    // Count total points and total cell-list size
+    int totalPoints = 6; // mesh vertices
+    int totalCells = 1;  // the triangle face
+    int totalCellListSize = 4; // "3 v0 v1 v2" for the triangle
+    for (const auto& path : allPaths) {
+        totalPoints += static_cast<int>(path.size());
+        totalCells += 1; // one polyline per path
+        totalCellListSize += 1 + static_cast<int>(path.size()); // count + point indices
+    }
+
+    std::ofstream out(filename);
+    if (out.is_open()) {
+        // Header
+        out << "# vtk DataFile Version 3.0\n";
+        out << "Singular Triangle Test\n";
+        out << "ASCII\n";
+        out << "DATASET POLYDATA\n";
+
+        // Points
+        out << "POINTS " << totalPoints << " double\n";
+        for (const auto& v : mesh->vertices) {
+            out << v[0] << " " << v[1] << " 0\n";
+        }
+        for (const auto& path : allPaths) {
+            for (const auto& pt : path) {
+                out << pt.global_pos[0] << " " << pt.global_pos[1] << " 0\n";
+            }
+        }
+
+        // Polygon (the triangle)
+        out << "POLYGONS 1 4\n";
+        out << "3 0 1 2\n";
+
+        // Lines (the streamlines)
+        int numLines = static_cast<int>(allPaths.size());
+        int linesListSize = 0;
+        for (const auto& path : allPaths) {
+            linesListSize += 1 + static_cast<int>(path.size());
+        }
+        out << "LINES " << numLines << " " << linesListSize << "\n";
+
+        int ptOffset = 6; // first 6 points are mesh vertices
+        for (const auto& path : allPaths) {
+            out << path.size();
+            for (size_t i = 0; i < path.size(); ++i) {
+                out << " " << (ptOffset + i);
+            }
+            out << "\n";
+            ptOffset += static_cast<int>(path.size());
+        }
+
+        // Cell data: edge index for coloring
+        // Total cells = 1 (polygon) + numLines
+        out << "CELL_DATA " << (1 + numLines) << "\n";
+        out << "SCALARS EdgeGroup int 1\n";
+        out << "LOOKUP_TABLE default\n";
+        out << "3\n"; // triangle gets its own group
+        for (size_t p = 0; p < allPaths.size(); ++p) {
+            out << pathEdgeIndex[p] << "\n"; // -1 for separatrices, 0/1/2 for edges
+        }
+
+        out.close();
+        std::cout << "Wrote visualization to " << filename << std::endl;
+    }
+
+    std::cout << "PASS" << std::endl;
+    return true;
+}
+
+//=============================================================================
 // Test registry and main
 //=============================================================================
 using TestFunc = std::function<bool()>;
@@ -405,6 +644,10 @@ int main(int argc, char** argv) {
         {1, {"ConstantFieldTrace", test1_ConstantFieldTrace}},
         {2, {"RigidBodyRotation", test2_RigidBodyRotation}},
         {3, {"ParabolicStreamline", test3_ParabolicStreamline}},
+        {4, {"SingularTriangleViertelTrace_1", []() { return test4_SingularTriangleViertelTrace(0.25, {1.0/3.0, 1.0/3.0, 1.0/3.0}); }}},
+        {5, {"SingularTriangleViertelTrace_2", []() { return test4_SingularTriangleViertelTrace(0.25, {2.0/5.0, 2.0/5.0, 1.0/5.0}); }}},
+        {6, {"SingularTriangleViertelTrace_3", []() { return test4_SingularTriangleViertelTrace(-0.25, {1.0/3.0, 1.0/3.0, 1.0/3.0}); }}},
+        {7, {"SingularTriangleViertelTrace_4", []() { return test4_SingularTriangleViertelTrace(-0.25, {2.0/5.0, 2.0/5.0, 1.0/5.0}); }}}
     };
 
     std::vector<int> testsToRun;
