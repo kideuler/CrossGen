@@ -102,7 +102,7 @@ public:
     void stepHeuns(Separatrix& sep);
 
     // step separatrix using the Viertel IMR 2019 method, which includes special handling for singularities.
-    void stepViertel(Separatrix& sep);
+    void stepViertel(Separatrix& sep, bool stopAtOrthogonal = true);
 
 private:
     // Private members for internal use during tracing

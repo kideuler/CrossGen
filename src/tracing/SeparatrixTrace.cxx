@@ -568,7 +568,7 @@ void SeparatrixTrace::stepHeuns(Separatrix& sep) {
 }
 
 
-void SeparatrixTrace::stepViertel(Separatrix& sep) {
+void SeparatrixTrace::stepViertel(Separatrix& sep, bool stopAtOrthogonal) {
     if (!sep.active) return;
     if (sep.path.empty()) {
         sep.active = false;
@@ -660,13 +660,31 @@ void SeparatrixTrace::stepViertel(Separatrix& sep) {
     double M = (4.0 - d_type) / 8.0;
     double M_inv = 1.0 / M;
     double M_qr = std::pow(r_q, M); // conformally mapped radius
-    double M_qtheta = theta_q * M; // conformally mapped angle
+    double phi_q = theta_q * M; // conformally mapped angle
 
-    // calculate hyperbola constant A_q
-    double A_q = M_qr*M_qr * std::sin(M_qtheta) * std::cos(M_qtheta);
+    // 1. Map the incoming FIELD ANGLE to the conformal tangent angle (psi)
+    // We strictly use current.field_angle instead of current.trace_direction to shed numerical noise
+    double gamma_local = current.trace_direction - bestTheta;
+    double psi = (M - 1.0) * theta_q + gamma_local;
 
-    // step through hyperbola, for now just take fixed step size with fixed number of steps, later can step until we exit the triangle.
-    double phi = M_qtheta;
+    // 2. Determine which hyperbolic family this streamline belongs to.
+    double delta_psi = wrap_pi(psi + phi_q);
+    bool isSweepFamily = (std::abs(delta_psi) < M_PI / 4.0 || std::abs(delta_psi) > 3.0 * M_PI / 4.0);
+
+    // 3. Determine the direction to step phi.
+    // In polar coordinates, the sign of dphi ALWAYS matches the sign of sin(tangent_angle - position_angle).
+    double dphi_sign = (std::sin(psi - phi_q) >= 0) ? 1.0 : -1.0;
+    double dphi = dphi_sign * dphi_singularity_zone;
+
+    // 4. Calculate the correct hyperbola constant based on the chosen family
+    double A_q;
+    if (isSweepFamily) {
+        A_q = M_qr * M_qr * std::sin(phi_q) * std::cos(phi_q);
+    } else {
+        A_q = M_qr * M_qr * std::cos(2.0 * phi_q);
+    }
+
+    double phi = phi_q;
     double rho = M_qr;
     Point q_current = q;
     double phi_next = phi;
@@ -675,23 +693,62 @@ void SeparatrixTrace::stepViertel(Separatrix& sep) {
     double r_next, theta_next;
     bool exitedTriangle = false;
 
-    // Calculate the physical flow vector from the incoming trace
-    Point v_flow = {std::cos(current.trace_direction), std::sin(current.trace_direction)};
+    // Validate the initial stepping direction with a trial step.
+    // If the first step immediately exits through the entry edge (same edge we came
+    // from), the dphi sign is wrong — flip it. This guards against incorrect conformal
+    // tangent angle causing the hyperbola to be traversed outward.
+    {
+        double phi_trial = phi_q + dphi;
+        double rho_trial;
+        if (isSweepFamily) {
+            rho_trial = std::sqrt(std::abs(A_q) / std::abs(std::sin(phi_trial) * std::cos(phi_trial)));
+        } else {
+            double cos2 = std::cos(2.0 * phi_trial);
+            rho_trial = std::sqrt(std::abs(A_q) / std::max(std::abs(cos2), 1e-12));
+        }
+        double r_trial = std::pow(rho_trial, M_inv);
+        double theta_trial = phi_trial * M_inv;
+        Point q_trial = sc + Point{r_trial * std::cos(theta_trial + bestTheta),
+                                   r_trial * std::sin(theta_trial + bestTheta)};
 
-    // Calculate the tangential vector (counter-clockwise) at the entry point q
-    Point v_theta = {-std::sin(theta_raw), std::cos(theta_raw)};
-
-    // Dot product determines if the flow is counter-clockwise (+) or clockwise (-)
-    double flow_dir = (v_flow[0] * v_theta[0] + v_flow[1] * v_theta[1]);
-
-    // Apply the correct sign to the integration step
-    double dphi = (flow_dir >= 0) ? dphi_singularity_zone : -dphi_singularity_zone;
+        std::array<double, 3> bary_trial = globalToBarycentric(nextTri, q_trial);
+        // Check if trial point exits through the entry edge (neighborEdge)
+        // The entry edge is 'neighborEdge'; the barycentric coordinate opposite to that edge's
+        // starting vertex goes negative when we cross back out.
+        // Edge e is between vertices e and (e+1)%3, opposite vertex is (e+2)%3.
+        int oppositeVertex = (neighborEdge + 2) % 3;
+        if (bary_trial[oppositeVertex] < -EPS_BARY) {
+            // Trial step went backward through the entry edge — flip direction
+            dphi_sign = -dphi_sign;
+            dphi = -dphi;
+        }
+    }
 
     int i = 0;
     while (i < maxStepsInSingularityZone && !exitedTriangle) {
-        // compute next point on hyperbola,
+        // compute next angle on hyperbola
         phi_next = phi + dphi;
-        rho_next = std::sqrt(A_q / (std::sin(phi_next) * std::cos(phi_next)));
+
+        // STRICT BOUNDS GUARD: Asymptotes are at 0 and pi/2 for BOTH families
+        // This cuts off separatrices to prevent tangential crossings per the Viertel method
+        if ((phi_next <= 0.0 || phi_next >= M_PI / 2.0) && stopAtOrthogonal) {
+            sep.active = false;
+            sep.termination_reason = TerminationReason::ORTHOGONAL_TO_SINGULARITY_SEPARATRIX;
+            return; 
+        }
+
+        // Safe radius computation depending on the family
+        if (isSweepFamily) {
+            rho_next = std::sqrt(std::abs(A_q) / (std::sin(phi_next) * std::cos(phi_next)));
+        } else {
+            double cos2 = std::cos(2.0 * phi_next);
+            if (std::abs(cos2) < 1e-12 && stopAtOrthogonal) {
+                sep.active = false;
+                sep.termination_reason = TerminationReason::ORTHOGONAL_TO_SINGULARITY_SEPARATRIX;
+                return;
+            }
+            rho_next = std::sqrt(std::abs(A_q) / std::abs(cos2));
+        }
 
         // apply inverse mapping to get back to original domain
         r_next = std::pow(rho_next, M_inv);

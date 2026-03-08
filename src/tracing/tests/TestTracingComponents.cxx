@@ -535,18 +535,41 @@ bool test4_SingularTriangleViertelTrace(double singularityIndex, std::array<doub
                 inwardNormal[1] = -inwardNormal[1];
             }
             entryfieldAngle = std::atan2(inwardNormal[1], inwardNormal[0]);
-        
-            entry.field_angle = entryfieldAngle; 
+         
             entry.trace_direction = entryfieldAngle;
+
+            // interpolate the field angle at the entry point using barycentric coordinates
+            // First compute barycentric coordinates of P in the neighbor triangle
+            auto bary = tracer.globalToBarycentric(def.neighborTri, P);
+
+            // Then interpolate the field angle using the barycentric coordinates and the u_k values at the vertices
+            double theta0 = std::arg(crossField->u_k[0]) / 4.0;
+            double theta1 = std::arg(crossField->u_k[1]) / 4.0;
+            double theta2 = std::arg(crossField->u_k[2]) / 4.0;
+            theta1 = tracer.makeAngleSamePhase(theta0, theta1);
+            theta2 = tracer.makeAngleSamePhase(theta0, theta2);
+            double thetaInterp = theta0 * bary[0] + theta1 * bary[1] + theta2 * bary[2];
+            entry.field_angle = thetaInterp;
 
             sep.path.push_back(entry);
 
             // Execute the analytical hyperbolic step
-            tracer.stepViertel(sep);
+            tracer.stepViertel(sep, false);
 
             if (sep.path.size() < 2) {
                 std::cerr << "FAIL: Streamline " << sep.id << " did not find an exit." << std::endl;
-                //return false;
+                return false;
+            }
+
+            if (sep.path.size() < 3) {
+                std::cerr << "FAIL: Streamline " << sep.id << " is too short. likely on wrong hyperbola." << std::endl;
+                for (const auto& pt : sep.path) {
+                    std::cout << "  pos=(" << pt.global_pos[0] << "," << pt.global_pos[1] 
+                              << ") field_angle=" << pt.field_angle 
+                              << " trace_dir=" << pt.trace_direction << std::endl;
+                }
+
+                return false;
             }
             
             allPaths.emplace_back(sep.path.begin(), sep.path.end());
@@ -557,76 +580,139 @@ bool test4_SingularTriangleViertelTrace(double singularityIndex, std::array<doub
 
     std::cout << "Successfully traced " << successfulTraces << " custom streamlines through the singular triangle." << std::endl;
 
-    // Generate VTK file for visualization (ParaView-compatible with per-line colors)
+    // Generate separate VTK files for triangle, separatrices, and streamlines
+    // so each can be styled independently in ParaView
     std::string basename = "test4_singular_triangle_idx" + std::to_string(singularityIndex) 
                          + "_bary" + std::to_string(singularityBarycenter[0]) 
                          + "_" + std::to_string(singularityBarycenter[1])
                          + "_" + std::to_string(singularityBarycenter[2]);
-    std::string filename = basename + ".vtk";
 
-    // Count total points and total cell-list size
-    int totalPoints = 6; // mesh vertices
-    int totalCells = 1;  // the triangle face
-    int totalCellListSize = 4; // "3 v0 v1 v2" for the triangle
-    for (const auto& path : allPaths) {
-        totalPoints += static_cast<int>(path.size());
-        totalCells += 1; // one polyline per path
-        totalCellListSize += 1 + static_cast<int>(path.size()); // count + point indices
+    // --- File 1: Triangle mesh (uncolored) ---
+    {
+        std::string filename = basename + "_mesh.vtk";
+        std::ofstream out(filename);
+        if (out.is_open()) {
+            out << "# vtk DataFile Version 3.0\n";
+            out << "Singular Triangle Mesh\n";
+            out << "ASCII\n";
+            out << "DATASET POLYDATA\n";
+            out << "POINTS 3 double\n";
+            out << v0[0] << " " << v0[1] << " 0\n";
+            out << v1[0] << " " << v1[1] << " 0\n";
+            out << v2[0] << " " << v2[1] << " 0\n";
+            out << "POLYGONS 1 4\n";
+            out << "3 0 1 2\n";
+            out.close();
+            std::cout << "Wrote triangle mesh to " << filename << std::endl;
+        }
     }
 
-    std::ofstream out(filename);
-    if (out.is_open()) {
-        // Header
-        out << "# vtk DataFile Version 3.0\n";
-        out << "Singular Triangle Test\n";
-        out << "ASCII\n";
-        out << "DATASET POLYDATA\n";
-
-        // Points
-        out << "POINTS " << totalPoints << " double\n";
-        for (const auto& v : mesh->vertices) {
-            out << v[0] << " " << v[1] << " 0\n";
-        }
-        for (const auto& path : allPaths) {
-            for (const auto& pt : path) {
-                out << pt.global_pos[0] << " " << pt.global_pos[1] << " 0\n";
-            }
-        }
-
-        // Polygon (the triangle)
-        out << "POLYGONS 1 4\n";
-        out << "3 0 1 2\n";
-
-        // Lines (the streamlines)
-        int numLines = static_cast<int>(allPaths.size());
-        int linesListSize = 0;
-        for (const auto& path : allPaths) {
-            linesListSize += 1 + static_cast<int>(path.size());
-        }
-        out << "LINES " << numLines << " " << linesListSize << "\n";
-
-        int ptOffset = 6; // first 6 points are mesh vertices
-        for (const auto& path : allPaths) {
-            out << path.size();
-            for (size_t i = 0; i < path.size(); ++i) {
-                out << " " << (ptOffset + i);
-            }
-            out << "\n";
-            ptOffset += static_cast<int>(path.size());
-        }
-
-        // Cell data: edge index for coloring
-        // Total cells = 1 (polygon) + numLines
-        out << "CELL_DATA " << (1 + numLines) << "\n";
-        out << "SCALARS EdgeGroup int 1\n";
-        out << "LOOKUP_TABLE default\n";
-        out << "3\n"; // triangle gets its own group
+    // --- File 2: Separatrices (uncolored) ---
+    {
+        std::string filename = basename + "_separatrices.vtk";
+        // Collect separatrix paths
+        std::vector<const std::vector<TracePoint>*> sepPaths;
         for (size_t p = 0; p < allPaths.size(); ++p) {
-            out << pathEdgeIndex[p] << "\n"; // -1 for separatrices, 0/1/2 for edges
+            if (pathEdgeIndex[p] < 0) {
+                sepPaths.push_back(&allPaths[p]);
+            }
         }
 
-        out.close();
-        std::cout << "Wrote visualization to " << filename << std::endl;
+        if (!sepPaths.empty()) {
+            int totalPts = 0;
+            for (const auto* path : sepPaths) totalPts += static_cast<int>(path->size());
+
+            std::ofstream out(filename);
+            if (out.is_open()) {
+                out << "# vtk DataFile Version 3.0\n";
+                out << "Separatrices\n";
+                out << "ASCII\n";
+                out << "DATASET POLYDATA\n";
+                out << "POINTS " << totalPts << " double\n";
+                for (const auto* path : sepPaths) {
+                    for (const auto& pt : *path) {
+                        out << pt.global_pos[0] << " " << pt.global_pos[1] << " 0\n";
+                    }
+                }
+
+                int numLines = static_cast<int>(sepPaths.size());
+                int linesListSize = 0;
+                for (const auto* path : sepPaths) linesListSize += 1 + static_cast<int>(path->size());
+                out << "LINES " << numLines << " " << linesListSize << "\n";
+
+                int ptOffset = 0;
+                for (const auto* path : sepPaths) {
+                    out << path->size();
+                    for (size_t i = 0; i < path->size(); ++i) {
+                        out << " " << (ptOffset + i);
+                    }
+                    out << "\n";
+                    ptOffset += static_cast<int>(path->size());
+                }
+
+                out.close();
+                std::cout << "Wrote separatrices to " << filename << std::endl;
+            }
+        }
+    }
+
+    // --- File 3: Streamlines (colored by entry edge) ---
+    {
+        std::string filename = basename + "_streamlines.vtk";
+        // Collect streamline paths and their edge indices
+        std::vector<const std::vector<TracePoint>*> streamPaths;
+        std::vector<int> streamEdgeIndex;
+        for (size_t p = 0; p < allPaths.size(); ++p) {
+            if (pathEdgeIndex[p] >= 0) {
+                streamPaths.push_back(&allPaths[p]);
+                streamEdgeIndex.push_back(pathEdgeIndex[p]);
+            }
+        }
+
+        if (!streamPaths.empty()) {
+            int totalPts = 0;
+            for (const auto* path : streamPaths) totalPts += static_cast<int>(path->size());
+
+            std::ofstream out(filename);
+            if (out.is_open()) {
+                out << "# vtk DataFile Version 3.0\n";
+                out << "Streamlines\n";
+                out << "ASCII\n";
+                out << "DATASET POLYDATA\n";
+                out << "POINTS " << totalPts << " double\n";
+                for (const auto* path : streamPaths) {
+                    for (const auto& pt : *path) {
+                        out << pt.global_pos[0] << " " << pt.global_pos[1] << " 0\n";
+                    }
+                }
+
+                int numLines = static_cast<int>(streamPaths.size());
+                int linesListSize = 0;
+                for (const auto* path : streamPaths) linesListSize += 1 + static_cast<int>(path->size());
+                out << "LINES " << numLines << " " << linesListSize << "\n";
+
+                int ptOffset = 0;
+                for (const auto* path : streamPaths) {
+                    out << path->size();
+                    for (size_t i = 0; i < path->size(); ++i) {
+                        out << " " << (ptOffset + i);
+                    }
+                    out << "\n";
+                    ptOffset += static_cast<int>(path->size());
+                }
+
+                // Cell data: color by entry edge (0, 1, 2)
+                out << "CELL_DATA " << numLines << "\n";
+                out << "SCALARS EdgeGroup int 1\n";
+                out << "LOOKUP_TABLE default\n";
+                for (int idx : streamEdgeIndex) {
+                    out << idx << "\n";
+                }
+
+                out.close();
+                std::cout << "Wrote streamlines to " << filename << std::endl;
+            }
+        }
     }
 
     std::cout << "PASS" << std::endl;
