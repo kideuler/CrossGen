@@ -91,6 +91,9 @@ public:
     // sister method which takes a direction vector instead of an angle
     std::tuple<Point, int, double, int> rayEdgeIntersection(int triangleIndex, const Point& origin, const Point& direction, int excludeEdge = -1);
 
+    // Compute the intersection of two edges defined by their endpoints line 1: p0->p1, line 2: p2->p3/ Returns (bool intersects, intersection point if intersects)
+    std::tuple<bool, Point> edgeEdgeIntersection(const Point& p0, const Point& p1, const Point& p2, const Point& p3);
+
     // For a given reference angle and another angle, compute the angle that is closest to the reference angle but still matches the cross field direction at that point
     double makeAngleSamePhase(double referenceAngle, double angleCandidate);
 

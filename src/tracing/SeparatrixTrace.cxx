@@ -326,6 +326,34 @@ int SeparatrixTrace::findCrossedEdge(const std::array<double, 3>& b_prev, const 
     return exit_edge;
 }
 
+std::tuple<bool, Point> SeparatrixTrace::edgeEdgeIntersection(const Point& p0, const Point& p1, const Point& p2, const Point& p3) {
+    // Computes the intersection of segment p0->p1 with segment p2->p3.
+    // Returns (true, intersection_point) if the segments intersect, (false, {0,0}) otherwise.
+    //
+    // Parameterize: p0 + t*(p1 - p0) = p2 + u*(p3 - p2), solve for t and u.
+    // Both t and u must be in [0, 1] for the segments to intersect.
+
+    Point d1 = {p1[0] - p0[0], p1[1] - p0[1]}; // direction of segment 1
+    Point d2 = {p3[0] - p2[0], p3[1] - p2[1]}; // direction of segment 2
+
+    double denom = cross2(d1, d2);
+    if (std::abs(denom) < 1e-20) {
+        // Segments are parallel (or degenerate)
+        return {false, {0.0, 0.0}};
+    }
+
+    Point d02 = {p2[0] - p0[0], p2[1] - p0[1]};
+    double t = cross2(d02, d2) / denom;
+    double u = cross2(d02, d1) / denom;
+
+    if (t >= 0.0 && t <= 1.0 && u >= 0.0 && u <= 1.0) {
+        Point ip = {p0[0] + t * d1[0], p0[1] + t * d1[1]};
+        return {true, ip};
+    }
+
+    return {false, {0.0, 0.0}};
+}
+
 
 void SeparatrixTrace::stepHeuns(Separatrix& sep) {
     // Heun's method step: https://en.wikipedia.org/wiki/Heun%27s_method
@@ -724,29 +752,25 @@ void SeparatrixTrace::stepViertel(Separatrix& sep, bool stopAtOrthogonal) {
         }
     }
 
+    // get angle for intersecting orthogonal separatrix family if stopAtOrthogonal is true
+    int bestPortOrthogonal = bestPort + int(dphi_sign > 0);
+    if (bestPortOrthogonal >= s.numPorts) { bestPortOrthogonal -= s.numPorts; }
+    if (bestPortOrthogonal < 0) { bestPortOrthogonal += s.numPorts; }
+    int orthoSepid = s.portSeparatrixIds[bestPortOrthogonal];
+    // get points 1 and 2 from the separatrix
+    Point ortho_p0 = separatrices[orthoSepid].path[0].global_pos;
+    Point ortho_p1 = separatrices[orthoSepid].path[1].global_pos;
+
     int i = 0;
     while (i < maxStepsInSingularityZone && !exitedTriangle) {
         // compute next angle on hyperbola
         phi_next = phi + dphi;
-
-        // STRICT BOUNDS GUARD: Asymptotes are at 0 and pi/2 for BOTH families
-        // This cuts off separatrices to prevent tangential crossings per the Viertel method
-        if ((phi_next <= 0.0 || phi_next >= M_PI / 2.0) && stopAtOrthogonal) {
-            sep.active = false;
-            sep.termination_reason = TerminationReason::ORTHOGONAL_TO_SINGULARITY_SEPARATRIX;
-            return; 
-        }
 
         // Safe radius computation depending on the family
         if (isSweepFamily) {
             rho_next = std::sqrt(std::abs(A_q) / (std::sin(phi_next) * std::cos(phi_next)));
         } else {
             double cos2 = std::cos(2.0 * phi_next);
-            if (std::abs(cos2) < 1e-12 && stopAtOrthogonal) {
-                sep.active = false;
-                sep.termination_reason = TerminationReason::ORTHOGONAL_TO_SINGULARITY_SEPARATRIX;
-                return;
-            }
             rho_next = std::sqrt(std::abs(A_q) / std::abs(cos2));
         }
 
@@ -755,6 +779,23 @@ void SeparatrixTrace::stepViertel(Separatrix& sep, bool stopAtOrthogonal) {
         theta_next = phi_next * M_inv;
 
         Point q_next = sc + Point{r_next * std::cos(theta_next + bestTheta), r_next * std::sin(theta_next + bestTheta)};
+
+        // check if we have crossed a separatrix orthogonal to the current one, if stopAtOrthogonal is true
+        if (stopAtOrthogonal) {
+            auto [intersects, ip] = edgeEdgeIntersection(q_current, q_next, ortho_p0, ortho_p1);
+            if (intersects) {
+                // construct a TracePoint at the intersection and add to path, then terminate
+                TracePoint tp;
+                tp.face_id = nextTri;
+                tp.global_pos = ip;
+                tp.barycentric = globalToBarycentric(nextTri, ip);
+                
+                sep.path.push_back(tp);
+                sep.active = false;
+                sep.termination_reason = TerminationReason::ORTHOGONAL_TO_SINGULARITY_SEPARATRIX;
+                return;
+            }
+        }
 
         // determine if we have exited the triangle by checking the barycentric coordinates of q_next in nextTri
         std::array<double, 3> bary_next = globalToBarycentric(nextTri, q_next);

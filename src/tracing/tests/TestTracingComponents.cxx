@@ -502,7 +502,7 @@ bool test4_SingularTriangleViertelTrace(double singularityIndex, std::array<doub
     };
 
     int successfulTraces = 0;
-    int numTracesPerEdge = 30;
+    int numTracesPerEdge = 50;
     for (int e = 0; e < 3; ++e) {
         auto def = entries[e];
         for (int i = 1; i <= numTracesPerEdge; ++i) {
@@ -554,14 +554,14 @@ bool test4_SingularTriangleViertelTrace(double singularityIndex, std::array<doub
             sep.path.push_back(entry);
 
             // Execute the analytical hyperbolic step
-            tracer.stepViertel(sep, false);
+            tracer.stepViertel(sep, true);
 
             if (sep.path.size() < 2) {
                 std::cerr << "FAIL: Streamline " << sep.id << " did not find an exit." << std::endl;
                 return false;
             }
 
-            if (sep.path.size() < 3) {
+            if (sep.path.size() < 3 && sep.termination_reason != TerminationReason::ORTHOGONAL_TO_SINGULARITY_SEPARATRIX) {
                 std::cerr << "FAIL: Streamline " << sep.id << " is too short. likely on wrong hyperbola." << std::endl;
                 for (const auto& pt : sep.path) {
                     std::cout << "  pos=(" << pt.global_pos[0] << "," << pt.global_pos[1] 
