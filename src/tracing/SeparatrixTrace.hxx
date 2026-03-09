@@ -70,6 +70,7 @@ public:
     std::vector<Separatrix> separatrices; // List of all separatrices being traced
     std::vector<Singularity> singularities; // List of singularities in the cross field, with their properties and associated separatrix ports
     std::shared_ptr<CrossField> crossField; // Shared pointer to the cross field 
+    bool finishedTracing = false; // Flag to indicate when tracing is complete
 
     double dphi_singularity_zone = 0.05; // step size in the conformal domain when tracing within the singularity zone
     int maxStepsInSingularityZone = 1000; // maximum number of steps to take when tracing within the singularity zone before giving up
@@ -106,6 +107,9 @@ public:
 
     // step separatrix using the Viertel IMR 2019 method, which includes special handling for singularities.
     void stepViertel(Separatrix& sep, bool stopAtOrthogonal = true);
+
+    // step and check function, the main function which is called repeatedly to step the separatrix and check for intersections, singularity zone, and max steps.
+    void stepAndCheck();
 
 private:
     // Private members for internal use during tracing

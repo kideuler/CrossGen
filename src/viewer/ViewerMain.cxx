@@ -41,6 +41,7 @@ enum class MBOPhase {
     CrossField = 2,
     Stepping = 3,
     Separatrices = 4,
+    Trace = 5,
 };
 
 Phase nextPhase(Phase p) {
@@ -59,9 +60,10 @@ MBOPhase nextMBOPhase(MBOPhase p) {
         case MBOPhase::MeshOnly: return MBOPhase::CrossField;
         case MBOPhase::CrossField: return MBOPhase::Stepping;
         case MBOPhase::Stepping: return MBOPhase::Separatrices;
-        case MBOPhase::Separatrices: return MBOPhase::Separatrices;
+        case MBOPhase::Separatrices: return MBOPhase::Trace;
+        case MBOPhase::Trace: return MBOPhase::Trace;
     }
-    return MBOPhase::Separatrices;
+    return MBOPhase::Trace;
 }
 
 const char *phaseName(Phase p) {
@@ -81,6 +83,7 @@ const char *mboPhaseName(MBOPhase p) {
         case MBOPhase::CrossField: return "2) MBO crossfield";
         case MBOPhase::Stepping: return "3) MBO stepping";
         case MBOPhase::Separatrices: return "4) separatrices";
+        case MBOPhase::Trace: return "5) trace";
     }
     return "?";
 }
@@ -135,6 +138,8 @@ int main(int argc, char **argv) {
     bool singularitiesLogged = false;
     bool mboSteppingStarted = false;
     bool mboConverged = false;
+    bool mboTracingStarted = false;
+    bool mboTracingFinished = false;
     int mboStepCount = 0;
     
     // Console for timing output
@@ -327,7 +332,7 @@ int main(int argc, char **argv) {
             continue;
         }
 
-        // MBO mode: Lazily construct SeparatrixTrace when entering Separatrices phase
+        // MBO mode: Lazily construct SeparatrixTrace when entering Separatrices or Trace phase
         if (mode == Mode::MBO && mboPhase >= MBOPhase::Separatrices && crossField.has_value() && !separatrixTrace) {
             auto t0 = Clock::now();
             // Wrap the existing CrossField in a shared_ptr with a no-op deleter (ownership stays with the optional)
@@ -340,6 +345,57 @@ int main(int argc, char **argv) {
                 << " separatrices from " << separatrixTrace->singularities.size()
                 << " singularities: " << formatMs(ms);
             console.log(oss.str());
+        }
+
+        // MBO mode: Trace phase - step separatrices one iteration at a time with animation
+        if (mode == Mode::MBO && mboPhase == MBOPhase::Trace && separatrixTrace && !mboTracingFinished) {
+            if (!mboTracingStarted) {
+                mboTracingStarted = true;
+                console.log("[Trace] Starting separatrix tracing...");
+            }
+
+            // Run one stepAndCheck iteration
+            separatrixTrace->stepAndCheck();
+
+            if (separatrixTrace->finishedTracing) {
+                mboTracingFinished = true;
+                console.log("[Trace] Tracing complete.");
+            }
+
+            // Render: mesh + separatrices
+            glClearColor(0.1f, 0.1f, 0.12f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+            glDisable(GL_DEPTH_TEST);
+
+            viewer::drawMesh(*mesh);
+
+            // Draw separatrices: red if active, purple if inactive
+            glLineWidth(3.0f);
+            for (const auto &sep : separatrixTrace->separatrices) {
+                if (sep.path.size() < 2) continue;
+                if (sep.active) {
+                    glColor3f(0.95f, 0.1f, 0.1f);   // red for active
+                } else {
+                    glColor3f(0.6f, 0.1f, 0.9f);     // purple for inactive
+                }
+                glBegin(GL_LINE_STRIP);
+                for (const auto &tp : sep.path) {
+                    glVertex2d(tp.global_pos[0], tp.global_pos[1]);
+                }
+                glEnd();
+            }
+            glLineWidth(1.0f);
+
+            console.draw(window, 55.0f);
+            viewer::drawTextOverlay(window, "Tracing separatrices...\npress 'q' to quit", 10.0f, 20.0f, 0.8f, 0.8f, 0.8f);
+
+            glfwSwapBuffers(window);
+            glfwPollEvents();
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+            // Skip normal rendering this frame
+            continue;
         }
 
         // PolyVector mode: Lazily compute data when entering phases (with timing).
@@ -469,12 +525,16 @@ int main(int argc, char **argv) {
                 }
             }
 
-            // Draw initial separatrices in red
+            // Draw separatrices: red if active, purple if inactive
             if (mboPhase >= MBOPhase::Separatrices && separatrixTrace) {
-                glColor3f(0.95f, 0.1f, 0.1f);
                 glLineWidth(3.0f);
                 for (const auto &sep : separatrixTrace->separatrices) {
                     if (sep.path.size() < 2) continue;
+                    if (sep.active) {
+                        glColor3f(0.95f, 0.1f, 0.1f);   // red for active
+                    } else {
+                        glColor3f(0.6f, 0.1f, 0.9f);     // purple for inactive
+                    }
                     glBegin(GL_LINE_STRIP);
                     for (const auto &tp : sep.path) {
                         glVertex2d(tp.global_pos[0], tp.global_pos[1]);

@@ -4,6 +4,14 @@ SeparatrixTrace::SeparatrixTrace(std::shared_ptr<CrossField> cf, bool useActualS
     separatrices.clear();
     singularities.clear();
 
+    // Initialize isSingularTriangle lookup vector
+    isSingularTriangle.assign(crossField->mesh->triangles.size(), false);
+    for (const auto& [triIdx, cfIndex] : crossField->singularTriangles) {
+        if (triIdx >= 0 && triIdx < static_cast<int>(isSingularTriangle.size())) {
+            isSingularTriangle[triIdx] = true;
+        }
+    }
+
     // Fill singularity vector and map from cross field data
     for (const auto& [triIdx, cfIndex] : crossField->singularTriangles) {
         Singularity s;
@@ -559,13 +567,6 @@ void SeparatrixTrace::stepHeuns(Separatrix& sep) {
     // Compute the field angle at the EXIT point for phase continuity in next step
     double exitTheta = theta0 * exitBary[0] + theta1 * exitBary[1] + theta2 * exitBary[2];
 
-    // Debug: check if exitTheta differs significantly from theta_entry
-    if (std::abs(wrap_pi(exitTheta - theta_entry)) > 0.1) {
-        std::cerr << "Debug: exitTheta=" << exitTheta << " differs from theta_entry=" << theta_entry << std::endl;
-        std::cerr << "  theta0=" << theta0 << " theta1=" << theta1 << " theta2=" << theta2 << std::endl;
-        std::cerr << "  exitBary=[" << exitBary[0] << "," << exitBary[1] << "," << exitBary[2] << "]" << std::endl;
-    }
-
     // Compute the actual traced direction (from entry to exit)
     // This is the true direction we moved, used for phase continuity in the next step
     Point traceVec = exitPos - entryPos;
@@ -593,6 +594,20 @@ void SeparatrixTrace::stepHeuns(Separatrix& sep) {
         sep.active = false;
         sep.termination_reason = TerminationReason::EXIT_BOUNDARY;
     }
+
+    //add seperatrix id to triangleSeparatrixMap for next triangle
+    triangleSeparatrixMap[nextTri].first.push_back(sep.id);
+    if (triangleSeparatrixMap[nextTri].first.size() > 1) {
+        triangleSeparatrixMap[nextTri].second = true; // mark as multiple separatrices passing through this triangle
+        Intersections.push(nextTri); // add next triangle to Intersections queue for intersection checking
+    }
+
+    // check whether the next triangle is singular
+    if (sep.active) {
+        nextTri = crossField->mesh->triangleAdjacency[next.face_id][next.local_edge_index];
+        sep.in_singularity_zone = isSingularTriangle[nextTri];
+    }
+    
 }
 
 
@@ -620,6 +635,13 @@ void SeparatrixTrace::stepViertel(Separatrix& sep, bool stopAtOrthogonal) {
     }
 
     auto sigIt = singularityMap.find(nextTri);
+
+    // If the next triangle is not actually singular, fall back to Heun's method
+    if (sigIt == singularityMap.end()) {
+        sep.in_singularity_zone = false;
+        stepHeuns(sep);
+        return;
+    }
 
     // 3. Find neighbor edge and entry coordinates
     const Triangle &currentTri = crossField->mesh->triangles[current.face_id];
@@ -853,9 +875,37 @@ void SeparatrixTrace::stepViertel(Separatrix& sep, bool stopAtOrthogonal) {
             tp.field_angle = thetaInterp;
 
             sep.path.push_back(tp);
+
+            // Update in_singularity_zone: check if the triangle beyond the exit edge is also singular
+            int beyondTri = crossField->mesh->triangleAdjacency[nextTri][exit_edge];
+            if (beyondTri < 0) {
+                sep.active = false;
+                sep.termination_reason = TerminationReason::EXIT_BOUNDARY;
+                sep.in_singularity_zone = false;
+            } else {
+                sep.in_singularity_zone = isSingularTriangle[beyondTri];
+            }
         }
 
         i++;
     }
         
+}
+
+
+void SeparatrixTrace::stepAndCheck() {
+    // Step all active separatrices and check for intersections
+    finishedTracing = true;
+    for (Separatrix& sep : separatrices) {
+        if (!sep.active) continue;
+
+        // Step the separatrix 
+        if (!sep.in_singularity_zone) {
+            stepHeuns(sep);
+        } else {
+            stepViertel(sep, true); // stop at orthogonal crossings to singularity separatrices
+        }
+        finishedTracing = false; // if any separatrix is still active, we're not finished;
+    }
+
 }
