@@ -60,6 +60,10 @@ target_link_libraries(PolyVector PUBLIC CoMISo::CoMISo)
 add_executable(LoadMesh src/utils/LoadMesh.cxx)
 target_link_libraries(LoadMesh PRIVATE PolyVector)
 
+# Utility to trace separatrices on a mesh
+add_executable(TraceMesh src/utils/TraceMesh.cxx)
+target_link_libraries(TraceMesh PRIVATE PolyVector)
+
 # Utility to cut a mesh into a disk and run sanity checks
 add_executable(TestCutMesh src/utils/TestCutMesh.cxx)
 target_link_libraries(TestCutMesh PRIVATE PolyVector)
