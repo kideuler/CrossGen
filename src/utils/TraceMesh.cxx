@@ -78,7 +78,7 @@ int main(int argc, char **argv) {
 
     std::cerr << "Tracing complete after " << traceStep << " steps\n";
 
-    // 4. Print summary
+    // 4. Print summary and detect angle jumps
     for (const auto &sep : separatrixTrace->separatrices) {
         const char *reason = "?";
         switch (sep.termination_reason) {
@@ -94,6 +94,43 @@ int main(int argc, char **argv) {
         std::cerr << "  Separatrix " << sep.id
                   << ": " << sep.path.size() << " points, "
                   << reason << "\n";
+
+        // Detect large direction jumps between consecutive segments
+        for (size_t j = 2; j < sep.path.size(); ++j) {
+            Point v_prev = sep.path[j-1].global_pos - sep.path[j-2].global_pos;
+            Point v_curr = sep.path[j].global_pos - sep.path[j-1].global_pos;
+            double dir_prev = std::atan2(v_prev[1], v_prev[0]);
+            double dir_curr = std::atan2(v_curr[1], v_curr[0]);
+            double jump = std::abs(wrap_pi(dir_curr - dir_prev));
+            bool prevSingular = false;
+            for (const auto &sing : separatrixTrace->singularities) {
+                if (sing.triangleIndex == sep.path[j-1].face_id) { prevSingular = true; break; }
+            }
+            if (jump > M_PI / 3.0) {
+                std::cerr << "    ** JUMP at point " << j << "/" << sep.path.size()
+                          << ": angle change = " << (jump * 180.0 / M_PI) << " deg"
+                          << "\n      pt[" << j-2 << "] pos=(" << sep.path[j-2].global_pos[0] << "," << sep.path[j-2].global_pos[1] << ")"
+                          << " face=" << sep.path[j-2].face_id
+                          << " trace_dir=" << std::fixed << std::setprecision(4) << sep.path[j-2].trace_direction
+                          << " field_angle=" << sep.path[j-2].field_angle
+                          << " edge=" << sep.path[j-2].local_edge_index
+                          << " t=" << sep.path[j-2].edge_crossing_t
+                          << "\n      pt[" << j-1 << "] pos=(" << sep.path[j-1].global_pos[0] << "," << sep.path[j-1].global_pos[1] << ")"
+                          << " face=" << sep.path[j-1].face_id
+                          << (prevSingular ? " (SINGULAR)" : "")
+                          << " trace_dir=" << sep.path[j-1].trace_direction
+                          << " field_angle=" << sep.path[j-1].field_angle
+                          << " edge=" << sep.path[j-1].local_edge_index
+                          << " t=" << sep.path[j-1].edge_crossing_t
+                          << "\n      pt[" << j << "] pos=(" << sep.path[j].global_pos[0] << "," << sep.path[j].global_pos[1] << ")"
+                          << " face=" << sep.path[j].face_id
+                          << " trace_dir=" << sep.path[j].trace_direction
+                          << " field_angle=" << sep.path[j].field_angle
+                          << " edge=" << sep.path[j].local_edge_index
+                          << " t=" << sep.path[j].edge_crossing_t
+                          << "\n";
+            }
+        }
     }
 
     return 0;

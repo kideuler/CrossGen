@@ -337,7 +337,7 @@ int main(int argc, char **argv) {
             auto t0 = Clock::now();
             // Wrap the existing CrossField in a shared_ptr with a no-op deleter (ownership stays with the optional)
             auto cfPtr = std::shared_ptr<CrossField>(&*crossField, [](CrossField*){});
-            separatrixTrace = std::make_shared<SeparatrixTrace>(cfPtr, true);
+            separatrixTrace = std::make_shared<SeparatrixTrace>(cfPtr, false);
             auto t1 = Clock::now();
             double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
             std::ostringstream oss;
@@ -369,14 +369,14 @@ int main(int argc, char **argv) {
 
             viewer::drawMesh(*mesh);
 
-            // Draw separatrices: red if active, purple if inactive
+            // Draw separatrices: red if active, green if inactive
             glLineWidth(3.0f);
             for (const auto &sep : separatrixTrace->separatrices) {
                 if (sep.path.size() < 2) continue;
                 if (sep.active) {
                     glColor3f(0.95f, 0.1f, 0.1f);   // red for active
                 } else {
-                    glColor3f(0.6f, 0.1f, 0.9f);     // purple for inactive
+                    glColor3f(0.1f, 0.9f, 0.2f);     // green for finished
                 }
                 glBegin(GL_LINE_STRIP);
                 for (const auto &tp : sep.path) {
@@ -392,7 +392,7 @@ int main(int argc, char **argv) {
             glfwSwapBuffers(window);
             glfwPollEvents();
 
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
             // Skip normal rendering this frame
             continue;
@@ -525,7 +525,7 @@ int main(int argc, char **argv) {
                 }
             }
 
-            // Draw separatrices: red if active, purple if inactive
+            // Draw separatrices: red if active, green if inactive
             if (mboPhase >= MBOPhase::Separatrices && separatrixTrace) {
                 glLineWidth(3.0f);
                 for (const auto &sep : separatrixTrace->separatrices) {
@@ -533,7 +533,7 @@ int main(int argc, char **argv) {
                     if (sep.active) {
                         glColor3f(0.95f, 0.1f, 0.1f);   // red for active
                     } else {
-                        glColor3f(0.6f, 0.1f, 0.9f);     // purple for inactive
+                        glColor3f(0.1f, 0.9f, 0.2f);     // green for finished
                     }
                     glBegin(GL_LINE_STRIP);
                     for (const auto &tp : sep.path) {

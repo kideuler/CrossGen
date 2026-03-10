@@ -362,6 +362,12 @@ std::tuple<bool, Point> SeparatrixTrace::edgeEdgeIntersection(const Point& p0, c
     return {false, {0.0, 0.0}};
 }
 
+std::optional<FallbackResult> SeparatrixTrace::tryRayDirection(int triangleIndex, const Point& entryPos, double angle, int excludeEdge) {
+    auto [fp, fe, ft, fn] = rayEdgeIntersection(triangleIndex, entryPos, angle, excludeEdge);
+    if (fe >= 0) return FallbackResult{fp, fe, ft, fn};
+    return std::nullopt;
+}
+
 
 void SeparatrixTrace::stepHeuns(Separatrix& sep) {
     // Heun's method step: https://en.wikipedia.org/wiki/Heun%27s_method
@@ -459,30 +465,31 @@ void SeparatrixTrace::stepHeuns(Separatrix& sep) {
     
     double theta_entry = theta0 * bary[0] + theta1 * bary[1] + theta2 * bary[2];
 
-    // Match the interpolated field angle to the field angle from the previous triangle's exit point.
-    // current.field_angle is the field at the exit of the previous triangle (same geometric point as our entry).
-    // This ensures continuity of the field across edges, which is crucial when the cross-field
-    // representation (u^4) loses branch information (e.g., when u^4 ≈ 1 everywhere).
-    int k = findPhaseDifference(current.field_angle, theta_entry);
+    // Match the interpolated field angle to the trace direction from the previous step.
+    // We use trace_direction (the actual geometric direction of travel) rather than
+    // field_angle because trace_direction is unambiguous — it's a true geometric angle,
+    // not a cross-field angle that is only defined mod pi/2. This prevents branch
+    // switching when field_angle is near a pi/2 boundary.
+    int k = findPhaseDifference(current.trace_direction, theta_entry);
 
-    // Debug phase matching
-    double theta_entry_raw = theta_entry;
-    double adjusted = theta_entry + k * (M_PI / 2.0);
-    if (std::abs(wrap_pi(adjusted - current.field_angle)) > 0.5) {
-        std::cerr << "Debug phase: raw_entry=" << theta_entry_raw 
-                  << " current.field_angle=" << current.field_angle 
-                  << " k=" << k << " adjusted=" << adjusted << std::endl;
-    }
-
-    // Debug: check if the phase matching introduces a large jump
-    double adjusted_theta = theta_entry + k * (M_PI / 2.0);
-    double angle_diff = std::abs(wrap_pi(adjusted_theta - current.field_angle));
-    if (angle_diff > M_PI / 4.0 + 0.1) {
-        std::cerr << "Warning: Large phase jump detected! k=" << k 
-                  << ", theta_entry=" << theta_entry 
-                  << ", current.field_angle=" << current.field_angle 
-                  << ", adjusted=" << adjusted_theta 
-                  << ", diff=" << angle_diff << std::endl;
+    // Validate the chosen branch: when the difference between trace_direction and
+    // theta_entry is close to ±pi/4 (halfway between two branches), round() can pick
+    // the wrong k. Check the angular deviation and try the neighboring k values if
+    // the chosen one is too far from the trace direction.
+    {
+        double chosen = wrap_pi(theta_entry + k * (M_PI / 2.0) - current.trace_direction);
+        double bestDev = std::abs(chosen);
+        int bestK = k;
+        for (int dk = -1; dk <= 1; dk += 2) {
+            int kk = k + dk;
+            if (kk < -2 || kk > 2) continue;
+            double dev = std::abs(wrap_pi(theta_entry + kk * (M_PI / 2.0) - current.trace_direction));
+            if (dev < bestDev) {
+                bestDev = dev;
+                bestK = kk;
+            }
+        }
+        k = bestK;
     }
 
     // make all angles same branch
@@ -497,6 +504,14 @@ void SeparatrixTrace::stepHeuns(Separatrix& sep) {
     const Point &p2 = crossField->mesh->vertices[nextTriVerts[2]];
     Point entryPos = p0 * bary[0] + p1 * bary[1] + p2 * bary[2];
 
+    // Snap the previous point's global_pos to the entry position computed in this
+    // triangle.  Both positions lie on the shared edge, but floating-point evaluation
+    // of the same edge point via two different triangles' vertex coordinates can give
+    // slightly different results.  Near a vertex (edge_crossing_t ≈ 0 or 1) the
+    // discrepancy can be large enough to reverse the apparent direction of the short
+    // segment, producing a visual "jump".  Overwriting keeps the polyline continuous.
+    sep.path.back().global_pos = entryPos;
+
     // =========== HEUN'S METHOD ===========
     // Step 1: Euler step using direction at entry point
     // Exclude the entry edge (neighborEdge) to avoid backtracking
@@ -504,40 +519,66 @@ void SeparatrixTrace::stepHeuns(Separatrix& sep) {
     auto [exitPos1, exitEdge1, exitT1, exitNeighbor1] = rayEdgeIntersection(nextTri, entryPos, v1, neighborEdge);
 
     if (exitEdge1 < 0) {
-        // The computed direction doesn't lead to a valid exit.
-        // This can happen due to numerical issues or if the direction points back toward the entry edge.
-        // Try using the field angle directly without phase adjustment as a fallback.
-        std::cerr << "Warning: stepHeuns Euler step failed in triangle " << nextTri 
-                  << ", theta_entry=" << theta_entry << ", field_angle=" << current.field_angle << std::endl;
-        
-        // Fallback: try using current.field_angle directly (the direction we were traveling)
-        Point v_fallback = {std::cos(current.field_angle), std::sin(current.field_angle)};
-        auto [fbExitPos, fbExitEdge, fbExitT, fbExitNeighbor] = rayEdgeIntersection(nextTri, entryPos, v_fallback, neighborEdge);
-        
-        if (fbExitEdge < 0) {
-            std::cerr << "Warning: stepHeuns fallback also failed in triangle " << nextTri << std::endl;
+        // The computed direction doesn't lead to a valid exit through a non-entry edge.
+        // This typically happens when the entry point is near a vertex (edge_crossing_t ≈ 0 or 1)
+        // and the field direction is nearly parallel to one of the adjacent edges.
+        // We try a series of fallbacks:
+        //   1. current.trace_direction (actual geometric movement direction)
+        //   2. current.field_angle (field angle from previous triangle)
+        //   3. theta_entry without excluding the entry edge (direction may legitimately
+        //      re-cross the same mesh edge when the entry point is near a vertex)
+        //   4. All 4 cross-field branches without excluding the entry edge
+
+        std::optional<FallbackResult> fb;
+
+        // Fallback 1: trace direction from previous step (excludes entry edge)
+        if (!fb) fb = tryRayDirection(nextTri, entryPos, current.trace_direction, neighborEdge);
+
+        // Fallback 2: field angle from previous triangle (excludes entry edge)
+        if (!fb) fb = tryRayDirection(nextTri, entryPos, current.field_angle, neighborEdge);
+
+        // Fallback 3: theta_entry without excluding entry edge — the point may be at a
+        // vertex shared by the entry edge, so the ray legitimately exits through it
+        if (!fb) fb = tryRayDirection(nextTri, entryPos, theta_entry, -1);
+
+        // Fallback 4: try all 4 cross-field branches without excluding entry edge
+        if (!fb) {
+            for (int rot = 1; rot < 4 && !fb; ++rot) {
+                fb = tryRayDirection(nextTri, entryPos, theta_entry + rot * M_PI / 2.0, -1);
+            }
+        }
+
+        if (!fb) {
             sep.active = false;
             sep.termination_reason = TerminationReason::UNDEFINED;
             return;
         }
-        
-        // Use fallback result
+
+        // Compute field angle at the fallback exit point for phase continuity
+        std::array<double, 3> fbBary = globalToBarycentric(nextTri, fb->pos);
+        double fbExitTheta = theta0 * fbBary[0] + theta1 * fbBary[1] + theta2 * fbBary[2];
+
         TracePoint next;
         next.face_id = nextTri;
-        next.barycentric = globalToBarycentric(nextTri, fbExitPos);
-        next.global_pos = fbExitPos;
-        next.field_angle = current.field_angle; // Keep the same field angle
-        next.trace_direction = std::atan2(fbExitPos[1] - entryPos[1], fbExitPos[0] - entryPos[0]);
-        next.edge_id = crossField->mesh->triangleEdges[nextTri][fbExitEdge];
-        next.local_edge_index = fbExitEdge;
-        next.edge_crossing_t = fbExitT;
+        next.barycentric = fbBary;
+        next.global_pos = fb->pos;
+        next.field_angle = fbExitTheta;
+        next.trace_direction = std::atan2(fb->pos[1] - entryPos[1], fb->pos[0] - entryPos[0]);
+        next.edge_id = crossField->mesh->triangleEdges[nextTri][fb->edge];
+        next.local_edge_index = fb->edge;
+        next.edge_crossing_t = fb->t;
         sep.path.push_back(next);
         sep.visited_edges.insert(next.edge_id);
 
-        // Check if the exit edge is on the boundary
-        if (fbExitNeighbor < 0) {
+        if (fb->neighbor < 0) {
             sep.active = false;
             sep.termination_reason = TerminationReason::EXIT_BOUNDARY;
+        }
+
+        // Check if the next triangle is singular
+        if (sep.active) {
+            int beyondTri = crossField->mesh->triangleAdjacency[nextTri][fb->edge];
+            sep.in_singularity_zone = isSingularTriangle[beyondTri];
         }
         return;
     }
@@ -561,6 +602,54 @@ void SeparatrixTrace::stepHeuns(Separatrix& sep) {
         exitNeighbor = exitNeighbor1;
     }
 
+    // Smoothness guard: if the Heun's corrector produced an exit on a different edge
+    // than the Euler step, check whether the traced direction deviates significantly
+    // from the entry field direction. A large deviation (> pi/4) usually means the
+    // corrector overcorrected in a triangle with a rapidly varying field. In that case,
+    // fall back to the Euler result which is at least consistent with the entry direction.
+    if (exitEdge != exitEdge1 && exitEdge1 >= 0) {
+        Point heunVec = exitPos - entryPos;
+        double heunDir = std::atan2(heunVec[1], heunVec[0]);
+        Point eulerVec = exitPos1 - entryPos;
+        double eulerDir = std::atan2(eulerVec[1], eulerVec[0]);
+        double heunDev = std::abs(wrap_pi(heunDir - current.trace_direction));
+        double eulerDev = std::abs(wrap_pi(eulerDir - current.trace_direction));
+        if (heunDev > M_PI / 4.0 && eulerDev < heunDev) {
+            // Heun's overcorrected — revert to Euler
+            exitPos = exitPos1;
+            exitEdge = exitEdge1;
+            exitT = exitT1;
+            exitNeighbor = exitNeighbor1;
+        }
+    }
+
+    // Near-vertex guard: when entry is close to a vertex (edge_crossing_t near 0 or 1),
+    // the ray may exit through a backward-facing edge since excludeEdge only blocks one
+    // of the edges meeting at the vertex. If the exit direction deviates more than pi/3
+    // from the incoming trace direction, retrace using the incoming trace direction
+    // without excluding any edge (valid near a vertex where edges converge).
+    {
+        Point segVec = exitPos - entryPos;
+        double segDir = std::atan2(segVec[1], segVec[0]);
+        double segDev = std::abs(wrap_pi(segDir - current.trace_direction));
+        if (segDev > M_PI / 3.0) {
+            // Try tracing with current.trace_direction, no edge exclusion
+            auto [fixPos, fixEdge, fixT, fixNeighbor] = rayEdgeIntersection(
+                nextTri, entryPos, current.trace_direction, -1);
+            if (fixEdge >= 0) {
+                Point fixVec = fixPos - entryPos;
+                double fixDir = std::atan2(fixVec[1], fixVec[0]);
+                double fixDev = std::abs(wrap_pi(fixDir - current.trace_direction));
+                if (fixDev < segDev) {
+                    exitPos = fixPos;
+                    exitEdge = fixEdge;
+                    exitT = fixT;
+                    exitNeighbor = fixNeighbor;
+                }
+            }
+        }
+    }
+
     // Compute barycentric coordinates of the final exit point
     std::array<double, 3> exitBary = globalToBarycentric(nextTri, exitPos);
 
@@ -571,6 +660,17 @@ void SeparatrixTrace::stepHeuns(Separatrix& sep) {
     // This is the true direction we moved, used for phase continuity in the next step
     Point traceVec = exitPos - entryPos;
     double actualTraceDir = std::atan2(traceVec[1], traceVec[0]);
+
+    // When the entry point is very close to a vertex (edge_crossing_t near 0 or 1),
+    // the entry-to-exit segment can be extremely short and its computed direction
+    // unreliable or even reversed. If the actual traced direction deviates more than
+    // pi/3 from the previous trace direction, keep the previous direction to maintain
+    // continuity. The field angle (theta_entry) was already correctly aligned via
+    // findPhaseDifference, so the next triangle will still get the right branch.
+    double traceDeviation = std::abs(wrap_pi(actualTraceDir - current.trace_direction));
+    if (traceDeviation > M_PI / 3.0) {
+        actualTraceDir = current.trace_direction;
+    }
 
     // Get the global edge ID for the exit edge
     int exitEdgeId = crossField->mesh->triangleEdges[nextTri][exitEdge];
@@ -676,6 +776,10 @@ void SeparatrixTrace::stepViertel(Separatrix& sep, bool stopAtOrthogonal) {
     Point p1 = crossField->mesh->vertices[nextTriVerts[1]];
     Point p2 = crossField->mesh->vertices[nextTriVerts[2]];
     Point q = p0 * bary[0] + p1 * bary[1] + p2 * bary[2];
+
+    // Snap the previous point's stored position to the entry position computed in
+    // this triangle, ensuring geometric continuity of the polyline (see stepHeuns).
+    sep.path.back().global_pos = q;
 
     const Singularity& s = singularities[sigIt->second];
 
@@ -832,7 +936,8 @@ void SeparatrixTrace::stepViertel(Separatrix& sep, bool stopAtOrthogonal) {
             tp.global_pos = q_next;
             tp.barycentric = globalToBarycentric(nextTri, q_next);
             tp.field_angle = bestTheta; // use the port direction as the field angle for this point since we're following that direction
-            tp.trace_direction = std::atan2(q_next[1] - sc[1], q_next[0] - sc[0]);
+            // trace_direction = actual direction of motion along the hyperbola
+            tp.trace_direction = std::atan2(q_next[1] - q_current[1], q_next[0] - q_current[0]);
             sep.path.push_back(tp);
 
             // update phi and rho for next iteration
@@ -851,7 +956,8 @@ void SeparatrixTrace::stepViertel(Separatrix& sep, bool stopAtOrthogonal) {
                 return;
             }
 
-            // evaluate the exit point on the edge using t_exit
+            // evaluate the exit point on the edge using t_exit (interpolation fraction
+            // between q_current and q_next, NOT the edge parameter)
             Point exitPos = q_current * (1.0 - t_exit) + q_next * t_exit;
 
             // add the exit point as the final trace point
@@ -859,20 +965,49 @@ void SeparatrixTrace::stepViertel(Separatrix& sep, bool stopAtOrthogonal) {
             tp.face_id = nextTri;
             tp.global_pos = exitPos;
             tp.barycentric = globalToBarycentric(nextTri, exitPos);
-            tp.trace_direction = std::atan2(exitPos[1] - q_current[1], exitPos[0] - q_current[0]);
             tp.edge_id = crossField->mesh->triangleEdges[nextTri][exit_edge];
             tp.local_edge_index = exit_edge;
-            tp.edge_crossing_t = t_exit;
 
-            // field angle at the exit point by interpolating vertex angles
-            const Triangle &exitTri = crossField->mesh->triangles[nextTri];
-            double theta0 = std::arg(crossField->u_k[exitTri[0]]) / 4.0;
-            double theta1 = std::arg(crossField->u_k[exitTri[1]]) / 4.0;
-            double theta2 = std::arg(crossField->u_k[exitTri[2]]) / 4.0;
-            theta1 = makeAngleSamePhase(theta0, theta1);
-            theta2 = makeAngleSamePhase(theta0, theta2);
-            double thetaInterp = theta0 * tp.barycentric[0] + theta1 * tp.barycentric[1] + theta2 * tp.barycentric[2];
-            tp.field_angle = thetaInterp;
+            // Compute the actual edge parameter from barycentric coordinates.
+            // Edge exit_edge goes from vertex exit_edge to vertex (exit_edge+1)%3,
+            // so edge_crossing_t = bary[(exit_edge+1)%3] / (bary[exit_edge] + bary[(exit_edge+1)%3]).
+            {
+                double b_e0 = tp.barycentric[exit_edge];
+                double b_e1 = tp.barycentric[(exit_edge + 1) % 3];
+                double sum_edge = b_e0 + b_e1;
+                tp.edge_crossing_t = (sum_edge > 1e-30) ? (b_e1 / sum_edge) : 0.5;
+            }
+
+            // Compute the trace direction at exit as the direction from the last
+            // interior hyperbola point to the exit point. This is the actual geometric
+            // direction the separatrix traveled in its last segment, which is what
+            // stepHeuns needs for branch matching on the next step.
+            {
+                Point segDir = exitPos - q_current;
+                double segLen = normP(segDir);
+                if (segLen > 1e-30) {
+                    tp.trace_direction = std::atan2(segDir[1], segDir[0]);
+                } else {
+                    // Degenerate: exit is at the same point as q_current.
+                    // Fall back to the direction from the entry point q to exitPos.
+                    Point entryDir = exitPos - q;
+                    tp.trace_direction = std::atan2(entryDir[1], entryDir[0]);
+                }
+            }
+
+            // Interpolate field angle at exit and align it to the trace direction
+            // so that the next stepHeuns call has consistent phase information.
+            {
+                const Triangle &exitTri = crossField->mesh->triangles[nextTri];
+                double th0 = std::arg(crossField->u_k[exitTri[0]]) / 4.0;
+                double th1 = std::arg(crossField->u_k[exitTri[1]]) / 4.0;
+                double th2 = std::arg(crossField->u_k[exitTri[2]]) / 4.0;
+                th1 = makeAngleSamePhase(th0, th1);
+                th2 = makeAngleSamePhase(th0, th2);
+                double thetaInterp = th0 * tp.barycentric[0] + th1 * tp.barycentric[1] + th2 * tp.barycentric[2];
+                // Align the interpolated field angle to the trace direction
+                tp.field_angle = makeAngleSamePhase(tp.trace_direction, thetaInterp);
+            }
 
             sep.path.push_back(tp);
 
@@ -889,6 +1024,15 @@ void SeparatrixTrace::stepViertel(Separatrix& sep, bool stopAtOrthogonal) {
 
         i++;
     }
+
+    // If we exhausted maxStepsInSingularityZone without exiting the triangle,
+    // terminate the separatrix to avoid leaving it in an inconsistent state
+    // (the last TracePoint has no valid local_edge_index for the next step).
+    if (!exitedTriangle && sep.active) {
+        sep.active = false;
+        sep.termination_reason = TerminationReason::LIMIT_CYCLE;
+        sep.in_singularity_zone = false;
+    }
         
 }
 
@@ -896,6 +1040,7 @@ void SeparatrixTrace::stepViertel(Separatrix& sep, bool stopAtOrthogonal) {
 void SeparatrixTrace::stepAndCheck() {
     // Step all active separatrices and check for intersections
     finishedTracing = true;
+    steps++;
     for (Separatrix& sep : separatrices) {
         if (!sep.active) continue;
 
@@ -905,6 +1050,11 @@ void SeparatrixTrace::stepAndCheck() {
         } else {
             stepViertel(sep, true); // stop at orthogonal crossings to singularity separatrices
         }
+
+        if (steps >= MAX_STEPS) {
+            sep.active = false;
+            sep.termination_reason = TerminationReason::MAX_STEPS_REACHED;
+        }   
         finishedTracing = false; // if any separatrix is still active, we're not finished;
     }
 

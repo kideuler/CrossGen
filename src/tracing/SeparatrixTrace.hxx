@@ -3,6 +3,7 @@
 
 #include "crossfield/CrossField.hxx"
 #include <deque>
+#include <optional>
 #include <queue>
 #include <set>
 #include <unordered_map>
@@ -13,8 +14,17 @@
 static const double EPS_INTERSECT_T = 1e-10;      // param epsilon for segment intersections
 static const double EPS_BARY = 1e-9;              // barycentric inside tolerance
 static const double MIN_ADVANCE_REL = 1e-7;       // minimum accepted segment length as fraction of avg edge
-static const int MAX_STEPS = 50000;
+static const int MAX_STEPS = 1000;
 
+
+// FallbackResult stores the output of a ray–edge intersection attempt used
+// during the fallback chain in stepHeuns when the primary direction fails.
+struct FallbackResult {
+    Point pos;
+    int edge;
+    double t;
+    int neighbor;
+};
 
 // TracePoint represents a point along a separatrix trace, storing the triangle it is in, its barycentric coordinates, and its global position.
 struct TracePoint {
@@ -72,8 +82,10 @@ public:
     std::shared_ptr<CrossField> crossField; // Shared pointer to the cross field 
     bool finishedTracing = false; // Flag to indicate when tracing is complete
 
-    double dphi_singularity_zone = 0.05; // step size in the conformal domain when tracing within the singularity zone
+    double dphi_singularity_zone = 0.01; // step size in the conformal domain when tracing within the singularity zone
     int maxStepsInSingularityZone = 1000; // maximum number of steps to take when tracing within the singularity zone before giving up
+
+    int steps = 0; // counter for total steps taken across all separatrices, used for termination condition
     
     SeparatrixTrace(std::shared_ptr<CrossField> cf, bool useActualSingularityCoordinates);
 
@@ -84,6 +96,10 @@ public:
     // Returns: (intersection point, local edge index, edge parameter t, neighbor triangle index)
     // excludeEdge: optional edge index to exclude (e.g., the entry edge when tracing)
     std::tuple<Point, int, double, int> rayEdgeIntersection(int triangleIndex, const Point& origin, double direction, int excludeEdge = -1);
+
+    // Try a ray in the given direction from entryPos inside triangleIndex, returning a
+    // FallbackResult if the ray exits through a valid edge, or std::nullopt otherwise.
+    std::optional<FallbackResult> tryRayDirection(int triangleIndex, const Point& entryPos, double angle, int excludeEdge);
 
     // find the intersection edge of another edge using the barycentric coordinates of the 2 points.
     // Returns the local edge index (0, 1, or 2) that was crossed, or -1 if no edge was crossed.
