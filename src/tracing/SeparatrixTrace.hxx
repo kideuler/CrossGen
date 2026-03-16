@@ -132,6 +132,7 @@ private:
     std::vector<bool> isSingularTriangle; // Precomputed lookup for whether a triangle is singular
     std::unordered_map<int, std::pair<std::vector<int>, bool>> triangleSeparatrixMap; // triangle index -> (list of separatrix IDs passing through, is an intersection present)
     std::queue<int> Intersections; // Queue of triangle indices where intersections have been detected, to be processed.
+    std::set<int> IntersectionsSet; // Set of triangle indices already in the Intersections queue, for O(1) deduplication.
     std::unordered_map<int,int> singularityMap; // triangle index -> singularity index for quick lookup during tracing
 };
 

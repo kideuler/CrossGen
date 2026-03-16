@@ -699,7 +699,12 @@ void SeparatrixTrace::stepHeuns(Separatrix& sep) {
     triangleSeparatrixMap[nextTri].first.push_back(sep.id);
     if (triangleSeparatrixMap[nextTri].first.size() > 1) {
         triangleSeparatrixMap[nextTri].second = true; // mark as multiple separatrices passing through this triangle
-        Intersections.push(nextTri); // add next triangle to Intersections queue for intersection checking
+
+        // if nextTri is not already in the Intersections queue, add it for intersection checking
+        if (IntersectionsSet.find(nextTri) == IntersectionsSet.end()) {
+            Intersections.push(nextTri); // add next triangle to Intersections queue for intersection checking
+            IntersectionsSet.insert(nextTri);
+        }
     }
 
     // check whether the next triangle is singular
@@ -1056,6 +1061,15 @@ void SeparatrixTrace::stepAndCheck() {
             sep.termination_reason = TerminationReason::MAX_STEPS_REACHED;
         }   
         finishedTracing = false; // if any separatrix is still active, we're not finished;
+    }
+
+    // check for intersections by popping triangles from the Intersections queue and checking all pairs of separatrices passing through them
+    while (!Intersections.empty()) {
+        int triId = Intersections.front();
+        Intersections.pop();
+        IntersectionsSet.erase(triId);
+
+        
     }
 
 }

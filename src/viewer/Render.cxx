@@ -634,5 +634,25 @@ void drawSingularitiesOnUV(const MIQSolver &miq, const CutMesh &cutMesh,
     }
 }
 
+void drawMedialAxis(const MedialAxis &ma, double vertexRadius) {
+    // Draw medial axis edges (Voronoi dual edges) in orange
+    glColor3f(1.0f, 0.6f, 0.1f);
+    glLineWidth(2.5f);
+    glBegin(GL_LINES);
+    for (const auto &edge : ma.medialEdges) {
+        const Point &a = ma.medialVertices[edge[0]];
+        const Point &b = ma.medialVertices[edge[1]];
+        glVertex2d(a[0], a[1]);
+        glVertex2d(b[0], b[1]);
+    }
+    glEnd();
+    glLineWidth(1.0f);
+
+    // Draw medial axis vertices (circumcenters) as small cyan disks
+    for (const auto &v : ma.medialVertices) {
+        drawDisk3D(v, vertexRadius, 0.1f, 0.85f, 0.85f);
+    }
+}
+
 } // namespace viewer
 

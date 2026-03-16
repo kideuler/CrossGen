@@ -11,6 +11,7 @@
 #include "IGM/MIQ.hxx"
 #include "polyvector/PolyVectors.hxx"
 #include "crossfield/CrossField.hxx"
+#include "medialaxis/MedialAxis.hxx"
 
 namespace viewer {
 
@@ -76,6 +77,9 @@ void drawUVMesh(const MIQSolver &miq);
 // Uses the origToCutVerts mapping from CutMesh to find UV coordinates.
 void drawSingularitiesOnUV(const MIQSolver &miq, const CutMesh &cutMesh, 
                            const PolyField &field, double radius);
+
+// Draw the medial axis (Voronoi edges + vertices) on top of a mesh.
+void drawMedialAxis(const MedialAxis &ma, double vertexRadius);
 
 } // namespace viewer
 

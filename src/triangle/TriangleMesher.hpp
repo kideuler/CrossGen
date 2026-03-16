@@ -432,6 +432,13 @@ public:
     // Set to 0 to forbid Steiner points (may cause failure if constraints can't be met).
     int max_steiner_points = -1;
 
+    // If true, compute only the constrained Delaunay triangulation of the
+    // input vertices and segments — no quality refinement, no area
+    // constraints, no Steiner points, and no segment splitting.
+    // Overrides min_angle_degrees, max_area_override, max_steiner_points,
+    // suppress_boundary_splitting, and suppress_all_splitting.
+    bool just_delaunay = false;
+
     // Extra raw switches appended verbatim (advanced use).
     // Example: "D" for conforming Delaunay, "O2" for second-order elements, etc.
     std::string extra_switches;
@@ -824,35 +831,41 @@ private:
     if (!opt_.verbose) ss << "Q";
     if (opt_.suppress_segment_output) ss << "P";
 
-    // Quality:
-    if (opt_.min_angle_degrees > 0.0) {
-      ss << "q" << std::setprecision(16) << opt_.min_angle_degrees;
-    }
+    if (opt_.just_delaunay) {
+      // Constrained Delaunay only: no quality, no area constraint,
+      // no Steiner points, no segment splitting.
+      ss << "YYS0";
+    } else {
+      // Quality:
+      if (opt_.min_angle_degrees > 0.0) {
+        ss << "q" << std::setprecision(16) << opt_.min_angle_degrees;
+      }
 
-    // Area constraint:
-    // NOTE: Triangle's switch parser does not handle scientific notation
-    // (e.g. 1.08e-05) because it interprets the 'e' as a switch character.
-    // We must use std::fixed to emit a plain decimal representation.
-    const double max_area = effectiveMaxArea_(h);
-    if (max_area > 0.0) {
-      ss << "a" << std::fixed << std::setprecision(20) << max_area;
+      // Area constraint:
+      // NOTE: Triangle's switch parser does not handle scientific notation
+      // (e.g. 1.08e-05) because it interprets the 'e' as a switch character.
+      // We must use std::fixed to emit a plain decimal representation.
+      const double max_area = effectiveMaxArea_(h);
+      if (max_area > 0.0) {
+        ss << "a" << std::fixed << std::setprecision(20) << max_area;
+      }
+
+      // Splitting control:
+      if (opt_.suppress_all_splitting) {
+        ss << "YY";
+      } else if (opt_.suppress_boundary_splitting) {
+        ss << "Y";
+      }
+
+      // Steiner limit:
+      if (opt_.max_steiner_points >= 0) {
+        ss << "S" << opt_.max_steiner_points;
+      }
     }
 
     // Optional outputs:
     if (opt_.output_edges) ss << "e";
     if (opt_.output_neighbors) ss << "n";
-
-    // Splitting control:
-    if (opt_.suppress_all_splitting) {
-      ss << "YY";
-    } else if (opt_.suppress_boundary_splitting) {
-      ss << "Y";
-    }
-
-    // Steiner limit:
-    if (opt_.max_steiner_points >= 0) {
-      ss << "S" << opt_.max_steiner_points;
-    }
 
     // Extra switches:
     if (!opt_.extra_switches.empty()) {

@@ -19,6 +19,8 @@
 #include "polyvector/PolyVectors.hxx"
 #include "crossfield/CrossField.hxx"
 #include "tracing/SeparatrixTrace.hxx"
+#include "triangle/TriangleMesher.hpp"
+#include "medialaxis/MedialAxis.hxx"
 
 namespace {
 
@@ -26,6 +28,7 @@ enum class Mode {
     Unselected = 0,
     PolyVector = 1,
     MBO = 2,
+    MedialAxis = 3,
 };
 
 enum class Phase {
@@ -42,6 +45,12 @@ enum class MBOPhase {
     Stepping = 3,
     Separatrices = 4,
     Trace = 5,
+};
+
+enum class MedialAxisPhase {
+    MeshOnly = 0,
+    DelaunayMesh = 1,
+    MedialAxis = 2,
 };
 
 Phase nextPhase(Phase p) {
@@ -66,6 +75,15 @@ MBOPhase nextMBOPhase(MBOPhase p) {
     return MBOPhase::Trace;
 }
 
+MedialAxisPhase nextMedialAxisPhase(MedialAxisPhase p) {
+    switch (p) {
+        case MedialAxisPhase::MeshOnly: return MedialAxisPhase::DelaunayMesh;
+        case MedialAxisPhase::DelaunayMesh: return MedialAxisPhase::MedialAxis;
+        case MedialAxisPhase::MedialAxis: return MedialAxisPhase::MedialAxis;
+    }
+    return MedialAxisPhase::MedialAxis;
+}
+
 const char *phaseName(Phase p) {
     switch (p) {
         case Phase::MeshOnly: return "1) mesh";
@@ -88,11 +106,21 @@ const char *mboPhaseName(MBOPhase p) {
     return "?";
 }
 
+const char *medialAxisPhaseName(MedialAxisPhase p) {
+    switch (p) {
+        case MedialAxisPhase::MeshOnly: return "1) mesh";
+        case MedialAxisPhase::DelaunayMesh: return "2) Delaunay re-triangulation";
+        case MedialAxisPhase::MedialAxis: return "3) Medial axis";
+    }
+    return "?";
+}
+
 const char *modeName(Mode m) {
     switch (m) {
         case Mode::Unselected: return "unselected";
         case Mode::PolyVector: return "PolyVector";
         case Mode::MBO: return "MBO";
+        case Mode::MedialAxis: return "Medial Axis";
     }
     return "?";
 }
@@ -129,12 +157,16 @@ int main(int argc, char **argv) {
     std::optional<MIQSolver> miqSolver;
     std::optional<CrossField> crossField;
     std::shared_ptr<SeparatrixTrace> separatrixTrace;
+    std::shared_ptr<Mesh> delaunayMesh;
+    std::shared_ptr<MedialAxis> medialAxis;
     Mode mode = Mode::Unselected;
     Phase phase = Phase::MeshOnly;
     MBOPhase mboPhase = MBOPhase::MeshOnly;
+    MedialAxisPhase maPhase = MedialAxisPhase::MeshOnly;
     bool cWasDown = false;
     bool oneWasDown = false;
     bool twoWasDown = false;
+    bool threeWasDown = false;
     bool singularitiesLogged = false;
     bool mboSteppingStarted = false;
     bool mboConverged = false;
@@ -199,7 +231,7 @@ int main(int argc, char **argv) {
     double avgEdge = viewer::averageTriangleEdgeLength(*mesh);
     double scale = 0.7 * avgEdge;
 
-    std::cerr << "[Viewer] Phase " << phaseName(phase) << " (press '1' for PolyVector mode, '2' for MBO mode)\n";
+    std::cerr << "[Viewer] Phase " << phaseName(phase) << " (press '1' for PolyVector mode, '2' for MBO mode, '3' for Medial Axis mode)\n";
 
     glEnable(GL_MULTISAMPLE);
     glEnable(GL_BLEND);
@@ -215,6 +247,7 @@ int main(int argc, char **argv) {
         if (mode == Mode::Unselected && phase == Phase::MeshOnly) {
             bool oneDown = (glfwGetKey(window, GLFW_KEY_1) == GLFW_PRESS);
             bool twoDown = (glfwGetKey(window, GLFW_KEY_2) == GLFW_PRESS);
+            bool threeDown = (glfwGetKey(window, GLFW_KEY_3) == GLFW_PRESS);
             
             if (oneDown && !oneWasDown) {
                 mode = Mode::PolyVector;
@@ -226,9 +259,15 @@ int main(int argc, char **argv) {
                 std::cerr << "[Viewer] Selected mode: " << modeName(mode) << " (press 'c' to advance)\n";
                 console.log("Selected mode: MBO");
             }
+            if (threeDown && !threeWasDown) {
+                mode = Mode::MedialAxis;
+                std::cerr << "[Viewer] Selected mode: " << modeName(mode) << " (press 'c' to advance)\n";
+                console.log("Selected mode: Medial Axis");
+            }
             
             oneWasDown = oneDown;
             twoWasDown = twoDown;
+            threeWasDown = threeDown;
         }
 
         // Phase progression (edge-triggered) - only when mode is selected
@@ -245,6 +284,12 @@ int main(int argc, char **argv) {
                 mboPhase = nextMBOPhase(mboPhase);
                 if (mboPhase != old) {
                     std::cerr << "[Viewer] MBO Phase " << mboPhaseName(mboPhase) << "\n";
+                }
+            } else if (mode == Mode::MedialAxis) {
+                MedialAxisPhase old = maPhase;
+                maPhase = nextMedialAxisPhase(maPhase);
+                if (maPhase != old) {
+                    std::cerr << "[Viewer] Medial Axis Phase " << medialAxisPhaseName(maPhase) << "\n";
                 }
             }
         }
@@ -398,6 +443,120 @@ int main(int argc, char **argv) {
             continue;
         }
 
+        // Medial Axis mode: Lazily re-triangulate boundary with Delaunay
+        if (mode == Mode::MedialAxis && maPhase >= MedialAxisPhase::DelaunayMesh && !delaunayMesh) {
+            auto t0 = Clock::now();
+
+            // 1) Collect ordered boundary loops from the original mesh boundary edges
+            //    Build adjacency for boundary vertices along boundary edges
+            std::unordered_map<int, std::vector<int>> bAdj;
+            for (int beIdx : mesh->boundaryEdges) {
+                int a = mesh->edges[beIdx][0];
+                int b = mesh->edges[beIdx][1];
+                bAdj[a].push_back(b);
+                bAdj[b].push_back(a);
+            }
+
+            // Walk boundary loops
+            std::unordered_set<int> visited;
+            std::vector<std::vector<int>> loops; // vertex index loops
+            for (int bv : mesh->boundaryVertices) {
+                if (visited.count(bv)) continue;
+                std::vector<int> loop;
+                int prev = -1;
+                int curr = bv;
+                while (true) {
+                    visited.insert(curr);
+                    loop.push_back(curr);
+                    int next = -1;
+                    for (int nb : bAdj[curr]) {
+                        if (nb != prev && !visited.count(nb)) {
+                            next = nb;
+                            break;
+                        }
+                    }
+                    if (next == -1) break; // loop closed or dead end
+                    prev = curr;
+                    curr = next;
+                }
+                if (loop.size() >= 3) {
+                    loops.push_back(std::move(loop));
+                }
+            }
+
+            if (loops.empty()) {
+                console.log("[MedialAxis] No boundary loops found!");
+            } else {
+                // 2) Build TriangleMesher input from boundary loops
+                //    Collect unique boundary vertices and remap indices
+                std::unordered_map<int, int> vertRemap; // old index -> new index
+                std::vector<std::array<double, 2>> vertlist;
+
+                for (const auto &loop : loops) {
+                    for (int vi : loop) {
+                        if (!vertRemap.count(vi)) {
+                            int newIdx = static_cast<int>(vertlist.size());
+                            vertRemap[vi] = newIdx;
+                            vertlist.push_back(mesh->vertices[vi]);
+                        }
+                    }
+                }
+
+                std::vector<std::vector<std::array<int, 2>>> segment_loops;
+                std::vector<int> loopTypes;
+
+                for (size_t li = 0; li < loops.size(); ++li) {
+                    const auto &loop = loops[li];
+                    std::vector<std::array<int, 2>> segments;
+                    for (size_t i = 0; i < loop.size(); ++i) {
+                        int a = vertRemap[loop[i]];
+                        int b = vertRemap[loop[(i + 1) % loop.size()]];
+                        segments.push_back({a, b});
+                    }
+                    segment_loops.push_back(std::move(segments));
+                    // First loop is exterior, subsequent loops are holes
+                    loopTypes.push_back(li == 0 ? 0 : 1);
+                }
+
+                // 3) Triangulate with just_delaunay = true
+                triangle_wrapper::TriangleMesher2D::Options opts;
+                opts.just_delaunay = true;
+                triangle_wrapper::TriangleMesher2D mesher(opts);
+
+                triangle_wrapper::TriangleMesher2D::MeshInput input;
+                input.vertlist = vertlist;
+                input.segment_loops = segment_loops;
+                input.type = loopTypes;
+                input.h = 0.0; // no refinement
+
+                auto output = mesher.triangulate(input);
+
+                // 4) Build new Mesh from the Delaunay output
+                delaunayMesh = std::make_shared<Mesh>(output.verts, output.triangles);
+
+                auto t1 = Clock::now();
+                double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+                std::ostringstream oss;
+                oss << "[MedialAxis] Delaunay re-triangulation: "
+                    << delaunayMesh->triangles.size() << " triangles, "
+                    << delaunayMesh->vertices.size() << " vertices: " << formatMs(ms);
+                console.log(oss.str());
+            }
+        }
+
+        // Medial Axis mode: Lazily compute medial axis
+        if (mode == Mode::MedialAxis && maPhase >= MedialAxisPhase::MedialAxis && delaunayMesh && !medialAxis) {
+            auto t0 = Clock::now();
+            medialAxis = std::make_shared<MedialAxis>(delaunayMesh);
+            auto t1 = Clock::now();
+            double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            std::ostringstream oss;
+            oss << "[MedialAxis] Computed medial axis: "
+                << medialAxis->medialVertices.size() << " vertices, "
+                << medialAxis->medialEdges.size() << " edges: " << formatMs(ms);
+            console.log(oss.str());
+        }
+
         // PolyVector mode: Lazily compute data when entering phases (with timing).
         if (mode == Mode::PolyVector && phase >= Phase::CrossField && !field.has_value()) {
             auto t0 = Clock::now();
@@ -543,6 +702,20 @@ int main(int argc, char **argv) {
                 }
                 glLineWidth(1.0f);
             }
+        } else if (mode == Mode::MedialAxis) {
+            // Medial Axis mode rendering
+            if (delaunayMesh) {
+                viewer::drawMesh(*delaunayMesh);
+            } else {
+                viewer::drawMesh(*mesh);
+            }
+
+            // Draw medial axis overlay
+            if (maPhase >= MedialAxisPhase::MedialAxis && medialAxis) {
+                double maAvgEdge = delaunayMesh ? viewer::averageTriangleEdgeLength(*delaunayMesh) : avgEdge;
+                double vertRadius = 0.01 * maAvgEdge;
+                viewer::drawMedialAxis(*medialAxis, vertRadius);
+            }
         } else {
             // PolyVector mode rendering (phases 1-4)
             // Phase 1: mesh
@@ -591,7 +764,7 @@ int main(int argc, char **argv) {
 
         // Draw help text overlay based on mode
         if (mode == Mode::Unselected) {
-            viewer::drawTextOverlay(window, "press '1' for PolyVector mode\npress '2' for MBO mode\npress 'q' to quit", 10.0f, 20.0f, 0.8f, 0.8f, 0.8f);
+            viewer::drawTextOverlay(window, "press '1' for PolyVector mode\npress '2' for MBO mode\npress '3' for Medial Axis mode\npress 'q' to quit", 10.0f, 20.0f, 0.8f, 0.8f, 0.8f);
         } else {
             viewer::drawTextOverlay(window, "press 'c' to continue\npress 'q' to quit", 10.0f, 20.0f, 0.8f, 0.8f, 0.8f);
         }

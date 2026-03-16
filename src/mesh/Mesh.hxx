@@ -17,6 +17,7 @@
 
 typedef std::array<double, 2> Point;
 typedef std::array<int, 3> Triangle;
+typedef std::array<int, 2> Edge;
 
 // operators and functions for Point
 inline Point operator+(const Point &a, const Point &b) {
