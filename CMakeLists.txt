@@ -74,6 +74,10 @@ target_link_libraries(TestCutMesh PRIVATE PolyVector)
 add_executable(TestMIQ src/utils/TestMIQ.cxx)
 target_link_libraries(TestMIQ PRIVATE PolyVector)
 
+# Test medial axis construction and phi-inverse mapping
+add_executable(TestMedialAxis src/utils/TestMedialAxis.cxx)
+target_link_libraries(TestMedialAxis PRIVATE PolyVector)
+
 # Generate circle/ellipse topologies
 add_executable(GenerateCircleTopologies src/utils/GenerateCircleTopologies.cxx)
 target_link_libraries(GenerateCircleTopologies PRIVATE PolyVector)

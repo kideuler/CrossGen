@@ -51,6 +51,7 @@ enum class MedialAxisPhase {
     MeshOnly = 0,
     DelaunayMesh = 1,
     MedialAxis = 2,
+    PreImage = 3,
 };
 
 Phase nextPhase(Phase p) {
@@ -79,9 +80,10 @@ MedialAxisPhase nextMedialAxisPhase(MedialAxisPhase p) {
     switch (p) {
         case MedialAxisPhase::MeshOnly: return MedialAxisPhase::DelaunayMesh;
         case MedialAxisPhase::DelaunayMesh: return MedialAxisPhase::MedialAxis;
-        case MedialAxisPhase::MedialAxis: return MedialAxisPhase::MedialAxis;
+        case MedialAxisPhase::MedialAxis: return MedialAxisPhase::PreImage;
+        case MedialAxisPhase::PreImage: return MedialAxisPhase::PreImage;
     }
-    return MedialAxisPhase::MedialAxis;
+    return MedialAxisPhase::PreImage;
 }
 
 const char *phaseName(Phase p) {
@@ -111,6 +113,7 @@ const char *medialAxisPhaseName(MedialAxisPhase p) {
         case MedialAxisPhase::MeshOnly: return "1) mesh";
         case MedialAxisPhase::DelaunayMesh: return "2) Delaunay re-triangulation";
         case MedialAxisPhase::MedialAxis: return "3) Medial axis";
+        case MedialAxisPhase::PreImage: return "4) Pre-image mapping";
     }
     return "?";
 }
@@ -173,6 +176,7 @@ int main(int argc, char **argv) {
     bool mboTracingStarted = false;
     bool mboTracingFinished = false;
     int mboStepCount = 0;
+    bool preImageComputed = false;
     
     // Console for timing output
     viewer::Console console;
@@ -552,9 +556,19 @@ int main(int argc, char **argv) {
             double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
             std::ostringstream oss;
             oss << "[MedialAxis] Computed medial axis: "
-                << medialAxis->medialVertices.size() << " vertices, "
+                << medialAxis->medialNodes.size() << " nodes, "
                 << medialAxis->medialEdges.size() << " edges: " << formatMs(ms);
             console.log(oss.str());
+        }
+
+        // Medial Axis mode: Lazily compute pre-image mapping
+        if (mode == Mode::MedialAxis && maPhase >= MedialAxisPhase::PreImage && medialAxis && !preImageComputed) {
+            auto t0 = Clock::now();
+            medialAxis->constructPhiInverseMapping();
+            auto t1 = Clock::now();
+            double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            console.log("[MedialAxis] Computed pre-image mapping: " + formatMs(ms));
+            preImageComputed = true;
         }
 
         // PolyVector mode: Lazily compute data when entering phases (with timing).
@@ -704,17 +718,31 @@ int main(int argc, char **argv) {
             }
         } else if (mode == Mode::MedialAxis) {
             // Medial Axis mode rendering
-            if (delaunayMesh) {
-                viewer::drawMesh(*delaunayMesh);
-            } else {
-                viewer::drawMesh(*mesh);
-            }
+            if (maPhase >= MedialAxisPhase::PreImage && delaunayMesh && medialAxis) {
+                // PreImage phase: only boundary edges, medial axis, and preimage lines
+                viewer::drawBoundaryEdges(*delaunayMesh);
 
-            // Draw medial axis overlay
-            if (maPhase >= MedialAxisPhase::MedialAxis && medialAxis) {
-                double maAvgEdge = delaunayMesh ? viewer::averageTriangleEdgeLength(*delaunayMesh) : avgEdge;
-                double vertRadius = 0.01 * maAvgEdge;
-                viewer::drawMedialAxis(*medialAxis, vertRadius);
+                double ballRadius_ma = avgEdge / 5.0;
+                viewer::drawMedialAxis(*medialAxis, ballRadius_ma);
+                viewer::drawPreImageLines(*medialAxis);
+
+                // Draw boundary vertices of the Delaunay mesh as red disks
+                for (int bv : delaunayMesh->boundaryVertices) {
+                    viewer::drawDisk3D(delaunayMesh->vertices[bv], ballRadius_ma, 0.95f, 0.2f, 0.2f);
+                }
+            } else {
+                // Earlier phases: draw full mesh
+                if (delaunayMesh) {
+                    viewer::drawMesh(*delaunayMesh);
+                } else {
+                    viewer::drawMesh(*mesh);
+                }
+
+                // Draw medial axis overlay
+                if (maPhase >= MedialAxisPhase::MedialAxis && medialAxis) {
+                    double ballRadius_ma = avgEdge / 5.0;
+                    viewer::drawMedialAxis(*medialAxis, ballRadius_ma);
+                }
             }
         } else {
             // PolyVector mode rendering (phases 1-4)

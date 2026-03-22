@@ -81,5 +81,11 @@ void drawSingularitiesOnUV(const MIQSolver &miq, const CutMesh &cutMesh,
 // Draw the medial axis (Voronoi edges + vertices) on top of a mesh.
 void drawMedialAxis(const MedialAxis &ma, double vertexRadius);
 
+// Draw only the boundary edges of a mesh.
+void drawBoundaryEdges(const Mesh &m);
+
+// Draw pre-image lines from each medial node to its boundary mapped points.
+void drawPreImageLines(const MedialAxis &ma);
+
 } // namespace viewer
 
