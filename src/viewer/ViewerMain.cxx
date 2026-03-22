@@ -167,6 +167,7 @@ int main(int argc, char **argv) {
     MBOPhase mboPhase = MBOPhase::MeshOnly;
     MedialAxisPhase maPhase = MedialAxisPhase::MeshOnly;
     bool cWasDown = false;
+    bool rWasDown = false;
     bool oneWasDown = false;
     bool twoWasDown = false;
     bool threeWasDown = false;
@@ -247,6 +248,60 @@ int main(int argc, char **argv) {
     using Clock = std::chrono::high_resolution_clock;
 
     while (!glfwWindowShouldClose(window)) {
+        // Reset (edge-triggered) - press 'r' to restart as if freshly loaded
+        {
+            bool rDown = (glfwGetKey(window, GLFW_KEY_R) == GLFW_PRESS);
+            if (rDown && !rWasDown) {
+                // Reset all computed data
+                field.reset();
+                cutMesh.reset();
+                miqSolver.reset();
+                crossField.reset();
+                separatrixTrace.reset();
+                delaunayMesh.reset();
+                medialAxis.reset();
+
+                // Reset mode and phase state
+                mode = Mode::Unselected;
+                phase = Phase::MeshOnly;
+                mboPhase = MBOPhase::MeshOnly;
+                maPhase = MedialAxisPhase::MeshOnly;
+
+                // Reset flags
+                singularitiesLogged = false;
+                mboSteppingStarted = false;
+                mboConverged = false;
+                mboTracingStarted = false;
+                mboTracingFinished = false;
+                mboStepCount = 0;
+                preImageComputed = false;
+
+                // Reset view to original mesh bounds
+                view.cx = 0.5 * (B.minx + B.maxx);
+                view.cy = 0.5 * (B.miny + B.maxy);
+                view.baseW = (B.maxx - B.minx) + 2.0 * pad;
+                view.baseH = (B.maxy - B.miny) + 2.0 * pad;
+                if (view.baseW <= 0.0) view.baseW = 1.0;
+                if (view.baseH <= 0.0) view.baseH = 1.0;
+                view.zoom = 1.0;
+                viewer::applyOrtho(view);
+
+                // Reset console
+                console.clear();
+                console.setMaxLines(8);
+                {
+                    std::ostringstream oss;
+                    oss << "Loaded mesh: " << mesh->triangles.size() << " triangles, "
+                        << mesh->vertices.size() << " vertices";
+                    console.log(oss.str());
+                }
+                console.log("[Reset] Restarted viewer.");
+                std::cerr << "[Viewer] Reset. Phase " << phaseName(phase)
+                          << " (press '1' for PolyVector mode, '2' for MBO mode, '3' for Medial Axis mode)\n";
+            }
+            rWasDown = rDown;
+        }
+
         // Mode selection (edge-triggered) - only when mode is unselected and in MeshOnly phase
         if (mode == Mode::Unselected && phase == Phase::MeshOnly) {
             bool oneDown = (glfwGetKey(window, GLFW_KEY_1) == GLFW_PRESS);
@@ -792,9 +847,9 @@ int main(int argc, char **argv) {
 
         // Draw help text overlay based on mode
         if (mode == Mode::Unselected) {
-            viewer::drawTextOverlay(window, "press '1' for PolyVector mode\npress '2' for MBO mode\npress '3' for Medial Axis mode\npress 'q' to quit", 10.0f, 20.0f, 0.8f, 0.8f, 0.8f);
+            viewer::drawTextOverlay(window, "press '1' for PolyVector mode\npress '2' for MBO mode\npress '3' for Medial Axis mode\npress 'r' to restart\npress 'q' to quit", 10.0f, 20.0f, 0.8f, 0.8f, 0.8f);
         } else {
-            viewer::drawTextOverlay(window, "press 'c' to continue\npress 'q' to quit", 10.0f, 20.0f, 0.8f, 0.8f, 0.8f);
+            viewer::drawTextOverlay(window, "press 'c' to continue\npress 'r' to restart\npress 'q' to quit", 10.0f, 20.0f, 0.8f, 0.8f, 0.8f);
         }
 
         glfwSwapBuffers(window);
