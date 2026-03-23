@@ -46,7 +46,8 @@ class MedialAxis {
 
         MedialAxis(std::shared_ptr<Mesh> mesh);
 
-        void constructPhiInverseMapping();
+        void constructMappingPhase1();
+        void constructMappingPhase2();
     private:
         Point computeCircumcenter(int triIndex);
         bool areCollinear(const Point& a, const Point& b, const Point& c);

@@ -619,7 +619,8 @@ int main(int argc, char **argv) {
         // Medial Axis mode: Lazily compute pre-image mapping
         if (mode == Mode::MedialAxis && maPhase >= MedialAxisPhase::PreImage && medialAxis && !preImageComputed) {
             auto t0 = Clock::now();
-            medialAxis->constructPhiInverseMapping();
+            medialAxis->constructMappingPhase1();
+            medialAxis->constructMappingPhase2();
             auto t1 = Clock::now();
             double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
             console.log("[MedialAxis] Computed pre-image mapping: " + formatMs(ms));

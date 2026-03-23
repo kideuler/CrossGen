@@ -137,7 +137,8 @@ int main(int argc, char** argv) {
     std::cout << "  Degree counts:  deg1=" << nDeg1 << "  deg2=" << nDeg2 << "  deg3=" << nDeg3 << "\n";
 
     // ── Run constructPhiInverseMapping ──
-    ma.constructPhiInverseMapping();
+    ma.constructMappingPhase1();
+    ma.constructMappingPhase2();
 
     // ── Sanity checks ──
     int totalFails = 0;

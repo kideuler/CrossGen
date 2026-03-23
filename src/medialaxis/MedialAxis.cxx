@@ -111,7 +111,7 @@ Point MedialAxis::computeCircumcenter(int triIndex) {
     return {ux, uy};
 }
 
-void MedialAxis::constructPhiInverseMapping() {
+void MedialAxis::constructMappingPhase1() {
     // for each medial node, we want to find the corresponding point(s) on the boundary that map to it under the phi mapping.
     // first we loop through all medial nodes and identify which ones correspond to boundary triangles (these will have degree 2) and which correspond to corner triangles (degree 1).
     int n = 0;
@@ -138,7 +138,10 @@ void MedialAxis::constructPhiInverseMapping() {
         n++;
     }
 
-    n = 0;
+}
+
+void MedialAxis::constructMappingPhase2() {
+    int n = 0;
     for (auto& node : medialNodes) {
         int triIndex = node.id;
         int deg = node.degree;
@@ -184,46 +187,28 @@ void MedialAxis::constructPhiInverseMapping() {
                 double rdy = node.coord[1] - c[1];
                 double rayLenSq = rdx * rdx + rdy * rdy;
 
-                if (rayLenSq < 1e-20) {
-                    // Degenerate case: c ≈ node.coord (e.g. near-circular geometry
-                    // where all circumcenters collapse to the same point).
-                    // Fall back to orthogonal projection.
-                    auto [t0, valid0] = computePointEdgeProjection(node.coord, mesh->vertices[mesh->edges[be0][0]], mesh->vertices[mesh->edges[be0][1]]);
-                    auto [t1, valid1] = computePointEdgeProjection(node.coord, mesh->vertices[mesh->edges[be1][0]], mesh->vertices[mesh->edges[be1][1]]);
-                    if (valid0) {
-                        BoundaryMappedPoint bmp;
-                        bmp.edgeIndex = be0;
-                        bmp.t = t0;
-                        node.preImage.push_back(bmp);
-                    }
-                    if (valid1) {
-                        BoundaryMappedPoint bmp;
-                        bmp.edgeIndex = be1;
-                        bmp.t = t1;
-                        node.preImage.push_back(bmp);
-                    }
-                } else {
-                    // try intersection for both edges be0 and be1
-                    auto [t0, valid0] = computeLineEdgeIntersection(c, node.coord, mesh->vertices[mesh->edges[be0][0]], mesh->vertices[mesh->edges[be0][1]]);
-                    auto [t1, valid1] = computeLineEdgeIntersection(c, node.coord, mesh->vertices[mesh->edges[be1][0]], mesh->vertices[mesh->edges[be1][1]]);
+                // try intersection for both edges be0 and be1
+                auto [t0, valid0] = computeLineEdgeIntersection(c, node.coord, mesh->vertices[mesh->edges[be0][0]], mesh->vertices[mesh->edges[be0][1]]);
+                auto [t1, valid1] = computeLineEdgeIntersection(c, node.coord, mesh->vertices[mesh->edges[be1][0]], mesh->vertices[mesh->edges[be1][1]]);
 
-                    if (valid0) {
-                        BoundaryMappedPoint bmp;
-                        bmp.edgeIndex = be0;
-                        bmp.t = t0;
-                        node.preImage.push_back(bmp);
-                    }
-                    if (valid1) {
-                        BoundaryMappedPoint bmp;
-                        bmp.edgeIndex = be1;
-                        bmp.t = t1;
-                        node.preImage.push_back(bmp);
-                    }
+                if (valid0) {
+                    BoundaryMappedPoint bmp;
+                    bmp.edgeIndex = be0;
+                    bmp.t = t0;
+                    node.preImage.push_back(bmp);
+                }
+                if (valid1) {
+                    BoundaryMappedPoint bmp;
+                    bmp.edgeIndex = be1;
+                    bmp.t = t1;
+                    node.preImage.push_back(bmp);
                 }
             }
         }
     }  
+    
 }
+
 
 bool MedialAxis::areCollinear(const Point& a, const Point& b, const Point& c) {
     // Compute the area of the triangle formed by points a, b, c using the determinant method
