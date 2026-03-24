@@ -640,8 +640,8 @@ void drawMedialAxis(const MedialAxis &ma, double vertexRadius) {
     glLineWidth(2.5f);
     glBegin(GL_LINES);
     for (const auto &edge : ma.medialEdges) {
-        const Point &a = ma.medialNodes[edge[0]].coord;
-        const Point &b = ma.medialNodes[edge[1]].coord;
+        const Point &a = ma.medialVertices[edge[0]];
+        const Point &b = ma.medialVertices[edge[1]];
         glVertex2d(a[0], a[1]);
         glVertex2d(b[0], b[1]);
     }
@@ -649,8 +649,8 @@ void drawMedialAxis(const MedialAxis &ma, double vertexRadius) {
     glLineWidth(1.0f);
 
     // Draw medial axis vertices (circumcenters) as small cyan disks
-    for (const auto &node : ma.medialNodes) {
-        drawDisk3D(node.coord, vertexRadius, 0.1f, 0.85f, 0.85f);
+    for (const auto &v : ma.medialVertices) {
+        drawDisk3D(v, vertexRadius, 0.1f, 0.85f, 0.85f);
     }
 }
 
@@ -663,21 +663,6 @@ void drawBoundaryEdges(const Mesh &m) {
         const Point &b = m.vertices[m.edges[beIdx][1]];
         glVertex2d(a[0], a[1]);
         glVertex2d(b[0], b[1]);
-    }
-    glEnd();
-    glLineWidth(1.0f);
-}
-
-void drawPreImageLines(const MedialAxis &ma) {
-    glColor3f(0.5f, 0.8f, 1.0f); // light blue
-    glLineWidth(1.5f);
-    glBegin(GL_LINES);
-    for (const auto &node : ma.medialNodes) {
-        for (const auto &bmp : node.preImage) {
-            Point bpt = bmp.evaluate(ma.mesh);
-            glVertex2d(node.coord[0], node.coord[1]);
-            glVertex2d(bpt[0], bpt[1]);
-        }
     }
     glEnd();
     glLineWidth(1.0f);

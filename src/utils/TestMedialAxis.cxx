@@ -124,158 +124,30 @@ int main(int argc, char** argv) {
 
     // ── Construct medial axis ──
     MedialAxis ma(delaunayMesh);
-    std::cout << "  Medial nodes:   " << ma.medialNodes.size() << "\n";
-    std::cout << "  Medial edges:   " << ma.medialEdges.size() << "\n";
-
-    // ── Count degrees ──
-    int nDeg1 = 0, nDeg2 = 0, nDeg3 = 0;
-    for (const auto& node : ma.medialNodes) {
-        if (node.degree == 1) ++nDeg1;
-        else if (node.degree == 2) ++nDeg2;
-        else if (node.degree == 3) ++nDeg3;
-    }
-    std::cout << "  Degree counts:  deg1=" << nDeg1 << "  deg2=" << nDeg2 << "  deg3=" << nDeg3 << "\n";
-
-    // ── Run constructPhiInverseMapping ──
-    ma.constructMappingPhase1();
-    ma.constructMappingPhase2();
+    std::cout << "  Medial vertices: " << ma.medialVertices.size() << "\n";
+    std::cout << "  Medial edges:    " << ma.medialEdges.size() << "\n";
 
     // ── Sanity checks ──
     int totalFails = 0;
 
-    // Check 1: Every degree-1 node should have exactly 2 preImage entry (from the initial pass)
+    // Check 1: There should be one medial vertex per triangle
     {
-        int pass = 0, fail = 0;
-        for (const auto& node : ma.medialNodes) {
-            if (node.degree != 1) continue;
-            int expected = 2; // corner triangle: 2 boundary edges
-            if ((int)node.preImage.size() != expected) {
-                if (fail < 10) {
-                    std::cout << YELLOW "  [deg1] node " << node.id
-                              << ": expected " << expected << " preImage entries, got "
-                              << node.preImage.size() << RESET "\n";
-                }
-                ++fail;
-            } else {
-                ++pass;
-            }
-        }
-        std::cout << (fail == 0 ? GREEN "[PASS]" RESET : RED "[FAIL]" RESET)
-                  << " Degree-1 preImage count: " << pass << " pass, " << fail << " fail\n";
-        totalFails += fail;
+        bool ok = (ma.medialVertices.size() == delaunayMesh->triangles.size());
+        std::cout << (ok ? GREEN "[PASS]" RESET : RED "[FAIL]" RESET)
+                  << " medialVertices.size() == triangles.size() ("
+                  << ma.medialVertices.size() << " vs " << delaunayMesh->triangles.size() << ")\n";
+        if (!ok) ++totalFails;
     }
 
-    // Check 2: Every degree-2 node should have exactly 2 preImage entries
-    //   (1 from the boundary edge of the triangle + 1 from the adjacent boundary edges through intersection)
+    // Check 2: All medial edges should reference valid vertex indices
     {
         int pass = 0, fail = 0;
-        for (const auto& node : ma.medialNodes) {
-            if (node.degree != 2) continue;
-            int expected = 2;
-            if ((int)node.preImage.size() != expected) {
-                if (fail < 10) {
-                    std::cout << YELLOW "  [deg2] node " << node.id
-                              << ": expected " << expected << " preImage entries, got "
-                              << node.preImage.size() << "\n";
-
-                    // Detailed debug info for this node
-                    int triIndex = node.id;
-                    std::cout << "    triangle vertices:";
-                    for (int k = 0; k < 3; ++k) {
-                        int vi = delaunayMesh->triangles[triIndex][k];
-                        std::cout << " v" << vi << "(" << delaunayMesh->vertices[vi][0]
-                                  << ", " << delaunayMesh->vertices[vi][1] << ")";
-                    }
-                    std::cout << "\n";
-                    std::cout << "    node coord: (" << node.coord[0] << ", " << node.coord[1] << ")\n";
-
-                    // Print which boundary edges this triangle has
-                    std::cout << "    triangle edges:";
-                    for (int e = 0; e < 3; ++e) {
-                        int edgeIdx = delaunayMesh->triangleEdges[triIndex][e];
-                        bool isBdy = delaunayMesh->isBoundaryEdge[edgeIdx];
-                        std::cout << " e" << edgeIdx << (isBdy ? "(bdy)" : "(int)");
-                    }
-                    std::cout << "\n";
-
-                    // Print the preImage entries we do have
-                    for (int pi = 0; pi < (int)node.preImage.size(); ++pi) {
-                        const auto& bmp = node.preImage[pi];
-                        Point pt = bmp.evaluate(delaunayMesh);
-                        std::cout << "    preImage[" << pi << "]: edge=" << bmp.edgeIndex
-                                  << " lid=" << (int)bmp.lid << " t=" << bmp.t
-                                  << " -> (" << pt[0] << ", " << pt[1] << ")\n";
-                    }
-
-                    // Print the vertex opposite the boundary edge and its adjacent bdy edges
-                    if (!node.preImage.empty()) {
-                        int vlid = edgeToOppositeVertex[node.preImage[0].lid];
-                        int vIdx = delaunayMesh->triangles[triIndex][vlid];
-                        std::cout << "    opposite vertex: v" << vIdx
-                                  << " (" << delaunayMesh->vertices[vIdx][0]
-                                  << ", " << delaunayMesh->vertices[vIdx][1] << ")\n";
-
-                        if (ma.bdyNodeToEdges.count(vIdx)) {
-                            int be0 = ma.bdyNodeToEdges[vIdx].front();
-                            int be1 = ma.bdyNodeToEdges[vIdx].back();
-                            int v0 = delaunayMesh->edges[be0][0];
-                            int v1 = delaunayMesh->edges[be1][1];
-                            std::cout << "    be0=" << be0 << " (v" << delaunayMesh->edges[be0][0]
-                                      << "->v" << delaunayMesh->edges[be0][1] << ")\n";
-                            std::cout << "    be1=" << be1 << " (v" << delaunayMesh->edges[be1][0]
-                                      << "->v" << delaunayMesh->edges[be1][1] << ")\n";
-
-                            // Compute and print the intersection point c
-                            int mn0 = ma.EdgeToMedialNode[be0][0];
-                            int mn1 = ma.EdgeToMedialNode[be1][0];
-                            if (mn0 >= 0 && mn1 >= 0) {
-                                Point p0 = ma.medialNodes[mn0].coord;
-                                Point p1 = (delaunayMesh->vertices[v0] + delaunayMesh->vertices[vIdx]) * 0.5;
-                                Point p3 = ma.medialNodes[mn1].coord;
-                                Point p4 = (delaunayMesh->vertices[v1] + delaunayMesh->vertices[vIdx]) * 0.5;
-
-                                std::cout << "    line0: (" << p0[0] << "," << p0[1] << ") -> ("
-                                          << p1[0] << "," << p1[1] << ")\n";
-                                std::cout << "    line1: (" << p3[0] << "," << p3[1] << ") -> ("
-                                          << p4[0] << "," << p4[1] << ")\n";
-
-                                // Ray from c through node.coord
-                                // Compute c as the intersection of the two lines
-                                // (same logic as in constructPhiInverseMapping)
-                                // We need to replicate it here since it's private
-                                // Instead, print what the ray direction would be
-                                std::cout << "    (use debug output above to check ray/edge intersection)\n";
-                            } else {
-                                std::cout << "    EdgeToMedialNode not set for be0 or be1!\n";
-                                if (mn0 < 0) std::cout << "      be0 (edge " << be0 << ") has no medial node mapping\n";
-                                if (mn1 < 0) std::cout << "      be1 (edge " << be1 << ") has no medial node mapping\n";
-                            }
-                        } else {
-                            std::cout << "    vertex v" << vIdx << " not in bdyNodeToEdges!\n";
-                        }
-                    }
-                }
-                std::cout << RESET;
-                ++fail;
-            } else {
-                ++pass;
-            }
-        }
-        std::cout << (fail == 0 ? GREEN "[PASS]" RESET : RED "[FAIL]" RESET)
-                  << " Degree-2 preImage count: " << pass << " pass, " << fail << " fail\n";
-        totalFails += fail;
-    }
-
-    // Check 3: Every degree-3 node should have exactly 0 preImage entries (no boundary edge)
-    {
-        int pass = 0, fail = 0;
-        for (const auto& node : ma.medialNodes) {
-            if (node.degree != 3) continue;
-            if (node.preImage.size() != 3) {
+        int nv = static_cast<int>(ma.medialVertices.size());
+        for (const auto& edge : ma.medialEdges) {
+            if (edge[0] < 0 || edge[0] >= nv || edge[1] < 0 || edge[1] >= nv) {
                 if (fail < 5) {
-                    std::cout << YELLOW "  [deg3] node " << node.id
-                              << ": expected 3 preImage entries, got "
-                              << node.preImage.size() << RESET "\n";
+                    std::cout << YELLOW "  medial edge (" << edge[0] << ", " << edge[1]
+                              << ") out of range [0, " << nv << ")" RESET "\n";
                 }
                 ++fail;
             } else {
@@ -283,56 +155,40 @@ int main(int argc, char** argv) {
             }
         }
         std::cout << (fail == 0 ? GREEN "[PASS]" RESET : RED "[FAIL]" RESET)
-                  << " Degree-3 preImage count: " << pass << " pass, " << fail << " fail\n";
+                  << " Medial edge index validity: " << pass << " pass, " << fail << " fail\n";
         totalFails += fail;
     }
 
-    // Check 4: All preImage t-values should be in [0, 1]
+    // Check 3: Medial edges should only come from internal mesh edges (no boundary duals)
     {
-        int pass = 0, fail = 0;
-        for (const auto& node : ma.medialNodes) {
-            for (const auto& bmp : node.preImage) {
-                if (bmp.t < 0.0 || bmp.t > 1.0) {
-                    if (fail < 5) {
-                        std::cout << YELLOW "  node " << node.id << ": preImage t=" << bmp.t
-                                  << " out of [0,1] on edge " << bmp.edgeIndex << RESET "\n";
-                    }
-                    ++fail;
-                } else {
-                    ++pass;
-                }
-            }
+        int numInternal = 0;
+        for (const auto& et : delaunayMesh->edgeTriangles) {
+            if (et[0] != -1 && et[1] != -1) ++numInternal;
         }
-        std::cout << (fail == 0 ? GREEN "[PASS]" RESET : RED "[FAIL]" RESET)
-                  << " PreImage t-values in [0,1]: " << pass << " pass, " << fail << " fail\n";
-        totalFails += fail;
+        bool ok = (static_cast<int>(ma.medialEdges.size()) == numInternal);
+        std::cout << (ok ? GREEN "[PASS]" RESET : RED "[FAIL]" RESET)
+                  << " medialEdges.size() == internal edges ("
+                  << ma.medialEdges.size() << " vs " << numInternal << ")\n";
+        if (!ok) ++totalFails;
     }
 
-    // Check 5: bdyNodeToEdges should be populated for all boundary vertices
+    // Check 4: Medial vertices (circumcenters) should be finite
     {
         int pass = 0, fail = 0;
-        for (int bv : delaunayMesh->boundaryVertices) {
-            if (!ma.bdyNodeToEdges.count(bv)) {
+        for (size_t i = 0; i < ma.medialVertices.size(); ++i) {
+            const auto& v = ma.medialVertices[i];
+            if (!std::isfinite(v[0]) || !std::isfinite(v[1])) {
                 if (fail < 5) {
-                    std::cout << YELLOW "  boundary vertex v" << bv << " missing from bdyNodeToEdges" RESET "\n";
+                    std::cout << YELLOW "  medial vertex " << i
+                              << " is not finite: (" << v[0] << ", " << v[1] << ")" RESET "\n";
                 }
                 ++fail;
             } else {
-                const auto& chain = ma.bdyNodeToEdges[bv];
-                if (chain.size() < 2) {
-                    if (fail < 5) {
-                        std::cout << YELLOW "  boundary vertex v" << bv
-                                  << ": bdyNodeToEdges chain has only "
-                                  << chain.size() << " edge(s)" RESET "\n";
-                    }
-                    ++fail;
-                } else {
-                    ++pass;
-                }
+                ++pass;
             }
         }
         std::cout << (fail == 0 ? GREEN "[PASS]" RESET : RED "[FAIL]" RESET)
-                  << " bdyNodeToEdges completeness: " << pass << " pass, " << fail << " fail\n";
+                  << " Medial vertex finiteness: " << pass << " pass, " << fail << " fail\n";
         totalFails += fail;
     }
 
