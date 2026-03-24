@@ -216,8 +216,8 @@ int main(int argc, char** argv) {
                                   << ", " << delaunayMesh->vertices[vIdx][1] << ")\n";
 
                         if (ma.bdyNodeToEdges.count(vIdx)) {
-                            int be0 = ma.bdyNodeToEdges[vIdx][0];
-                            int be1 = ma.bdyNodeToEdges[vIdx][1];
+                            int be0 = ma.bdyNodeToEdges[vIdx].front();
+                            int be1 = ma.bdyNodeToEdges[vIdx].back();
                             int v0 = delaunayMesh->edges[be0][0];
                             int v1 = delaunayMesh->edges[be1][1];
                             std::cout << "    be0=" << be0 << " (v" << delaunayMesh->edges[be0][0]
@@ -318,13 +318,12 @@ int main(int argc, char** argv) {
                 }
                 ++fail;
             } else {
-                int be0 = ma.bdyNodeToEdges[bv][0];
-                int be1 = ma.bdyNodeToEdges[bv][1];
-                if (be0 < 0 || be1 < 0) {
+                const auto& chain = ma.bdyNodeToEdges[bv];
+                if (chain.size() < 2) {
                     if (fail < 5) {
                         std::cout << YELLOW "  boundary vertex v" << bv
-                                  << ": bdyNodeToEdges has invalid entry ("
-                                  << be0 << ", " << be1 << ")" RESET "\n";
+                                  << ": bdyNodeToEdges chain has only "
+                                  << chain.size() << " edge(s)" RESET "\n";
                     }
                     ++fail;
                 } else {

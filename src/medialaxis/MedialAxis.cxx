@@ -52,33 +52,18 @@ MedialAxis::MedialAxis(std::shared_ptr<Mesh> mesh) : mesh(mesh) {
     }
 
     // Step 3: Build bdyNodeToEdges map for boundary vertices.
-    // For each boundary vertex v, find the two boundary edges incident on it.
-    // bdyNodeToEdges[v] = {edge0, edge1} where both are boundary edge indices
-    // incident on v. We fill slot [0] first, then [1].
-    // Note: edges are stored in canonical (min,max) order, so we cannot rely
-    // on vertex position within the edge to distinguish the two edges.
-    // Pre-initialize entries for all boundary vertices to {-1, -1}.
+    // For each boundary vertex v, build a CCW-ordered chain of incident
+    // boundary edges.  BoundaryEdgeChain::insert automatically places
+    // each edge at the correct end of the chain and enforces CCW order.
     for (int bv : mesh->boundaryVertices) {
-        bdyNodeToEdges[bv] = {-1, -1};
+        bdyNodeToEdges[bv] = BoundaryEdgeChain{};
     }
     for (int beIdx : mesh->boundaryEdges) {
         int v0 = mesh->edges[beIdx][0];
         int v1 = mesh->edges[beIdx][1];
 
-        // For each endpoint, fill the first available slot
-        auto& entry0 = bdyNodeToEdges[v0];
-        if (entry0[0] == -1) {
-            entry0[0] = beIdx;
-        } else {
-            entry0[1] = beIdx;
-        }
-
-        auto& entry1 = bdyNodeToEdges[v1];
-        if (entry1[0] == -1) {
-            entry1[0] = beIdx;
-        } else {
-            entry1[1] = beIdx;
-        }
+        bdyNodeToEdges[v0].insert(beIdx, v0, v1, mesh->vertices);
+        bdyNodeToEdges[v1].insert(beIdx, v0, v1, mesh->vertices);
     }
 }
 
@@ -148,9 +133,9 @@ void MedialAxis::constructMappingPhase2() {
         if (deg == 2) {
             int vlid = edgeToOppositeVertex[node.preImage[0].lid]; // local vertex index opposite the first boundary edge
             int vIdx = mesh->triangles[triIndex][vlid]; // global vertex
-            // get the two boundary edges connected to this vertex from bdyNodeToEdges
-            int be0 = bdyNodeToEdges[vIdx][0];
-            int be1 = bdyNodeToEdges[vIdx][1];
+            // get the first and last boundary edges of the CCW chain at this vertex
+            int be0 = bdyNodeToEdges[vIdx].front();
+            int be1 = bdyNodeToEdges[vIdx].back();
             // find the "other" vertex of each boundary edge (the one that isn't vIdx)
             int v0 = (mesh->edges[be0][0] == vIdx) ? mesh->edges[be0][1] : mesh->edges[be0][0];
             int v1 = (mesh->edges[be1][0] == vIdx) ? mesh->edges[be1][1] : mesh->edges[be1][0];
