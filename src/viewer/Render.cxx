@@ -640,8 +640,8 @@ void drawMedialAxis(const MedialAxis &ma, double vertexRadius) {
     glLineWidth(2.5f);
     glBegin(GL_LINES);
     for (const auto &edge : ma.medialEdges) {
-        const Point &a = ma.medialVertices[edge[0]];
-        const Point &b = ma.medialVertices[edge[1]];
+        const Point &a = ma.medialVertices[edge[0]].coord;
+        const Point &b = ma.medialVertices[edge[1]].coord;
         glVertex2d(a[0], a[1]);
         glVertex2d(b[0], b[1]);
     }
@@ -650,7 +650,7 @@ void drawMedialAxis(const MedialAxis &ma, double vertexRadius) {
 
     // Draw medial axis vertices (circumcenters) as small cyan disks
     for (const auto &v : ma.medialVertices) {
-        drawDisk3D(v, vertexRadius, 0.1f, 0.85f, 0.85f);
+        drawDisk3D(v.coord, vertexRadius, 0.1f, 0.85f, 0.85f);
     }
 }
 

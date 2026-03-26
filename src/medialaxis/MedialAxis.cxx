@@ -14,7 +14,29 @@ MedialAxis::MedialAxis(std::shared_ptr<Mesh> mesh) : mesh(mesh) {
     // Each triangle's circumcenter is a discrete medial axis vertex.
     // The index of the circumcenter in medialVertices directly matches the triangle index.
     for (int t = 0; t < numTriangles; ++t) {
-        medialVertices.push_back(computeCircumcenter(t));
+        Point cc = computeCircumcenter(t);
+        const Triangle& tri = mesh->triangles[t];
+
+        // Compute radius as distance from circumcenter to any triangle vertex
+        const Point& v0 = mesh->vertices[tri[0]];
+        double radius = normP(cc - v0);
+
+        // Collect the touch points (triangle vertices equidistant to the circumcenter)
+        std::unordered_set<int> touchPoints;
+        touchPoints.insert(tri[0]);
+        touchPoints.insert(tri[1]);
+        touchPoints.insert(tri[2]);
+
+        MedialVertex mv;
+        mv.coord = cc;
+        mv.triangleIndex = t;
+        mv.touchPoints = std::move(touchPoints);
+        mv.degree = 0;       // will be set after edges are built
+        mv.radius = radius;
+        mv.active = true;
+        mv.nodeType = TopMakerNodeType::Normal;
+
+        medialVertices.push_back(std::move(mv));
     }
 
     // Step 2: Extract internal Voronoi edges
@@ -28,7 +50,15 @@ MedialAxis::MedialAxis(std::shared_ptr<Mesh> mesh) : mesh(mesh) {
         // (boundary edges have -1 for one of the adjacent triangles).
         if (t0 != -1 && t1 != -1) {
             medialEdges.push_back({t0, t1});
+            // Update neighbor sets and degree for both endpoints
+            medialVertices[t0].neighbors.insert(t1);
+            medialVertices[t1].neighbors.insert(t0);
         }
+    }
+
+    // Step 3: Set the degree of each medial vertex from its neighbor set
+    for (auto& mv : medialVertices) {
+        mv.degree = static_cast<int>(mv.neighbors.size());
     }
 }
 

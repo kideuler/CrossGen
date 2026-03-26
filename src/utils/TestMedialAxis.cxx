@@ -177,10 +177,10 @@ int main(int argc, char** argv) {
         int pass = 0, fail = 0;
         for (size_t i = 0; i < ma.medialVertices.size(); ++i) {
             const auto& v = ma.medialVertices[i];
-            if (!std::isfinite(v[0]) || !std::isfinite(v[1])) {
+            if (!std::isfinite(v.coord[0]) || !std::isfinite(v.coord[1])) {
                 if (fail < 5) {
                     std::cout << YELLOW "  medial vertex " << i
-                              << " is not finite: (" << v[0] << ", " << v[1] << ")" RESET "\n";
+                              << " is not finite: (" << v.coord[0] << ", " << v.coord[1] << ")" RESET "\n";
                 }
                 ++fail;
             } else {
