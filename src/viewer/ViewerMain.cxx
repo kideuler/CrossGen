@@ -769,6 +769,14 @@ int main(int argc, char **argv) {
             if (maPhase >= MedialAxisPhase::MedialAxis && medialAxis) {
                 double ballRadius_ma = avgEdge / 5.0;
                 viewer::drawMedialAxis(*medialAxis, ballRadius_ma);
+
+                // Draw red circles at sharp corner vertices
+                for (int i = 0; i < static_cast<int>(medialAxis->sharpVertices.size()); ++i) {
+                    if (medialAxis->sharpVertices[i]) {
+                        const Point &p = medialAxis->mesh->vertices[i];
+                        viewer::drawDisk3D(p, ballRadius_ma, 0.95f, 0.2f, 0.2f);
+                    }
+                }
             }
         } else {
             // PolyVector mode rendering (phases 1-4)

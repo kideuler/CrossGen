@@ -10,6 +10,12 @@ enum class TopMakerNodeType {
     Dangle,
 };
 
+struct BoundaryVertex {
+    int vertexIndex; // Index of the vertex in the original mesh
+    int nextBoundaryVertex; // Index of the next boundary vertex in the same boundary loop
+    int prevBoundaryVertex; // Index of the previous boundary vertex in the same boundary loop
+};
+
 struct MedialVertex {
     Point coord; // 2D position of the medial vertex
     int triangleIndex; // Index of the corresponding triangle in the mesh
@@ -26,6 +32,8 @@ class MedialAxis {
         std::shared_ptr<Mesh> mesh;
         std::vector<MedialVertex> medialVertices; // List of medial axis vertices
         std::vector<Edge> medialEdges; // List of medial axis edges
+        std::vector<BoundaryVertex> boundaryVertices; // List of boundary vertices and their connectivity
+        std::vector<bool> sharpVertices; // Whether each boundary vertex is a "sharp" vertex geometrically.
 
         MedialAxis(std::shared_ptr<Mesh> mesh);
     private:
