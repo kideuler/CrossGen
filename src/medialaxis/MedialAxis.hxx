@@ -4,6 +4,8 @@
 #include "mesh/Mesh.hxx"
 #include <unordered_set>
 
+const double MEDIAL_VERTEX_MERGE_TOLERANCE = 0.01; // Tolerance for merging close medial vertices in deduplication
+
 enum class TopMakerNodeType {
     Normal,
     Corner,
@@ -36,6 +38,8 @@ class MedialAxis {
         std::vector<bool> sharpVertices; // Whether each boundary vertex is a "sharp" vertex geometrically.
 
         MedialAxis(std::shared_ptr<Mesh> mesh);
+
+        void deduplicateMedialVertices();
     private:
         Point computeCircumcenter(int triIndex);
         

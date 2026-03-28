@@ -1,5 +1,6 @@
 #include "medialaxis/MedialAxis.hxx"
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 
 MedialAxis::MedialAxis(std::shared_ptr<Mesh> mesh) : mesh(mesh) {
@@ -160,4 +161,215 @@ Point MedialAxis::computeCircumcenter(int triIndex) {
     double uy = (aSq * (cx - bx) + bSq * (ax - cx) + cSq * (bx - ax)) / d;
 
     return {ux, uy};
+}
+
+void MedialAxis::deduplicateMedialVertices() {
+    
+    // Pass 1: Deduplicate degree-1 medial vertices.
+    // Loop through degree 1 medial vertices and check if the connected vertex
+    // is close within tolerance with respect to radius. If so, absorb the
+    // degree-1 vertex into its neighbor: transfer touch points, remove the
+    // leaf, and update the neighbor's degree.
+
+    bool done = false;
+    while (!done) {
+        done = true;
+
+        for (size_t i = 0; i < medialVertices.size(); ++i) {
+            MedialVertex& mv = medialVertices[i];
+            if (!mv.active || mv.degree != 1) continue;
+
+            // Get the single neighbor
+            int neighborIdx = *mv.neighbors.begin();
+            MedialVertex& neighbor = medialVertices[neighborIdx];
+
+            // Check distance between mv and neighbor relative to radius
+            double dist = normP(mv.coord - neighbor.coord);
+            double localRadius = std::max(mv.radius, neighbor.radius);
+            if (dist < MEDIAL_VERTEX_MERGE_TOLERANCE * localRadius) {
+                // Transfer touch points to the neighbor
+                neighbor.touchPoints.insert(mv.touchPoints.begin(), mv.touchPoints.end());
+
+                // Remove mv from neighbor's neighbor set
+                neighbor.neighbors.erase(static_cast<int>(i));
+
+                // Mark mv as inactive and clear its connections
+                mv.active = false;
+                mv.neighbors.clear();
+                mv.degree = 0;
+
+                // Update neighbor's degree
+                neighbor.degree = static_cast<int>(neighbor.neighbors.size());
+
+                done = false;
+                break;
+            }
+        }
+    }
+
+    // Pass 2: Deduplicate degree-2 medial vertices.
+    // A degree-2 vertex sits in the middle of a chain. If it is close to one
+    // of its two neighbors, absorb it into that neighbor and reconnect the
+    // other neighbor to the merge target.
+
+    done = false;
+    while (!done) {
+        done = true;
+
+        for (size_t i = 0; i < medialVertices.size(); ++i) {
+            MedialVertex& mv = medialVertices[i];
+            if (!mv.active || mv.degree != 2) continue;
+
+            // Find the closest neighbor within tolerance
+            int mergeTarget = -1;
+            double bestDist = std::numeric_limits<double>::max();
+            for (int nb : mv.neighbors) {
+                double dist = normP(mv.coord - medialVertices[nb].coord);
+                double localRadius = std::max(mv.radius, medialVertices[nb].radius);
+                if (dist < MEDIAL_VERTEX_MERGE_TOLERANCE * localRadius && dist < bestDist) {
+                    bestDist = dist;
+                    mergeTarget = nb;
+                }
+            }
+            if (mergeTarget == -1) continue;
+
+            MedialVertex& target = medialVertices[mergeTarget];
+
+            // Transfer touch points
+            target.touchPoints.insert(mv.touchPoints.begin(), mv.touchPoints.end());
+
+            // Reconnect all other neighbors of mv to the merge target
+            for (int nb : mv.neighbors) {
+                if (nb == mergeTarget) continue;
+                MedialVertex& other = medialVertices[nb];
+                other.neighbors.erase(static_cast<int>(i));
+                other.neighbors.insert(mergeTarget);
+                target.neighbors.insert(nb);
+            }
+
+            // Remove mv from the merge target's neighbor set
+            target.neighbors.erase(static_cast<int>(i));
+
+            // Deactivate mv
+            mv.active = false;
+            mv.neighbors.clear();
+            mv.degree = 0;
+
+            // Update target's degree
+            target.degree = static_cast<int>(target.neighbors.size());
+
+            // Update degrees of reconnected neighbors
+            for (int nb : target.neighbors) {
+                medialVertices[nb].degree = static_cast<int>(medialVertices[nb].neighbors.size());
+            }
+
+            done = false;
+            break;
+        }
+    }
+
+    // Pass 3: Deduplicate degree-3+ medial vertices.
+    // A high-degree vertex is a junction. If it is close to one of its
+    // neighbors, absorb it into that neighbor and rewire all other neighbors.
+
+    done = false;
+    while (!done) {
+        done = true;
+
+        for (size_t i = 0; i < medialVertices.size(); ++i) {
+            MedialVertex& mv = medialVertices[i];
+            if (!mv.active || mv.degree < 3) continue;
+
+            // Find the closest neighbor within tolerance
+            int mergeTarget = -1;
+            double bestDist = std::numeric_limits<double>::max();
+            for (int nb : mv.neighbors) {
+                double dist = normP(mv.coord - medialVertices[nb].coord);
+                double localRadius = std::max(mv.radius, medialVertices[nb].radius);
+                if (dist < MEDIAL_VERTEX_MERGE_TOLERANCE * localRadius && dist < bestDist) {
+                    bestDist = dist;
+                    mergeTarget = nb;
+                }
+            }
+            if (mergeTarget == -1) continue;
+
+            MedialVertex& target = medialVertices[mergeTarget];
+
+            // Transfer touch points
+            target.touchPoints.insert(mv.touchPoints.begin(), mv.touchPoints.end());
+
+            // Reconnect all other neighbors of mv to the merge target
+            for (int nb : mv.neighbors) {
+                if (nb == mergeTarget) continue;
+                MedialVertex& other = medialVertices[nb];
+                other.neighbors.erase(static_cast<int>(i));
+                other.neighbors.insert(mergeTarget);
+                target.neighbors.insert(nb);
+            }
+
+            // Remove mv from the merge target's neighbor set
+            target.neighbors.erase(static_cast<int>(i));
+
+            // Deactivate mv
+            mv.active = false;
+            mv.neighbors.clear();
+            mv.degree = 0;
+
+            // Update target's degree
+            target.degree = static_cast<int>(target.neighbors.size());
+
+            // Update degrees of reconnected neighbors
+            for (int nb : target.neighbors) {
+                medialVertices[nb].degree = static_cast<int>(medialVertices[nb].neighbors.size());
+            }
+
+            done = false;
+            break;
+        }
+    }
+
+    // ── Compaction: remove inactive vertices and rebuild edges with new indices ──
+
+    // Build old-to-new index mapping for active vertices only
+    std::vector<int> oldToNew(medialVertices.size(), -1);
+    int newIdx = 0;
+    for (size_t i = 0; i < medialVertices.size(); ++i) {
+        if (medialVertices[i].active) {
+            oldToNew[i] = newIdx++;
+        }
+    }
+
+    // Build compacted vertex list with remapped neighbor sets
+    std::vector<MedialVertex> compacted;
+    compacted.reserve(newIdx);
+    for (size_t i = 0; i < medialVertices.size(); ++i) {
+        if (!medialVertices[i].active) continue;
+        MedialVertex mv = std::move(medialVertices[i]);
+
+        // Remap neighbor indices
+        std::unordered_set<int> newNeighbors;
+        for (int nb : mv.neighbors) {
+            int mapped = oldToNew[nb];
+            if (mapped != -1) {
+                newNeighbors.insert(mapped);
+            }
+        }
+        mv.neighbors = std::move(newNeighbors);
+        mv.degree = static_cast<int>(mv.neighbors.size());
+
+        compacted.push_back(std::move(mv));
+    }
+
+    // Rebuild medial edges from neighbor sets (each edge stored once, with i < j)
+    std::vector<Edge> newEdges;
+    for (int i = 0; i < static_cast<int>(compacted.size()); ++i) {
+        for (int nb : compacted[i].neighbors) {
+            if (i < nb) {
+                newEdges.push_back({i, nb});
+            }
+        }
+    }
+
+    medialVertices = std::move(compacted);
+    medialEdges = std::move(newEdges);
 }

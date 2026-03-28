@@ -192,6 +192,90 @@ int main(int argc, char** argv) {
         totalFails += fail;
     }
 
+    // ── Run deduplication ──
+    ma.deduplicateMedialVertices();
+    {
+        int activeCount = 0;
+        for (const auto& mv : ma.medialVertices) {
+            if (mv.active) ++activeCount;
+        }
+        std::cout << "  After deduplication: " << activeCount << " active medial vertices\n";
+    }
+
+    // Check 5: After deduplication, no active degree-1 vertex should be within
+    // 0.01 of any other active vertex.
+    {
+        const double minSepDist = 1e-8;
+        int fail = 0;
+        for (size_t i = 0; i < ma.medialVertices.size(); ++i) {
+            const auto& mv = ma.medialVertices[i];
+            if (!mv.active) continue;
+
+            for (size_t j = 0; j < ma.medialVertices.size(); ++j) {
+                if (j == i) continue;
+                const auto& other = ma.medialVertices[j];
+                if (!other.active) continue;
+
+                double dist = normP(mv.coord - other.coord);
+                if (dist < minSepDist) {
+                    if (fail < 5) {
+                        std::cout << YELLOW "  vertex " << i
+                                  << " (deg=" << mv.degree << ") is " << dist
+                                  << " from vertex " << j
+                                  << " (deg=" << other.degree << ")" RESET "\n";
+                        // Print neighbors of both
+                        std::cout << "    neighbors of " << i << ":";
+                        for (int nb : mv.neighbors) std::cout << " " << nb;
+                        std::cout << "\n";
+                        std::cout << "    neighbors of " << j << ":";
+                        for (int nb : other.neighbors) std::cout << " " << nb;
+                        std::cout << "\n";
+                        // Check if they share a neighbor
+                        bool isNeighbor = mv.neighbors.count(static_cast<int>(j)) > 0;
+                        std::cout << "    directly connected: " << (isNeighbor ? "YES" : "NO") << "\n";
+                        std::cout << "    radius_i=" << mv.radius << " radius_j=" << other.radius
+                                  << " tol_i=" << MEDIAL_VERTEX_MERGE_TOLERANCE * mv.radius
+                                  << " tol_j=" << MEDIAL_VERTEX_MERGE_TOLERANCE * other.radius << "\n";
+                        // Walk path from i to j via neighbors (BFS, max 10 hops)
+                        {
+                            std::unordered_map<int, int> parent;
+                            std::vector<int> queue = {static_cast<int>(i)};
+                            parent[static_cast<int>(i)] = -1;
+                            bool found = false;
+                            for (size_t qi = 0; qi < queue.size() && qi < 1000; ++qi) {
+                                int cur = queue[qi];
+                                if (cur == static_cast<int>(j)) { found = true; break; }
+                                for (int nb : ma.medialVertices[cur].neighbors) {
+                                    if (!ma.medialVertices[nb].active) continue;
+                                    if (parent.count(nb)) continue;
+                                    parent[nb] = cur;
+                                    queue.push_back(nb);
+                                }
+                            }
+                            if (found) {
+                                std::vector<int> path;
+                                for (int c = static_cast<int>(j); c != -1; c = parent[c])
+                                    path.push_back(c);
+                                std::reverse(path.begin(), path.end());
+                                std::cout << "    path (" << path.size() - 1 << " hops):";
+                                for (int p : path) std::cout << " " << p;
+                                std::cout << "\n";
+                            } else {
+                                std::cout << "    no path found (disconnected components)\n";
+                            }
+                        }
+                    }
+                    ++fail;
+                    break;
+                }
+            }
+        }
+        std::cout << (fail == 0 ? GREEN "[PASS]" RESET : RED "[FAIL]" RESET)
+                  << " Post-dedup separation (>= " << minSepDist << "): "
+                  << fail << " violations\n";
+        totalFails += fail;
+    }
+
     // ── Summary ──
     std::cout << "\n";
     if (totalFails == 0) {

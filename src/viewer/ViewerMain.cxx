@@ -602,12 +602,15 @@ int main(int argc, char **argv) {
         if (mode == Mode::MedialAxis && maPhase >= MedialAxisPhase::MedialAxis && delaunayMesh && !medialAxis) {
             auto t0 = Clock::now();
             medialAxis = std::make_shared<MedialAxis>(delaunayMesh);
+            int rawVerts = static_cast<int>(medialAxis->medialVertices.size());
+            int rawEdges = static_cast<int>(medialAxis->medialEdges.size());
+            medialAxis->deduplicateMedialVertices();
             auto t1 = Clock::now();
             double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
             std::ostringstream oss;
             oss << "[MedialAxis] Computed medial axis: "
-                << medialAxis->medialVertices.size() << " vertices, "
-                << medialAxis->medialEdges.size() << " edges: " << formatMs(ms);
+                << rawVerts << " -> " << medialAxis->medialVertices.size() << " vertices, "
+                << rawEdges << " -> " << medialAxis->medialEdges.size() << " edges: " << formatMs(ms);
             console.log(oss.str());
         }
 
