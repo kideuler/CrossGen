@@ -4,6 +4,7 @@
 #include <iostream>
 #include <iomanip>
 #include <memory>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -273,6 +274,131 @@ int main(int argc, char** argv) {
         std::cout << (fail == 0 ? GREEN "[PASS]" RESET : RED "[FAIL]" RESET)
                   << " Post-dedup separation (>= " << minSepDist << "): "
                   << fail << " violations\n";
+        totalFails += fail;
+    }
+
+    // ── Create polylines ──
+    ma.createPolylines();
+    std::cout << "  Polylines:      " << ma.polyLines.size() << "\n";
+
+    // Check 6: Every polyline has at least 2 vertices, all indices in bounds, and no duplicates (forwards/backwards)
+    {
+        int fail = 0;
+        std::set<std::vector<int>> uniquePolys;
+        for (size_t i = 0; i < ma.polyLines.size(); ++i) {
+            const auto& pl = ma.polyLines[i];
+            if (pl.size() < 2) {
+                std::cout << YELLOW "  polyline " << i << " has <2 vertices\n" RESET;
+                ++fail;
+            }
+            for (int vi : pl) {
+                if (vi < 0 || vi >= static_cast<int>(ma.medialVertices.size())) {
+                    std::cout << YELLOW "  polyline " << i << " has out-of-bounds vertex " << vi << "\n" RESET;
+                    ++fail;
+                }
+            }
+            // Check for duplicate (forwards/backwards)
+            std::vector<int> rev = pl;
+            std::reverse(rev.begin(), rev.end());
+            if (uniquePolys.count(pl) || uniquePolys.count(rev)) {
+                std::cout << YELLOW "  polyline " << i << " is a duplicate (forwards/backwards)\n" RESET;
+                ++fail;
+            }
+            uniquePolys.insert(pl);
+        }
+        std::cout << (fail == 0 ? GREEN "[PASS]" RESET : RED "[FAIL]" RESET)
+                  << " Polyline structure: " << ma.polyLines.size() << " polylines, " << fail << " issues\n";
+        totalFails += fail;
+    }
+
+    // Check 7: All polyline edges exist in the medial axis
+    {
+        int fail = 0;
+        std::unordered_set<uint64_t> edgeSet;
+        for (const auto& e : ma.medialEdges) {
+            int a = std::min(e[0], e[1]);
+            int b = std::max(e[0], e[1]);
+            edgeSet.insert((static_cast<uint64_t>(a) << 32) | static_cast<uint32_t>(b));
+        }
+        for (size_t i = 0; i < ma.polyLines.size(); ++i) {
+            const auto& pl = ma.polyLines[i];
+            for (size_t j = 1; j < pl.size(); ++j) {
+                int a = std::min(pl[j-1], pl[j]);
+                int b = std::max(pl[j-1], pl[j]);
+                if (a == b) continue;
+                uint64_t key = (static_cast<uint64_t>(a) << 32) | static_cast<uint32_t>(b);
+                if (!edgeSet.count(key)) {
+                    std::cout << YELLOW "  polyline " << i << " has non-medial edge (" << pl[j-1] << ", " << pl[j] << ")\n" RESET;
+                    ++fail;
+                }
+            }
+        }
+        std::cout << (fail == 0 ? GREEN "[PASS]" RESET : RED "[FAIL]" RESET)
+                  << " Polyline edges exist in medial axis: " << fail << " issues\n";
+        totalFails += fail;
+    }
+
+    // Check 8: All non-degree-2 vertices are endpoints of at least one polyline
+    {
+        int fail = 0;
+        for (size_t i = 0; i < ma.medialVertices.size(); ++i) {
+            const auto& mv = ma.medialVertices[i];
+            if (!mv.active) continue;
+            if (mv.degree == 2) continue;
+
+            // Count how many polylines have this vertex as an endpoint
+            int endpointCount = 0;
+            for (const auto& pl : ma.polyLines) {
+                if (pl.empty()) continue;
+                if (pl.front() == static_cast<int>(i) || pl.back() == static_cast<int>(i)) {
+                    ++endpointCount;
+                }
+            }
+
+            if (endpointCount == 0) {
+                std::cout << YELLOW "  non-degree-2 vertex " << i << " is not a polyline endpoint\n" RESET;
+                ++fail;
+                continue;
+            }
+
+            // Warn if the number of polylines attached doesn't match the degree
+            if (endpointCount != mv.degree) {
+                std::cout << YELLOW "  vertex " << i << " has degree " << mv.degree
+                          << " but is an endpoint of " << endpointCount << " polylines\n" RESET;
+            }
+        }
+        std::cout << (fail == 0 ? GREEN "[PASS]" RESET : RED "[FAIL]" RESET)
+                  << " All non-degree-2 vertices are polyline endpoints: " << fail << " issues\n";
+        totalFails += fail;
+    }
+
+    // Check 9: All degree-2 vertices are interior to exactly one polyline (except for pure cycles)
+    {
+        int fail = 0;
+        for (size_t i = 0; i < ma.medialVertices.size(); ++i) {
+            const auto& mv = ma.medialVertices[i];
+            if (!mv.active) continue;
+            if (mv.degree != 2) continue;
+            int endpointCount = 0;
+            for (const auto& pl : ma.polyLines) {
+                if (pl.front() == static_cast<int>(i) || pl.back() == static_cast<int>(i)) {
+                    ++endpointCount;
+                }
+            }
+            if (endpointCount > 0) continue; // degree-2 vertex is an endpoint (cycle)
+            int count = 0;
+            for (const auto& pl : ma.polyLines) {
+                for (size_t j = 1; j + 1 < pl.size(); ++j) {
+                    if (pl[j] == static_cast<int>(i)) ++count;
+                }
+            }
+            if (count != 1) {
+                std::cout << YELLOW "  degree-2 vertex " << i << " is interior to " << count << " polylines\n" RESET;
+                ++fail;
+            }
+        }
+        std::cout << (fail == 0 ? GREEN "[PASS]" RESET : RED "[FAIL]" RESET)
+                  << " All degree-2 vertices are interior to one polyline: " << fail << " issues\n";
         totalFails += fail;
     }
 

@@ -51,6 +51,7 @@ enum class MedialAxisPhase {
     MeshOnly = 0,
     DelaunayMesh = 1,
     MedialAxis = 2,
+    Classify = 3,
 };
 
 Phase nextPhase(Phase p) {
@@ -79,7 +80,8 @@ MedialAxisPhase nextMedialAxisPhase(MedialAxisPhase p) {
     switch (p) {
         case MedialAxisPhase::MeshOnly: return MedialAxisPhase::DelaunayMesh;
         case MedialAxisPhase::DelaunayMesh: return MedialAxisPhase::MedialAxis;
-        case MedialAxisPhase::MedialAxis: return MedialAxisPhase::MedialAxis;
+        case MedialAxisPhase::MedialAxis: return MedialAxisPhase::Classify;
+        case MedialAxisPhase::Classify: return MedialAxisPhase::Classify;
     }
     return MedialAxisPhase::MedialAxis;
 }
@@ -111,6 +113,7 @@ const char *medialAxisPhaseName(MedialAxisPhase p) {
         case MedialAxisPhase::MeshOnly: return "1) mesh";
         case MedialAxisPhase::DelaunayMesh: return "2) Delaunay re-triangulation";
         case MedialAxisPhase::MedialAxis: return "3) Medial axis";
+        case MedialAxisPhase::Classify: return "4) Classify / polylines";
     }
     return "?";
 }
@@ -614,6 +617,19 @@ int main(int argc, char **argv) {
             console.log(oss.str());
         }
 
+        // When entering Classify phase, compute polylines lazily
+        if (mode == Mode::MedialAxis && maPhase >= MedialAxisPhase::Classify && medialAxis && medialAxis->polyLines.empty()) {
+            auto t0 = Clock::now();
+            medialAxis->createPolylines();
+            // Classify medial vertices once after polylines are created
+            medialAxis->classifyMedialVertices();
+            auto t1 = Clock::now();
+            double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            std::ostringstream oss;
+            oss << "[MedialAxis] Created " << medialAxis->polyLines.size() << " polylines: " << formatMs(ms);
+            console.log(oss.str());
+        }
+
         // PolyVector mode: Lazily compute data when entering phases (with timing).
         if (mode == Mode::PolyVector && phase >= Phase::CrossField && !field.has_value()) {
             auto t0 = Clock::now();
@@ -762,22 +778,79 @@ int main(int argc, char **argv) {
         } else if (mode == Mode::MedialAxis) {
             // Medial Axis mode rendering
             // Draw full mesh (Delaunay if available, otherwise original)
-            if (delaunayMesh) {
-                viewer::drawMesh(*delaunayMesh);
-            } else {
-                viewer::drawMesh(*mesh);
+            // NOTE: in Classify phase we do NOT draw the triangulation interior —
+            // the overlay below will draw only the boundary loops and polylines.
+            if (maPhase != MedialAxisPhase::Classify) {
+                if (delaunayMesh) {
+                    viewer::drawMesh(*delaunayMesh);
+                } else {
+                    viewer::drawMesh(*mesh);
+                }
             }
 
             // Draw medial axis overlay
-            if (maPhase >= MedialAxisPhase::MedialAxis && medialAxis) {
-                double ballRadius_ma = avgEdge / 5.0;
-                viewer::drawMedialAxis(*medialAxis, ballRadius_ma);
+            if (medialAxis) {
+                if (maPhase == MedialAxisPhase::Classify) {
+                    // Classify phase: erase triangulation interior, draw only boundary loops
+                    // Draw boundary edges in grey
+                    if (delaunayMesh) {
+                        viewer::drawBoundaryEdges(*delaunayMesh);
+                    } else {
+                        viewer::drawBoundaryEdges(*mesh);
+                    }
 
-                // Draw red circles at sharp corner vertices
-                for (int i = 0; i < static_cast<int>(medialAxis->sharpVertices.size()); ++i) {
-                    if (medialAxis->sharpVertices[i]) {
-                        const Point &p = medialAxis->mesh->vertices[i];
-                        viewer::drawDisk3D(p, ballRadius_ma, 0.95f, 0.2f, 0.2f);
+                    // Draw polylines in yellow
+                    glLineWidth(2.5f);
+                    glColor3f(0.95f, 0.85f, 0.1f);
+                    for (const auto &pl : medialAxis->polyLines) {
+                        if (pl.size() < 2) continue;
+                        glBegin(GL_LINE_STRIP);
+                        for (int vi : pl) {
+                            const Point &p = medialAxis->medialVertices[vi].coord;
+                            glVertex2d(p[0], p[1]);
+                        }
+                        glEnd();
+                    }
+                    glLineWidth(1.0f);
+
+                    // Draw medial vertices whose degree != 2 as disks
+                    double ballRadius_ma = avgEdge / 5.0;
+                    for (size_t i = 0; i < medialAxis->medialVertices.size(); ++i) {
+                        const auto &mv = medialAxis->medialVertices[i];
+                        if (!mv.active) continue;
+                        if (mv.degree == 2) continue;
+                        // Color by node type: Normal=blue, Corner=red, Dangle=green
+                        if (mv.nodeType == TopMakerNodeType::Normal) {
+                            viewer::drawDisk3D(mv.coord, ballRadius_ma, 0.2f, 0.2f, 0.95f);
+                        } else if (mv.nodeType == TopMakerNodeType::Corner) {
+                            // Don't draw a disk at the medial vertex — only the corner itself
+                            if (mv.cornerIndex >= 0 && mv.cornerIndex < static_cast<int>(medialAxis->mesh->vertices.size())) {
+                                const Point &cornerP = medialAxis->mesh->vertices[mv.cornerIndex];
+                                // draw red disk at the actual corner vertex
+                                viewer::drawDisk3D(cornerP, ballRadius_ma, 0.95f, 0.2f, 0.2f);
+                                // draw yellow line from corner to medial vertex
+                                glLineWidth(2.0f);
+                                glColor3f(0.95f, 0.85f, 0.1f);
+                                glBegin(GL_LINES);
+                                glVertex2d(cornerP[0], cornerP[1]);
+                                glVertex2d(mv.coord[0], mv.coord[1]);
+                                glEnd();
+                                glLineWidth(1.0f);
+                            }
+                        } else { // Dangle
+                            viewer::drawDisk3D(mv.coord, ballRadius_ma, 0.1f, 0.9f, 0.2f);
+                        }
+                    }
+                } else if (maPhase >= MedialAxisPhase::MedialAxis) {
+                    double ballRadius_ma = avgEdge / 5.0;
+                    viewer::drawMedialAxis(*medialAxis, ballRadius_ma);
+
+                    // Draw red circles at sharp corner vertices
+                    for (int i = 0; i < static_cast<int>(medialAxis->sharpVertices.size()); ++i) {
+                        if (medialAxis->sharpVertices[i]) {
+                            const Point &p = medialAxis->mesh->vertices[i];
+                            viewer::drawDisk3D(p, ballRadius_ma, 0.95f, 0.2f, 0.2f);
+                        }
                     }
                 }
             }

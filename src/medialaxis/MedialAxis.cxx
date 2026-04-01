@@ -2,6 +2,7 @@
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <iostream>
 
 MedialAxis::MedialAxis(std::shared_ptr<Mesh> mesh) : mesh(mesh) {
     if (!mesh) {
@@ -200,6 +201,7 @@ void MedialAxis::deduplicateMedialVertices() {
 
                 // Update neighbor's degree
                 neighbor.degree = static_cast<int>(neighbor.neighbors.size());
+                neighbor.timesFused = mv.timesFused + 1;
 
                 done = false;
                 break;
@@ -372,4 +374,73 @@ void MedialAxis::deduplicateMedialVertices() {
 
     medialVertices = std::move(compacted);
     medialEdges = std::move(newEdges);
+}
+
+void MedialAxis::createPolylines() {
+    polyLines.clear();
+    for (auto& mv : medialVertices) {
+        mv.polyLines.clear();
+    }
+
+    // Mark degree-2 interior vertices as visited when they are consumed by a polyline,
+    // so each chain of degree-2 vertices is traced exactly once.
+    std::vector<bool> visited(medialVertices.size(), false);
+
+    int n = static_cast<int>(medialVertices.size());
+    for (int i = 0; i < n; ++i) {
+        if (!medialVertices[i].active || medialVertices[i].degree == 2) continue;
+
+        // From each junction/leaf vertex, walk along every incident edge
+        for (int nb : medialVertices[i].neighbors) {
+            // For degree-2 neighbors, only start the walk if the neighbor hasn't been visited yet.
+            // This prevents the same chain from being traced from both ends.
+            if (medialVertices[nb].degree == 2 && visited[nb]) continue;
+
+            // For direct junction-to-junction edges (no degree-2 chain), only emit once
+            if (medialVertices[nb].degree != 2 && nb < i) continue;
+
+            std::vector<int> polyline;
+            polyline.push_back(i);
+
+            int prev = i;
+            int cur  = nb;
+            while (true) {
+                polyline.push_back(cur);
+                if (medialVertices[cur].degree != 2) break; // reached another junction/leaf
+                visited[cur] = true;
+
+                // advance to the neighbor that isn't prev
+                int next = -1;
+                for (int nb2 : medialVertices[cur].neighbors) {
+                    if (nb2 != prev) { next = nb2; break; }
+                }
+                if (next == -1) break; // malformed graph
+                prev = cur;
+                cur  = next;
+            }
+
+            polyLines.push_back(std::move(polyline));
+        }
+    }
+}
+
+void MedialAxis::classifyMedialVertices() {
+    for (auto& mv : medialVertices) {
+        if (!mv.active || mv.degree == 2) continue;
+
+        if (mv.degree > 2) {
+            mv.nodeType = TopMakerNodeType::Normal;
+        } else { // degree 1
+            // A degree-1 vertex is a "corner" if one of its touch points is a sharp boundary vertex, otherwise it's a "dangle".
+            bool isCorner = false;
+            for (int tp : mv.touchPoints) {
+                if (sharpVertices[tp]) {
+                    isCorner = true;
+                    mv.cornerIndex = tp;
+                    break;
+                }
+            }
+            mv.nodeType = (isCorner && mv.timesFused < 2) ? TopMakerNodeType::Corner : TopMakerNodeType::Dangle;
+        }
+    }
 }
