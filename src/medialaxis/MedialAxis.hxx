@@ -10,6 +10,7 @@ enum class TopMakerNodeType {
     Normal,
     Corner,
     Dangle,
+    NONE = -1
 };
 
 struct BoundaryVertex {
@@ -27,7 +28,7 @@ struct MedialVertex {
     int degree; // Number of connected medial edges (degree of the vertex in the medial graph)
     double radius; // Distance from the medial vertex to any of the triangle's vertices.
     bool active; // Whether this medial vertex is active (not pruned) in the current iteration of TopMaker
-    TopMakerNodeType nodeType; // Type of the node for TopMaker (Normal, Corner, Dangle)
+    TopMakerNodeType nodeType = TopMakerNodeType::NONE; // Type of the node for TopMaker (Normal, Corner, Dangle)
     int cornerIndex = -1; // If this is a corner node, the index of the corresponding sharp corner vertex in the original mesh; otherwise -1
     bool partOfPolyline = false; // Whether this medial vertex is part of any polyline
     int timesFused = 0; // Number of times this vertex has been fused into another during deduplication (if more than 1 it is a sign this vertex is a dangle)

@@ -841,6 +841,21 @@ int main(int argc, char **argv) {
                             viewer::drawDisk3D(mv.coord, ballRadius_ma, 0.1f, 0.9f, 0.2f);
                         }
                     }
+
+                    // Draw touch points as cyan disks for Normal medial vertices (degree != 2)
+                    double touchRadius = avgEdge / 6.0;
+                    for (size_t i = 0; i < medialAxis->medialVertices.size(); ++i) {
+                        const auto &mv = medialAxis->medialVertices[i];
+                        if (!mv.active) continue;
+                        if (mv.degree == 2) continue;
+                        if (mv.nodeType != TopMakerNodeType::Normal) continue;
+                        for (int tpIdx : mv.touchPoints) {
+                            if (tpIdx >= 0 && tpIdx < static_cast<int>(medialAxis->mesh->vertices.size())) {
+                                const Point &tp = medialAxis->mesh->vertices[tpIdx];
+                                viewer::drawDisk3D(tp, touchRadius, 0.0f, 0.9f, 0.9f); // cyan
+                            }
+                        }
+                    }
                 } else if (maPhase >= MedialAxisPhase::MedialAxis) {
                     double ballRadius_ma = avgEdge / 5.0;
                     viewer::drawMedialAxis(*medialAxis, ballRadius_ma);
