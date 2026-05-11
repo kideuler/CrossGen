@@ -12,12 +12,6 @@ TODO:
 - [X] Add options to solve MBO method using formula $(M+\tau L)u^{k+1}=Mu^k$ where M is diagonal triangle areas. L is standard laplacian. Therefore $u^{k+1} = (M+\tau L)^{-1} M u^k$
 - [X] Make step operations on separatrix instead of on tracePoints
 - [X] Test singular triangle, for 3,5 singularities, one with directions going towards singularity, 4 tests total.
-- [ ] Fix robustness issue in stepHeuns.
-- [ ] Fix weird angles in stepViertel.
-- [ ] Boundary singularities.
-- [ ] Implement separatrix tracing (no topology simplification, no edge-maps) 
-- [ ] Create separatrix graph including t-junctions.
-- [ ] Do topological simplification as listed in the viertel imr 2019 paper
-- [ ] Show all steps in gui and get some example quad meshes.
-- [ ] Spin block topology in 3D for 90 and 180 degrees.
-- [ ] Smooth hex blocks using 3rd order TMOP on Q3 elements. 
+- [ ] Implement DG-SIPG to in P0 to get crosses on faces and singularities on nodes.
+- [ ] do isoline tracing using shepherd et al 2022.
+- [ ] test for planar geoms with no limit cycles.
