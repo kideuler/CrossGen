@@ -589,20 +589,15 @@ int main(int argc, char **argv) {
             viewer::drawMesh(*mesh);
             viewer::drawTriangleCrossField(*mesh, *sipgField, scale);
 
-            // Draw singularities at triangle centroids
+            // Draw singularities at vertex positions
             double ballRadius = 0.5 * avgEdge;
-            for (const auto &[triIdx, crossIndex] : sipgField->singularTriangles) {
-                if (triIdx < 0 || triIdx >= static_cast<int>(mesh->triangles.size())) continue;
-                const Triangle &tri = mesh->triangles[triIdx];
-                const Point &p0 = mesh->vertices[tri[0]];
-                const Point &p1 = mesh->vertices[tri[1]];
-                const Point &p2 = mesh->vertices[tri[2]];
-                Point centroid = {(p0[0] + p1[0] + p2[0]) / 3.0,
-                                  (p0[1] + p1[1] + p2[1]) / 3.0};
+            for (const auto &[vertIdx, crossIndex] : sipgField->singularVertices) {
+                if (vertIdx < 0 || vertIdx >= static_cast<int>(mesh->vertices.size())) continue;
+                const Point &c = mesh->vertices[vertIdx];
                 if (crossIndex > 0) {
-                    viewer::drawDisk3D(centroid, ballRadius, 0.2f, 0.2f, 0.95f);
+                    viewer::drawDisk3D(c, ballRadius, 0.2f, 0.2f, 0.95f);
                 } else {
-                    viewer::drawDisk3D(centroid, ballRadius, 0.95f, 0.2f, 0.2f);
+                    viewer::drawDisk3D(c, ballRadius, 0.95f, 0.2f, 0.2f);
                 }
             }
 
@@ -843,20 +838,15 @@ int main(int argc, char **argv) {
             if (sipgPhase >= SIPGPhase::CrossField && sipgField.has_value()) {
                 viewer::drawTriangleCrossField(*mesh, *sipgField, scale);
 
-                // Draw singularities at triangle centroids
+                // Draw singularities at vertex positions
                 double ballRadius = 0.5 * avgEdge;
-                for (const auto &[triIdx, crossIndex] : sipgField->singularTriangles) {
-                    if (triIdx < 0 || triIdx >= static_cast<int>(mesh->triangles.size())) continue;
-                    const Triangle &tri = mesh->triangles[triIdx];
-                    const Point &p0 = mesh->vertices[tri[0]];
-                    const Point &p1 = mesh->vertices[tri[1]];
-                    const Point &p2 = mesh->vertices[tri[2]];
-                    Point centroid = {(p0[0] + p1[0] + p2[0]) / 3.0,
-                                      (p0[1] + p1[1] + p2[1]) / 3.0};
+                for (const auto &[vertIdx, crossIndex] : sipgField->singularVertices) {
+                    if (vertIdx < 0 || vertIdx >= static_cast<int>(mesh->vertices.size())) continue;
+                    const Point &c = mesh->vertices[vertIdx];
                     if (crossIndex > 0) {
-                        viewer::drawDisk3D(centroid, ballRadius, 0.2f, 0.2f, 0.95f);
+                        viewer::drawDisk3D(c, ballRadius, 0.2f, 0.2f, 0.95f);
                     } else {
-                        viewer::drawDisk3D(centroid, ballRadius, 0.95f, 0.2f, 0.2f);
+                        viewer::drawDisk3D(c, ballRadius, 0.95f, 0.2f, 0.2f);
                     }
                 }
             }

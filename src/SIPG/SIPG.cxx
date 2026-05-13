@@ -215,7 +215,7 @@ void SIPG::step() {
 // for non-zero winding number.
 // ---------------------------------------------------------------------------
 void SIPG::computeSingularities() {
-    singularTriangles.clear();
+    singularVertices.clear();
 
     // Helper: smallest-angle difference between two unit complex numbers in (-pi, pi]
     auto angleDiff = [](std::complex<double> z_start, std::complex<double> z_end) -> double {
@@ -223,16 +223,12 @@ void SIPG::computeSingularities() {
         return std::atan2(d.imag(), d.real());
     };
 
-    const int NT = static_cast<int>(mesh->triangles.size());
-
-    // For a p=0 DG field the natural singularity check is per-interior-vertex:
-    // sum angle differences around the vertex star and look for non-zero winding.
-    // We report singularities as the triangle that "owns" the vertex (first in the star).
+    // For each interior vertex, sum angle differences around the triangle star.
+    // A non-zero winding number indicates a singularity; we report the vertex index.
     const int NV = static_cast<int>(mesh->vertices.size());
     for (int v = 0; v < NV; ++v) {
         if (mesh->isBoundaryVertex[v]) continue;
 
-        // Collect incident triangles in CCW order from VertexTriangleCSR
         const auto &vt = mesh->vertexTriangles;
         int start = vt.rowPtr[v];
         int end   = vt.rowPtr[v + 1];
@@ -248,10 +244,8 @@ void SIPG::computeSingularities() {
 
         int winding = static_cast<int>(std::round(totalAngle / (2.0 * M_PI)));
         if (winding != 0) {
-            // Report as the first triangle in the star
-            int tRep = vt.colIdx[start];
             double crossIndex = winding / 4.0;
-            singularTriangles.emplace_back(tRep, crossIndex);
+            singularVertices.emplace_back(v, crossIndex);
         }
     }
 }
@@ -262,7 +256,7 @@ void SIPG::computeSingularities() {
 void SIPG::runMBO() {
     int iteration = 0;
     double ntris = static_cast<double>(mesh->triangles.size());
-    while (iteration < maxIterations && error > 2.0 * ntris * 1e-5) {
+    while (iteration < maxIterations && error > 2.0 * ntris * 1e-7) {
         step();
         ++iteration;
     }

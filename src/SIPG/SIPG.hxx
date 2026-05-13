@@ -19,7 +19,7 @@ public:
     Eigen::VectorXcd u_k;      // current solution vector (per triangle)
     Eigen::VectorXcd u_k_prev; // previous solution vector (per triangle)
     double error = std::numeric_limits<double>::max(); // current error for convergence checking
-    std::vector<std::pair<int, double>> singularTriangles; // (triangle index, cross-field index) pairs
+    std::vector<std::pair<int, double>> singularVertices; // (vertex index, cross-field index) pairs
     std::shared_ptr<Mesh> mesh;
 
     SIPG(std::shared_ptr<Mesh> mesh, int maxIterations = 100, double gamma = 10.0)

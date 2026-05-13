@@ -82,9 +82,9 @@ int main(int argc, char **argv) {
     // ------------------------------------------------------------------
     sipg.computeSingularities();
 
-    std::cerr << "Found " << sipg.singularTriangles.size() << " singularity/singularities\n";
-    for (const auto &[triIdx, index] : sipg.singularTriangles) {
-        std::cout << "singularity  triangle=" << triIdx
+    std::cerr << "Found " << sipg.singularVertices.size() << " singularity/singularities\n";
+    for (const auto &[vertIdx, index] : sipg.singularVertices) {
+        std::cout << "singularity  vertex=" << vertIdx
                   << "  index=" << std::fixed << std::setprecision(4) << index << "\n";
     }
 
