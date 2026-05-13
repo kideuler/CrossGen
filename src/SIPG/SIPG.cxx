@@ -81,6 +81,10 @@ void SIPG::initialize() {
     }
 
     // --- Boundary edges ---
+    // Also accumulate weighted-average BC value per boundary triangle for hard pinning.
+    std::unordered_map<int, std::complex<double>> bcWeightedSum; // numerator: sum(kappa * ge)
+    std::unordered_map<int, double>               bcWeightTotal; // denominator: sum(kappa)
+
     for (int edgeIdx : mesh->boundaryEdges) {
         int ti = mesh->edgeTriangles[edgeIdx][0]; // K_i (only triangle on this edge)
 
@@ -114,6 +118,19 @@ void SIPG::initialize() {
         // K_ii += kappa,  b_i += kappa * g_e
         stiffTrips.emplace_back(ti, ti, std::complex<double>(kappa, 0.0));
         b[ti] += kappa * ge;
+
+        // Accumulate for hard BC map
+        bcWeightedSum[ti] += kappa * ge;
+        bcWeightTotal[ti] += kappa;
+    }
+
+    // Normalise each boundary triangle's BC to the unit circle.
+    boundaryTriangleBC.clear();
+    for (const auto &[ti, wsum] : bcWeightedSum) {
+        double mag = std::abs(wsum);
+        if (mag > 1e-14) {
+            boundaryTriangleBC[ti] = wsum / mag;
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -137,10 +154,46 @@ void SIPG::initialize() {
     tau = D * D / 10.0;
 
     // -----------------------------------------------------------------------
-    // Step 6 – Form and factorize A = M + tau*K
+    // Step 6 – Form A = M + tau*K, then eliminate boundary triangle DOFs
+    //
+    // Following CrossField's approach: for each boundary triangle row, zero out
+    // the entire row in both M and A, then put 1 on the diagonal.  This turns
+    // the boundary triangle equation into "u_tilde[ti] = u_k_prev[ti] = BC",
+    // while interior rows retain full coupling to the (fixed) BC values through
+    // the off-diagonal K columns – exactly as CrossField handles vertex BCs.
     // -----------------------------------------------------------------------
     A = M + tau * K;
 
+    const std::complex<double> czero(0.0, 0.0);
+    const std::complex<double> cone (1.0, 0.0);
+
+    // Build a fast lookup for boundary triangles
+    std::unordered_set<int> bndTriSet;
+    for (const auto &[ti, _] : boundaryTriangleBC) bndTriSet.insert(ti);
+
+    // Zero boundary rows in M (column-major iteration)
+    for (int col = 0; col < M.outerSize(); ++col) {
+        for (Eigen::SparseMatrix<std::complex<double>>::InnerIterator it(M, col); it; ++it) {
+            if (bndTriSet.count(it.row())) {
+                it.valueRef() = (it.row() == col) ? cone : czero;
+            }
+        }
+    }
+    M.prune(czero);
+
+    // Zero boundary rows in A (column-major iteration)
+    for (int col = 0; col < A.outerSize(); ++col) {
+        for (Eigen::SparseMatrix<std::complex<double>>::InnerIterator it(A, col); it; ++it) {
+            if (bndTriSet.count(it.row())) {
+                it.valueRef() = (it.row() == col) ? cone : czero;
+            }
+        }
+    }
+    A.prune(czero);
+
+    // -----------------------------------------------------------------------
+    // Step 7 – Factorise the modified A
+    // -----------------------------------------------------------------------
     solverLU.compute(A);
     if (solverLU.info() != Eigen::Success) {
         std::cerr << "SIPG: SparseLU factorization failed, falling back to BiCGSTAB" << std::endl;
@@ -156,13 +209,15 @@ void SIPG::initialize() {
     }
 
     // -----------------------------------------------------------------------
-    // Step 7 – Initialize field u^0 to the boundary-driven values where
-    //          boundary edges exist, and ones elsewhere
+    // Step 8 – Initialise field: interior = 1, boundary = BC value
     // -----------------------------------------------------------------------
     u_k_prev.resize(NT);
-    u_k_prev.setOnes(); // start from constant unit field
+    u_k_prev.setOnes();
 
-    // Warm-start: one diffusion step to propagate boundary data into interior
+    for (const auto &[ti, bc] : boundaryTriangleBC) {
+        u_k_prev[ti] = bc;
+    }
+
     u_k.resize(NT);
     u_k = u_k_prev;
 }

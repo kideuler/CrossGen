@@ -572,7 +572,7 @@ int main(int argc, char **argv) {
             for (int i = 0; i < 2 && sipgStepCount < 500; ++i) {
                 sipgField->step();
                 ++sipgStepCount;
-                if (sipgField->error < 2.0 * ntris * 1e-5) {
+                if (sipgField->error < 2.0 * ntris * 1e-8) {
                     console.log("[SIPG] Converged at step " + std::to_string(sipgStepCount) +
                                 " error=" + std::to_string(sipgField->error));
                     sipgConverged = true;

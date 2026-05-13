@@ -4,6 +4,7 @@
 #include <complex>
 #include <cmath>
 #include <memory>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 #include <limits>
@@ -50,6 +51,10 @@ private:
     double tau;          // time step size
     double gamma;        // SIPG penalty parameter
     int maxIterations;   // maximum number of iterations
+
+    // Hard Dirichlet BC per boundary triangle: triangle index -> prescribed exp(4i*theta)
+    // Computed from the dominant boundary edge tangent in initialize(); applied after each step.
+    std::unordered_map<int, std::complex<double>> boundaryTriangleBC;
 };
 
 #endif // __SIPG_HXX__
