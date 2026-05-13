@@ -11,6 +11,7 @@
 #include "IGM/MIQ.hxx"
 #include "polyvector/PolyVectors.hxx"
 #include "crossfield/CrossField.hxx"
+#include "sipg/SIPG.hxx"
 #include "medialaxis/MedialAxis.hxx"
 
 namespace viewer {
@@ -59,6 +60,9 @@ void drawVertexCrossField(const Mesh &m, const CrossField &cf, double scale);
 // Draw crossfield on mesh vertices from CrossField u_k (MBO method, during stepping)
 // Each cross direction is (u_k[i])^(1/4)
 void drawVertexCrossFieldUK(const Mesh &m, const CrossField &cf, double scale);
+
+// Draw SIPG p=0 cross field: one cross per triangle centroid from SIPG u_k.
+void drawTriangleCrossField(const Mesh &m, const SIPG &sipg, double scale);
 
 void drawDisk3D(const Point &center, double radius, float baseR, float baseG, float baseB, int segments = 96);
 

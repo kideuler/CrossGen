@@ -41,6 +41,8 @@ add_library(PolyVector SHARED
     src/mesh/Mesh.hxx
     src/polyvector/PolyVectors.hxx
     src/polyvector/PolyVectors.cxx
+    src/SIPG/SIPG.hxx
+    src/SIPG/SIPG.cxx
     src/IGM/CutMesh.hxx
     src/IGM/CutMesh.cxx
     src/IGM/MIQ.hxx
@@ -84,6 +86,10 @@ target_link_libraries(TestMedialAxis PRIVATE PolyVector)
 # Generate circle/ellipse topologies
 add_executable(GenerateCircleTopologies src/utils/GenerateCircleTopologies.cxx)
 target_link_libraries(GenerateCircleTopologies PRIVATE PolyVector)
+
+# Test p=0 DG/SIPG MBO cross-field solver
+add_executable(TestSIPG src/utils/TestSIPG.cxx)
+target_link_libraries(TestSIPG PRIVATE PolyVector)
 
 # copy all meshes to build directory for easy access
 file(GLOB MESH_FILES "${CMAKE_CURRENT_SOURCE_DIR}/data/meshes/*")

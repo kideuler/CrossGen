@@ -265,6 +265,39 @@ void drawVertexCrossFieldUK(const Mesh &m, const CrossField &cf, double scale) {
     }
 }
 
+void drawTriangleCrossField(const Mesh &m, const SIPG &sipg, double scale) {
+    glLineWidth(2.5f);
+    const float br = 0.45f, bg = 0.05f, bb = 0.55f; // dark purple
+
+    const Eigen::VectorXcd &u_k = sipg.u_k;
+
+    for (int t = 0; t < static_cast<int>(m.triangles.size()); ++t) {
+        if (t >= u_k.size()) continue;
+
+        std::complex<double> u4 = u_k[t];
+        if (std::abs(u4) < 1e-14) continue;
+
+        // Compute centroid of triangle
+        const Triangle &tri = m.triangles[t];
+        const Point &p0 = m.vertices[tri[0]];
+        const Point &p1 = m.vertices[tri[1]];
+        const Point &p2 = m.vertices[tri[2]];
+        Point c = {(p0[0] + p1[0] + p2[0]) / 3.0,
+                   (p0[1] + p1[1] + p2[1]) / 3.0};
+
+        // Decode spin-4 angle: u4 = exp(4i*theta)
+        double theta4 = std::arg(u4);
+        double theta  = theta4 / 4.0;
+
+        // Draw four arms of the cross
+        for (int k = 0; k < 4; ++k) {
+            double angle = theta + k * M_PI_2;
+            Point dir{std::cos(angle), std::sin(angle)};
+            drawArrow(c, dir, scale, br, bg, bb);
+        }
+    }
+}
+
 void drawDisk3D(const Point &center, double radius, float baseR, float baseG, float baseB, int segments) {
     // Fake light direction in view space (towards viewer, slightly to top-right)
     Eigen::Vector3d L = Eigen::Vector3d(0.4, 0.4, 0.8).normalized();

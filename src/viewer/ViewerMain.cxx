@@ -18,6 +18,7 @@
 #include "IGM/MIQ.hxx"
 #include "polyvector/PolyVectors.hxx"
 #include "crossfield/CrossField.hxx"
+#include "sipg/SIPG.hxx"
 #include "tracing/SeparatrixTrace.hxx"
 #include "triangle/TriangleMesher.hpp"
 #include "medialaxis/MedialAxis.hxx"
@@ -29,6 +30,7 @@ enum class Mode {
     PolyVector = 1,
     MBO = 2,
     MedialAxis = 3,
+    SIPG = 4,
 };
 
 enum class Phase {
@@ -45,6 +47,12 @@ enum class MBOPhase {
     Stepping = 3,
     Separatrices = 4,
     Trace = 5,
+};
+
+enum class SIPGPhase {
+    MeshOnly = 1,
+    CrossField = 2,
+    Stepping = 3,
 };
 
 enum class MedialAxisPhase {
@@ -74,6 +82,15 @@ MBOPhase nextMBOPhase(MBOPhase p) {
         case MBOPhase::Trace: return MBOPhase::Trace;
     }
     return MBOPhase::Trace;
+}
+
+SIPGPhase nextSIPGPhase(SIPGPhase p) {
+    switch (p) {
+        case SIPGPhase::MeshOnly:   return SIPGPhase::CrossField;
+        case SIPGPhase::CrossField: return SIPGPhase::Stepping;
+        case SIPGPhase::Stepping:   return SIPGPhase::Stepping;
+    }
+    return SIPGPhase::Stepping;
 }
 
 MedialAxisPhase nextMedialAxisPhase(MedialAxisPhase p) {
@@ -108,6 +125,15 @@ const char *mboPhaseName(MBOPhase p) {
     return "?";
 }
 
+const char *sipgPhaseName(SIPGPhase p) {
+    switch (p) {
+        case SIPGPhase::MeshOnly:   return "1) mesh";
+        case SIPGPhase::CrossField: return "2) SIPG crossfield";
+        case SIPGPhase::Stepping:   return "3) SIPG stepping";
+    }
+    return "?";
+}
+
 const char *medialAxisPhaseName(MedialAxisPhase p) {
     switch (p) {
         case MedialAxisPhase::MeshOnly: return "1) mesh";
@@ -124,6 +150,7 @@ const char *modeName(Mode m) {
         case Mode::PolyVector: return "PolyVector";
         case Mode::MBO: return "MBO";
         case Mode::MedialAxis: return "Medial Axis";
+        case Mode::SIPG: return "SIPG";
     }
     return "?";
 }
@@ -159,12 +186,14 @@ int main(int argc, char **argv) {
     std::optional<CutMesh> cutMesh;
     std::optional<MIQSolver> miqSolver;
     std::optional<CrossField> crossField;
+    std::optional<SIPG> sipgField;
     std::shared_ptr<SeparatrixTrace> separatrixTrace;
     std::shared_ptr<Mesh> delaunayMesh;
     std::shared_ptr<MedialAxis> medialAxis;
     Mode mode = Mode::Unselected;
     Phase phase = Phase::MeshOnly;
     MBOPhase mboPhase = MBOPhase::MeshOnly;
+    SIPGPhase sipgPhase = SIPGPhase::MeshOnly;
     MedialAxisPhase maPhase = MedialAxisPhase::MeshOnly;
     bool cWasDown = false;
     bool rWasDown = false;
@@ -177,6 +206,9 @@ int main(int argc, char **argv) {
     bool mboTracingStarted = false;
     bool mboTracingFinished = false;
     int mboStepCount = 0;
+    bool sipgSteppingStarted = false;
+    bool sipgConverged = false;
+    int sipgStepCount = 0;
     
     // Console for timing output
     viewer::Console console;
@@ -256,6 +288,7 @@ int main(int argc, char **argv) {
                 cutMesh.reset();
                 miqSolver.reset();
                 crossField.reset();
+                sipgField.reset();
                 separatrixTrace.reset();
                 delaunayMesh.reset();
                 medialAxis.reset();
@@ -264,6 +297,7 @@ int main(int argc, char **argv) {
                 mode = Mode::Unselected;
                 phase = Phase::MeshOnly;
                 mboPhase = MBOPhase::MeshOnly;
+                sipgPhase = SIPGPhase::MeshOnly;
                 maPhase = MedialAxisPhase::MeshOnly;
 
                 // Reset flags
@@ -273,6 +307,9 @@ int main(int argc, char **argv) {
                 mboTracingStarted = false;
                 mboTracingFinished = false;
                 mboStepCount = 0;
+                sipgSteppingStarted = false;
+                sipgConverged = false;
+                sipgStepCount = 0;
 
                 // Reset view to original mesh bounds
                 view.cx = 0.5 * (B.minx + B.maxx);
@@ -305,6 +342,7 @@ int main(int argc, char **argv) {
             bool oneDown = (glfwGetKey(window, GLFW_KEY_1) == GLFW_PRESS);
             bool twoDown = (glfwGetKey(window, GLFW_KEY_2) == GLFW_PRESS);
             bool threeDown = (glfwGetKey(window, GLFW_KEY_3) == GLFW_PRESS);
+            bool fourDown  = (glfwGetKey(window, GLFW_KEY_4) == GLFW_PRESS);
             
             if (oneDown && !oneWasDown) {
                 mode = Mode::PolyVector;
@@ -320,6 +358,11 @@ int main(int argc, char **argv) {
                 mode = Mode::MedialAxis;
                 std::cerr << "[Viewer] Selected mode: " << modeName(mode) << " (press 'c' to advance)\n";
                 console.log("Selected mode: Medial Axis");
+            }
+            if (fourDown && !oneWasDown) {
+                mode = Mode::SIPG;
+                std::cerr << "[Viewer] Selected mode: " << modeName(mode) << " (press 'c' to advance)\n";
+                console.log("Selected mode: SIPG");
             }
             
             oneWasDown = oneDown;
@@ -347,6 +390,12 @@ int main(int argc, char **argv) {
                 maPhase = nextMedialAxisPhase(maPhase);
                 if (maPhase != old) {
                     std::cerr << "[Viewer] Medial Axis Phase " << medialAxisPhaseName(maPhase) << "\n";
+                }
+            } else if (mode == Mode::SIPG) {
+                SIPGPhase old = sipgPhase;
+                sipgPhase = nextSIPGPhase(sipgPhase);
+                if (sipgPhase != old) {
+                    std::cerr << "[Viewer] SIPG Phase " << sipgPhaseName(sipgPhase) << "\n";
                 }
             }
         }
@@ -497,6 +546,76 @@ int main(int argc, char **argv) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
             // Skip normal rendering this frame
+            continue;
+        }
+
+        // SIPG mode: Initialize when entering CrossField phase
+        if (mode == Mode::SIPG && sipgPhase >= SIPGPhase::CrossField && !sipgField.has_value()) {
+            auto t0 = Clock::now();
+            sipgField.emplace(mesh);
+            sipgField->initialize();
+            auto t1 = Clock::now();
+            double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            console.log("[SIPG] Initialized: " + formatMs(ms));
+        }
+
+        // SIPG mode: Run stepping when in Stepping phase
+        if (mode == Mode::SIPG && sipgPhase == SIPGPhase::Stepping && sipgField.has_value() && !sipgSteppingStarted) {
+            sipgSteppingStarted = true;
+            sipgStepCount = 0;
+            console.log("[SIPG] Starting MBO iterations (max " + std::to_string(sipgField->getMesh().triangles.size()) + " tris)...");
+        }
+
+        if (mode == Mode::SIPG && sipgPhase == SIPGPhase::Stepping &&
+            sipgSteppingStarted && !sipgConverged) {
+            double ntris = static_cast<double>(mesh->triangles.size());
+            for (int i = 0; i < 2 && sipgStepCount < 500; ++i) {
+                sipgField->step();
+                ++sipgStepCount;
+                if (sipgField->error < 2.0 * ntris * 1e-5) {
+                    console.log("[SIPG] Converged at step " + std::to_string(sipgStepCount) +
+                                " error=" + std::to_string(sipgField->error));
+                    sipgConverged = true;
+                    break;
+                }
+            }
+            sipgField->computeSingularities();
+
+            // Animated render during stepping
+            glClearColor(0.1f, 0.1f, 0.12f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+            glDisable(GL_DEPTH_TEST);
+
+            viewer::drawMesh(*mesh);
+            viewer::drawTriangleCrossField(*mesh, *sipgField, scale);
+
+            // Draw singularities at triangle centroids
+            double ballRadius = 0.5 * avgEdge;
+            for (const auto &[triIdx, crossIndex] : sipgField->singularTriangles) {
+                if (triIdx < 0 || triIdx >= static_cast<int>(mesh->triangles.size())) continue;
+                const Triangle &tri = mesh->triangles[triIdx];
+                const Point &p0 = mesh->vertices[tri[0]];
+                const Point &p1 = mesh->vertices[tri[1]];
+                const Point &p2 = mesh->vertices[tri[2]];
+                Point centroid = {(p0[0] + p1[0] + p2[0]) / 3.0,
+                                  (p0[1] + p1[1] + p2[1]) / 3.0};
+                if (crossIndex > 0) {
+                    viewer::drawDisk3D(centroid, ballRadius, 0.2f, 0.2f, 0.95f);
+                } else {
+                    viewer::drawDisk3D(centroid, ballRadius, 0.95f, 0.2f, 0.2f);
+                }
+            }
+
+            std::ostringstream stepMsg;
+            stepMsg << "[SIPG] Step " << sipgStepCount << "  error=" << std::scientific
+                    << std::setprecision(3) << sipgField->error;
+            console.log(stepMsg.str());
+            console.draw(window, 55.0f);
+            viewer::drawTextOverlay(window, "SIPG stepping...\npress 'q' to quit", 10.0f, 20.0f, 0.8f, 0.8f, 0.8f);
+
+            glfwSwapBuffers(window);
+            glfwPollEvents();
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
 
@@ -717,6 +836,30 @@ int main(int argc, char **argv) {
                 double uvRadius = 0.8; // fixed size that looks good on integer grid
                 viewer::drawSingularitiesOnUV(*miqSolver, *cutMesh, *field, uvRadius);
             }
+        } else if (mode == Mode::SIPG) {
+            // SIPG mode rendering
+            viewer::drawMesh(*mesh);
+
+            if (sipgPhase >= SIPGPhase::CrossField && sipgField.has_value()) {
+                viewer::drawTriangleCrossField(*mesh, *sipgField, scale);
+
+                // Draw singularities at triangle centroids
+                double ballRadius = 0.5 * avgEdge;
+                for (const auto &[triIdx, crossIndex] : sipgField->singularTriangles) {
+                    if (triIdx < 0 || triIdx >= static_cast<int>(mesh->triangles.size())) continue;
+                    const Triangle &tri = mesh->triangles[triIdx];
+                    const Point &p0 = mesh->vertices[tri[0]];
+                    const Point &p1 = mesh->vertices[tri[1]];
+                    const Point &p2 = mesh->vertices[tri[2]];
+                    Point centroid = {(p0[0] + p1[0] + p2[0]) / 3.0,
+                                      (p0[1] + p1[1] + p2[1]) / 3.0};
+                    if (crossIndex > 0) {
+                        viewer::drawDisk3D(centroid, ballRadius, 0.2f, 0.2f, 0.95f);
+                    } else {
+                        viewer::drawDisk3D(centroid, ballRadius, 0.95f, 0.2f, 0.2f);
+                    }
+                }
+            }
         } else if (mode == Mode::MBO) {
             // MBO mode rendering
             viewer::drawMesh(*mesh);
@@ -917,7 +1060,7 @@ int main(int argc, char **argv) {
 
         // Draw help text overlay based on mode
         if (mode == Mode::Unselected) {
-            viewer::drawTextOverlay(window, "press '1' for PolyVector mode\npress '2' for MBO mode\npress '3' for Medial Axis mode\npress 'r' to restart\npress 'q' to quit", 10.0f, 20.0f, 0.8f, 0.8f, 0.8f);
+            viewer::drawTextOverlay(window, "press '1' for PolyVector mode\npress '2' for MBO mode\npress '3' for Medial Axis mode\npress '4' for SIPG mode\npress 'r' to restart\npress 'q' to quit", 10.0f, 20.0f, 0.8f, 0.8f, 0.8f);
         } else {
             viewer::drawTextOverlay(window, "press 'c' to continue\npress 'r' to restart\npress 'q' to quit", 10.0f, 20.0f, 0.8f, 0.8f, 0.8f);
         }
