@@ -1,0 +1,979 @@
+// CrossGenWidget.cxx – Qt6 QOpenGLWidget implementation of the CrossGen viewer.
+// Replaces the old GLFW-based ViewerMain render loop with Qt event-driven rendering.
+
+#include "viewer/CrossGenWidget.hxx"
+#include "viewer/GL.hxx"
+#include "viewer/Interaction.hxx"
+#include "viewer/Render.hxx"
+
+#include <QKeyEvent>
+#include <QMouseEvent>
+#include <QWheelEvent>
+#include <QTimer>
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <iomanip>
+#include <iostream>
+#include <sstream>
+#include <unordered_map>
+#include <unordered_set>
+
+#include "triangle/TriangleMesher.hpp"
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+namespace {
+
+std::string formatMs(double ms) {
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(2) << ms << " ms";
+    return oss.str();
+}
+
+using Clock = std::chrono::high_resolution_clock;
+
+Phase nextPhase(Phase p) {
+    switch (p) {
+        case Phase::MeshOnly:      return Phase::CrossField;
+        case Phase::CrossField:    return Phase::Singularities;
+        case Phase::Singularities: return Phase::CutSeams;
+        case Phase::CutSeams:      return Phase::UVMesh;
+        case Phase::UVMesh:        return Phase::UVMesh;
+    }
+    return Phase::UVMesh;
+}
+
+MBOPhase nextMBOPhase(MBOPhase p) {
+    switch (p) {
+        case MBOPhase::MeshOnly:     return MBOPhase::CrossField;
+        case MBOPhase::CrossField:   return MBOPhase::Stepping;
+        case MBOPhase::Stepping:     return MBOPhase::Separatrices;
+        case MBOPhase::Separatrices: return MBOPhase::Trace;
+        case MBOPhase::Trace:        return MBOPhase::Trace;
+    }
+    return MBOPhase::Trace;
+}
+
+SIPGPhase nextSIPGPhase(SIPGPhase p) {
+    switch (p) {
+        case SIPGPhase::MeshOnly:   return SIPGPhase::CrossField;
+        case SIPGPhase::CrossField: return SIPGPhase::Stepping;
+        case SIPGPhase::Stepping:   return SIPGPhase::Stepping;
+    }
+    return SIPGPhase::Stepping;
+}
+
+MedialAxisPhase nextMedialAxisPhase(MedialAxisPhase p) {
+    switch (p) {
+        case MedialAxisPhase::MeshOnly:     return MedialAxisPhase::DelaunayMesh;
+        case MedialAxisPhase::DelaunayMesh: return MedialAxisPhase::MedialAxis;
+        case MedialAxisPhase::MedialAxis:   return MedialAxisPhase::Classify;
+        case MedialAxisPhase::Classify:     return MedialAxisPhase::Classify;
+    }
+    return MedialAxisPhase::Classify;
+}
+
+const char *phaseName(Phase p) {
+    switch (p) {
+        case Phase::MeshOnly:      return "1) mesh";
+        case Phase::CrossField:    return "2) crossfield";
+        case Phase::Singularities: return "3) singularities";
+        case Phase::CutSeams:      return "4) cut seams";
+        case Phase::UVMesh:        return "5) UV mesh (MIQ)";
+    }
+    return "?";
+}
+
+const char *mboPhaseName(MBOPhase p) {
+    switch (p) {
+        case MBOPhase::MeshOnly:     return "1) mesh";
+        case MBOPhase::CrossField:   return "2) MBO crossfield";
+        case MBOPhase::Stepping:     return "3) MBO stepping";
+        case MBOPhase::Separatrices: return "4) separatrices";
+        case MBOPhase::Trace:        return "5) trace";
+    }
+    return "?";
+}
+
+const char *sipgPhaseName(SIPGPhase p) {
+    switch (p) {
+        case SIPGPhase::MeshOnly:   return "1) mesh";
+        case SIPGPhase::CrossField: return "2) SIPG crossfield";
+        case SIPGPhase::Stepping:   return "3) SIPG stepping";
+    }
+    return "?";
+}
+
+const char *medialAxisPhaseName(MedialAxisPhase p) {
+    switch (p) {
+        case MedialAxisPhase::MeshOnly:     return "1) mesh";
+        case MedialAxisPhase::DelaunayMesh: return "2) Delaunay re-triangulation";
+        case MedialAxisPhase::MedialAxis:   return "3) Medial axis";
+        case MedialAxisPhase::Classify:     return "4) Classify / polylines";
+    }
+    return "?";
+}
+
+const char *modeName(Mode m) {
+    switch (m) {
+        case Mode::Unselected: return "unselected";
+        case Mode::PolyVector: return "PolyVector";
+        case Mode::MBO:        return "MBO";
+        case Mode::MedialAxis: return "Medial Axis";
+        case Mode::SIPG:       return "SIPG";
+    }
+    return "?";
+}
+
+} // anonymous namespace
+
+// ── constructor ───────────────────────────────────────────────────────────────
+
+CrossGenWidget::CrossGenWidget(const std::string &meshPath, QWidget *parent)
+    : QOpenGLWidget(parent)
+{
+    mesh_ = std::make_shared<Mesh>(meshPath);
+
+    // Compute view bounds
+    bounds_  = viewer::computeBounds(*mesh_);
+    avgEdge_ = viewer::averageTriangleEdgeLength(*mesh_);
+    scale_   = 0.7 * avgEdge_;
+
+    double dx  = bounds_.maxx - bounds_.minx;
+    double dy  = bounds_.maxy - bounds_.miny;
+    double ext = std::max(dx, dy);
+    if (ext <= 0) ext = 1.0;
+    pad_ = 0.1 * ext;
+
+    view_.cx    = 0.5 * (bounds_.minx + bounds_.maxx);
+    view_.cy    = 0.5 * (bounds_.miny + bounds_.maxy);
+    view_.baseW = dx + 2.0 * pad_;
+    view_.baseH = dy + 2.0 * pad_;
+    if (view_.baseW <= 0.0) view_.baseW = 1.0;
+    if (view_.baseH <= 0.0) view_.baseH = 1.0;
+    view_.zoom  = 1.0;
+
+    // Console setup
+    console_.setMaxLines(8);
+    {
+        std::ostringstream oss;
+        oss << "Loaded mesh: " << mesh_->triangles.size() << " triangles, "
+            << mesh_->vertices.size() << " vertices";
+        console_.log(oss.str());
+    }
+
+    // Timer drives continuous repaints (animation + general refresh)
+    timer_ = new QTimer(this);
+    connect(timer_, &QTimer::timeout, this, &CrossGenWidget::onTimer);
+    timer_->start(16); // ~60 fps
+
+    setFocusPolicy(Qt::StrongFocus);
+
+    std::cerr << "[Viewer] Phase " << phaseName(phase_)
+              << " (press '1' for PolyVector, '2' for MBO, '3' for Medial Axis, '4' for SIPG)\n";
+}
+
+// ── QOpenGLWidget overrides ───────────────────────────────────────────────────
+
+void CrossGenWidget::initializeGL() {
+    glEnable(GL_MULTISAMPLE);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glEnable(GL_LINE_SMOOTH);
+    glHint(GL_LINE_SMOOTH_HINT, GL_NICEST);
+    glShadeModel(GL_SMOOTH);
+}
+
+void CrossGenWidget::resizeGL(int w, int h) {
+    viewer::resizeAndApplyOrtho(view_, fbw(), fbh());
+}
+
+void CrossGenWidget::paintGL() {
+    // Apply current view/zoom state — must happen here where the GL context is current.
+    viewer::applyOrtho(view_);
+
+    // Run any lazy computations that are triggered by the current phase/mode.
+    runComputations();
+
+    // Clear
+    glClearColor(0.1f, 0.1f, 0.12f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glDisable(GL_DEPTH_TEST);
+
+    // Choose render path
+    bool isMBOStepping = (mode_ == Mode::MBO &&
+                          mboPhase_ == MBOPhase::Stepping &&
+                          mboSteppingStarted_ &&
+                          mboStepCount_ < MBO_MAX_STEPS &&
+                          !mboConverged_);
+
+    bool isSIPGStepping = (mode_ == Mode::SIPG &&
+                           sipgPhase_ == SIPGPhase::Stepping &&
+                           sipgSteppingStarted_ &&
+                           !sipgConverged_);
+
+    bool isTracing = (mode_ == Mode::MBO &&
+                      mboPhase_ == MBOPhase::Trace &&
+                      separatrixTrace_ &&
+                      !mboTracingFinished_);
+
+    if (isMBOStepping) {
+        renderMBOAnimation();
+    } else if (isSIPGStepping) {
+        renderSIPGAnimation();
+    } else if (isTracing) {
+        renderTraceAnimation();
+    } else {
+        renderNormal();
+    }
+}
+
+// ── slot ──────────────────────────────────────────────────────────────────────
+
+void CrossGenWidget::onTimer() {
+    update(); // trigger paintGL
+}
+
+// ── key events ────────────────────────────────────────────────────────────────
+
+void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
+    if (event->isAutoRepeat()) return;
+
+    switch (event->key()) {
+    case Qt::Key_Q:
+    case Qt::Key_Escape:
+        close();
+        break;
+
+    case Qt::Key_R:
+        doReset();
+        break;
+
+    case Qt::Key_C:
+        if (mode_ != Mode::Unselected)
+            advancePhase();
+        break;
+
+    case Qt::Key_1:
+        if (mode_ == Mode::Unselected && phase_ == Phase::MeshOnly) {
+            mode_ = Mode::PolyVector;
+            std::cerr << "[Viewer] Selected mode: " << modeName(mode_) << " (press 'c' to advance)\n";
+            console_.log("Selected mode: PolyVector");
+        }
+        break;
+
+    case Qt::Key_2:
+        if (mode_ == Mode::Unselected && phase_ == Phase::MeshOnly) {
+            mode_ = Mode::MBO;
+            std::cerr << "[Viewer] Selected mode: " << modeName(mode_) << " (press 'c' to advance)\n";
+            console_.log("Selected mode: MBO");
+        }
+        break;
+
+    case Qt::Key_3:
+        if (mode_ == Mode::Unselected && phase_ == Phase::MeshOnly) {
+            mode_ = Mode::MedialAxis;
+            std::cerr << "[Viewer] Selected mode: " << modeName(mode_) << " (press 'c' to advance)\n";
+            console_.log("Selected mode: Medial Axis");
+        }
+        break;
+
+    case Qt::Key_4:
+        if (mode_ == Mode::Unselected && phase_ == Phase::MeshOnly) {
+            mode_ = Mode::SIPG;
+            std::cerr << "[Viewer] Selected mode: " << modeName(mode_) << " (press 'c' to advance)\n";
+            console_.log("Selected mode: SIPG");
+        }
+        break;
+
+    default:
+        QOpenGLWidget::keyPressEvent(event);
+        break;
+    }
+}
+
+// ── mouse events ─────────────────────────────────────────────────────────────
+
+void CrossGenWidget::mousePressEvent(QMouseEvent *event) {
+    if (event->button() == Qt::RightButton) {
+        rightDragging_ = true;
+        lastMousePos_  = event->pos();
+    }
+}
+
+void CrossGenWidget::mouseReleaseEvent(QMouseEvent *event) {
+    if (event->button() == Qt::RightButton)
+        rightDragging_ = false;
+}
+
+void CrossGenWidget::mouseMoveEvent(QMouseEvent *event) {
+    if (!rightDragging_) return;
+
+    QPoint delta    = event->pos() - lastMousePos_;
+    lastMousePos_   = event->pos();
+
+    // Scale from logical pixels to physical pixels for pan calculation
+    double dpr = devicePixelRatio();
+    viewer::panView(view_, delta.x() * dpr, delta.y() * dpr);
+    update();
+}
+
+void CrossGenWidget::wheelEvent(QWheelEvent *event) {
+    // On macOS trackpads Qt delivers high-resolution pixel deltas via pixelDelta().
+    // angleDelta() is tiny (< 1 degree per gesture tick) on trackpads, so prefer
+    // pixelDelta() when available and fall back to angleDelta() for click-wheel mice.
+    double scrollSteps = 0.0;
+    if (!event->pixelDelta().isNull()) {
+        // pixelDelta().y() is in physical pixels; scale to a comfortable zoom rate.
+        scrollSteps = event->pixelDelta().y() / 50.0;
+    } else {
+        double degrees = event->angleDelta().y() / 8.0;
+        scrollSteps    = degrees / 15.0;
+    }
+
+    if (scrollSteps == 0.0) return;
+
+    // Cursor in physical pixel coordinates
+    double dpr = devicePixelRatio();
+#if QT_VERSION >= QT_VERSION_CHECK(5, 14, 0)
+    double cx = event->position().x() * dpr;
+    double cy = event->position().y() * dpr;
+#else
+    double cx = event->pos().x() * dpr;
+    double cy = event->pos().y() * dpr;
+#endif
+    // zoomView: positive scrollSteps => pow(0.9, positive) < 1 => zoom shrinks => zooms in ✓
+    viewer::zoomView(view_, scrollSteps, cx, cy);
+    update();
+}
+
+// ── reset ─────────────────────────────────────────────────────────────────────
+
+void CrossGenWidget::doReset() {
+    field_.reset();
+    cutMesh_.reset();
+    miqSolver_.reset();
+    crossField_.reset();
+    sipgField_.reset();
+    separatrixTrace_.reset();
+    delaunayMesh_.reset();
+    medialAxis_.reset();
+
+    mode_     = Mode::Unselected;
+    phase_    = Phase::MeshOnly;
+    mboPhase_ = MBOPhase::MeshOnly;
+    sipgPhase_ = SIPGPhase::MeshOnly;
+    maPhase_  = MedialAxisPhase::MeshOnly;
+
+    singularitiesLogged_  = false;
+    mboSteppingStarted_   = false;
+    mboConverged_         = false;
+    mboTracingStarted_    = false;
+    mboTracingFinished_   = false;
+    mboStepCount_         = 0;
+    sipgSteppingStarted_  = false;
+    sipgConverged_        = false;
+    sipgStepCount_        = 0;
+
+    view_.cx    = 0.5 * (bounds_.minx + bounds_.maxx);
+    view_.cy    = 0.5 * (bounds_.miny + bounds_.maxy);
+    view_.baseW = (bounds_.maxx - bounds_.minx) + 2.0 * pad_;
+    view_.baseH = (bounds_.maxy - bounds_.miny) + 2.0 * pad_;
+    if (view_.baseW <= 0.0) view_.baseW = 1.0;
+    if (view_.baseH <= 0.0) view_.baseH = 1.0;
+    view_.zoom  = 1.0;
+    viewer::applyOrtho(view_);
+
+    console_.clear();
+    console_.setMaxLines(8);
+    {
+        std::ostringstream oss;
+        oss << "Loaded mesh: " << mesh_->triangles.size() << " triangles, "
+            << mesh_->vertices.size() << " vertices";
+        console_.log(oss.str());
+    }
+    console_.log("[Reset] Restarted viewer.");
+    std::cerr << "[Viewer] Reset. Phase " << phaseName(phase_)
+              << " (press '1' for PolyVector, '2' for MBO, '3' for Medial Axis, '4' for SIPG)\n";
+}
+
+// ── phase advancement ────────────────────────────────────────────────────────
+
+void CrossGenWidget::advancePhase() {
+    if (mode_ == Mode::PolyVector) {
+        Phase old = phase_;
+        phase_ = nextPhase(phase_);
+        if (phase_ != old)
+            std::cerr << "[Viewer] Phase " << phaseName(phase_) << "\n";
+    } else if (mode_ == Mode::MBO) {
+        MBOPhase old = mboPhase_;
+        mboPhase_ = nextMBOPhase(mboPhase_);
+        if (mboPhase_ != old)
+            std::cerr << "[Viewer] MBO Phase " << mboPhaseName(mboPhase_) << "\n";
+    } else if (mode_ == Mode::MedialAxis) {
+        MedialAxisPhase old = maPhase_;
+        maPhase_ = nextMedialAxisPhase(maPhase_);
+        if (maPhase_ != old)
+            std::cerr << "[Viewer] Medial Axis Phase " << medialAxisPhaseName(maPhase_) << "\n";
+    } else if (mode_ == Mode::SIPG) {
+        SIPGPhase old = sipgPhase_;
+        sipgPhase_ = nextSIPGPhase(sipgPhase_);
+        if (sipgPhase_ != old)
+            std::cerr << "[Viewer] SIPG Phase " << sipgPhaseName(sipgPhase_) << "\n";
+    }
+}
+
+// ── lazy computations ────────────────────────────────────────────────────────
+
+void CrossGenWidget::runComputations() {
+    // ── MBO: Initialize CrossField ────────────────────────────────────────────
+    if (mode_ == Mode::MBO && mboPhase_ >= MBOPhase::CrossField && !crossField_.has_value()) {
+        auto t0 = Clock::now();
+        crossField_.emplace(mesh_);
+        crossField_->initialize(1);
+        auto t1 = Clock::now();
+        console_.log("[MBO] Initialized CrossField: " +
+                     formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count()));
+    }
+
+    // ── MBO: Kick off stepping ────────────────────────────────────────────────
+    if (mode_ == Mode::MBO && mboPhase_ == MBOPhase::Stepping &&
+        crossField_.has_value() && !mboSteppingStarted_) {
+        mboSteppingStarted_ = true;
+        mboStepCount_       = 0;
+        console_.log("[MBO] Starting " + std::to_string(MBO_MAX_STEPS) + " iterations...");
+    }
+
+    // ── MBO: Run 2 stepping iterations per frame ──────────────────────────────
+    if (mode_ == Mode::MBO && mboPhase_ == MBOPhase::Stepping &&
+        mboSteppingStarted_ && mboStepCount_ < MBO_MAX_STEPS && !mboConverged_) {
+        double nv = static_cast<double>(crossField_->u_k.size());
+        for (int i = 0; i < 2 && mboStepCount_ < MBO_MAX_STEPS; ++i) {
+            crossField_->step();
+            ++mboStepCount_;
+            if (crossField_->error < 2.0 * nv * 1e-7) {
+                console_.log("[MBO] Convergence at step " + std::to_string(mboStepCount_) +
+                             " error=" + std::to_string(crossField_->error));
+                mboConverged_ = true;
+                break;
+            }
+        }
+        crossField_->computeSingularities();
+
+        std::ostringstream oss;
+        oss << "[MBO] Step " << mboStepCount_ << "/" << MBO_MAX_STEPS;
+        console_.log(oss.str());
+    }
+
+    // ── MBO: Build SeparatrixTrace ────────────────────────────────────────────
+    if (mode_ == Mode::MBO && mboPhase_ >= MBOPhase::Separatrices &&
+        crossField_.has_value() && !separatrixTrace_) {
+        auto t0 = Clock::now();
+        auto cfPtr = std::shared_ptr<CrossField>(&*crossField_, [](CrossField *) {});
+        separatrixTrace_ = std::make_shared<SeparatrixTrace>(cfPtr, false);
+        auto t1 = Clock::now();
+        std::ostringstream oss;
+        oss << "[Separatrices] Initialized " << separatrixTrace_->separatrices.size()
+            << " separatrices from " << separatrixTrace_->singularities.size()
+            << " singularities: "
+            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+    }
+
+    // ── MBO: Step tracing one iteration per frame ─────────────────────────────
+    if (mode_ == Mode::MBO && mboPhase_ == MBOPhase::Trace &&
+        separatrixTrace_ && !mboTracingFinished_) {
+        if (!mboTracingStarted_) {
+            mboTracingStarted_ = true;
+            console_.log("[Trace] Starting separatrix tracing...");
+        }
+        separatrixTrace_->stepAndCheck();
+        if (separatrixTrace_->finishedTracing) {
+            mboTracingFinished_ = true;
+            console_.log("[Trace] Tracing complete.");
+        }
+    }
+
+    // ── SIPG: Initialize ──────────────────────────────────────────────────────
+    if (mode_ == Mode::SIPG && sipgPhase_ >= SIPGPhase::CrossField && !sipgField_.has_value()) {
+        auto t0 = Clock::now();
+        sipgField_.emplace(mesh_);
+        sipgField_->initialize();
+        auto t1 = Clock::now();
+        console_.log("[SIPG] Initialized: " +
+                     formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count()));
+    }
+
+    // ── SIPG: Kick off stepping ───────────────────────────────────────────────
+    if (mode_ == Mode::SIPG && sipgPhase_ == SIPGPhase::Stepping &&
+        sipgField_.has_value() && !sipgSteppingStarted_) {
+        sipgSteppingStarted_ = true;
+        sipgStepCount_       = 0;
+        console_.log("[SIPG] Starting MBO iterations (" +
+                     std::to_string(sipgField_->getMesh().triangles.size()) + " tris)...");
+    }
+
+    // ── SIPG: Run 2 stepping iterations per frame ─────────────────────────────
+    if (mode_ == Mode::SIPG && sipgPhase_ == SIPGPhase::Stepping &&
+        sipgSteppingStarted_ && !sipgConverged_) {
+        double ntris = static_cast<double>(mesh_->triangles.size());
+        for (int i = 0; i < 2 && sipgStepCount_ < 500; ++i) {
+            sipgField_->step();
+            ++sipgStepCount_;
+            if (sipgField_->error < 2.0 * ntris * 1e-8) {
+                console_.log("[SIPG] Converged at step " + std::to_string(sipgStepCount_) +
+                             " error=" + std::to_string(sipgField_->error));
+                sipgConverged_ = true;
+                break;
+            }
+        }
+        sipgField_->computeSingularities();
+
+        std::ostringstream stepMsg;
+        stepMsg << "[SIPG] Step " << sipgStepCount_ << "  error=" << std::scientific
+                << std::setprecision(3) << sipgField_->error;
+        console_.log(stepMsg.str());
+    }
+
+    // ── Medial Axis: Delaunay re-triangulation ────────────────────────────────
+    if (mode_ == Mode::MedialAxis && maPhase_ >= MedialAxisPhase::DelaunayMesh && !delaunayMesh_) {
+        auto t0 = Clock::now();
+
+        // Build boundary loops
+        std::unordered_map<int, std::vector<int>> bAdj;
+        for (int beIdx : mesh_->boundaryEdges) {
+            int a = mesh_->edges[beIdx][0];
+            int b = mesh_->edges[beIdx][1];
+            bAdj[a].push_back(b);
+            bAdj[b].push_back(a);
+        }
+
+        std::unordered_set<int> visited;
+        std::vector<std::vector<int>> loops;
+        for (int bv : mesh_->boundaryVertices) {
+            if (visited.count(bv)) continue;
+            std::vector<int> loop;
+            int prev = -1, curr = bv;
+            while (true) {
+                visited.insert(curr);
+                loop.push_back(curr);
+                int next = -1;
+                for (int nb : bAdj[curr]) {
+                    if (nb != prev && !visited.count(nb)) { next = nb; break; }
+                }
+                if (next == -1) break;
+                prev = curr;
+                curr = next;
+            }
+            if (loop.size() >= 3) loops.push_back(std::move(loop));
+        }
+
+        if (loops.empty()) {
+            console_.log("[MedialAxis] No boundary loops found!");
+        } else {
+            std::unordered_map<int, int> vertRemap;
+            std::vector<std::array<double, 2>> vertlist;
+
+            for (const auto &loop : loops) {
+                for (int vi : loop) {
+                    if (!vertRemap.count(vi)) {
+                        int newIdx = static_cast<int>(vertlist.size());
+                        vertRemap[vi] = newIdx;
+                        vertlist.push_back(mesh_->vertices[vi]);
+                    }
+                }
+            }
+
+            std::vector<std::vector<std::array<int, 2>>> segLoops;
+            std::vector<int> loopTypes;
+            for (size_t li = 0; li < loops.size(); ++li) {
+                const auto &loop = loops[li];
+                std::vector<std::array<int, 2>> segs;
+                for (size_t i = 0; i < loop.size(); ++i) {
+                    int a = vertRemap[loop[i]];
+                    int b = vertRemap[loop[(i + 1) % loop.size()]];
+                    segs.push_back({a, b});
+                }
+                segLoops.push_back(std::move(segs));
+                loopTypes.push_back(li == 0 ? 0 : 1);
+            }
+
+            triangle_wrapper::TriangleMesher2D::Options opts;
+            opts.just_delaunay = true;
+            triangle_wrapper::TriangleMesher2D mesher(opts);
+
+            triangle_wrapper::TriangleMesher2D::MeshInput input;
+            input.vertlist      = vertlist;
+            input.segment_loops = segLoops;
+            input.type          = loopTypes;
+            input.h             = 0.0;
+
+            auto output = mesher.triangulate(input);
+            delaunayMesh_ = std::make_shared<Mesh>(output.verts, output.triangles);
+
+            auto t1 = Clock::now();
+            std::ostringstream oss;
+            oss << "[MedialAxis] Delaunay re-triangulation: "
+                << delaunayMesh_->triangles.size() << " triangles, "
+                << delaunayMesh_->vertices.size() << " vertices: "
+                << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+            console_.log(oss.str());
+        }
+    }
+
+    // ── Medial Axis: compute axis ─────────────────────────────────────────────
+    if (mode_ == Mode::MedialAxis && maPhase_ >= MedialAxisPhase::MedialAxis &&
+        delaunayMesh_ && !medialAxis_) {
+        auto t0 = Clock::now();
+        medialAxis_ = std::make_shared<MedialAxis>(delaunayMesh_);
+        int rawV = static_cast<int>(medialAxis_->medialVertices.size());
+        int rawE = static_cast<int>(medialAxis_->medialEdges.size());
+        medialAxis_->deduplicateMedialVertices();
+        auto t1 = Clock::now();
+        std::ostringstream oss;
+        oss << "[MedialAxis] Computed: " << rawV << " -> "
+            << medialAxis_->medialVertices.size() << " vertices, "
+            << rawE << " -> " << medialAxis_->medialEdges.size() << " edges: "
+            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+    }
+
+    // ── Medial Axis: polylines / classify ─────────────────────────────────────
+    if (mode_ == Mode::MedialAxis && maPhase_ >= MedialAxisPhase::Classify &&
+        medialAxis_ && medialAxis_->polyLines.empty()) {
+        auto t0 = Clock::now();
+        medialAxis_->createPolylines();
+        medialAxis_->classifyMedialVertices();
+        auto t1 = Clock::now();
+        std::ostringstream oss;
+        oss << "[MedialAxis] Created " << medialAxis_->polyLines.size() << " polylines: "
+            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+    }
+
+    // ── PolyVector: solve crossfield ──────────────────────────────────────────
+    if (mode_ == Mode::PolyVector && phase_ >= Phase::CrossField && !field_.has_value()) {
+        auto t0 = Clock::now();
+        field_.emplace(mesh_);
+        field_->solveForPolyCoeffs();
+        auto t1 = Clock::now();
+        field_->convertToFieldVectors();
+        auto t2 = Clock::now();
+        console_.log("[CrossField] Solved poly-coeffs: " +
+                     formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count()));
+        console_.log("[CrossField] Converted to field vectors: " +
+                     formatMs(std::chrono::duration<double, std::milli>(t2 - t1).count()));
+    }
+
+    // ── PolyVector: singularities ─────────────────────────────────────────────
+    if (mode_ == Mode::PolyVector && phase_ >= Phase::Singularities &&
+        field_.has_value() && !singularitiesLogged_) {
+        auto t0 = Clock::now();
+        field_->computeUSingularities();
+        auto t1 = Clock::now();
+        std::ostringstream oss;
+        oss << "[Singularities] Found " << field_->uSingularities.size() << " singularities: "
+            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+        singularitiesLogged_ = true;
+    }
+
+    // ── PolyVector: cut seams ─────────────────────────────────────────────────
+    if (mode_ == Mode::PolyVector && phase_ >= Phase::CutSeams &&
+        field_.has_value() && !cutMesh_.has_value()) {
+        auto t0 = Clock::now();
+        cutMesh_.emplace(*field_);
+        auto t1 = Clock::now();
+        std::ostringstream oss;
+        oss << "[CutSeams] Generated " << cutMesh_->getCutEdges().size() << " cut edges: "
+            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+
+        std::cerr << "[Viewer] #tri=" << mesh_->triangles.size()
+                  << " #vtx=" << mesh_->vertices.size()
+                  << " | uSingularities=" << field_->uSingularities.size()
+                  << " | cutEdges=" << cutMesh_->getCutEdges().size()
+                  << " | singularityPathCutEdges="
+                  << cutMesh_->getSingularityPathCutEdges().size() << "\n";
+    }
+
+    // ── PolyVector: MIQ parametrization ──────────────────────────────────────
+    if (mode_ == Mode::PolyVector && phase_ >= Phase::UVMesh &&
+        cutMesh_.has_value() && !miqSolver_.has_value()) {
+        auto t0 = Clock::now();
+        miqSolver_.emplace(*cutMesh_);
+        miqSolver_->solve(100.0, 5.0, false, 10, 5000, true, true, true);
+        auto t1 = Clock::now();
+
+        int flips = miqSolver_->numFlips();
+        const auto &UV = miqSolver_->getUV();
+        std::ostringstream oss;
+        oss << "[MIQ] Computed UV mesh: " << UV.rows() << " vertices, "
+            << flips << " flips: "
+            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+        std::cerr << "[Viewer] MIQ parametrization: " << UV.rows()
+                  << " UV vertices, " << flips << " flipped triangles\n";
+
+        viewer::computeUVMeshBounds(*miqSolver_, view_.cx, view_.cy, view_.baseW, view_.baseH);
+        view_.zoom = 1.0;
+        viewer::applyOrtho(view_);
+    }
+}
+
+// ── animation render paths ───────────────────────────────────────────────────
+
+void CrossGenWidget::renderMBOAnimation() {
+    viewer::drawMesh(*mesh_);
+    viewer::drawVertexCrossFieldUK(*mesh_, *crossField_, scale_);
+
+    double ballRadius = 0.5 * avgEdge_;
+    for (const auto &sig : crossField_->singularTriangles) {
+        int triIdx = sig.first;
+        double crossIndex = sig.second;
+        if (triIdx < 0 || triIdx >= static_cast<int>(mesh_->triangles.size())) continue;
+        const Triangle &tri = mesh_->triangles[triIdx];
+        const Point &p0 = mesh_->vertices[tri[0]];
+        const Point &p1 = mesh_->vertices[tri[1]];
+        const Point &p2 = mesh_->vertices[tri[2]];
+        Point centroid = {(p0[0] + p1[0] + p2[0]) / 3.0,
+                          (p0[1] + p1[1] + p2[1]) / 3.0};
+        if (crossIndex > 0)
+            viewer::drawDisk3D(centroid, ballRadius, 0.2f, 0.2f, 0.95f);
+        else
+            viewer::drawDisk3D(centroid, ballRadius, 0.95f, 0.2f, 0.2f);
+    }
+
+    renderOverlay("MBO stepping in progress...\npress 'q' to quit");
+}
+
+void CrossGenWidget::renderSIPGAnimation() {
+    viewer::drawMesh(*mesh_);
+    viewer::drawTriangleCrossField(*mesh_, *sipgField_, scale_);
+
+    double ballRadius = 0.5 * avgEdge_;
+    for (const auto &[vertIdx, crossIndex] : sipgField_->singularVertices) {
+        if (vertIdx < 0 || vertIdx >= static_cast<int>(mesh_->vertices.size())) continue;
+        const Point &c = mesh_->vertices[vertIdx];
+        if (crossIndex > 0)
+            viewer::drawDisk3D(c, ballRadius, 0.2f, 0.2f, 0.95f);
+        else
+            viewer::drawDisk3D(c, ballRadius, 0.95f, 0.2f, 0.2f);
+    }
+
+    renderOverlay("SIPG stepping...\npress 'q' to quit");
+}
+
+void CrossGenWidget::renderTraceAnimation() {
+    viewer::drawMesh(*mesh_);
+
+    glLineWidth(3.0f);
+    for (const auto &sep : separatrixTrace_->separatrices) {
+        if (sep.path.size() < 2) continue;
+        if (sep.active)
+            glColor3f(0.95f, 0.1f, 0.1f);
+        else
+            glColor3f(0.1f, 0.9f, 0.2f);
+        glBegin(GL_LINE_STRIP);
+        for (const auto &tp : sep.path)
+            glVertex2d(tp.global_pos[0], tp.global_pos[1]);
+        glEnd();
+    }
+    glLineWidth(1.0f);
+
+    renderOverlay("Tracing separatrices...\npress 'q' to quit");
+}
+
+// ── normal render ─────────────────────────────────────────────────────────────
+
+void CrossGenWidget::renderNormal() {
+    if (mode_ == Mode::PolyVector && phase_ == Phase::UVMesh && miqSolver_.has_value()) {
+        // UV-space view
+        viewer::drawUVMesh(*miqSolver_);
+        if (field_.has_value() && cutMesh_.has_value()) {
+            double uvRadius = 0.8;
+            viewer::drawSingularitiesOnUV(*miqSolver_, *cutMesh_, *field_, uvRadius);
+        }
+    } else if (mode_ == Mode::SIPG) {
+        viewer::drawMesh(*mesh_);
+        if (sipgPhase_ >= SIPGPhase::CrossField && sipgField_.has_value()) {
+            viewer::drawTriangleCrossField(*mesh_, *sipgField_, scale_);
+            double ballRadius = 0.5 * avgEdge_;
+            for (const auto &[vertIdx, crossIndex] : sipgField_->singularVertices) {
+                if (vertIdx < 0 || vertIdx >= static_cast<int>(mesh_->vertices.size())) continue;
+                const Point &c = mesh_->vertices[vertIdx];
+                if (crossIndex > 0)
+                    viewer::drawDisk3D(c, ballRadius, 0.2f, 0.2f, 0.95f);
+                else
+                    viewer::drawDisk3D(c, ballRadius, 0.95f, 0.2f, 0.2f);
+            }
+        }
+    } else if (mode_ == Mode::MBO) {
+        viewer::drawMesh(*mesh_);
+        if (mboPhase_ >= MBOPhase::CrossField && crossField_.has_value()) {
+            if (mboPhase_ >= MBOPhase::Stepping && mboStepCount_ > 0)
+                viewer::drawVertexCrossFieldUK(*mesh_, *crossField_, scale_);
+            else
+                viewer::drawVertexCrossField(*mesh_, *crossField_, scale_);
+
+            if (mboPhase_ < MBOPhase::Separatrices) {
+                double ballRadius = 0.5 * avgEdge_;
+                for (const auto &sig : crossField_->singularTriangles) {
+                    int triIdx = sig.first;
+                    double crossIndex = sig.second;
+                    if (triIdx < 0 || triIdx >= static_cast<int>(mesh_->triangles.size())) continue;
+                    const Triangle &tri = mesh_->triangles[triIdx];
+                    const Point &p0 = mesh_->vertices[tri[0]];
+                    const Point &p1 = mesh_->vertices[tri[1]];
+                    const Point &p2 = mesh_->vertices[tri[2]];
+                    Point centroid = {(p0[0] + p1[0] + p2[0]) / 3.0,
+                                      (p0[1] + p1[1] + p2[1]) / 3.0};
+                    if (crossIndex > 0)
+                        viewer::drawDisk3D(centroid, ballRadius, 0.2f, 0.2f, 0.95f);
+                    else
+                        viewer::drawDisk3D(centroid, ballRadius, 0.95f, 0.2f, 0.2f);
+                }
+            }
+        }
+
+        if (mboPhase_ >= MBOPhase::Separatrices && separatrixTrace_) {
+            glLineWidth(3.0f);
+            for (const auto &sep : separatrixTrace_->separatrices) {
+                if (sep.path.size() < 2) continue;
+                if (sep.active)
+                    glColor3f(0.95f, 0.1f, 0.1f);
+                else
+                    glColor3f(0.1f, 0.9f, 0.2f);
+                glBegin(GL_LINE_STRIP);
+                for (const auto &tp : sep.path)
+                    glVertex2d(tp.global_pos[0], tp.global_pos[1]);
+                glEnd();
+            }
+            glLineWidth(1.0f);
+        }
+    } else if (mode_ == Mode::MedialAxis) {
+        if (maPhase_ != MedialAxisPhase::Classify) {
+            if (delaunayMesh_)
+                viewer::drawMesh(*delaunayMesh_);
+            else
+                viewer::drawMesh(*mesh_);
+        }
+
+        if (medialAxis_) {
+            if (maPhase_ == MedialAxisPhase::Classify) {
+                if (delaunayMesh_)
+                    viewer::drawBoundaryEdges(*delaunayMesh_);
+                else
+                    viewer::drawBoundaryEdges(*mesh_);
+
+                glLineWidth(2.5f);
+                glColor3f(0.95f, 0.85f, 0.1f);
+                for (const auto &pl : medialAxis_->polyLines) {
+                    if (pl.size() < 2) continue;
+                    glBegin(GL_LINE_STRIP);
+                    for (int vi : pl) {
+                        const Point &p = medialAxis_->medialVertices[vi].coord;
+                        glVertex2d(p[0], p[1]);
+                    }
+                    glEnd();
+                }
+                glLineWidth(1.0f);
+
+                double ballRadius_ma = avgEdge_ / 5.0;
+                for (size_t i = 0; i < medialAxis_->medialVertices.size(); ++i) {
+                    const auto &mv = medialAxis_->medialVertices[i];
+                    if (!mv.active || mv.degree == 2) continue;
+                    if (mv.nodeType == TopMakerNodeType::Normal) {
+                        viewer::drawDisk3D(mv.coord, ballRadius_ma, 0.2f, 0.2f, 0.95f);
+                    } else if (mv.nodeType == TopMakerNodeType::Corner) {
+                        if (mv.cornerIndex >= 0 && mv.cornerIndex < static_cast<int>(medialAxis_->mesh->vertices.size())) {
+                            const Point &cornerP = medialAxis_->mesh->vertices[mv.cornerIndex];
+                            viewer::drawDisk3D(cornerP, ballRadius_ma, 0.95f, 0.2f, 0.2f);
+                            glLineWidth(2.0f);
+                            glColor3f(0.95f, 0.85f, 0.1f);
+                            glBegin(GL_LINES);
+                            glVertex2d(cornerP[0], cornerP[1]);
+                            glVertex2d(mv.coord[0], mv.coord[1]);
+                            glEnd();
+                            glLineWidth(1.0f);
+                        }
+                    } else {
+                        viewer::drawDisk3D(mv.coord, ballRadius_ma, 0.1f, 0.9f, 0.2f);
+                    }
+                }
+
+                double touchRadius = avgEdge_ / 6.0;
+                for (size_t i = 0; i < medialAxis_->medialVertices.size(); ++i) {
+                    const auto &mv = medialAxis_->medialVertices[i];
+                    if (!mv.active || mv.degree == 2) continue;
+                    if (mv.nodeType != TopMakerNodeType::Normal) continue;
+                    for (int tpIdx : mv.touchPoints) {
+                        if (tpIdx >= 0 && tpIdx < static_cast<int>(medialAxis_->mesh->vertices.size())) {
+                            const Point &tp = medialAxis_->mesh->vertices[tpIdx];
+                            viewer::drawDisk3D(tp, touchRadius, 0.0f, 0.9f, 0.9f);
+                        }
+                    }
+                }
+            } else if (maPhase_ >= MedialAxisPhase::MedialAxis) {
+                double ballRadius_ma = avgEdge_ / 5.0;
+                viewer::drawMedialAxis(*medialAxis_, ballRadius_ma);
+                for (int i = 0; i < static_cast<int>(medialAxis_->sharpVertices.size()); ++i) {
+                    if (medialAxis_->sharpVertices[i]) {
+                        const Point &p = medialAxis_->mesh->vertices[i];
+                        viewer::drawDisk3D(p, ballRadius_ma, 0.95f, 0.2f, 0.2f);
+                    }
+                }
+            }
+        }
+    } else {
+        // PolyVector phases 1-4 (not UV)
+        if (phase_ >= Phase::MeshOnly)
+            viewer::drawMesh(*mesh_);
+
+        if (phase_ >= Phase::CrossField && phase_ < Phase::CutSeams && field_.has_value())
+            viewer::drawField(*mesh_, *field_, scale_);
+
+        if (phase_ >= Phase::Singularities && field_.has_value()) {
+            double ballRadius = 0.5 * avgEdge_;
+            for (const auto &sig : field_->uSingularities) {
+                int vid = sig.first;
+                int index4 = sig.second;
+                if (vid < 0 || vid >= static_cast<int>(mesh_->vertices.size())) continue;
+                const Point &c = mesh_->vertices[vid];
+                if (index4 == 1)
+                    viewer::drawDisk3D(c, ballRadius, 0.2f, 0.2f, 0.95f);
+                else if (index4 == -1)
+                    viewer::drawDisk3D(c, ballRadius, 0.95f, 0.2f, 0.2f);
+            }
+        }
+
+        if (phase_ >= Phase::CutSeams && cutMesh_.has_value()) {
+            viewer::drawUField(*mesh_, cutMesh_->getUField(), scale_);
+            viewer::drawVField(*mesh_, cutMesh_->getVField(), scale_);
+            if (!cutMesh_->getSingularityPathCutEdges().empty())
+                viewer::drawEdgeSetOnMesh(*mesh_, cutMesh_->getCutEdges(), 1.0f, 0.75f, 0.1f, 4.0f);
+            else
+                viewer::drawEdgeSetOnMesh(*mesh_, cutMesh_->getCutEdges(), 1.0f, 0.2f, 0.9f, 3.5f);
+        }
+    }
+
+    // Overlay text
+    if (mode_ == Mode::Unselected) {
+        renderOverlay("press '1' for PolyVector mode\npress '2' for MBO mode\n"
+                      "press '3' for Medial Axis mode\npress '4' for SIPG mode\n"
+                      "right-drag to pan, scroll to zoom\n"
+                      "press 'r' to restart\npress 'q' to quit");
+    } else {
+        renderOverlay("press 'c' to continue\npress 'r' to restart\npress 'q' to quit");
+    }
+}
+
+// ── overlay helper ────────────────────────────────────────────────────────────
+
+void CrossGenWidget::renderOverlay(const char *helpText) {
+    int w = fbw(), h = fbh();
+    console_.draw(w, h, 55.0f);
+    viewer::drawTextOverlay(w, h, helpText, 10.0f, 20.0f, 0.8f, 0.8f, 0.8f);
+}

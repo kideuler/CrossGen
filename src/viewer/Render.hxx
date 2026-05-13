@@ -25,8 +25,9 @@ public:
     // Clear all messages
     void clear();
 
-    // Draw the console at the top of the screen
-    void draw(GLFWwindow *window, float startY = 50.0f) const;
+    // Draw the console at the top of the screen.
+    // fbw/fbh are the physical framebuffer dimensions (widget size × devicePixelRatio).
+    void draw(int fbw, int fbh, float startY = 50.0f) const;
 
     // Set maximum number of lines to display (default 10)
     void setMaxLines(int n) { maxLines_ = n; }
@@ -67,8 +68,8 @@ void drawTriangleCrossField(const Mesh &m, const SIPG &sipg, double scale);
 void drawDisk3D(const Point &center, double radius, float baseR, float baseG, float baseB, int segments = 96);
 
 // Draw simple text overlay in screen coordinates (top-left origin).
-// Must be called with proper orthographic projection set up for screen space.
-void drawTextOverlay(GLFWwindow *window, const char *text, float x, float y, float r, float g, float b);
+// fbw/fbh are the physical framebuffer dimensions.
+void drawTextOverlay(int fbw, int fbh, const char *text, float x, float y, float r, float g, float b);
 
 // Compute view bounds for a UV mesh (for initializing the view state once).
 void computeUVMeshBounds(const MIQSolver &miq, double &cx, double &cy, double &baseW, double &baseH);

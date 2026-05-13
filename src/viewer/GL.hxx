@@ -1,12 +1,10 @@
 #pragma once
 
-// OpenGL/GLFW includes for the viewer.
-// We centralize them to avoid including GL headers before GLFW when using GLFW_INCLUDE_NONE.
-
-#include <GLFW/glfw3.h>
+// OpenGL includes for the viewer (Qt6 / platform-native).
+// GLFW has been replaced by Qt6; OpenGL context is managed by QOpenGLWidget.
 
 #ifdef __APPLE__
-#include <OpenGL/gl.h>
+#  include <OpenGL/gl.h>
 #else
-#include <GL/gl.h>
+#  include <GL/gl.h>
 #endif

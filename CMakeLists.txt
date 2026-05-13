@@ -160,48 +160,33 @@ add_test(NAME Tracing_SingularTriangleViertelTrace_3port_center COMMAND TestTrac
 add_test(NAME Tracing_SingularTriangleViertelTrace_3port_offcenter COMMAND TestTracingComponents 5)
 add_test(NAME Tracing_SingularTriangleViertelTrace_5port_center COMMAND TestTracingComponents 6)
 add_test(NAME Tracing_SingularTriangleViertelTrace_5port_offcenter COMMAND TestTracingComponents 7)
-# Optional OpenGL viewer
-option(BUILD_OPENGL_VIEWER "Build the OpenGL mesh/field viewer" OFF)
+# Optional Qt6 OpenGL viewer (replaces the old GLFW-based viewer)
+option(BUILD_OPENGL_VIEWER "Build the Qt6 OpenGL mesh/field viewer" OFF)
 if (BUILD_OPENGL_VIEWER)
-    if(APPLE)
-        find_package(OpenGL REQUIRED)
-        # Try multiple glfw package names/targets for robustness on macOS/Homebrew
-        set(GLFW_TARGET "")
-        # First try config package (defines target `glfw` or `glfw::glfw`)
-        find_package(glfw3 CONFIG QUIET)
-        if (TARGET glfw)
-            set(GLFW_TARGET glfw)
-        elseif (TARGET glfw::glfw)
-            set(GLFW_TARGET glfw::glfw)
-        endif()
+    find_package(OpenGL REQUIRED)
+    find_package(Qt6 REQUIRED COMPONENTS Core Widgets OpenGL OpenGLWidgets)
 
-        # Fallback to module mode (may also define `glfw` or `glfw3::glfw`)
-        if (NOT GLFW_TARGET)
-            find_package(glfw3 QUIET)
-            if (TARGET glfw)
-                set(GLFW_TARGET glfw)
-            elseif (TARGET glfw3::glfw)
-                set(GLFW_TARGET glfw3::glfw)
-            endif()
-        endif()
+    # Qt6 requires these global settings
+    set(CMAKE_AUTOMOC ON)
+    set(CMAKE_AUTORCC ON)
 
-        if (GLFW_TARGET)
-            message(STATUS "Building OpenGL viewer with target ${GLFW_TARGET}")
-            add_executable(Viewer
-                src/viewer/ViewerMain.cxx
-                src/viewer/Geometry.cxx
-                src/viewer/Render.cxx
-                src/viewer/Interaction.cxx
-            )
-            target_include_directories(Viewer PRIVATE src)
-            target_link_libraries(Viewer PRIVATE PolyVector OpenGL::GL ${GLFW_TARGET})
-            target_compile_definitions(Viewer PRIVATE GL_SILENCE_DEPRECATION GLFW_INCLUDE_NONE)
-            # Prefer a modern C++ standard for the viewer too
-            target_compile_features(Viewer PRIVATE cxx_std_17)
-        else()
-            message(WARNING "glfw3 not found. The OpenGL viewer will not be built. Install via Homebrew: brew install glfw")
-        endif()
-    else()
-        message(WARNING "BUILD_OPENGL_VIEWER is currently supported only on macOS in this project setup.")
-    endif()
+    add_executable(Viewer
+        src/viewer/ViewerMain.cxx
+        src/viewer/CrossGenWidget.cxx
+        src/viewer/Geometry.cxx
+        src/viewer/Render.cxx
+        src/viewer/Interaction.cxx
+    )
+    target_include_directories(Viewer PRIVATE src)
+    target_link_libraries(Viewer PRIVATE
+        PolyVector
+        OpenGL::GL
+        Qt6::Core
+        Qt6::Widgets
+        Qt6::OpenGL
+        Qt6::OpenGLWidgets
+    )
+    target_compile_definitions(Viewer PRIVATE GL_SILENCE_DEPRECATION)
+    target_compile_features(Viewer PRIVATE cxx_std_17)
+    message(STATUS "Building Qt6 OpenGL viewer")
 endif()

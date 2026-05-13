@@ -27,11 +27,8 @@ void Console::clear() {
     lines_.clear();
 }
 
-void Console::draw(GLFWwindow *window, float startY) const {
+void Console::draw(int fbw, int fbh, float startY) const {
     if (lines_.empty()) return;
-
-    int fbw, fbh;
-    glfwGetFramebufferSize(window, &fbw, &fbh);
 
     // Save current projection/modelview and set up screen-space orthographic
     glMatrixMode(GL_PROJECTION);
@@ -80,7 +77,7 @@ void Console::draw(GLFWwindow *window, float startY) const {
     // Draw each line using drawTextOverlay (it sets up its own projection)
     float y = startY;
     for (const auto &line : lines_) {
-        drawTextOverlay(window, line.c_str(), 18.0f, y, 0.4f, 0.9f, 0.4f);
+        drawTextOverlay(fbw, fbh, line.c_str(), 18.0f, y, 0.4f, 0.9f, 0.4f);
         y += lineSpacing;
     }
 }
@@ -442,9 +439,7 @@ static const unsigned char kFont5x7[95][7] = {
     {0x00,0x00,0x08,0x15,0x02,0x00,0x00}, // '~'
 };
 
-void drawTextOverlay(GLFWwindow *window, const char *text, float x, float y, float r, float g, float b) {
-    int fbw, fbh;
-    glfwGetFramebufferSize(window, &fbw, &fbh);
+void drawTextOverlay(int fbw, int fbh, const char *text, float x, float y, float r, float g, float b) {
 
     // Save current projection/modelview and set up screen-space orthographic
     glMatrixMode(GL_PROJECTION);
