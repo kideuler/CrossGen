@@ -31,6 +31,13 @@ public:
     const Eigen::VectorXd& getU() const { return u_; }
     const Eigen::VectorXd& getV() const { return v_; }
 
+    // Access the underlying cut mesh (for rendering).
+    const CutMesh& getCutMesh() const { return cm_; }
+
+    // Returns the number of triangles with negative signed area in UV space
+    // (i.e. flipped/inverted triangles). Zero means a valid, flip-free parametrization.
+    int numFlippedTriangles() const;
+
     // Write the parametrized mesh as an OBJ with UV coordinates.
     bool writeOBJ(const std::string& filename) const;
 

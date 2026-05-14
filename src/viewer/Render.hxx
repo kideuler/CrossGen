@@ -5,10 +5,12 @@
 
 #include <string>
 #include <vector>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "IGM/CutMesh.hxx"
 #include "IGM/MIQ.hxx"
+#include "IGM/UVGParam.hxx"
 #include "polyvector/PolyVectors.hxx"
 #include "crossfield/CrossField.hxx"
 #include "sipg/SIPG.hxx"
@@ -88,6 +90,19 @@ void drawMedialAxis(const MedialAxis &ma, double vertexRadius);
 
 // Draw only the boundary edges of a mesh.
 void drawBoundaryEdges(const Mesh &m);
+
+// Compute view bounds for a UVGParam parametrization.
+void computeUVGParamBounds(const UVGParam &uvp, double &cx, double &cy, double &baseW, double &baseH);
+
+// Draw UV mesh from UVGParam parametrization (2D view of UV coordinates).
+// Does not modify the view state - call computeUVGParamBounds first to set up the view.
+void drawUVGParam(const UVGParam &uvp);
+
+// Draw SIPG singularities on the UVGParam view.
+// singularVertices: (original-mesh vertex index, cross-index) pairs from SIPG.
+void drawSingularitiesOnUVG(const UVGParam &uvp,
+                             const std::vector<std::pair<int, double>> &singularVertices,
+                             double radius);
 
 } // namespace viewer
 

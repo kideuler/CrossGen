@@ -133,8 +133,28 @@ UVGParam::UVGParam(const CutMesh& cutMesh)
         throw std::runtime_error("UVGParam: linear solve failed.");
     }
 
-    std::cout << "[UVGParam] Solved UV parameterization: "
+    std::cerr << "[UVGParam] Solved UV parameterization: "
               << nV << " vertices, " << nT << " triangles.\n";
+}
+
+// ---------------------------------------------------------------------------
+int UVGParam::numFlippedTriangles() const
+{
+    const Mesh& mesh = cm_.getCutMesh();
+    const int nV = static_cast<int>(u_.size());
+    int count = 0;
+
+    for (const Triangle& tri : mesh.triangles) {
+        const int i = tri[0], j = tri[1], k = tri[2];
+        if (i < 0 || i >= nV || j < 0 || j >= nV || k < 0 || k >= nV) continue;
+
+        // Signed area = 0.5 * ((uj-ui)*(vk-vi) - (uk-ui)*(vj-vi))
+        // Negative means the UV triangle has opposite winding (flipped).
+        double signedArea2 = (u_(j) - u_(i)) * (v_(k) - v_(i))
+                           - (u_(k) - u_(i)) * (v_(j) - v_(i));
+        if (signedArea2 < 0.0) ++count;
+    }
+    return count;
 }
 
 // ---------------------------------------------------------------------------
@@ -172,6 +192,6 @@ bool UVGParam::writeOBJ(const std::string& filename) const
             << (tri[2]+1) << "/" << (tri[2]+1) << "\n";
     }
 
-    std::cout << "[UVGParam] Written UV OBJ: " << filename << "\n";
+    std::cerr << "[UVGParam] Written UV OBJ: " << filename << "\n";
     return true;
 }

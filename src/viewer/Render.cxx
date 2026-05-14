@@ -696,5 +696,81 @@ void drawBoundaryEdges(const Mesh &m) {
     glLineWidth(1.0f);
 }
 
+void computeUVGParamBounds(const UVGParam &uvp, double &cx, double &cy, double &baseW, double &baseH) {
+    const Eigen::VectorXd &u = uvp.getU();
+    const Eigen::VectorXd &v = uvp.getV();
+
+    if (u.size() == 0) {
+        cx = 0.0; cy = 0.0; baseW = 1.0; baseH = 1.0;
+        return;
+    }
+
+    double minU = u.minCoeff(), maxU = u.maxCoeff();
+    double minV = v.minCoeff(), maxV = v.maxCoeff();
+
+    double du = maxU - minU;
+    double dv = maxV - minV;
+    double ext = std::max(du, dv);
+    if (ext <= 0) ext = 1.0;
+    double pad = 0.1 * ext;
+
+    cx = 0.5 * (minU + maxU);
+    cy = 0.5 * (minV + maxV);
+    baseW = du + 2.0 * pad;
+    baseH = dv + 2.0 * pad;
+    if (baseW <= 0.0) baseW = 1.0;
+    if (baseH <= 0.0) baseH = 1.0;
+}
+
+void drawUVGParam(const UVGParam &uvp) {
+    const Eigen::VectorXd &u = uvp.getU();
+    const Eigen::VectorXd &v = uvp.getV();
+    const Mesh &cutMesh = uvp.getCutMesh().getCutMesh();
+
+    if (u.size() == 0) return;
+
+    int nV = static_cast<int>(u.size());
+
+    // Draw triangle edges in UV space
+    glColor3f(0.3f, 0.8f, 0.9f);
+    glLineWidth(1.5f);
+    glBegin(GL_LINES);
+    for (const auto &tri : cutMesh.triangles) {
+        for (int e = 0; e < 3; ++e) {
+            int a = tri[e];
+            int b = tri[(e + 1) % 3];
+            if (a < 0 || a >= nV || b < 0 || b >= nV) continue;
+            glVertex2d(u(a), v(a));
+            glVertex2d(u(b), v(b));
+        }
+    }
+    glEnd();
+    glLineWidth(1.0f);
+}
+
+void drawSingularitiesOnUVG(const UVGParam &uvp,
+                             const std::vector<std::pair<int, double>> &singularVertices,
+                             double radius) {
+    const Eigen::VectorXd &u = uvp.getU();
+    const Eigen::VectorXd &v = uvp.getV();
+    const auto &origToCut = uvp.getCutMesh().getOriginalToCutVertices();
+    int nV = static_cast<int>(u.size());
+
+    for (const auto &[origVtx, crossIndex] : singularVertices) {
+        if (origVtx < 0 || origVtx >= static_cast<int>(origToCut.size())) continue;
+        const auto &cutVerts = origToCut[origVtx];
+        if (cutVerts.empty()) continue;
+
+        int cutVid = cutVerts[0];
+        if (cutVid < 0 || cutVid >= nV) continue;
+
+        Point center{u(cutVid), v(cutVid)};
+        if (crossIndex > 0)
+            drawDisk3D(center, radius, 0.2f, 0.2f, 0.95f);
+        else
+            drawDisk3D(center, radius, 0.95f, 0.2f, 0.2f);
+    }
+}
+
 } // namespace viewer
 

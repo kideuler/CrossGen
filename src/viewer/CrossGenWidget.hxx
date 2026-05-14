@@ -15,6 +15,7 @@
 #include "mesh/Mesh.hxx"
 #include "IGM/CutMesh.hxx"
 #include "IGM/MIQ.hxx"
+#include "IGM/UVGParam.hxx"
 #include "polyvector/PolyVectors.hxx"
 #include "crossfield/CrossField.hxx"
 #include "sipg/SIPG.hxx"
@@ -52,6 +53,7 @@ enum class SIPGPhase {
     CrossField = 2,
     Stepping   = 3,
     CutSeams   = 4,
+    UVMesh     = 5,
 };
 
 enum class MedialAxisPhase {
@@ -114,6 +116,7 @@ private:
     std::optional<CrossField>  crossField_;
     std::optional<SIPG>        sipgField_;
     std::optional<CutMesh>     sipgCutMesh_;
+    std::optional<UVGParam>    sipgUVParam_;
     std::shared_ptr<SeparatrixTrace> separatrixTrace_;
     std::shared_ptr<Mesh>      delaunayMesh_;
     std::shared_ptr<MedialAxis> medialAxis_;
@@ -136,7 +139,8 @@ private:
     int  sipgStepCount_        = 0;
 
     // ── view / camera ────────────────────────────────────────────────────────
-    viewer::ViewState view_;
+    viewer::ViewState view_;     // mesh-space view (left panel)
+    viewer::ViewState uvView_;   // UV-space view   (right panel, split screen)
     viewer::Bounds    bounds_;
     double avgEdge_ = 1.0;
     double scale_   = 1.0;

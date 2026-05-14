@@ -61,9 +61,10 @@ SIPGPhase nextSIPGPhase(SIPGPhase p) {
         case SIPGPhase::MeshOnly:   return SIPGPhase::CrossField;
         case SIPGPhase::CrossField: return SIPGPhase::Stepping;
         case SIPGPhase::Stepping:   return SIPGPhase::CutSeams;
-        case SIPGPhase::CutSeams:   return SIPGPhase::CutSeams;
+        case SIPGPhase::CutSeams:   return SIPGPhase::UVMesh;
+        case SIPGPhase::UVMesh:     return SIPGPhase::UVMesh;
     }
-    return SIPGPhase::CutSeams;
+    return SIPGPhase::UVMesh;
 }
 
 MedialAxisPhase nextMedialAxisPhase(MedialAxisPhase p) {
@@ -104,6 +105,7 @@ const char *sipgPhaseName(SIPGPhase p) {
         case SIPGPhase::CrossField: return "2) SIPG crossfield";
         case SIPGPhase::Stepping:   return "3) SIPG stepping";
         case SIPGPhase::CutSeams:   return "4) cut seams (combed)";
+        case SIPGPhase::UVMesh:     return "5) UV mesh (UVGParam)";
     }
     return "?";
 }
@@ -190,6 +192,8 @@ void CrossGenWidget::initializeGL() {
 
 void CrossGenWidget::resizeGL(int w, int h) {
     viewer::resizeAndApplyOrtho(view_, fbw(), fbh());
+    uvView_.fbw = view_.fbw;
+    uvView_.fbh = view_.fbh;
 }
 
 void CrossGenWidget::paintGL() {
@@ -360,6 +364,7 @@ void CrossGenWidget::doReset() {
     crossField_.reset();
     sipgField_.reset();
     sipgCutMesh_.reset();
+    sipgUVParam_.reset();
     separatrixTrace_.reset();
     delaunayMesh_.reset();
     medialAxis_.reset();
@@ -557,6 +562,30 @@ void CrossGenWidget::runComputations() {
                                         : "not a disk \033[31m[FAIL]\033[0m"));
     }
 
+    // ── SIPG: UVGParam parametrization ───────────────────────────────────────
+    if (mode_ == Mode::SIPG && sipgPhase_ >= SIPGPhase::UVMesh &&
+        sipgCutMesh_.has_value() && !sipgUVParam_.has_value()) {
+        auto t0 = Clock::now();
+        try {
+            sipgUVParam_.emplace(*sipgCutMesh_);
+        } catch (const std::exception &e) {
+            console_.log(std::string("[UVGParam] ERROR: ") + e.what());
+        }
+        if (sipgUVParam_.has_value()) {
+            auto t1 = Clock::now();
+            std::ostringstream oss;
+            oss << "[UVGParam] Solved: "
+                << sipgUVParam_->getU().size() << " vertices: "
+                << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+            console_.log(oss.str());
+
+            viewer::computeUVGParamBounds(*sipgUVParam_, uvView_.cx, uvView_.cy, uvView_.baseW, uvView_.baseH);
+            uvView_.zoom = 1.0;
+            uvView_.fbw  = view_.fbw;
+            uvView_.fbh  = view_.fbh;
+        }
+    }
+
     // ── Medial Axis: Delaunay re-triangulation ────────────────────────────────
     if (mode_ == Mode::MedialAxis && maPhase_ >= MedialAxisPhase::DelaunayMesh && !delaunayMesh_) {
         auto t0 = Clock::now();
@@ -737,9 +766,10 @@ void CrossGenWidget::runComputations() {
         std::cerr << "[Viewer] MIQ parametrization: " << UV.rows()
                   << " UV vertices, " << flips << " flipped triangles\n";
 
-        viewer::computeUVMeshBounds(*miqSolver_, view_.cx, view_.cy, view_.baseW, view_.baseH);
-        view_.zoom = 1.0;
-        viewer::applyOrtho(view_);
+        viewer::computeUVMeshBounds(*miqSolver_, uvView_.cx, uvView_.cy, uvView_.baseW, uvView_.baseH);
+        uvView_.zoom = 1.0;
+        uvView_.fbw  = view_.fbw;
+        uvView_.fbh  = view_.fbh;
     }
 }
 
@@ -810,13 +840,148 @@ void CrossGenWidget::renderTraceAnimation() {
 
 void CrossGenWidget::renderNormal() {
     if (mode_ == Mode::PolyVector && phase_ == Phase::UVMesh && miqSolver_.has_value()) {
-        // UV-space view
+        // ── Split-screen: left = original mesh, right = UV mesh ───────────────
+        int w = fbw(), h = fbh();
+        int halfW = w / 2;
+
+        // Helper: set viewport + ortho projection for a sub-rectangle
+        auto applyHalfOrtho = [&](int x, int vpW, const viewer::ViewState &vs) {
+            viewer::ViewState tmp = vs;
+            tmp.fbw = vpW;
+            tmp.fbh = h;
+            double worldW = 1.0, worldH = 1.0;
+            viewer::computeWorldBox(tmp, worldW, worldH);
+            double left   = tmp.cx - 0.5 * worldW;
+            double right  = tmp.cx + 0.5 * worldW;
+            double bottom = tmp.cy - 0.5 * worldH;
+            double top    = tmp.cy + 0.5 * worldH;
+            glViewport(x, 0, vpW, h);
+            glMatrixMode(GL_PROJECTION);
+            glLoadIdentity();
+            glOrtho(left, right, bottom, top, -1, 1);
+            glMatrixMode(GL_MODELVIEW);
+            glLoadIdentity();
+        };
+
+        // ── Left panel: mesh with cut seams & singularities ───────────────────
+        applyHalfOrtho(0, halfW, view_);
+        viewer::drawMesh(*mesh_);
+        if (field_.has_value() && cutMesh_.has_value()) {
+            viewer::drawUField(*mesh_, cutMesh_->getUField(), scale_);
+            viewer::drawVField(*mesh_, cutMesh_->getVField(), scale_);
+            if (!cutMesh_->getSingularityPathCutEdges().empty())
+                viewer::drawEdgeSetOnMesh(*mesh_, cutMesh_->getCutEdges(), 1.0f, 0.75f, 0.1f, 4.0f);
+            else
+                viewer::drawEdgeSetOnMesh(*mesh_, cutMesh_->getCutEdges(), 1.0f, 0.2f, 0.9f, 3.5f);
+            double ballRadius = 0.5 * avgEdge_;
+            for (const auto &sig : field_->uSingularities) {
+                int vid    = sig.first;
+                int index4 = sig.second;
+                if (vid < 0 || vid >= static_cast<int>(mesh_->vertices.size())) continue;
+                const Point &c = mesh_->vertices[vid];
+                if (index4 == 1)
+                    viewer::drawDisk3D(c, ballRadius, 0.2f, 0.2f, 0.95f);
+                else if (index4 == -1)
+                    viewer::drawDisk3D(c, ballRadius, 0.95f, 0.2f, 0.2f);
+            }
+        }
+
+        // ── Right panel: UV mesh ──────────────────────────────────────────────
+        applyHalfOrtho(halfW, w - halfW, uvView_);
         viewer::drawUVMesh(*miqSolver_);
         if (field_.has_value() && cutMesh_.has_value()) {
             double uvRadius = 0.8;
             viewer::drawSingularitiesOnUV(*miqSolver_, *cutMesh_, *field_, uvRadius);
         }
+
+        // ── Dividing line (pixel-space) ───────────────────────────────────────
+        glViewport(0, 0, w, h);
+        glMatrixMode(GL_PROJECTION);
+        glLoadIdentity();
+        glOrtho(0.0, static_cast<double>(w), 0.0, static_cast<double>(h), -1, 1);
+        glMatrixMode(GL_MODELVIEW);
+        glLoadIdentity();
+        glLineWidth(2.0f);
+        glColor3f(0.55f, 0.55f, 0.55f);
+        glBegin(GL_LINES);
+        glVertex2f(static_cast<float>(halfW), 0.0f);
+        glVertex2f(static_cast<float>(halfW), static_cast<float>(h));
+        glEnd();
+        glLineWidth(1.0f);
+
+        // Restore full viewport for overlay
+        glViewport(0, 0, w, h);
     } else if (mode_ == Mode::SIPG) {
+        if (sipgPhase_ == SIPGPhase::UVMesh && sipgUVParam_.has_value()) {
+            // ── Split-screen: left = mesh with cut seams, right = UVGParam ────
+            int w = fbw(), h = fbh();
+            int halfW = w / 2;
+
+            auto applyHalfOrtho = [&](int x, int vpW, const viewer::ViewState &vs) {
+                viewer::ViewState tmp = vs;
+                tmp.fbw = vpW;
+                tmp.fbh = h;
+                double worldW = 1.0, worldH = 1.0;
+                viewer::computeWorldBox(tmp, worldW, worldH);
+                double left   = tmp.cx - 0.5 * worldW;
+                double right  = tmp.cx + 0.5 * worldW;
+                double bottom = tmp.cy - 0.5 * worldH;
+                double top    = tmp.cy + 0.5 * worldH;
+                glViewport(x, 0, vpW, h);
+                glMatrixMode(GL_PROJECTION);
+                glLoadIdentity();
+                glOrtho(left, right, bottom, top, -1, 1);
+                glMatrixMode(GL_MODELVIEW);
+                glLoadIdentity();
+            };
+
+            // Left panel: mesh with combed field + cut seams
+            applyHalfOrtho(0, halfW, view_);
+            viewer::drawMesh(*mesh_);
+            if (sipgCutMesh_.has_value()) {
+                viewer::drawUField(*mesh_, sipgCutMesh_->getUField(), scale_);
+                viewer::drawVField(*mesh_, sipgCutMesh_->getVField(), scale_);
+                if (!sipgCutMesh_->getSingularityPathCutEdges().empty())
+                    viewer::drawEdgeSetOnMesh(*mesh_, sipgCutMesh_->getCutEdges(), 1.0f, 0.75f, 0.1f, 4.0f);
+                else
+                    viewer::drawEdgeSetOnMesh(*mesh_, sipgCutMesh_->getCutEdges(), 1.0f, 0.2f, 0.9f, 3.5f);
+            }
+            if (sipgField_.has_value()) {
+                double ballRadius = 0.5 * avgEdge_;
+                for (const auto &[vertIdx, crossIndex] : sipgField_->singularVertices) {
+                    if (vertIdx < 0 || vertIdx >= static_cast<int>(mesh_->vertices.size())) continue;
+                    const Point &c = mesh_->vertices[vertIdx];
+                    if (crossIndex > 0)
+                        viewer::drawDisk3D(c, ballRadius, 0.2f, 0.2f, 0.95f);
+                    else
+                        viewer::drawDisk3D(c, ballRadius, 0.95f, 0.2f, 0.2f);
+                }
+            }
+
+            // Right panel: UVGParam
+            applyHalfOrtho(halfW, w - halfW, uvView_);
+            viewer::drawUVGParam(*sipgUVParam_);
+            if (sipgField_.has_value()) {
+                double uvRadius = 0.5 * avgEdge_;
+                viewer::drawSingularitiesOnUVG(*sipgUVParam_, sipgField_->singularVertices, uvRadius);
+            }
+
+            // Dividing line
+            glViewport(0, 0, w, h);
+            glMatrixMode(GL_PROJECTION);
+            glLoadIdentity();
+            glOrtho(0.0, static_cast<double>(w), 0.0, static_cast<double>(h), -1, 1);
+            glMatrixMode(GL_MODELVIEW);
+            glLoadIdentity();
+            glLineWidth(2.0f);
+            glColor3f(0.55f, 0.55f, 0.55f);
+            glBegin(GL_LINES);
+            glVertex2f(static_cast<float>(halfW), 0.0f);
+            glVertex2f(static_cast<float>(halfW), static_cast<float>(h));
+            glEnd();
+            glLineWidth(1.0f);
+            glViewport(0, 0, w, h);
+        } else {
         viewer::drawMesh(*mesh_);
         if (sipgPhase_ >= SIPGPhase::CrossField && sipgField_.has_value()) {
             if (sipgPhase_ < SIPGPhase::CutSeams || !sipgCutMesh_.has_value()) {
@@ -842,6 +1007,7 @@ void CrossGenWidget::renderNormal() {
             else
                 viewer::drawEdgeSetOnMesh(*mesh_, sipgCutMesh_->getCutEdges(), 1.0f, 0.2f, 0.9f, 3.5f);
         }
+        } // end else (non-UVMesh SIPG phases)
     } else if (mode_ == Mode::MBO) {
         viewer::drawMesh(*mesh_);
         if (mboPhase_ >= MBOPhase::CrossField && crossField_.has_value()) {

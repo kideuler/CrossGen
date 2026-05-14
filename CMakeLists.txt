@@ -135,6 +135,23 @@ add_custom_target(miq
     VERBATIM
 )
 
+# Custom target to run TestSIPG on all meshes
+set(SIPG_COMMANDS "")
+foreach(MESH_FILE ${MESH_OBJ_FILES})
+    get_filename_component(MESH_NAME ${MESH_FILE} NAME)
+    list(APPEND SIPG_COMMANDS 
+        COMMAND ${CMAKE_COMMAND} -E echo "Processing ${MESH_NAME}..."
+        COMMAND $<TARGET_FILE:TestSIPG> ${CMAKE_CURRENT_BINARY_DIR}/data/meshes/${MESH_NAME} || ${CMAKE_COMMAND} -E true
+    )
+endforeach()
+
+add_custom_target(sipg
+    ${SIPG_COMMANDS}
+    DEPENDS TestSIPG
+    COMMENT "Running TestSIPG on all meshes in data/meshes"
+    VERBATIM
+)
+
 # Enable testing
 enable_testing()
 

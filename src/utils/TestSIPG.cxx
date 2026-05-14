@@ -30,22 +30,15 @@ int main(int argc, char **argv) {
     try {
         mesh = std::make_shared<Mesh>(path);
     } catch (const std::exception &e) {
-        std::cerr << "Failed to load mesh: " << e.what() << "\n";
+        std::cout << "\033[31m[FAIL]\033[0m Failed to load mesh: " << e.what() << "\n";
         return 2;
     }
-
-    std::cerr << "Loaded mesh: " << mesh->triangles.size() << " triangles, "
-              << mesh->vertices.size() << " vertices, "
-              << mesh->boundaryEdges.size() << " boundary edges\n";
 
     // ------------------------------------------------------------------
     // Initialize SIPG solver (assembles M, K, b and factorises A = M + tau*K)
     // ------------------------------------------------------------------
     SIPG sipg(mesh, maxSteps, gamma);
     sipg.initialize();
-
-    std::cerr << "SIPG initialized (gamma=" << gamma
-              << ", tau automatically set)\n";
 
     // ------------------------------------------------------------------
     // MBO iteration loop
@@ -54,29 +47,13 @@ int main(int argc, char **argv) {
     bool converged = false;
     double ntris   = static_cast<double>(mesh->triangles.size());
 
-    std::cerr << "Running MBO iterations (max " << maxSteps << ")...\n";
     for (int i = 0; i < maxSteps; ++i) {
         sipg.step();
         ++stepCount;
-
-        if (i > 0 && i % 50 == 0) {
-            std::cerr << "  step " << stepCount
-                      << "  error = " << std::scientific << std::setprecision(4)
-                      << sipg.error << "\n";
-        }
-
         if (sipg.error < 2.0 * ntris * 1e-5) {
             converged = true;
             break;
         }
-    }
-
-    if (converged) {
-        std::cerr << "MBO converged at step " << stepCount
-                  << "  (error = " << sipg.error << ")\n";
-    } else {
-        std::cerr << "MBO reached max steps (" << stepCount
-                  << ")  (error = " << sipg.error << ")\n";
     }
 
     // ------------------------------------------------------------------
@@ -84,62 +61,30 @@ int main(int argc, char **argv) {
     // ------------------------------------------------------------------
     sipg.computeSingularities();
 
-    std::cerr << "Found " << sipg.singularVertices.size() << " singularity/singularities\n";
-    for (const auto &[vertIdx, index] : sipg.singularVertices) {
-        std::cout << "singularity  vertex=" << vertIdx
-                  << "  index=" << std::fixed << std::setprecision(4) << index << "\n";
-    }
-
     // ------------------------------------------------------------------
     // Cut mesh from SIPG field
     // ------------------------------------------------------------------
-    std::cerr << "Building cut mesh from SIPG field...\n";
     CutMesh cm(sipg);
     const auto &rep = cm.sanityCheck();
 
-    std::cout << "\n# cut mesh sanity report\n";
-    std::cout << "  Triangle components : " << rep.triangleComponents
-              << " (connected=" << (rep.trianglesConnected ? "yes" : "no") << ")\n";
-    std::cout << "  Boundary components : " << rep.boundaryComponents << "\n";
-    std::cout << "  Euler characteristic: " << rep.eulerCharacteristic << "\n";
-    std::cout << "  Singularities on boundary: " << (rep.allSingularitiesOnBoundary ? "yes" : "no") << "\n";
-    std::cout << "  Looks like disk     : " << (rep.looksLikeDisk ? "yes" : "no") << "\n";
-    if (!rep.messages.empty()) {
-        for (const auto &msg : rep.messages)
-            std::cout << "  - " << msg << "\n";
-    }
     if (rep.looksLikeDisk && rep.allSingularitiesOnBoundary)
-        std::cout << "\033[32m[PASS]\033[0m\n";
+        std::cout << "\033[32m[PASS]\033[0m Cut mesh is a disk with singularities on boundary.\n";
     else
-        std::cout << "\033[31m[FAIL]\033[0m\n";
+        std::cout << "\033[31m[FAIL]\033[0m Cut mesh sanity check failed.\n";
 
     // ------------------------------------------------------------------
     // Global UV parameterization
     // ------------------------------------------------------------------
-    std::cerr << "Computing global UV parameterization...\n";
     try {
         UVGParam uvp(cm);
 
-        // Derive output filename: replace or append "_uv.obj"
-        std::string outPath = path;
-        auto dot = outPath.rfind('.');
-        if (dot != std::string::npos)
-            outPath = outPath.substr(0, dot);
-        outPath += "_uv.obj";
-
-        if (uvp.writeOBJ(outPath)) {
-            std::cerr << "UV mesh written to: " << outPath << "\n";
-            std::cout << "\n# UV parameterization\n";
-            std::cout << "  Output: " << outPath << "\n";
-            const auto &u = uvp.getU();
-            const auto &v = uvp.getV();
-            std::cout << "  U range: [" << u.minCoeff() << ", " << u.maxCoeff() << "]\n";
-            std::cout << "  V range: [" << v.minCoeff() << ", " << v.maxCoeff() << "]\n";
-        } else {
-            std::cerr << "Failed to write UV OBJ.\n";
-        }
+        int flips = uvp.numFlippedTriangles();
+        if (flips == 0)
+            std::cout << "\033[32m[PASS]\033[0m No flipped triangles in UV space.\n";
+        else
+            std::cout << "\033[31m[FAIL]\033[0m " << flips << " flipped triangle(s) in UV space.\n";
     } catch (const std::exception &e) {
-        std::cerr << "UVGParam failed: " << e.what() << "\n";
+        std::cout << "\033[31m[FAIL]\033[0m UVGParam failed: " << e.what() << "\n";
     }
 
     return 0;
