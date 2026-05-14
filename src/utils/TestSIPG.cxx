@@ -7,6 +7,7 @@
 
 #include "sipg/SIPG.hxx"
 #include "IGM/CutMesh.hxx"
+#include "IGM/UVGParam.hxx"
 
 static const int MBO_MAX_STEPS = 500;
 
@@ -111,6 +112,35 @@ int main(int argc, char **argv) {
         std::cout << "\033[32m[PASS]\033[0m\n";
     else
         std::cout << "\033[31m[FAIL]\033[0m\n";
-    
+
+    // ------------------------------------------------------------------
+    // Global UV parameterization
+    // ------------------------------------------------------------------
+    std::cerr << "Computing global UV parameterization...\n";
+    try {
+        UVGParam uvp(cm);
+
+        // Derive output filename: replace or append "_uv.obj"
+        std::string outPath = path;
+        auto dot = outPath.rfind('.');
+        if (dot != std::string::npos)
+            outPath = outPath.substr(0, dot);
+        outPath += "_uv.obj";
+
+        if (uvp.writeOBJ(outPath)) {
+            std::cerr << "UV mesh written to: " << outPath << "\n";
+            std::cout << "\n# UV parameterization\n";
+            std::cout << "  Output: " << outPath << "\n";
+            const auto &u = uvp.getU();
+            const auto &v = uvp.getV();
+            std::cout << "  U range: [" << u.minCoeff() << ", " << u.maxCoeff() << "]\n";
+            std::cout << "  V range: [" << v.minCoeff() << ", " << v.maxCoeff() << "]\n";
+        } else {
+            std::cerr << "Failed to write UV OBJ.\n";
+        }
+    } catch (const std::exception &e) {
+        std::cerr << "UVGParam failed: " << e.what() << "\n";
+    }
+
     return 0;
 }

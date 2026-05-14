@@ -47,6 +47,8 @@ add_library(PolyVector SHARED
     src/IGM/CutMesh.cxx
     src/IGM/MIQ.hxx
     src/IGM/MIQ.cxx
+    src/IGM/UVGParam.hxx
+    src/IGM/UVGParam.cxx
     src/crossfield/CrossField.hxx
     src/crossfield/CrossField.cxx
     src/tracing/SeparatrixTrace.hxx
