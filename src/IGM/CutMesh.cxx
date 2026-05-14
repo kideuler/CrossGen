@@ -12,6 +12,7 @@
 #include <sstream>
 
 #include "polyvector/PolyVectors.hxx" // PolyField
+#include "SIPG/SIPG.hxx"              // SIPG
 
 namespace {
 
@@ -111,6 +112,35 @@ CutMesh::CutMesh(const PolyField &field) {
     uField.resize(fieldVecs.size());
     for (size_t i = 0; i < fieldVecs.size(); ++i) {
         uField[i] = fieldVecs[i].u;
+    }
+
+    buildEdgeCuts();
+    connectSingularitiesWithShortestPaths();
+    buildExplicitCutMesh();
+    sanityInfo = sanityCheck();
+
+    if (sanityInfo.looksLikeDisk) {
+        combFieldDirections();
+    }
+    makeVFieldFromUField();
+}
+
+CutMesh::CutMesh(const SIPG &sipg) {
+    orig = sipg.getMeshPtr();
+
+    // Convert SIPG singularVertices (double crossIndex) to CutMesh singularities (int index).
+    singularities.reserve(sipg.singularVertices.size());
+    for (const auto &sv : sipg.singularVertices) {
+        singularities.emplace_back(sv.first, static_cast<int>(std::round(sv.second)));
+    }
+
+    // Derive per-triangle u direction from u_k[t] = exp(4i*theta_t).
+    // theta = arg(u_k[t]) / 4  =>  u = (cos(theta), sin(theta))
+    const int nT = static_cast<int>(orig->triangles.size());
+    uField.resize(nT);
+    for (int t = 0; t < nT; ++t) {
+        const double theta = std::arg(sipg.u_k[t]) / 4.0;
+        uField[t] = Point{std::cos(theta), std::sin(theta)};
     }
 
     buildEdgeCuts();

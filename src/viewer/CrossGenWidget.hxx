@@ -51,6 +51,7 @@ enum class SIPGPhase {
     MeshOnly   = 1,
     CrossField = 2,
     Stepping   = 3,
+    CutSeams   = 4,
 };
 
 enum class MedialAxisPhase {
@@ -112,6 +113,7 @@ private:
     std::optional<MIQSolver>   miqSolver_;
     std::optional<CrossField>  crossField_;
     std::optional<SIPG>        sipgField_;
+    std::optional<CutMesh>     sipgCutMesh_;
     std::shared_ptr<SeparatrixTrace> separatrixTrace_;
     std::shared_ptr<Mesh>      delaunayMesh_;
     std::shared_ptr<MedialAxis> medialAxis_;

@@ -60,9 +60,10 @@ SIPGPhase nextSIPGPhase(SIPGPhase p) {
     switch (p) {
         case SIPGPhase::MeshOnly:   return SIPGPhase::CrossField;
         case SIPGPhase::CrossField: return SIPGPhase::Stepping;
-        case SIPGPhase::Stepping:   return SIPGPhase::Stepping;
+        case SIPGPhase::Stepping:   return SIPGPhase::CutSeams;
+        case SIPGPhase::CutSeams:   return SIPGPhase::CutSeams;
     }
-    return SIPGPhase::Stepping;
+    return SIPGPhase::CutSeams;
 }
 
 MedialAxisPhase nextMedialAxisPhase(MedialAxisPhase p) {
@@ -102,6 +103,7 @@ const char *sipgPhaseName(SIPGPhase p) {
         case SIPGPhase::MeshOnly:   return "1) mesh";
         case SIPGPhase::CrossField: return "2) SIPG crossfield";
         case SIPGPhase::Stepping:   return "3) SIPG stepping";
+        case SIPGPhase::CutSeams:   return "4) cut seams (combed)";
     }
     return "?";
 }
@@ -357,6 +359,7 @@ void CrossGenWidget::doReset() {
     miqSolver_.reset();
     crossField_.reset();
     sipgField_.reset();
+    sipgCutMesh_.reset();
     separatrixTrace_.reset();
     delaunayMesh_.reset();
     medialAxis_.reset();
@@ -535,6 +538,23 @@ void CrossGenWidget::runComputations() {
         stepMsg << "[SIPG] Step " << sipgStepCount_ << "  error=" << std::scientific
                 << std::setprecision(3) << sipgField_->error;
         console_.log(stepMsg.str());
+    }
+
+    // ── SIPG: Cut seams from converged SIPG field ─────────────────────────────
+    if (mode_ == Mode::SIPG && sipgPhase_ >= SIPGPhase::CutSeams &&
+        sipgField_.has_value() && !sipgCutMesh_.has_value()) {
+        auto t0 = Clock::now();
+        sipgCutMesh_.emplace(*sipgField_);
+        auto t1 = Clock::now();
+        std::ostringstream oss;
+        oss << "[SIPG CutSeams] " << sipgCutMesh_->getCutEdges().size() << " cut edges: "
+            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+
+        const auto &rep = sipgCutMesh_->sanityCheck();
+        console_.log(std::string("[SIPG CutSeams] ") +
+                     (rep.looksLikeDisk ? "disk \033[32m[PASS]\033[0m"
+                                        : "not a disk \033[31m[FAIL]\033[0m"));
     }
 
     // ── Medial Axis: Delaunay re-triangulation ────────────────────────────────
@@ -799,7 +819,9 @@ void CrossGenWidget::renderNormal() {
     } else if (mode_ == Mode::SIPG) {
         viewer::drawMesh(*mesh_);
         if (sipgPhase_ >= SIPGPhase::CrossField && sipgField_.has_value()) {
-            viewer::drawTriangleCrossField(*mesh_, *sipgField_, scale_);
+            if (sipgPhase_ < SIPGPhase::CutSeams || !sipgCutMesh_.has_value()) {
+                viewer::drawTriangleCrossField(*mesh_, *sipgField_, scale_);
+            }
             double ballRadius = 0.5 * avgEdge_;
             for (const auto &[vertIdx, crossIndex] : sipgField_->singularVertices) {
                 if (vertIdx < 0 || vertIdx >= static_cast<int>(mesh_->vertices.size())) continue;
@@ -809,6 +831,16 @@ void CrossGenWidget::renderNormal() {
                 else
                     viewer::drawDisk3D(c, ballRadius, 0.95f, 0.2f, 0.2f);
             }
+        }
+        if (sipgPhase_ >= SIPGPhase::CutSeams && sipgCutMesh_.has_value()) {
+            // Draw combed u and v fields
+            viewer::drawUField(*mesh_, sipgCutMesh_->getUField(), scale_);
+            viewer::drawVField(*mesh_, sipgCutMesh_->getVField(), scale_);
+            // Draw cut edges (singularity paths highlighted differently)
+            if (!sipgCutMesh_->getSingularityPathCutEdges().empty())
+                viewer::drawEdgeSetOnMesh(*mesh_, sipgCutMesh_->getCutEdges(), 1.0f, 0.75f, 0.1f, 4.0f);
+            else
+                viewer::drawEdgeSetOnMesh(*mesh_, sipgCutMesh_->getCutEdges(), 1.0f, 0.2f, 0.9f, 3.5f);
         }
     } else if (mode_ == Mode::MBO) {
         viewer::drawMesh(*mesh_);

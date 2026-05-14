@@ -11,8 +11,9 @@
 
 #include "mesh/Mesh.hxx"
 
-// Forward declaration (definition in PolyVectors.hxx)
+// Forward declarations
 class PolyField;
+class SIPG;
 
 // Cut a triangle mesh (represented by PolyField::getMesh()) into a topological disk.
 //
@@ -55,6 +56,11 @@ public:
     };
 
     explicit CutMesh(const PolyField &field);
+
+    // Construct from a converged SIPG cross-field.
+    // u_k[t] = exp(4i*theta_t) encodes the per-triangle cross-field direction;
+    // singularVertices carries (vertex_index, crossIndex) detected by SIPG.
+    explicit CutMesh(const SIPG &sipg);
 
     const Mesh& getOriginalMesh() const { return *orig; }
     std::shared_ptr<Mesh> getOriginalMeshPtr() const { return orig; }

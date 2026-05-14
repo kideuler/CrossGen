@@ -6,6 +6,7 @@
 #include <string>
 
 #include "sipg/SIPG.hxx"
+#include "IGM/CutMesh.hxx"
 
 static const int MBO_MAX_STEPS = 500;
 
@@ -89,19 +90,27 @@ int main(int argc, char **argv) {
     }
 
     // ------------------------------------------------------------------
-    // Print per-triangle field values (angle in radians)
+    // Cut mesh from SIPG field
     // ------------------------------------------------------------------
-    std::cout << "\n# per-triangle cross-field  (triangle  cos4t  sin4t  theta_deg)\n";
-    for (int t = 0; t < static_cast<int>(mesh->triangles.size()); ++t) {
-        std::complex<double> u = sipg.u_k[t];
-        double theta4 = std::atan2(u.imag(), u.real()); // arg of exp(4i*theta)
-        double theta  = theta4 / 4.0;
-        std::cout << std::setw(6) << t
-                  << "  " << std::fixed << std::setprecision(6)
-                  << u.real()
-                  << "  " << u.imag()
-                  << "  " << theta * 180.0 / M_PI << "\n";
-    }
+    std::cerr << "Building cut mesh from SIPG field...\n";
+    CutMesh cm(sipg);
+    const auto &rep = cm.sanityCheck();
 
+    std::cout << "\n# cut mesh sanity report\n";
+    std::cout << "  Triangle components : " << rep.triangleComponents
+              << " (connected=" << (rep.trianglesConnected ? "yes" : "no") << ")\n";
+    std::cout << "  Boundary components : " << rep.boundaryComponents << "\n";
+    std::cout << "  Euler characteristic: " << rep.eulerCharacteristic << "\n";
+    std::cout << "  Singularities on boundary: " << (rep.allSingularitiesOnBoundary ? "yes" : "no") << "\n";
+    std::cout << "  Looks like disk     : " << (rep.looksLikeDisk ? "yes" : "no") << "\n";
+    if (!rep.messages.empty()) {
+        for (const auto &msg : rep.messages)
+            std::cout << "  - " << msg << "\n";
+    }
+    if (rep.looksLikeDisk && rep.allSingularitiesOnBoundary)
+        std::cout << "\033[32m[PASS]\033[0m\n";
+    else
+        std::cout << "\033[31m[FAIL]\033[0m\n";
+    
     return 0;
 }
