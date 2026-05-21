@@ -68,6 +68,9 @@ public:
 
     const std::unordered_set<EdgeKey, EdgeKeyHash>& getCutEdges() const { return cutEdges; }
 
+    // Natural boundary edges: boundary edges of the original mesh that are NOT part of any cut.
+    const std::unordered_set<EdgeKey, EdgeKeyHash>& getNaturalBoundaryEdges() const { return naturalBoundaryEdges; }
+
     // Subset of cut edges that were added specifically to connect singularities
     // to the boundary / existing cut graph (step 2 in the MIQ-style strategy).
     // These are expressed in original-mesh vertex indices, same as getCutEdges().
@@ -101,6 +104,7 @@ private:
     std::vector<std::pair<int,int>> singularities;
     std::unordered_set<EdgeKey, EdgeKeyHash> cutEdges;
     std::unordered_set<EdgeKey, EdgeKeyHash> singularityPathCutEdges;
+    std::unordered_set<EdgeKey, EdgeKeyHash> naturalBoundaryEdges;
 
     std::vector<Point> uField;  // per-triangle u direction from PolyField
     std::vector<Point> vField;  // per-triangle v direction from PolyField

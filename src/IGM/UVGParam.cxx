@@ -8,22 +8,6 @@
 
 #include <Eigen/SparseLU>
 
-// ---------------------------------------------------------------------------
-// UVGParam – Global UV parameterization from the .tex derivation
-//
-// Assembles the weak-form Poisson system
-//
-//   L u = b^X,   L v = b^Y
-//
-// where
-//   L_{ij} = sum_T  A_T  (grad phi_j · grad phi_i)      (cotangent Laplacian)
-//   b^X_i  = sum_T  A_T  (X_T · grad phi_i)
-//   b^Y_i  = sum_T  A_T  (Y_T · grad phi_i)
-//
-// and X_T, Y_T are the combed per-triangle u/v field vectors from CutMesh.
-// One vertex (index 0) is pinned (Dirichlet) to remove the translational d.o.f.
-// ---------------------------------------------------------------------------
-
 UVGParam::UVGParam(const CutMesh& cutMesh)
     : cm_(cutMesh)
 {
@@ -44,13 +28,12 @@ UVGParam::UVGParam(const CutMesh& cutMesh)
     }
 
     // ------------------------------------------------------------------
-    // Assemble  L  and  b^X, b^Y  (Algorithm from the .tex file)
+    // Assemble  A  and  [b^X, b^Y]
     // ------------------------------------------------------------------
     std::vector<Eigen::Triplet<double>> triplets;
-    triplets.reserve(static_cast<size_t>(nT) * 9);
+    triplets.reserve(static_cast<size_t>(2*nT) * 9);
 
-    Eigen::VectorXd bx = Eigen::VectorXd::Zero(nV);
-    Eigen::VectorXd by = Eigen::VectorXd::Zero(nV);
+    Eigen::VectorXd b = Eigen::VectorXd::Zero(2*nV);
 
     for (int t = 0; t < nT; ++t) {
         const Triangle& tri = mesh.triangles[t];
@@ -64,8 +47,6 @@ UVGParam::UVGParam(const CutMesh& cutMesh)
         // Signed area  (positive for CCW).
         double A2 = (p1[0]-p0[0])*(p2[1]-p0[1]) - (p2[0]-p0[0])*(p1[1]-p0[1]);
         double A  = 0.5 * A2;
-
-        if (std::abs(A) < 1e-15) continue; // degenerate triangle, skip
 
         // Gradients of the three hat functions (constant per triangle).
         //   grad phi_0 = ( y1-y2, x2-x1 ) / (2A)
@@ -85,49 +66,64 @@ UVGParam::UVGParam(const CutMesh& cutMesh)
             for (int b = 0; b < 3; ++b) {
                 double w = A * (g[a][0]*g[b][0] + g[a][1]*g[b][1]);
                 triplets.emplace_back(idx[a], idx[b], w);
+                triplets.emplace_back(idx[a]+nV, idx[b]+nV, w);
             }
             double dotX = X[0]*g[a][0] + X[1]*g[a][1];
             double dotY = Y[0]*g[a][0] + Y[1]*g[a][1];
-            bx(idx[a]) += A * dotX;
-            by(idx[a]) += A * dotY;
+            b(idx[a]) += A * dotX;
+            b(idx[a]+nV) += A * dotY;
         }
     }
 
     // ------------------------------------------------------------------
     // Build sparse matrix and pin vertex 0 (Dirichlet BC).
     // ------------------------------------------------------------------
-    Eigen::SparseMatrix<double> L(nV, nV);
-    L.setFromTriplets(triplets.begin(), triplets.end());
+    Eigen::SparseMatrix<double> A(2*nV, 2*nV);
+    A.setFromTriplets(triplets.begin(), triplets.end());
 
-    // Row 0: identity row (L[0,j] = delta_{0j})
+    // Row 0: identity row (A[0,j] = delta_{0j})
     // Zero out row 0 and column 0 contributions, set diagonal to 1.
-    for (Eigen::SparseMatrix<double>::InnerIterator it(L, 0); it; ++it)
+    for (Eigen::SparseMatrix<double>::InnerIterator it(A, 0); it; ++it)
         it.valueRef() = (it.row() == 0 && it.col() == 0) ? 1.0 : 0.0;
+
+    // Row nV: identity row (A[nV,j] = delta_{nVj})
+    for (Eigen::SparseMatrix<double>::InnerIterator it(A, nV); it; ++it)
+        it.valueRef() = (it.row() == nV && it.col() == nV) ? 1.0 : 0.0;
+
     // Also zero the entries in column 0 (other rows) to keep symmetry.
     for (int col = 0; col < nV; ++col) {
-        for (Eigen::SparseMatrix<double>::InnerIterator it(L, col); it; ++it) {
+        for (Eigen::SparseMatrix<double>::InnerIterator it(A, col); it; ++it) {
             if (it.row() == 0 && it.col() != 0)
                 it.valueRef() = 0.0;
         }
-    }
-    bx(0) = 0.0;
-    by(0) = 0.0;
 
-    L.makeCompressed();
+        for (Eigen::SparseMatrix<double>::InnerIterator it(A, col+nV); it; ++it) {
+            if (it.row() == nV && it.col() != nV)
+                it.valueRef() = 0.0;
+        }
+    }
+    b(0) = 0.0;
+    b(nV) = 0.0;
+
+
+    // Start building constraint matrix C and constraint RHS d.
+    // isoline
+
+    A.makeCompressed();
 
     // ------------------------------------------------------------------
     // Solve with SparseLU (SPD after pinning).
     // ------------------------------------------------------------------
     Eigen::SparseLU<Eigen::SparseMatrix<double>> solver;
-    solver.analyzePattern(L);
-    solver.factorize(L);
+    solver.analyzePattern(A);
+    solver.factorize(A);
 
     if (solver.info() != Eigen::Success) {
         throw std::runtime_error("UVGParam: factorization of Laplacian failed.");
     }
-
-    u_ = solver.solve(bx);
-    v_ = solver.solve(by);
+    auto x = solver.solve(b);
+    u_ = x.segment(0, nV);
+    v_ = x.segment(nV, nV);
 
     if (solver.info() != Eigen::Success) {
         throw std::runtime_error("UVGParam: linear solve failed.");

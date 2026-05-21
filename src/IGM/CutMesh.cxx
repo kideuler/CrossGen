@@ -255,6 +255,13 @@ void CutMesh::buildEdgeCuts() {
 
     // If already a disk, no cuts needed
     if (bCount == 1 && std::abs(g_est) < 1e-6) {
+        // Still populate naturalBoundaryEdges — all boundary edges are natural (no cuts were made).
+        naturalBoundaryEdges.clear();
+        for (int eid = 0; eid < nE; ++eid) {
+            if (edges[eid].f1 == -1) {
+                naturalBoundaryEdges.insert(EdgeKey(edges[eid].u, edges[eid].v));
+            }
+        }
         return;
     }
 
@@ -716,6 +723,18 @@ void CutMesh::buildEdgeCuts() {
     for (int eid = 0; eid < nE; ++eid) {
         if (inCut[eid] && edges[eid].f1 != -1) { // only stores cuts not on boundary
             cutEdges.insert(EdgeKey(edges[eid].u, edges[eid].v));
+        }
+    }
+
+    // -----------------------
+    // 9) Store natural boundary edges (boundary edges not in cutEdges)
+    // -----------------------
+    naturalBoundaryEdges.clear();
+    for (int eid = 0; eid < nE; ++eid) {
+        if (edges[eid].f1 != -1) continue; // not a boundary edge
+        EdgeKey ek(edges[eid].u, edges[eid].v);
+        if (cutEdges.find(ek) == cutEdges.end()) {
+            naturalBoundaryEdges.insert(ek);
         }
     }
 }

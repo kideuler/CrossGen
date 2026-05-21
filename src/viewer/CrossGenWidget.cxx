@@ -1006,6 +1006,8 @@ void CrossGenWidget::renderNormal() {
                 viewer::drawEdgeSetOnMesh(*mesh_, sipgCutMesh_->getCutEdges(), 1.0f, 0.75f, 0.1f, 4.0f);
             else
                 viewer::drawEdgeSetOnMesh(*mesh_, sipgCutMesh_->getCutEdges(), 1.0f, 0.2f, 0.9f, 3.5f);
+            // Draw natural boundary edges in red
+            viewer::drawEdgeSetOnMesh(*mesh_, sipgCutMesh_->getNaturalBoundaryEdges(), 1.0f, 0.1f, 0.1f, 3.5f);
         }
         } // end else (non-UVMesh SIPG phases)
     } else if (mode_ == Mode::MBO) {
