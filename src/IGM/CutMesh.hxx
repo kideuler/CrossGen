@@ -71,6 +71,10 @@ public:
     // Natural boundary edges: boundary edges of the original mesh that are NOT part of any cut.
     const std::unordered_set<EdgeKey, EdgeKeyHash>& getNaturalBoundaryEdges() const { return naturalBoundaryEdges; }
 
+    // Map from each natural boundary edge to the index of its single incident triangle.
+    // Use this to look up which cross-field direction the edge is aligned to.
+    const std::unordered_map<EdgeKey, int, EdgeKeyHash>& getNaturalBoundaryEdgeTriangle() const { return naturalBoundaryEdgeTriangle; }
+
     // Subset of cut edges that were added specifically to connect singularities
     // to the boundary / existing cut graph (step 2 in the MIQ-style strategy).
     // These are expressed in original-mesh vertex indices, same as getCutEdges().
@@ -105,6 +109,7 @@ private:
     std::unordered_set<EdgeKey, EdgeKeyHash> cutEdges;
     std::unordered_set<EdgeKey, EdgeKeyHash> singularityPathCutEdges;
     std::unordered_set<EdgeKey, EdgeKeyHash> naturalBoundaryEdges;
+    std::unordered_map<EdgeKey, int, EdgeKeyHash> naturalBoundaryEdgeTriangle;
 
     std::vector<Point> uField;  // per-triangle u direction from PolyField
     std::vector<Point> vField;  // per-triangle v direction from PolyField

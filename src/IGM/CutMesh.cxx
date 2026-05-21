@@ -257,9 +257,12 @@ void CutMesh::buildEdgeCuts() {
     if (bCount == 1 && std::abs(g_est) < 1e-6) {
         // Still populate naturalBoundaryEdges — all boundary edges are natural (no cuts were made).
         naturalBoundaryEdges.clear();
+        naturalBoundaryEdgeTriangle.clear();
         for (int eid = 0; eid < nE; ++eid) {
             if (edges[eid].f1 == -1) {
-                naturalBoundaryEdges.insert(EdgeKey(edges[eid].u, edges[eid].v));
+                EdgeKey ek(edges[eid].u, edges[eid].v);
+                naturalBoundaryEdges.insert(ek);
+                naturalBoundaryEdgeTriangle[ek] = edges[eid].f0;
             }
         }
         return;
@@ -730,11 +733,13 @@ void CutMesh::buildEdgeCuts() {
     // 9) Store natural boundary edges (boundary edges not in cutEdges)
     // -----------------------
     naturalBoundaryEdges.clear();
+    naturalBoundaryEdgeTriangle.clear();
     for (int eid = 0; eid < nE; ++eid) {
         if (edges[eid].f1 != -1) continue; // not a boundary edge
         EdgeKey ek(edges[eid].u, edges[eid].v);
         if (cutEdges.find(ek) == cutEdges.end()) {
             naturalBoundaryEdges.insert(ek);
+            naturalBoundaryEdgeTriangle[ek] = edges[eid].f0;
         }
     }
 }

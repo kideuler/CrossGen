@@ -97,6 +97,7 @@ void computeUVGParamBounds(const UVGParam &uvp, double &cx, double &cy, double &
 // Draw UV mesh from UVGParam parametrization (2D view of UV coordinates).
 // Does not modify the view state - call computeUVGParamBounds first to set up the view.
 void drawUVGParam(const UVGParam &uvp);
+void drawFlippedUVTriangles(const UVGParam &uvp);
 
 // Draw SIPG singularities on the UVGParam view.
 // singularVertices: (original-mesh vertex index, cross-index) pairs from SIPG.

@@ -322,7 +322,13 @@ void CrossGenWidget::mouseMoveEvent(QMouseEvent *event) {
 
     // Scale from logical pixels to physical pixels for pan calculation
     double dpr = devicePixelRatio();
-    viewer::panView(view_, delta.x() * dpr, delta.y() * dpr);
+    bool inUVSplitScreen = (mode_ == Mode::SIPG && sipgPhase_ == SIPGPhase::UVMesh && sipgUVParam_.has_value()) ||
+                           (mode_ == Mode::PolyVector && phase_ == Phase::UVMesh && miqSolver_.has_value());
+    bool panRight = inUVSplitScreen && (lastMousePos_.x() * dpr > fbw() / 2);
+    if (panRight)
+        viewer::panView(uvView_, delta.x() * dpr, delta.y() * dpr);
+    else
+        viewer::panView(view_, delta.x() * dpr, delta.y() * dpr);
     update();
 }
 
@@ -351,7 +357,13 @@ void CrossGenWidget::wheelEvent(QWheelEvent *event) {
     double cy = event->pos().y() * dpr;
 #endif
     // zoomView: positive scrollSteps => pow(0.9, positive) < 1 => zoom shrinks => zooms in ✓
-    viewer::zoomView(view_, scrollSteps, cx, cy);
+    bool inUVSplitScreen = (mode_ == Mode::SIPG && sipgPhase_ == SIPGPhase::UVMesh && sipgUVParam_.has_value()) ||
+                           (mode_ == Mode::PolyVector && phase_ == Phase::UVMesh && miqSolver_.has_value());
+    bool zoomRight = inUVSplitScreen && (cx > fbw() / 2);
+    if (zoomRight)
+        viewer::zoomView(uvView_, scrollSteps, cx - fbw() / 2, cy);
+    else
+        viewer::zoomView(view_, scrollSteps, cx, cy);
     update();
 }
 
@@ -961,6 +973,7 @@ void CrossGenWidget::renderNormal() {
             // Right panel: UVGParam
             applyHalfOrtho(halfW, w - halfW, uvView_);
             viewer::drawUVGParam(*sipgUVParam_);
+            viewer::drawFlippedUVTriangles(*sipgUVParam_);
             if (sipgField_.has_value()) {
                 double uvRadius = 0.5 * avgEdge_;
                 viewer::drawSingularitiesOnUVG(*sipgUVParam_, sipgField_->singularVertices, uvRadius);

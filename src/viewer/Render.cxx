@@ -748,6 +748,29 @@ void drawUVGParam(const UVGParam &uvp) {
     glLineWidth(1.0f);
 }
 
+void drawFlippedUVTriangles(const UVGParam &uvp) {
+    const Eigen::VectorXd &u = uvp.getU();
+    const Eigen::VectorXd &v = uvp.getV();
+    const Mesh &cutMesh = uvp.getCutMesh().getCutMesh();
+
+    if (u.size() == 0) return;
+    int nV = static_cast<int>(u.size());
+
+    glColor4f(0.9f, 0.1f, 0.1f, 0.45f);
+    glBegin(GL_TRIANGLES);
+    for (const auto &tri : cutMesh.triangles) {
+        int i = tri[0], j = tri[1], k = tri[2];
+        if (i < 0 || i >= nV || j < 0 || j >= nV || k < 0 || k >= nV) continue;
+        double signedArea2 = (u(j) - u(i)) * (v(k) - v(i)) - (u(k) - u(i)) * (v(j) - v(i));
+        if (signedArea2 < 0.0) {
+            glVertex2d(u(i), v(i));
+            glVertex2d(u(j), v(j));
+            glVertex2d(u(k), v(k));
+        }
+    }
+    glEnd();
+}
+
 void drawSingularitiesOnUVG(const UVGParam &uvp,
                              const std::vector<std::pair<int, double>> &singularVertices,
                              double radius) {
