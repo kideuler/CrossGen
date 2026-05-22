@@ -6,8 +6,8 @@
 #include <string>
 
 #include "sipg/SIPG.hxx"
-#include "IGM/CutMesh.hxx"
-#include "IGM/UVGParam.hxx"
+#include "Parameterization/CutMesh.hxx"
+#include "Parameterization/UVGParam.hxx"
 
 static const int MBO_MAX_STEPS = 500;
 

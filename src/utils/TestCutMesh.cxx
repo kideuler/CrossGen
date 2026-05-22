@@ -5,7 +5,7 @@
 #include <string>
 
 #include "polyvector/PolyVectors.hxx"
-#include "IGM/CutMesh.hxx"
+#include "Parameterization/CutMesh.hxx"
 
 static void printReport(const CutMesh::SanityReport &rep) {
     std::cout << "Sanity report\n";

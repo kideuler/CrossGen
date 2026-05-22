@@ -8,9 +8,9 @@
 #include <unordered_map>
 #include <unordered_set>
 
-#include "IGM/CutMesh.hxx"
-#include "IGM/MIQ.hxx"
-#include "IGM/UVGParam.hxx"
+#include "Parameterization/CutMesh.hxx"
+#include "Parameterization/MIQ.hxx"
+#include "Parameterization/UVGParam.hxx"
 #include "polyvector/PolyVectors.hxx"
 #include "crossfield/CrossField.hxx"
 #include "sipg/SIPG.hxx"
