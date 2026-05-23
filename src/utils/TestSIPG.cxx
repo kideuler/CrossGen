@@ -8,6 +8,7 @@
 #include "sipg/SIPG.hxx"
 #include "Parameterization/CutMesh.hxx"
 #include "Parameterization/UVGParam.hxx"
+#include "tracing/UVIsoTrace.hxx"
 
 static const int MBO_MAX_STEPS = 500;
 
@@ -76,15 +77,25 @@ int main(int argc, char **argv) {
     // Global UV parameterization
     // ------------------------------------------------------------------
     try {
-        UVGParam uvp(cm);
+        auto uvp = std::make_shared<UVGParam>(cm);
 
-        int flips = uvp.numFlippedTriangles();
+        int flips = uvp->numFlippedTriangles();
         if (flips == 0)
             std::cout << "\033[32m[PASS]\033[0m No flipped triangles in UV space.\n";
         else
             std::cout << "\033[31m[FAIL]\033[0m " << flips << " flipped triangle(s) in UV space.\n";
+
+        // ------------------------------------------------------------------
+        // UV isoline tracing
+        // ------------------------------------------------------------------
+        const int nU = 10;
+        const int nV = 10;
+        UVIsoTrace isoTrace(uvp, nU, nV);
+        std::cout << "\033[32m[PASS]\033[0m UVIsoTrace constructed ("
+                  << nU << " u-isolines, " << nV << " v-isolines).\n";
+
     } catch (const std::exception &e) {
-        std::cout << "\033[31m[FAIL]\033[0m UVGParam failed: " << e.what() << "\n";
+        std::cout << "\033[31m[FAIL]\033[0m UVGParam/UVIsoTrace failed: " << e.what() << "\n";
     }
 
     return 0;

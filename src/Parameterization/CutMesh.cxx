@@ -114,6 +114,12 @@ CutMesh::CutMesh(const PolyField &field) {
         uField[i] = fieldVecs[i].u;
     }
 
+    isSingularVertex.assign(orig->vertices.size(), false);
+    for (const auto& s : singularities) {
+        if (s.first >= 0 && s.first < static_cast<int>(orig->vertices.size()))
+            isSingularVertex[s.first] = true;
+    }
+
     buildEdgeCuts();
     connectSingularitiesWithShortestPaths();
     buildExplicitCutMesh();
@@ -141,6 +147,12 @@ CutMesh::CutMesh(const SIPG &sipg) {
     for (int t = 0; t < nT; ++t) {
         const double theta = std::arg(sipg.u_k[t]) / 4.0;
         uField[t] = Point{std::cos(theta), std::sin(theta)};
+    }
+
+    isSingularVertex.assign(orig->vertices.size(), false);
+    for (const auto& s : singularities) {
+        if (s.first >= 0 && s.first < static_cast<int>(orig->vertices.size()))
+            isSingularVertex[s.first] = true;
     }
 
     buildEdgeCuts();

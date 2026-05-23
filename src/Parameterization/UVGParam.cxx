@@ -291,6 +291,22 @@ UVGParam::UVGParam(const CutMesh& cutMesh)
     u_ = x.segment(0, nV);
     v_ = x.segment(nV, nV);
 
+    // Extract per-vertex translation vectors from the tau DOFs.
+    // tau_s^u = x[2*nV + 2*s],  tau_s^v = x[2*nV + 2*s + 1]
+    // Scatter to per-cut-vertex arrays (zero for vertices not on any seam).
+    const auto& cutToOrig = cm_.getCutVertexToOriginal();
+    tu_ = Eigen::VectorXd::Zero(nV);
+    tv_ = Eigen::VectorXd::Zero(nV);
+    for (int cv = 0; cv < nV; ++cv) {
+        const int origV = (cv < static_cast<int>(cutToOrig.size())) ? cutToOrig[cv] : -1;
+        if (origV < 0) continue;
+        auto it = vertToSeamComp.find(origV);
+        if (it == vertToSeamComp.end()) continue;
+        const int s = it->second;
+        tu_(cv) = x(2 * nV + 2 * s);
+        tv_(cv) = x(2 * nV + 2 * s + 1);
+    }
+
     std::cerr << "[UVGParam] Solved UV parameterization: "
               << nV << " vertices, " << nT << " triangles.\n";
 }

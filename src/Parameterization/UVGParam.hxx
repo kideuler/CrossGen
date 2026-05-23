@@ -45,6 +45,8 @@ private:
     const CutMesh& cm_;
     Eigen::VectorXd u_;
     Eigen::VectorXd v_;
+    Eigen::VectorXd tu_; // translation vector for seam transitions (same size as u_)  
+    Eigen::VectorXd tv_; // translation vector for seam transitions (same size as v_)
 };
 
 #endif // __UVGPARAM_HXX__
