@@ -53,6 +53,8 @@ add_library(PolyVector SHARED
     src/crossfield/CrossField.cxx
     src/tracing/SeparatrixTrace.hxx
     src/tracing/SeparatrixTrace.cxx
+    src/tracing/IntervalTree.hxx
+    src/tracing/IntervalTree.cxx
     src/tracing/UVIsoTrace.hxx
     src/tracing/UVIsoTrace.cxx
     src/triangle/triangle.cpp

@@ -1,11 +1,12 @@
 #include "UVIsoTrace.hxx"
 
-UVIsoTrace::UVIsoTrace(std::shared_ptr<UVGParam> uvParam, int nU, int nV) {
-    uvParam_ = uvParam;
+UVIsoTrace::UVIsoTrace(std::shared_ptr<UVGParam> uvParam, int nU, int nV)
+    : uvParam_(uvParam)
+    , uIntervalTree_(*uvParam, IntervalTree::Axis::U)
+    , vIntervalTree_(*uvParam, IntervalTree::Axis::V)
+{
     nU_ = nU;
     nV_ = nV;
-
-    // compute UV bounds from uvParam
     const Eigen::VectorXd &u = uvParam_->getU();
     const Eigen::VectorXd &v = uvParam_->getV();
     if (u.size() == 0 || v.size() == 0) {
@@ -41,6 +42,29 @@ UVIsoTrace::UVIsoTrace(std::shared_ptr<UVGParam> uvParam, int nU, int nV) {
             isValidTriangle_[t] = false;
             continue;
         }
+    }
+}
 
+
+void UVIsoTrace::printQueries() const {
+
+    //print u queries
+    for (double uVal = uvMin_[0]; uVal <= uvMax_[0]; uVal += deltaU_) {
+        std::vector<int> triIndices = uIntervalTree_.query(uVal);
+        std::cout << "u = " << uVal << ": " << triIndices.size() << " intersecting triangles\n";
+        // print the triangle indices for debugging
+        for (int idx : triIndices) {
+            std::cout << "  Triangle " << idx << (isValidTriangle_[idx] ? " (valid)" : " (invalid)") << "\n";
+        }   
+    }
+
+    // print v queries
+    for (double vVal = uvMin_[1]; vVal <= uvMax_[1]; vVal += deltaV_) {
+        std::vector<int> triIndices = vIntervalTree_.query(vVal);
+        std::cout << "v = " << vVal << ": " << triIndices.size() << " intersecting triangles\n";
+        // print the triangle indices for debugging
+        for (int idx : triIndices) {
+            std::cout << "  Triangle " << idx << (isValidTriangle_[idx] ? " (valid)" : " (invalid)") << "\n";
+        }      
     }
 }

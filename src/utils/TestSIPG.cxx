@@ -5,7 +5,7 @@
 #include <memory>
 #include <string>
 
-#include "sipg/SIPG.hxx"
+#include "SIPG/SIPG.hxx"
 #include "Parameterization/CutMesh.hxx"
 #include "Parameterization/UVGParam.hxx"
 #include "tracing/UVIsoTrace.hxx"
@@ -91,6 +91,7 @@ int main(int argc, char **argv) {
         const int nU = 10;
         const int nV = 10;
         UVIsoTrace isoTrace(uvp, nU, nV);
+        isoTrace.printQueries();
         std::cout << "\033[32m[PASS]\033[0m UVIsoTrace constructed ("
                   << nU << " u-isolines, " << nV << " v-isolines).\n";
 
