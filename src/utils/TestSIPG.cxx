@@ -88,10 +88,29 @@ int main(int argc, char **argv) {
         // ------------------------------------------------------------------
         // UV isoline tracing
         // ------------------------------------------------------------------
-        const int nU = 10;
-        const int nV = 10;
+        const int nU = 100;
+        const int nV = 100;
         UVIsoTrace isoTrace(uvp, nU, nV);
-        isoTrace.printQueries();
+
+        isoTrace.traceIsolines();
+        std::cout << "\033[32m[PASS]\033[0m Isoline tracing complete.\n";
+
+        // Derive output VTK filename from input mesh path
+        std::string stem = path;
+        {
+            // Strip directory
+            auto slash = stem.find_last_of("/\\");
+            if (slash != std::string::npos) stem = stem.substr(slash + 1);
+            // Strip extension
+            auto dot = stem.rfind('.');
+            if (dot != std::string::npos) stem = stem.substr(0, dot);
+        }
+        const std::string vtkFile = stem + "_isolines.vtk";
+        if (isoTrace.writeVTK(vtkFile))
+            std::cout << "\033[32m[PASS]\033[0m Wrote VTK: " << vtkFile << "\n";
+        else
+            std::cout << "\033[31m[FAIL]\033[0m Failed to write VTK.\n";
+
         std::cout << "\033[32m[PASS]\033[0m UVIsoTrace constructed ("
                   << nU << " u-isolines, " << nV << " v-isolines).\n";
 

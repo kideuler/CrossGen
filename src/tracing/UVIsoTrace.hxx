@@ -3,8 +3,12 @@
 
 #include "Parameterization/UVGParam.hxx"
 #include "IntervalTree.hxx"
-#include <iostream>
 #include <deque>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <string>
+#include <unordered_set>
 
 const int MAX_TRACE_STEPS = 5000; // Maximum number of steps to trace an isoline before termination
 
@@ -37,6 +41,25 @@ public:
 
     void printQueries() const; // For debugging: print the interval trees
 
+    void traceIsolines(); // Main method to trace all u and v isolines and populate integralCurves_
+
+    const std::vector<IntegralCurve>& getIntegralCurves() const { return integralCurves_; }
+
+    // Write the cut mesh + all traced isocurves to a VTK legacy unstructured grid
+    // file for viewing in ParaView.  Returns false on I/O error.
+    //
+    // The file contains:
+    //   - Mesh triangles as VTK_TRIANGLE (type 5) cells.
+    //   - Each isocurve as a VTK_POLY_LINE (type 4) cell.
+    //
+    // Cell data arrays:
+    //   cell_type  (int)    : 0 = mesh triangle, 1 = u-isoline, 2 = v-isoline
+    //   coord_value (double): constant u or v value of the isoline (0 for triangles)
+    //
+    // Point data arrays (on mesh vertices and curve sample points):
+    //   u_coord, v_coord (double): UV parameterization values at each point
+    bool writeVTK(const std::string& filename) const;
+
 private:
     std::shared_ptr<UVGParam> uvParam_;
     int nU_;
@@ -50,6 +73,9 @@ private:
     IntervalTree vIntervalTree_; // Interval tree for fast triangle lookup along v-isolines
 
     std::unordered_set<int> TrianglesInterstedByUIsolines; // Set of triangle indices intersected by any u-isoline (for quick validity checks to make sure we got all branches)
+
+
+    std::vector<IntegralCurve> integralCurves_; // List of all traced integral curves (u and v isolines)
 };
 
 #endif // __UV_ISO_TRACE_HXX__
