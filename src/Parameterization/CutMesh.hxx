@@ -94,8 +94,6 @@ public:
     // Per-triangle v field direction (from the PolyField).
     const std::vector<Point>& getVField() const { return vField; }
 
-    const std::vector<bool>& getIsSingularVertex() const { return isSingularVertex; }
-
     // Write the cut mesh as an OBJ file (z=0).
     bool writeOBJ(const std::string &filename) const;
 
@@ -112,7 +110,6 @@ private:
     std::unordered_set<EdgeKey, EdgeKeyHash> singularityPathCutEdges;
     std::unordered_set<EdgeKey, EdgeKeyHash> naturalBoundaryEdges;
     std::unordered_map<EdgeKey, int, EdgeKeyHash> naturalBoundaryEdgeTriangle;
-    std::vector<bool> isSingularVertex; // indexed by original vertex id, true if singular
 
     std::vector<Point> uField;  // per-triangle u direction from PolyField
     std::vector<Point> vField;  // per-triangle v direction from PolyField

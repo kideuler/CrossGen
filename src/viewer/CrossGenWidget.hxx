@@ -20,7 +20,6 @@
 #include "crossfield/CrossField.hxx"
 #include "sipg/SIPG.hxx"
 #include "tracing/SeparatrixTrace.hxx"
-#include "tracing/UVIsoTrace.hxx"
 #include "medialaxis/MedialAxis.hxx"
 
 // ── Enumerations mirroring the original viewer state machine ──────────────────
@@ -55,7 +54,6 @@ enum class SIPGPhase {
     Stepping   = 3,
     CutSeams   = 4,
     UVMesh     = 5,
-    IsoTrace   = 6,
 };
 
 enum class MedialAxisPhase {
@@ -99,7 +97,6 @@ private:
     void renderMBOAnimation();
     void renderSIPGAnimation();
     void renderTraceAnimation();
-    void renderSIPGIsoTraceAnimation();
     void renderNormal();
     void renderOverlay(const char *helpText);
 
@@ -120,7 +117,6 @@ private:
     std::optional<SIPG>        sipgField_;
     std::optional<CutMesh>     sipgCutMesh_;
     std::optional<UVGParam>    sipgUVParam_;
-    std::shared_ptr<UVIsoTrace> sipgIsoTrace_;
     std::shared_ptr<SeparatrixTrace> separatrixTrace_;
     std::shared_ptr<Mesh>      delaunayMesh_;
     std::shared_ptr<MedialAxis> medialAxis_;
@@ -141,10 +137,6 @@ private:
     bool sipgSteppingStarted_  = false;
     bool sipgConverged_        = false;
     int  sipgStepCount_        = 0;
-    bool sipgIsoTraceStarted_  = false;
-    bool sipgIsoTraceFinished_ = false;
-    int  sipgIsoTraceStep_     = 0;
-    int  sipgIsoTraceCurveIndex_ = 0; // Index of the currently active/visible curve being animated
 
     // ── view / camera ────────────────────────────────────────────────────────
     viewer::ViewState view_;     // mesh-space view (left panel)

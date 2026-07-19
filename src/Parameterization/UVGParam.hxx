@@ -30,8 +30,6 @@ public:
     // Per-vertex u and v coordinates (indexed over cut-mesh vertices).
     const Eigen::VectorXd& getU() const { return u_; }
     const Eigen::VectorXd& getV() const { return v_; }
-    const Eigen::VectorXd& getTu() const { return tu_; }
-    const Eigen::VectorXd& getTv() const { return tv_; }
 
     // Access the underlying cut mesh (for rendering).
     const CutMesh& getCutMesh() const { return cm_; }
@@ -47,8 +45,6 @@ private:
     const CutMesh& cm_;
     Eigen::VectorXd u_;
     Eigen::VectorXd v_;
-    Eigen::VectorXd tu_; // translation vector for seam transitions (same size as u_)  
-    Eigen::VectorXd tv_; // translation vector for seam transitions (same size as v_)
 };
 
 #endif // __UVGPARAM_HXX__

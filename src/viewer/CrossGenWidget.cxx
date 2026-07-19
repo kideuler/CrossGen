@@ -62,10 +62,9 @@ SIPGPhase nextSIPGPhase(SIPGPhase p) {
         case SIPGPhase::CrossField: return SIPGPhase::Stepping;
         case SIPGPhase::Stepping:   return SIPGPhase::CutSeams;
         case SIPGPhase::CutSeams:   return SIPGPhase::UVMesh;
-        case SIPGPhase::UVMesh:     return SIPGPhase::IsoTrace;
-        case SIPGPhase::IsoTrace:   return SIPGPhase::IsoTrace;
+        case SIPGPhase::UVMesh:     return SIPGPhase::UVMesh;
     }
-    return SIPGPhase::IsoTrace;
+    return SIPGPhase::UVMesh;
 }
 
 MedialAxisPhase nextMedialAxisPhase(MedialAxisPhase p) {
@@ -107,7 +106,6 @@ const char *sipgPhaseName(SIPGPhase p) {
         case SIPGPhase::Stepping:   return "3) SIPG stepping";
         case SIPGPhase::CutSeams:   return "4) cut seams (combed)";
         case SIPGPhase::UVMesh:     return "5) UV mesh (UVGParam)";
-        case SIPGPhase::IsoTrace:   return "6) Isoline trace";
     }
     return "?";
 }
@@ -227,19 +225,12 @@ void CrossGenWidget::paintGL() {
                       separatrixTrace_ &&
                       !mboTracingFinished_);
 
-    bool isSIPGIsoTracing = (mode_ == Mode::SIPG &&
-                             sipgPhase_ == SIPGPhase::IsoTrace &&
-                             sipgIsoTrace_ &&
-                             !sipgIsoTraceFinished_);
-
     if (isMBOStepping) {
         renderMBOAnimation();
     } else if (isSIPGStepping) {
         renderSIPGAnimation();
     } else if (isTracing) {
         renderTraceAnimation();
-    } else if (isSIPGIsoTracing) {
-        renderSIPGIsoTraceAnimation();
     } else {
         renderNormal();
     }
@@ -332,7 +323,6 @@ void CrossGenWidget::mouseMoveEvent(QMouseEvent *event) {
     // Scale from logical pixels to physical pixels for pan calculation
     double dpr = devicePixelRatio();
     bool inUVSplitScreen = (mode_ == Mode::SIPG && sipgPhase_ == SIPGPhase::UVMesh && sipgUVParam_.has_value()) ||
-                           (mode_ == Mode::SIPG && sipgPhase_ == SIPGPhase::IsoTrace && sipgUVParam_.has_value()) ||
                            (mode_ == Mode::PolyVector && phase_ == Phase::UVMesh && miqSolver_.has_value());
     bool panRight = inUVSplitScreen && (lastMousePos_.x() * dpr > fbw() / 2);
     if (panRight)
@@ -368,7 +358,6 @@ void CrossGenWidget::wheelEvent(QWheelEvent *event) {
 #endif
     // zoomView: positive scrollSteps => pow(0.9, positive) < 1 => zoom shrinks => zooms in ✓
     bool inUVSplitScreen = (mode_ == Mode::SIPG && sipgPhase_ == SIPGPhase::UVMesh && sipgUVParam_.has_value()) ||
-                           (mode_ == Mode::SIPG && sipgPhase_ == SIPGPhase::IsoTrace && sipgUVParam_.has_value()) ||
                            (mode_ == Mode::PolyVector && phase_ == Phase::UVMesh && miqSolver_.has_value());
     bool zoomRight = inUVSplitScreen && (cx > fbw() / 2);
     if (zoomRight)
@@ -388,7 +377,6 @@ void CrossGenWidget::doReset() {
     sipgField_.reset();
     sipgCutMesh_.reset();
     sipgUVParam_.reset();
-    sipgIsoTrace_.reset();
     separatrixTrace_.reset();
     delaunayMesh_.reset();
     medialAxis_.reset();
@@ -408,10 +396,6 @@ void CrossGenWidget::doReset() {
     sipgSteppingStarted_  = false;
     sipgConverged_        = false;
     sipgStepCount_        = 0;
-    sipgIsoTraceStarted_  = false;
-    sipgIsoTraceFinished_ = false;
-    sipgIsoTraceStep_     = 0;
-    sipgIsoTraceCurveIndex_ = 0;
 
     view_.cx    = 0.5 * (bounds_.minx + bounds_.maxx);
     view_.cy    = 0.5 * (bounds_.miny + bounds_.maxy);
@@ -612,54 +596,6 @@ void CrossGenWidget::runComputations() {
             uvView_.fbw  = view_.fbw;
             uvView_.fbh  = view_.fbh;
         }
-    }
-
-    // ── SIPG: Isoline Tracing (continuous setup) ──────────────────────────────────
-    if (mode_ == Mode::SIPG && sipgPhase_ >= SIPGPhase::IsoTrace &&
-        sipgUVParam_.has_value() && !sipgIsoTrace_) {
-        auto t0 = Clock::now();
-        const int nU = 20;
-        const int nV = 20;
-        // Construct IsoTrace using the solved UVGParam
-        auto uvpPtr = std::shared_ptr<UVGParam>(&*sipgUVParam_, [](UVGParam*) {});
-        sipgIsoTrace_ = std::make_shared<UVIsoTrace>(uvpPtr, nU, nV);
-        sipgIsoTrace_->traceIsolines();
-        auto t1 = Clock::now();
-        std::ostringstream oss;
-        oss << "[IsoTrace] Computed " << sipgIsoTrace_->getIntegralCurves().size()
-            << " curves: " << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
-        console_.log(oss.str());
-    }
-
-    // ── SIPG: Step isoline drawing animation progress ─────────────────────────────────
-    if (mode_ == Mode::SIPG && sipgPhase_ == SIPGPhase::IsoTrace &&
-        sipgIsoTrace_ && !sipgIsoTraceFinished_) {
-        if (!sipgIsoTraceStarted_) {
-            sipgIsoTraceStarted_ = true;
-            sipgIsoTraceStep_ = 0;
-            sipgIsoTraceCurveIndex_ = 0;
-            console_.log("[Trace] Animating isoline tracing sequentially...");
-        }
-        
-        // Retrieve curves
-        const auto &curves = sipgIsoTrace_->getIntegralCurves();
-        if (curves.empty()) {
-            sipgIsoTraceFinished_ = true;
-        } else {
-            // Animating the current curve indicated by sipgIsoTraceCurveIndex_
-            sipgIsoTraceStep_ += 8; // speed of tracing single curve
-            int current_curve_points = static_cast<int>(curves[sipgIsoTraceCurveIndex_].points.size());
-            if (sipgIsoTraceStep_ >= current_curve_points) {
-                // Completed tracing the current curve, move to the next curve in the next frame
-                sipgIsoTraceCurveIndex_++;
-                sipgIsoTraceStep_ = 0;
-                if (sipgIsoTraceCurveIndex_ >= static_cast<int>(curves.size())) {
-                    sipgIsoTraceFinished_ = true;
-                    console_.log("[Trace] Sequential isoline animation complete.");
-                }
-            }
-        }
-        update(); // Force continuous redraw so we see the animation play out frame-by-frame
     }
 
     // ── Medial Axis: Delaunay re-triangulation ────────────────────────────────
@@ -912,150 +848,6 @@ void CrossGenWidget::renderTraceAnimation() {
     renderOverlay("Tracing separatrices...\npress 'q' to quit");
 }
 
-void CrossGenWidget::renderSIPGIsoTraceAnimation() {
-    int w = fbw(), h = fbh();
-    int halfW = w / 2;
-
-    auto applyHalfOrtho = [&](int x, int vpW, const viewer::ViewState &vs) {
-        viewer::ViewState tmp = vs;
-        tmp.fbw = vpW;
-        tmp.fbh = h;
-        double worldW = 1.0, worldH = 1.0;
-        viewer::computeWorldBox(tmp, worldW, worldH);
-        double left   = tmp.cx - 0.5 * worldW;
-        double right  = tmp.cx + 0.5 * worldW;
-        double bottom = tmp.cy - 0.5 * worldH;
-        double top    = tmp.cy + 0.5 * worldH;
-        glViewport(x, 0, vpW, h);
-        glMatrixMode(GL_PROJECTION);
-        glLoadIdentity();
-        glOrtho(left, right, bottom, top, -1, 1);
-        glMatrixMode(GL_MODELVIEW);
-        glLoadIdentity();
-    };
-
-    // ── Left panel: Physical XY space mesh + animated tracking paths ──
-    applyHalfOrtho(0, halfW, view_);
-    viewer::drawMesh(*mesh_);
-    if (sipgCutMesh_.has_value()) {
-        if (!sipgCutMesh_->getSingularityPathCutEdges().empty())
-            viewer::drawEdgeSetOnMesh(*mesh_, sipgCutMesh_->getCutEdges(), 1.0f, 0.75f, 0.1f, 4.0f);
-        else
-            viewer::drawEdgeSetOnMesh(*mesh_, sipgCutMesh_->getCutEdges(), 1.0f, 0.2f, 0.9f, 3.5f);
-    }
-    if (sipgField_.has_value()) {
-        double ballRadius = 0.5 * avgEdge_;
-        for (const auto &[vertIdx, crossIndex] : sipgField_->singularVertices) {
-            if (vertIdx < 0 || vertIdx >= static_cast<int>(mesh_->vertices.size())) continue;
-            const Point &c = mesh_->vertices[vertIdx];
-            if (crossIndex > 0)
-                viewer::drawDisk3D(c, ballRadius, 0.2f, 0.2f, 0.95f);
-            else
-                viewer::drawDisk3D(c, ballRadius, 0.95f, 0.2f, 0.2f);
-        }
-    }
-
-    // Draw XY Space Isoline curves up to current step
-    if (sipgIsoTrace_) {
-        glLineWidth(2.5f);
-        const auto &curves = sipgIsoTrace_->getIntegralCurves();
-        for (int idx = 0; idx < static_cast<int>(curves.size()); ++idx) {
-            const auto &curve = curves[idx];
-            int len = 0;
-            if (idx < sipgIsoTraceCurveIndex_) {
-                // If it is an old curve, draw fully
-                len = static_cast<int>(curve.points.size());
-            } else if (idx == sipgIsoTraceCurveIndex_ && !sipgIsoTraceFinished_) {
-                // If it is the current curve, animate up to sipgIsoTraceStep_
-                len = std::min(sipgIsoTraceStep_, static_cast<int>(curve.points.size()));
-            } else if (sipgIsoTraceFinished_) {
-                // If animation completed, draw all curves fully
-                len = static_cast<int>(curve.points.size());
-            } else {
-                // Future curve, do not draw yet
-                len = 0;
-            }
-
-            if (len < 2) continue;
-            if (curve.traceType == IsoTraceType::U_ISOLINE) {
-                glColor3f(0.1f, 0.8f, 0.1f); // Green for U isoline
-            } else {
-                glColor3f(0.9f, 0.1f, 0.1f); // Red for V isoline
-            }
-            glBegin(GL_LINE_STRIP);
-            for (int i = 0; i < len; ++i) {
-                glVertex2d(curve.points[i][0], curve.points[i][1]);
-            }
-            glEnd();
-        }
-        glLineWidth(1.0f);
-    }
-
-    // ── Right panel: UV space mesh + animated tracking paths ──
-    applyHalfOrtho(halfW, w - halfW, uvView_);
-    if (sipgUVParam_.has_value()) {
-        viewer::drawUVGParam(*sipgUVParam_);
-        viewer::drawFlippedUVTriangles(*sipgUVParam_);
-        if (sipgField_.has_value()) {
-            double uvRadius = 0.5 * avgEdge_;
-            viewer::drawSingularitiesOnUVG(*sipgUVParam_, sipgField_->singularVertices, uvRadius);
-        }
-    }
-
-    // Draw UV Space Isoline curves up to current step
-    if (sipgIsoTrace_) {
-        glLineWidth(2.5f);
-        const auto &curves = sipgIsoTrace_->getIntegralCurves();
-        for (int idx = 0; idx < static_cast<int>(curves.size()); ++idx) {
-            const auto &curve = curves[idx];
-            int len = 0;
-            if (idx < sipgIsoTraceCurveIndex_) {
-                // If it is an old curve, draw fully
-                len = static_cast<int>(curve.uv_points.size());
-            } else if (idx == sipgIsoTraceCurveIndex_ && !sipgIsoTraceFinished_) {
-                // If it is the current curve, animate up to sipgIsoTraceStep_
-                len = std::min(sipgIsoTraceStep_, static_cast<int>(curve.uv_points.size()));
-            } else if (sipgIsoTraceFinished_) {
-                // If animation completed, draw all curves fully
-                len = static_cast<int>(curve.uv_points.size());
-            } else {
-                // Future curve, do not draw yet
-                len = 0;
-            }
-
-            if (len < 2) continue;
-            if (curve.traceType == IsoTraceType::U_ISOLINE) {
-                glColor3f(0.1f, 0.8f, 0.1f); // Green for U
-            } else {
-                glColor3f(0.9f, 0.1f, 0.1f); // Red for V
-            }
-            glBegin(GL_LINE_STRIP);
-            for (int i = 0; i < len; ++i) {
-                glVertex2d(curve.uv_points[i][0], curve.uv_points[i][1]);
-            }
-            glEnd();
-        }
-        glLineWidth(1.0f);
-    }
-
-    // ── Dividing line ──────
-    glViewport(0, 0, w, h);
-    glMatrixMode(GL_PROJECTION);
-    glLoadIdentity();
-    glOrtho(0.0, static_cast<double>(w), 0.0, static_cast<double>(h), -1, 1);
-    glMatrixMode(GL_MODELVIEW);
-    glLoadIdentity();
-    glLineWidth(2.0f);
-    glColor3f(0.55f, 0.55f, 0.55f);
-    glBegin(GL_LINES);
-    glVertex2f(static_cast<float>(halfW), 0.0f);
-    glVertex2f(static_cast<float>(halfW), static_cast<float>(h));
-    glEnd();
-    glLineWidth(1.0f);
-
-    renderOverlay("SIPG isoline tracing...\npress 'q' to quit");
-}
-
 // ── normal render ─────────────────────────────────────────────────────────────
 
 void CrossGenWidget::renderNormal() {
@@ -1132,10 +924,8 @@ void CrossGenWidget::renderNormal() {
         // Restore full viewport for overlay
         glViewport(0, 0, w, h);
     } else if (mode_ == Mode::SIPG) {
-        if (sipgPhase_ == SIPGPhase::IsoTrace && sipgUVParam_.has_value()) {
-            renderSIPGIsoTraceAnimation();
-        } else if (sipgPhase_ == SIPGPhase::UVMesh && sipgUVParam_.has_value()) {
-            // ── Split-screen: left = mesh with combed field, right = UVGParam ────
+        if (sipgPhase_ == SIPGPhase::UVMesh && sipgUVParam_.has_value()) {
+            // ── Split-screen: left = mesh with cut seams, right = UVGParam ────
             int w = fbw(), h = fbh();
             int halfW = w / 2;
 

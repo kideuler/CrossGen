@@ -5,10 +5,9 @@
 #include <memory>
 #include <string>
 
-#include "SIPG/SIPG.hxx"
+#include "sipg/SIPG.hxx"
 #include "Parameterization/CutMesh.hxx"
 #include "Parameterization/UVGParam.hxx"
-#include "tracing/UVIsoTrace.hxx"
 
 static const int MBO_MAX_STEPS = 500;
 
@@ -77,45 +76,15 @@ int main(int argc, char **argv) {
     // Global UV parameterization
     // ------------------------------------------------------------------
     try {
-        auto uvp = std::make_shared<UVGParam>(cm);
+        UVGParam uvp(cm);
 
-        int flips = uvp->numFlippedTriangles();
+        int flips = uvp.numFlippedTriangles();
         if (flips == 0)
             std::cout << "\033[32m[PASS]\033[0m No flipped triangles in UV space.\n";
         else
             std::cout << "\033[31m[FAIL]\033[0m " << flips << " flipped triangle(s) in UV space.\n";
-
-        // ------------------------------------------------------------------
-        // UV isoline tracing
-        // ------------------------------------------------------------------
-        const int nU = 100;
-        const int nV = 100;
-        UVIsoTrace isoTrace(uvp, nU, nV);
-
-        isoTrace.traceIsolines();
-        std::cout << "\033[32m[PASS]\033[0m Isoline tracing complete.\n";
-
-        // Derive output VTK filename from input mesh path
-        std::string stem = path;
-        {
-            // Strip directory
-            auto slash = stem.find_last_of("/\\");
-            if (slash != std::string::npos) stem = stem.substr(slash + 1);
-            // Strip extension
-            auto dot = stem.rfind('.');
-            if (dot != std::string::npos) stem = stem.substr(0, dot);
-        }
-        const std::string vtkFile = stem + "_isolines.vtk";
-        if (isoTrace.writeVTK(vtkFile))
-            std::cout << "\033[32m[PASS]\033[0m Wrote VTK: " << vtkFile << "\n";
-        else
-            std::cout << "\033[31m[FAIL]\033[0m Failed to write VTK.\n";
-
-        std::cout << "\033[32m[PASS]\033[0m UVIsoTrace constructed ("
-                  << nU << " u-isolines, " << nV << " v-isolines).\n";
-
     } catch (const std::exception &e) {
-        std::cout << "\033[31m[FAIL]\033[0m UVGParam/UVIsoTrace failed: " << e.what() << "\n";
+        std::cout << "\033[31m[FAIL]\033[0m UVGParam failed: " << e.what() << "\n";
     }
 
     return 0;
