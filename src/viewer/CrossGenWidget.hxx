@@ -148,6 +148,8 @@ private:
     // OASIS parameters and derived display range.
     double oasisLambda_  = 0.0;   // set by the dialog on first use
     double oasisAbsMax_  = 1.0;   // max|f|, the symmetric range for the ramp
+    int    oasisVibrationIterations_ = 0;  // 0 disables the Sec. 3.4 pass
+    double vibrationBefore_ = -1.0;        // mean E_a before the pass, for the log
 
     bool singularitiesLogged_  = false;
     bool mboSteppingStarted_   = false;

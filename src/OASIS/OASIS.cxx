@@ -257,8 +257,8 @@ std::vector<int> OASIS::gatherNeighborhood(int v, int rings) const {
 // Eq. 9: fit a quadratic to the neighborhood in a local frame and read the
 // coefficients back as linear forms in f.
 bool OASIS::fitLocalQuadratic(int v, std::vector<int> &neighbors, Eigen::MatrixXd &coeffs,
-                              int &ringsUsed) const {
-    for (int rings = kBoundaryFitRings; rings <= kMaxFitRings; ++rings) {
+                              int &ringsUsed, int startRings) const {
+    for (int rings = startRings; rings <= kMaxFitRings; ++rings) {
         neighbors = gatherNeighborhood(v, rings);
         ringsUsed = rings;
 
@@ -345,7 +345,7 @@ void OASIS::buildConstraints() {
     for (int v : mesh->boundaryVertices) {
         if (normP(normals[v]) < kEps) continue;
         int ringsUsed = kBoundaryFitRings;
-        if (!fitLocalQuadratic(v, neighbors, coeffs, ringsUsed)) {
+        if (!fitLocalQuadratic(v, neighbors, coeffs, ringsUsed, kBoundaryFitRings)) {
             ++dropped;
             continue;
         }
@@ -512,4 +512,342 @@ void OASIS::buildKKT() {
     kktRhs.resize(n);
     kktRhs.head(numVertices).setZero();
     kktRhs.tail(nc2) = C;
+}
+
+// ─── Vibration enhancement, Sec. 3.4 ────────────────────────────────────────
+
+// Cache the Eq. 9 fit at every vertex. Sec. 3.3 asks for a two-ring stencil on
+// the boundary and a one-ring stencil in the interior; both widen on demand.
+void OASIS::precomputeFits() const {
+    const int numVertices = static_cast<int>(mesh->vertices.size());
+    if (static_cast<int>(fits.size()) == numVertices) return;  // already cached
+
+    fits.assign(numVertices, VertexFit{});
+
+    std::vector<int> neighbors;
+    Eigen::MatrixXd coeffs;
+    int failed = 0;
+
+    for (int v = 0; v < numVertices; ++v) {
+        const int start = mesh->isBoundaryVertex[v] ? kBoundaryFitRings : 1;
+        int ringsUsed = start;
+        if (!fitLocalQuadratic(v, neighbors, coeffs, ringsUsed, start)) {
+            ++failed;
+            continue;
+        }
+        VertexFit &fit = fits[v];
+        fit.stencil = neighbors;
+        fit.au  = coeffs.row(AU).transpose();
+        fit.av  = coeffs.row(AV).transpose();
+        fit.auu = coeffs.row(AUU).transpose();
+        fit.auv = coeffs.row(AUV).transpose();
+        fit.avv = coeffs.row(AVV).transpose();
+        fit.valid = true;
+    }
+
+    if (failed > 0) {
+        std::cerr << "OASIS: no usable quadratic fit at " << failed << " of "
+                  << numVertices << " vertices; they carry no vibration penalty"
+                  << std::endl;
+    }
+}
+
+// Eq. 16 with Eq. 17 expanded. W^u = a_u a_u^T/(-lambda) + (a_uu a_uu^T +
+// a_uv a_uv^T)/lambda^2 is a sum of outer products, so f^T W^u f is a handful
+// of squared dot products of the fit rows with f -- no per-vertex matrix.
+//
+// Writing g = grad f and h_** for the Hessian entries in the fit frame, and
+// p = (h_uu + h_vv)/2, q = (h_uu - h_vv)/2, s = h_uv, R = sqrt(q^2 + s^2):
+//
+//   A_u^2 + A_v^2 = |g|^2/(-lambda) + (h_uu^2 + h_vv^2 + 2 h_uv^2)/lambda^2
+//
+// which is frame independent (both terms are traces). In the Hessian principal
+// frame the Hessian eigenvalues are p +/- R and the gradient splits through
+// e1 e1^T - e2 e2^T = H_dev/R, giving
+//
+//   A_u^2 - A_v^2 = [q(g_u^2 - g_v^2) + 2 s g_u g_v] / (R * -lambda)
+//                 + 4 p R / lambda^2.
+//
+// With s = 0 and q > 0 this collapses to the frame-naive expression, as it
+// must: that is the case where the fit frame already is the principal frame.
+void OASIS::vibrationAnisotropy(int i, const Eigen::VectorXd &values,
+                                double &sum, double &diff,
+                                Eigen::VectorXd *dSum, Eigen::VectorXd *dDiff) const {
+    const VertexFit &fit = fits[i];
+
+    const double gu  = fit.au.dot(values);
+    const double gv  = fit.av.dot(values);
+    const double huu = fit.auu.dot(values);
+    const double huv = fit.auv.dot(values);
+    const double hvv = fit.avv.dot(values);
+
+    const double invNegLambda = 1.0 / (-lambda);   // lambda < 0, so this is > 0
+    const double invLambdaSq = 1.0 / (lambda * lambda);
+
+    const double p = 0.5 * (huu + hvv);
+    const double q = 0.5 * (huu - hvv);
+    const double sdev = huv;
+
+    sum = (gu * gu + gv * gv) * invNegLambda
+        + (huu * huu + hvv * hvv + 2.0 * huv * huv) * invLambdaSq;
+
+    // R = 0 is an umbilic Hessian: the principal directions are undefined and
+    // the paper's local model degenerates. The deviatoric term vanishes with R
+    // there, so floor R and let that term go to zero rather than blow up.
+    const double R2 = q * q + sdev * sdev;
+    const double R = std::sqrt(R2);
+    const double scale = std::max(std::fabs(p), 1.0) * 1e-8;
+
+    const double N = q * (gu * gu - gv * gv) + 2.0 * sdev * gu * gv;
+
+    if (R <= scale) {
+        diff = 0.0;
+        if (dSum) {
+            *dSum = 2.0 * invNegLambda * (gu * fit.au + gv * fit.av)
+                  + 2.0 * invLambdaSq * (huu * fit.auu + hvv * fit.avv
+                                         + 2.0 * huv * fit.auv);
+        }
+        if (dDiff) dDiff->setZero(values.size());
+        return;
+    }
+
+    diff = N * invNegLambda / R + 4.0 * p * R * invLambdaSq;
+
+    if (dSum) {
+        *dSum = 2.0 * invNegLambda * (gu * fit.au + gv * fit.av)
+              + 2.0 * invLambdaSq * (huu * fit.auu + hvv * fit.avv
+                                     + 2.0 * huv * fit.auv);
+    }
+    if (dDiff) {
+        const Eigen::VectorXd dp = 0.5 * (fit.auu + fit.avv);
+        const Eigen::VectorXd dq = 0.5 * (fit.auu - fit.avv);
+        const Eigen::VectorXd &ds = fit.auv;
+
+        const Eigen::VectorXd dN = (gu * gu - gv * gv) * dq
+                                 + q * 2.0 * (gu * fit.au - gv * fit.av)
+                                 + 2.0 * gu * gv * ds
+                                 + 2.0 * sdev * (gv * fit.au + gu * fit.av);
+        const Eigen::VectorXd dR = (q * dq + sdev * ds) / R;
+
+        *dDiff = invNegLambda * (dN * R - N * dR) / R2
+               + 4.0 * invLambdaSq * (dp * R + p * dR);
+    }
+}
+
+double OASIS::vibrationEnergy() const {
+    if (f.size() != static_cast<Eigen::Index>(mesh->vertices.size())) return -1.0;
+    precomputeFits();
+
+    double total = 0.0;
+    int counted = 0;
+    Eigen::VectorXd values;
+
+    for (int i = 0; i < static_cast<int>(fits.size()); ++i) {
+        if (!fits[i].valid) continue;
+        const auto &stencil = fits[i].stencil;
+        values.resize(static_cast<Eigen::Index>(stencil.size()));
+        for (size_t k = 0; k < stencil.size(); ++k) values[static_cast<Eigen::Index>(k)] = f[stencil[k]];
+
+        double sum, diff;
+        vibrationAnisotropy(i, values, sum, diff);
+        if (sum <= kEps) continue;
+
+        // Eq. 18 collapses: with Abar^2 = (Au^2 + Av^2)/2 the two bracketed
+        // terms are equal and opposite, so E_a = 2 * ((Au^2 - Av^2)/(Au^2 + Av^2))^2.
+        const double ratio = diff / sum;
+        total += 2.0 * ratio * ratio;
+        ++counted;
+    }
+    return (counted > 0) ? total / counted : 0.0;
+}
+
+void OASIS::enhanceVibration(int iterations) {
+    if (f.size() != static_cast<Eigen::Index>(mesh->vertices.size())) {
+        throw std::runtime_error("OASIS::enhanceVibration: call solve() first");
+    }
+    if (iterations <= 0) return;
+
+    precomputeFits();
+
+    const int numVertices = static_cast<int>(mesh->vertices.size());
+    const Eigen::Index numRows = B.rows();
+
+    // Vertices that actually contribute a vibration residual.
+    std::vector<int> active;
+    active.reserve(static_cast<size_t>(numVertices));
+    for (int i = 0; i < numVertices; ++i)
+        if (fits[i].valid) active.push_back(i);
+    if (active.empty()) {
+        std::cerr << "OASIS: no vertices carry a vibration penalty; nothing to do"
+                  << std::endl;
+        return;
+    }
+
+    Eigen::SparseMatrix<double> identity(numVertices, numVertices);
+    identity.setIdentity();
+    const Eigen::SparseMatrix<double> M = Lr - lambda * identity;  // L_r - lambda I
+    const Eigen::SparseMatrix<double> Mt = Eigen::SparseMatrix<double>(M.transpose());
+    const Eigen::SparseMatrix<double> Bt = Eigen::SparseMatrix<double>(B.transpose());
+    const Eigen::SparseMatrix<double> BtB = Bt * B;
+
+    // Builds the vibration residual vector and its Jacobian at the given f.
+    Eigen::VectorXd values;
+    Eigen::VectorXd dSum, dDiff;
+    auto evaluate = [&](const Eigen::VectorXd &x, Eigen::VectorXd &res,
+                        Eigen::SparseMatrix<double> *jac) {
+        res.setZero(static_cast<Eigen::Index>(active.size()));
+        std::vector<Eigen::Triplet<double>> trips;
+        if (jac) trips.reserve(active.size() * 12);
+
+        for (size_t a = 0; a < active.size(); ++a) {
+            const int i = active[a];
+            const auto &stencil = fits[i].stencil;
+            values.resize(static_cast<Eigen::Index>(stencil.size()));
+            for (size_t k = 0; k < stencil.size(); ++k)
+                values[static_cast<Eigen::Index>(k)] = x[stencil[k]];
+
+            double sum, diff;
+            vibrationAnisotropy(i, values, sum, diff, jac ? &dSum : nullptr,
+                                jac ? &dDiff : nullptr);
+            if (sum <= kEps) continue;
+            // E_a = r^2 with r = sqrt(2) * (Au^2 - Av^2) / (Au^2 + Av^2).
+            const double kRoot2 = std::sqrt(2.0);
+            res[static_cast<Eigen::Index>(a)] = kRoot2 * diff / sum;
+
+            if (jac) {
+                // d/df [ diff/sum ] = (sum * d(diff) - diff * d(sum)) / sum^2
+                const double invSumSq = 1.0 / (sum * sum);
+                for (size_t k = 0; k < stencil.size(); ++k) {
+                    const double g = kRoot2 * invSumSq *
+                                     (sum * dDiff[static_cast<Eigen::Index>(k)] -
+                                      diff * dSum[static_cast<Eigen::Index>(k)]);
+                    if (g != 0.0)
+                        trips.emplace_back(static_cast<int>(a), stencil[k], g);
+                }
+            }
+        }
+        if (jac) {
+            jac->resize(static_cast<Eigen::Index>(active.size()), numVertices);
+            jac->setFromTriplets(trips.begin(), trips.end());
+            jac->makeCompressed();
+        }
+    };
+
+    // Eq. 19's three terms live on wildly different scales here (see the
+    // header note on omega and xi). Balance them by *operator* magnitude, not
+    // by residual norm: what matters in the normal equations is how big
+    // w * G^T G and w * B^T B are next to H_Lr, and H_Lr carries entries of
+    // order 1/h^4. Scaling by residual norms instead leaves the boundary term
+    // orders of magnitude too weak, and the alignment conditions then drift
+    // away entirely during the pass.
+    Eigen::VectorXd vibRes;
+    Eigen::SparseMatrix<double> G0;
+    evaluate(f, vibRes, &G0);
+
+    auto maxEntry = [](const Eigen::SparseMatrix<double> &A) {
+        double m = 0.0;
+        for (int k = 0; k < A.outerSize(); ++k)
+            for (Eigen::SparseMatrix<double>::InnerIterator it(A, k); it; ++it)
+                m = std::max(m, std::fabs(it.value()));
+        return m;
+    };
+
+    const Eigen::SparseMatrix<double> H0 = Mt * M;
+    const Eigen::SparseMatrix<double> G0t = Eigen::SparseMatrix<double>(G0.transpose());
+    const Eigen::SparseMatrix<double> GtG0 = G0t * G0;
+
+    const double nH = maxEntry(H0);
+    const double nG = maxEntry(GtG0);
+    const double nB = (numRows > 0) ? maxEntry(BtB) : 0.0;
+
+    const double wVib = (nG > kEps) ? vibrationWeight * nH / nG : 0.0;
+    const double wBnd = (nB > kEps) ? boundaryPenaltyWeight * nH / nB : 0.0;
+
+    auto totalEnergy = [&](const Eigen::VectorXd &x, const Eigen::VectorXd &res) {
+        const double eHelm = (M * x).squaredNorm();
+        const double eVib = wVib * res.squaredNorm();
+        const double eBnd = (numRows > 0) ? wBnd * (B * x - C).squaredNorm() : 0.0;
+        return eHelm + eVib + eBnd;
+    };
+
+    double energy = totalEnergy(f, vibRes);
+    const double startEnergy = energy;
+    const double startVibration = vibrationEnergy();
+
+    // Gauss-Newton with Levenberg damping. The paper uses plain Gauss-Newton
+    // and CHOLMOD; the damping is here because J^T J picks up the squared
+    // conditioning of L_r and a plain step occasionally overshoots into a
+    // worse energy.
+    double damping = 1e-8;
+    Eigen::SparseMatrix<double> G;
+    Eigen::VectorXd best = f;
+    int accepted = 0;
+
+    for (int iter = 0; iter < iterations; ++iter) {
+        evaluate(f, vibRes, &G);
+
+        const Eigen::SparseMatrix<double> Gt = Eigen::SparseMatrix<double>(G.transpose());
+        Eigen::SparseMatrix<double> normal = Mt * M;
+        normal += wVib * (Gt * G);
+        if (numRows > 0) normal += wBnd * BtB;
+
+        Eigen::VectorXd grad = Mt * (M * f) + wVib * (Gt * vibRes);
+        if (numRows > 0) grad += wBnd * (Bt * (B * f - C));
+
+        bool stepTaken = false;
+        for (int attempt = 0; attempt < 8; ++attempt) {
+            Eigen::SparseMatrix<double> damped = normal;
+            for (int d = 0; d < numVertices; ++d) damped.coeffRef(d, d) += damping;
+            damped.makeCompressed();
+
+            Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> ldlt;
+            ldlt.compute(damped);
+            if (ldlt.info() != Eigen::Success) {
+                damping *= 10.0;
+                continue;
+            }
+            const Eigen::VectorXd delta = ldlt.solve(-grad);
+            if (ldlt.info() != Eigen::Success || !delta.allFinite()) {
+                damping *= 10.0;
+                continue;
+            }
+
+            const Eigen::VectorXd candidate = f + delta;
+            Eigen::VectorXd candRes;
+            evaluate(candidate, candRes, nullptr);
+            const double candEnergy = totalEnergy(candidate, candRes);
+
+            if (candEnergy < energy) {
+                f = candidate;
+                energy = candEnergy;
+                vibRes = candRes;
+                damping = std::max(damping * 0.1, 1e-12);
+                stepTaken = true;
+                ++accepted;
+                break;
+            }
+            damping *= 10.0;
+        }
+        if (!stepTaken) break;  // damping could not find a descent step
+        best = f;
+    }
+
+    f = best;
+
+    std::cerr << "OASIS: vibration enhancement took " << accepted << " of "
+              << iterations << " steps; energy " << startEnergy << " -> " << energy
+              << ", mean E_a " << startVibration << " -> " << vibrationEnergy()
+              << std::endl;
+
+    // The boundary conditions are a penalty in this phase, not hard
+    // constraints, so they end up approximately rather than exactly satisfied.
+    if (numRows > 0) {
+        const double bcError = (B * f - C).cwiseAbs().maxCoeff();
+        const double amplitude = std::max(1.0, f.cwiseAbs().maxCoeff());
+        if (bcError > 1e-2 * amplitude) {
+            std::cerr << "OASIS: WARNING - boundary conditions drifted to "
+                      << bcError << " (relative " << bcError / amplitude
+                      << ") during vibration enhancement" << std::endl;
+        }
+    }
 }

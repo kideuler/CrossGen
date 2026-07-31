@@ -35,6 +35,12 @@ static const double BOX_SIZE = 5.0;
 static const double DISK_RADIUS = 2.5;
 static const double ELLIPSE_A = 3.0;
 static const double ELLIPSE_B = 2.0;
+// The Sec. 3.4 pathological case: rotationally symmetric, so the unenhanced QE
+// vibrates radially and shows rings rather than isolated spots.
+static const double DISK_RADIUS_FULL = 1.5;
+
+// Gauss-Newton iterations for the vibration pass.
+static const int VIBRATION_ITERATIONS = 10;
 
 // Write an unstructured grid of triangles with one scalar per point.
 static void writeVTK(const std::string &filename,
@@ -87,7 +93,8 @@ static void writeVTK(const std::string &filename,
 static bool runCase(const std::string &label,
                     const std::shared_ptr<Mesh> &mesh,
                     double lambda,
-                    const std::string &outPath) {
+                    const std::string &outPath,
+                    const std::string &vibPath) {
     std::cout << "=== " << label << " ===\n";
     std::cout << "Triangles   : " << mesh->triangles.size() << "\n";
     std::cout << "Vertices    : " << mesh->vertices.size()
@@ -132,7 +139,32 @@ static bool runCase(const std::string &label,
         return false;
     }
 
-    std::cout << "\033[32m[OK]\033[0m Wrote " << outPath << "\n\n";
+    // Vibration enhancement (Sec. 3.4), written alongside so the two can be
+    // compared directly. On the disk this is the difference between rings and
+    // isolated spots.
+    const double eaBefore = oasis.vibrationEnergy();
+    try {
+        oasis.enhanceVibration(VIBRATION_ITERATIONS);
+    } catch (const std::exception &e) {
+        std::cout << "\033[31m[FAIL]\033[0m vibration enhancement: " << e.what() << "\n\n";
+        return false;
+    }
+    const double eaAfter = oasis.vibrationEnergy();
+    const double bcAfter =
+        (oasis.getConstraintMatrix() * oasis.f - oasis.getConstraintRhs()).cwiseAbs().maxCoeff();
+
+    std::cout << "mean E_a    : " << eaBefore << " -> " << eaAfter
+              << "   (0 = isotropic vibration, 2 = one direction only)\n";
+    std::cout << "|B f - C|   : " << bcAfter << "  after enhancement (penalty, not exact)\n";
+
+    try {
+        writeVTK(vibPath, *mesh, oasis.f, "quasi_eigenfunction");
+    } catch (const std::exception &e) {
+        std::cout << "\033[31m[FAIL]\033[0m " << e.what() << "\n\n";
+        return false;
+    }
+
+    std::cout << "\033[32m[OK]\033[0m Wrote " << outPath << " and " << vibPath << "\n\n";
     return true;
 }
 
@@ -159,13 +191,14 @@ int main(int argc, char **argv) {
     // ------------------------------------------------------------------
     // Build the domains
     // ------------------------------------------------------------------
-    std::shared_ptr<Mesh> square, halfDisk, ellipse;
+    std::shared_ptr<Mesh> square, halfDisk, ellipse, disk;
     try {
         square = TestHelper::createBox(0.0, 0.0, BOX_SIZE, BOX_SIZE, h);
         // A 180 degree sweep with equal semi-axes closes the arc with a
         // straight diameter, giving the upper half disk.
         halfDisk = TestHelper::createEllipse(0.0, 0.0, DISK_RADIUS, DISK_RADIUS, 180.0, h);
         ellipse = TestHelper::createEllipse(0.0, 0.0, ELLIPSE_A, ELLIPSE_B, 360.0, h);
+        disk = TestHelper::createCircle(0.0, 0.0, DISK_RADIUS_FULL, h);
     } catch (const std::exception &e) {
         std::cout << "\033[31m[FAIL]\033[0m Meshing failed: " << e.what() << "\n";
         return 2;
@@ -177,12 +210,15 @@ int main(int argc, char **argv) {
     bool ok = true;
     ok &= runCase("Square " + std::to_string(static_cast<int>(BOX_SIZE)) + " x " +
                       std::to_string(static_cast<int>(BOX_SIZE)),
-                  square, lambda, prefix + "_square.vtk");
+                  square, lambda, prefix + "_square.vtk", prefix + "_square_vib.vtk");
     ok &= runCase("Upper half disk, radius " + std::to_string(DISK_RADIUS),
-                  halfDisk, lambda, prefix + "_halfdisk.vtk");
+                  halfDisk, lambda, prefix + "_halfdisk.vtk", prefix + "_halfdisk_vib.vtk");
     ok &= runCase("Ellipse, semi-axes " + std::to_string(ELLIPSE_A) + " and " +
                       std::to_string(ELLIPSE_B),
-                  ellipse, lambda, prefix + "_ellipse.vtk");
+                  ellipse, lambda, prefix + "_ellipse.vtk", prefix + "_ellipse_vib.vtk");
+    ok &= runCase("Full disk, radius " + std::to_string(DISK_RADIUS_FULL) +
+                      " (the Sec. 3.4 rings-vs-spots case)",
+                  disk, lambda, prefix + "_disk.vtk", prefix + "_disk_vib.vtk");
 
     if (!ok) {
         std::cout << "\033[31mOne or more cases failed.\033[0m\n";

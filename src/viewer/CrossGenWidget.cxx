@@ -13,6 +13,7 @@
 #include <QFormLayout>
 #include <QKeyEvent>
 #include <QLabel>
+#include <QSpinBox>
 #include <QMouseEvent>
 #include <QWheelEvent>
 #include <QTimer>
@@ -507,6 +508,23 @@ bool CrossGenWidget::promptOASISParameters() {
     QObject::connect(lambdaBox, &QDoubleSpinBox::valueChanged, &dlg, updateDerived);
     updateDerived();
 
+    // Vibration enhancement (Sec. 3.4). Off by default: it is a second,
+    // nonlinear pass, and on a field whose amplitudes are already balanced it
+    // costs time without changing much.
+    auto *vibrationBox = new QCheckBox("run vibration enhancement (Sec. 3.4)", &dlg);
+    vibrationBox->setChecked(oasisVibrationIterations_ > 0);
+    vibrationBox->setToolTip(
+        "Equalizes the two local vibration amplitudes.\n"
+        "Worth it when the field vibrates in one direction only —\n"
+        "the paper's example is a disk-like, rotationally symmetric region.\n"
+        "Trades exact boundary alignment for a penalty, so |Bf-C| grows.");
+
+    auto *iterBox = new QSpinBox(&dlg);
+    iterBox->setRange(1, 200);
+    iterBox->setValue(oasisVibrationIterations_ > 0 ? oasisVibrationIterations_ : 10);
+    iterBox->setEnabled(vibrationBox->isChecked());
+    QObject::connect(vibrationBox, &QCheckBox::toggled, iterBox, &QSpinBox::setEnabled);
+
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
     QObject::connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
     QObject::connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
@@ -514,6 +532,8 @@ bool CrossGenWidget::promptOASISParameters() {
     auto *form = new QFormLayout(&dlg);
     form->addRow("lambda", lambdaBox);
     form->addRow("implied sizing", derived);
+    form->addRow(vibrationBox);
+    form->addRow("iterations", iterBox);
     form->addRow(new QLabel(QString("mesh: %1 vertices, mean edge %2")
                                 .arg(mesh_->vertices.size())
                                 .arg(avgEdge_, 0, 'f', 4),
@@ -523,6 +543,7 @@ bool CrossGenWidget::promptOASISParameters() {
     if (dlg.exec() != QDialog::Accepted) return false;
 
     oasisLambda_ = lambdaBox->value();
+    oasisVibrationIterations_ = vibrationBox->isChecked() ? iterBox->value() : 0;
     return true;
 }
 
@@ -532,6 +553,12 @@ void CrossGenWidget::runOASIS() {
         oasis_.emplace(mesh_, oasisLambda_);
         oasis_->assemble();
         oasis_->solve();
+        if (oasisVibrationIterations_ > 0) {
+            vibrationBefore_ = oasis_->vibrationEnergy();
+            oasis_->enhanceVibration(oasisVibrationIterations_);
+        } else {
+            vibrationBefore_ = -1.0;
+        }
     } catch (const std::exception &e) {
         oasis_.reset();
         oasisPhase_ = OASISPhase::MeshOnly;
@@ -564,6 +591,15 @@ void CrossGenWidget::runOASIS() {
             << "  |Lf-lambda f|=" << oasis_->residual()
             << "  quad edge ~" << std::fixed << std::setprecision(4)
             << M_PI / std::sqrt(-oasisLambda_);
+        console_.log(oss.str());
+    }
+    if (vibrationBefore_ >= 0.0) {
+        // Mean E_a is the quantity Sec. 3.4 minimizes, so report it either
+        // side of the pass: that is the direct readout of whether it helped.
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(4)
+            << "[OASIS] vibration " << oasisVibrationIterations_ << " iters, mean E_a "
+            << vibrationBefore_ << " -> " << oasis_->vibrationEnergy() << " (0 = isotropic)";
         console_.log(oss.str());
     }
 }

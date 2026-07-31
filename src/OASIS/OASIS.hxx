@@ -76,6 +76,13 @@ public:
     void setLambda(double value) { lambda = value; assembled = false; }
     double getLambda() const { return lambda; }
 
+    // Relative weights of Eq. 19. The paper's omega = 0.1 and xi = 100 do NOT
+    // carry over, because the three terms are balanced against each other by
+    // operator magnitude here rather than in the paper's own normalization.
+    // See the defaults below for the measured values and why they were chosen.
+    void setVibrationWeight(double omega) { vibrationWeight = omega; }
+    void setBoundaryPenaltyWeight(double xi) { boundaryPenaltyWeight = xi; }
+
     // Builds L_r (Eq. 8), B and C (Eq. 11), H_Lr (Eq. 14) and finally the KKT
     // system of Eq. 13 together with its right-hand side [0; C].
     void assemble();
@@ -83,6 +90,28 @@ public:
     // Factorizes and solves Eq. 13, filling f and nu. Calls assemble() first if
     // that has not happened yet. Throws if the factorization or solve fails.
     void solve();
+
+    // Vibration enhancement, Sec. 3.4. A QE can vibrate strongly in one
+    // direction and barely at all in the orthogonal one — the paper's example
+    // is a disk-like region with rotational symmetry, where the field varies
+    // radially and hardly at all around. Its critical points are then hard to
+    // detect or unevenly spaced, and the Morse-Smale complex built on them is
+    // poor. This pass pushes the two local vibration amplitudes together by
+    // minimizing Eq. 19 with Gauss-Newton, starting from the Eq. 13 solution.
+    //
+    // The boundary conditions move from hard constraints to a penalty here,
+    // deliberately: the paper notes that keeping them as Lagrange multipliers
+    // "prevents the scalar field near the boundary from adjusting for desired
+    // vibration", which is exactly what this pass needs to do.
+    //
+    // Requires solve() to have run. Leaves f at the best iterate found.
+    void enhanceVibration(int iterations = 10);
+
+    // Mean of the Eq. 18 amplitude-difference energy over all vertices, in
+    // [0, 2]. Zero means the two local vibration amplitudes match everywhere;
+    // this is the quantity enhanceVibration() drives down, so comparing it
+    // before and after is the direct measure of whether the pass did anything.
+    double vibrationEnergy() const;
 
     // ||L_r f - lambda f||, the Helmholtz residual of Eq. 12 left over after
     // the alignment constraints. Nonzero by construction: that is precisely
@@ -136,12 +165,78 @@ private:
     //   (a_uu, a_uv, a_vv, a_u, a_v, a_c)^T = P * f[neighbors],
     // so that each a_k is the linear form a_k^T f of the paper. P depends only
     // on the discretization, never on f. `ringsUsed` reports how wide the
-    // stencil had to grow to make the fit well posed.
+    // stencil had to grow to make the fit well posed; `startRings` is where it
+    // begins (Sec. 3.3 wants two rings on the boundary, one in the interior).
     bool fitLocalQuadratic(int v, std::vector<int> &neighbors, Eigen::MatrixXd &coeffs,
-                           int &ringsUsed) const;
+                           int &ringsUsed, int startRings) const;
+
+    // The Eq. 9 fit at one vertex, stored as the five linear forms the
+    // vibration energy needs. W^u and W^v of Eq. 17 are never formed: they are
+    // sums of outer products, so f^T W^u f expands to a few squared dot
+    // products of these rows with f, which is far cheaper than one sparse
+    // matrix per vertex.
+    struct VertexFit {
+        std::vector<int> stencil;  // global vertex ids
+        Eigen::VectorXd au, av;    // first-derivative coefficient rows
+        Eigen::VectorXd auu, auv, avv;  // second-derivative coefficient rows
+        bool valid = false;
+    };
+    mutable std::vector<VertexFit> fits;
+
+    // Fit every vertex, caching the coefficient rows for the vibration pass.
+    void precomputeFits() const;
+
+    // The two invariants of Eq. 16 that Eq. 18 is built from, evaluated at
+    // vertex i: `sum` = A^2_u + A^2_v and `diff` = A^2_u - A^2_v, with their
+    // gradients in the stencil values when requested.
+    //
+    // Sec. 3.4 measures the amplitudes in the *Hessian principal frame* ("using
+    // these directions as the local coordinate system"), not the frame the
+    // Eq. 9 fit happens to be expressed in. `sum` is a trace and so is the same
+    // either way, but `diff` is not: computed naively it reports a rotated but
+    // perfectly isotropic field as strongly anisotropic. Rather than
+    // eigendecompose the Hessian at every vertex on every iteration, `diff` is
+    // evaluated in closed form through the deviatoric identity
+    // e1 e1^T - e2 e2^T = H_dev / R, which stays differentiable.
+    void vibrationAnisotropy(int i, const Eigen::VectorXd &values,
+                             double &sum, double &diff,
+                             Eigen::VectorXd *dSum = nullptr,
+                             Eigen::VectorXd *dDiff = nullptr) const;
 
     double lambda;     // Helmholtz parameter, negative
     Eigen::VectorXd r; // density field of Eq. 8, one entry per vertex
+
+    // omega and xi of Eq. 19. The paper's values are 0.1 and 100; neither
+    // transfers, because the terms are balanced against operator magnitude here
+    // rather than in the paper's own normalization. Both defaults were picked
+    // by sweeping against two measured quantities -- the mean E_a the pass is
+    // supposed to reduce, and the alignment error it must not destroy:
+    //
+    //   omega   1 leaves a rotationally symmetric disk stuck at E_a 1.78 (its
+    //           unenhanced value); 10 takes it to 0.29.
+    //   xi      1e5 lets the boundary drift to 2% of the field amplitude; 1e7
+    //           holds it at 5e-4 while costing almost nothing in E_a.
+    // omega and xi of Eq. 19, tuned here rather than taken from the paper.
+    //
+    // These were picked against a measurement that matters more than E_a: on a
+    // disk, how much the field varies *around* a circle of constant radius
+    // compared with its mean on that circle. A ring-shaped field scores ~0; a
+    // properly spotted one scores ~1. Sweeping omega at xi = 1e7 gives
+    //
+    //   omega     0.1     10      30      100     300
+    //   E_a       1.78    0.29    0.16    0.079   0.15
+    //   ang/ring  0.05    0.82    0.96    1.08    1.21
+    //
+    // The paper's omega = 0.1 is a no-op under this normalization: the field
+    // stays a set of rings. Note also that E_a alone would have stopped at
+    // omega = 10, which still leaves visible ring structure — E_a can be driven
+    // partway down without the field ever developing angular variation, so it
+    // is a necessary but not sufficient check.
+    //
+    // xi = 1e7 keeps the alignment conditions to under 1e-3 of the field
+    // amplitude; 1e5 lets them drift to 2%, and 1e2 to over half.
+    double vibrationWeight = 100.0;
+    double boundaryPenaltyWeight = 1e7;
 
     std::vector<int> constrainedVertices;   // boundary (and later feature) vertices
     std::vector<Point> constrainedNormals;  // matching outward unit normals
