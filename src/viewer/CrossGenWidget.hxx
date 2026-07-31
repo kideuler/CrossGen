@@ -21,6 +21,7 @@
 #include "sipg/SIPG.hxx"
 #include "tracing/SeparatrixTrace.hxx"
 #include "medialaxis/MedialAxis.hxx"
+#include "OASIS/OASIS.hxx"
 
 // ── Enumerations mirroring the original viewer state machine ──────────────────
 
@@ -30,6 +31,7 @@ enum class Mode {
     MBO         = 2,
     MedialAxis  = 3,
     SIPG        = 4,
+    OASIS       = 5,
 };
 
 enum class Phase {
@@ -54,6 +56,13 @@ enum class SIPGPhase {
     Stepping   = 3,
     CutSeams   = 4,
     UVMesh     = 5,
+};
+
+// OASIS is a one-shot solve driven by a parameter dialog rather than a
+// sequence of stages, so it has only "before" and "after".
+enum class OASISPhase {
+    MeshOnly = 1,
+    Field    = 2,
 };
 
 enum class MedialAxisPhase {
@@ -93,6 +102,12 @@ private:
     void doReset();
     void advancePhase();
 
+    // Modal dialog collecting the OASIS parameters. Returns false if cancelled.
+    bool promptOASISParameters();
+
+    // Assemble and solve the Eq. 13 KKT system at the current oasisLambda_.
+    void runOASIS();
+
     // rendering sub-routines called from paintGL
     void renderMBOAnimation();
     void renderSIPGAnimation();
@@ -120,6 +135,7 @@ private:
     std::shared_ptr<SeparatrixTrace> separatrixTrace_;
     std::shared_ptr<Mesh>      delaunayMesh_;
     std::shared_ptr<MedialAxis> medialAxis_;
+    std::optional<OASIS>       oasis_;
 
     // ── state machine ────────────────────────────────────────────────────────
     Mode           mode_     = Mode::Unselected;
@@ -127,6 +143,11 @@ private:
     MBOPhase       mboPhase_ = MBOPhase::MeshOnly;
     SIPGPhase      sipgPhase_ = SIPGPhase::MeshOnly;
     MedialAxisPhase maPhase_ = MedialAxisPhase::MeshOnly;
+    OASISPhase     oasisPhase_ = OASISPhase::MeshOnly;
+
+    // OASIS parameters and derived display range.
+    double oasisLambda_  = 0.0;   // set by the dialog on first use
+    double oasisAbsMax_  = 1.0;   // max|f|, the symmetric range for the ramp
 
     bool singularitiesLogged_  = false;
     bool mboSteppingStarted_   = false;

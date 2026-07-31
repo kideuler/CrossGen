@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iomanip>
+#include <sstream>
 
 #include <Eigen/Dense>
 
@@ -102,6 +104,25 @@ void drawMesh(const Mesh &m) {
         glVertex2d(a[0], a[1]);
     }
     glEnd();
+}
+
+void drawMeshOverlay(const Mesh &m, float r, float g, float b, float a, float lineWidth) {
+    glColor4f(r, g, b, a);
+    glLineWidth(lineWidth);
+    glBegin(GL_LINES);
+    for (const auto &tri : m.triangles) {
+        const Point &p0 = m.vertices[tri[0]];
+        const Point &p1 = m.vertices[tri[1]];
+        const Point &p2 = m.vertices[tri[2]];
+        glVertex2d(p0[0], p0[1]);
+        glVertex2d(p1[0], p1[1]);
+        glVertex2d(p1[0], p1[1]);
+        glVertex2d(p2[0], p2[1]);
+        glVertex2d(p2[0], p2[1]);
+        glVertex2d(p0[0], p0[1]);
+    }
+    glEnd();
+    glLineWidth(1.0f);
 }
 
 void drawEdgeSetOnMesh(const Mesh &m,
@@ -680,6 +701,103 @@ void drawMedialAxis(const MedialAxis &ma, double vertexRadius) {
     for (const auto &v : ma.medialVertices) {
         drawDisk3D(v.coord, vertexRadius, 0.1f, 0.85f, 0.85f);
     }
+}
+
+namespace {
+
+// Diverging ramp: two hues with a neutral gray midpoint, stepped for a dark
+// surface. A quasi-eigenfunction is signed and oscillates about zero, so the
+// job is polarity, not magnitude — zero must land exactly on the neutral, and
+// the two arms must be opposite hues (never a rainbow, never a hue at the
+// midpoint). Blue and red separate under all three CVD types.
+void divergingColor(double t, float &r, float &g, float &b) {
+    static const float kNeg[3] = {0.224f, 0.529f, 0.898f}; // #3987e5 blue
+    static const float kMid[3] = {0.220f, 0.220f, 0.208f}; // #383835 neutral
+    static const float kPos[3] = {0.902f, 0.404f, 0.404f}; // #e66767 red
+
+    if (t < -1.0) t = -1.0;
+    if (t > 1.0) t = 1.0;
+
+    const float *end = (t < 0.0) ? kNeg : kPos;
+    const float a = static_cast<float>(std::fabs(t));
+    r = kMid[0] + a * (end[0] - kMid[0]);
+    g = kMid[1] + a * (end[1] - kMid[1]);
+    b = kMid[2] + a * (end[2] - kMid[2]);
+}
+
+} // namespace
+
+void drawScalarField(const Mesh &m, const Eigen::VectorXd &f, double vmax) {
+    if (!(vmax > 0.0)) vmax = 1.0;
+    const Eigen::Index n = f.size();
+
+    glBegin(GL_TRIANGLES);
+    for (const auto &tri : m.triangles) {
+        for (int k = 0; k < 3; ++k) {
+            const int v = tri[k];
+            if (v < 0 || v >= n) continue;
+            float r, g, b;
+            divergingColor(f[v] / vmax, r, g, b);
+            glColor3f(r, g, b);
+            glVertex2d(m.vertices[v][0], m.vertices[v][1]);
+        }
+    }
+    glEnd();
+}
+
+void drawScalarFieldLegend(int fbw, int fbh, double vmin, double vmax, const char *title) {
+    const float barW = 220.0f;
+    const float barH = 18.0f;
+    const float x0 = 20.0f;
+    const float y0 = static_cast<float>(fbh) - 70.0f;
+
+    glMatrixMode(GL_PROJECTION);
+    glPushMatrix();
+    glLoadIdentity();
+    glOrtho(0, fbw, fbh, 0, -1, 1); // top-left origin
+
+    glMatrixMode(GL_MODELVIEW);
+    glPushMatrix();
+    glLoadIdentity();
+
+    // The ramp itself, drawn as a strip so the neutral midpoint is visible.
+    const int steps = 64;
+    glBegin(GL_QUAD_STRIP);
+    for (int i = 0; i <= steps; ++i) {
+        const double t = -1.0 + 2.0 * static_cast<double>(i) / steps;
+        float r, g, b;
+        divergingColor(t, r, g, b);
+        glColor3f(r, g, b);
+        const float x = x0 + barW * static_cast<float>(i) / steps;
+        glVertex2f(x, y0);
+        glVertex2f(x, y0 + barH);
+    }
+    glEnd();
+
+    // Border
+    glColor3f(0.55f, 0.55f, 0.55f);
+    glLineWidth(1.0f);
+    glBegin(GL_LINE_LOOP);
+    glVertex2f(x0, y0);
+    glVertex2f(x0 + barW, y0);
+    glVertex2f(x0 + barW, y0 + barH);
+    glVertex2f(x0, y0 + barH);
+    glEnd();
+
+    glMatrixMode(GL_PROJECTION);
+    glPopMatrix();
+    glMatrixMode(GL_MODELVIEW);
+    glPopMatrix();
+
+    // Labels: the extremes and the zero level, in ink rather than ramp colors.
+    std::ostringstream lo, hi;
+    lo << std::scientific << std::setprecision(2) << vmin;
+    hi << std::scientific << std::setprecision(2) << vmax;
+
+    drawTextOverlay(fbw, fbh, title, x0, y0 - 22.0f, 0.8f, 0.8f, 0.8f);
+    drawTextOverlay(fbw, fbh, lo.str().c_str(), x0, y0 + barH + 6.0f, 0.8f, 0.8f, 0.8f);
+    drawTextOverlay(fbw, fbh, "0", x0 + 0.5f * barW - 6.0f, y0 + barH + 6.0f, 0.8f, 0.8f, 0.8f);
+    drawTextOverlay(fbw, fbh, hi.str().c_str(), x0 + barW - 60.0f, y0 + barH + 6.0f, 0.8f, 0.8f, 0.8f);
 }
 
 void drawBoundaryEdges(const Mesh &m) {

@@ -51,6 +51,8 @@ add_library(PolyVector SHARED
     src/Parameterization/UVGParam.cxx
     src/crossfield/CrossField.hxx
     src/crossfield/CrossField.cxx
+    src/OASIS/OASIS.hxx
+    src/OASIS/OASIS.cxx
     src/tracing/SeparatrixTrace.hxx
     src/tracing/SeparatrixTrace.cxx
     src/triangle/triangle.cpp
@@ -88,6 +90,10 @@ target_link_libraries(TestMedialAxis PRIVATE PolyVector)
 # Generate circle/ellipse topologies
 add_executable(GenerateCircleTopologies src/utils/GenerateCircleTopologies.cxx)
 target_link_libraries(GenerateCircleTopologies PRIVATE PolyVector)
+
+# Test OASIS quasi-eigenfunction on a meshed rectangle
+add_executable(TestOasis src/utils/TestOasis.cxx)
+target_link_libraries(TestOasis PRIVATE PolyVector)
 
 # Test p=0 DG/SIPG MBO cross-field solver
 add_executable(TestSIPG src/utils/TestSIPG.cxx)

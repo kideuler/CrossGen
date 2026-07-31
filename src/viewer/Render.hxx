@@ -41,6 +41,11 @@ private:
 
 void drawMesh(const Mesh &m);
 
+// Draw the mesh wireframe as a translucent overlay, for laying edges over
+// filled geometry (a scalar field) without burying it. Relies on the blending
+// enabled in initializeGL.
+void drawMeshOverlay(const Mesh &m, float r, float g, float b, float a, float lineWidth);
+
 void drawEdgeSetOnMesh(const Mesh &m,
                        const std::unordered_set<CutMesh::EdgeKey, CutMesh::EdgeKeyHash> &edges,
                        float r, float g, float b,
@@ -90,6 +95,16 @@ void drawMedialAxis(const MedialAxis &ma, double vertexRadius);
 
 // Draw only the boundary edges of a mesh.
 void drawBoundaryEdges(const Mesh &m);
+
+// Fill the mesh with a per-vertex scalar field using a diverging blue/red ramp
+// with a neutral midpoint. The field is a signed quantity oscillating about
+// zero (a quasi-eigenfunction), so the range is taken symmetric: `vmax` should
+// be max|f| and zero always lands on the neutral midpoint.
+void drawScalarField(const Mesh &m, const Eigen::VectorXd &f, double vmax);
+
+// Screen-space legend for drawScalarField, drawn bottom-left with the field
+// extents labelled. fbw/fbh are the physical framebuffer dimensions.
+void drawScalarFieldLegend(int fbw, int fbh, double vmin, double vmax, const char *title);
 
 // Compute view bounds for a UVGParam parametrization.
 void computeUVGParamBounds(const UVGParam &uvp, double &cx, double &cy, double &baseW, double &baseH);

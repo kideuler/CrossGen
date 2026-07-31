@@ -6,7 +6,13 @@
 #include "viewer/Interaction.hxx"
 #include "viewer/Render.hxx"
 
+#include <QCheckBox>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QDoubleSpinBox>
+#include <QFormLayout>
 #include <QKeyEvent>
+#include <QLabel>
 #include <QMouseEvent>
 #include <QWheelEvent>
 #include <QTimer>
@@ -120,6 +126,14 @@ const char *medialAxisPhaseName(MedialAxisPhase p) {
     return "?";
 }
 
+const char *oasisPhaseName(OASISPhase p) {
+    switch (p) {
+        case OASISPhase::MeshOnly: return "1) mesh";
+        case OASISPhase::Field:    return "2) quasi-eigenfunction";
+    }
+    return "?";
+}
+
 const char *modeName(Mode m) {
     switch (m) {
         case Mode::Unselected: return "unselected";
@@ -127,6 +141,7 @@ const char *modeName(Mode m) {
         case Mode::MBO:        return "MBO";
         case Mode::MedialAxis: return "Medial Axis";
         case Mode::SIPG:       return "SIPG";
+        case Mode::OASIS:      return "OASIS";
     }
     return "?";
 }
@@ -176,7 +191,7 @@ CrossGenWidget::CrossGenWidget(const std::string &meshPath, QWidget *parent)
     setFocusPolicy(Qt::StrongFocus);
 
     std::cerr << "[Viewer] Phase " << phaseName(phase_)
-              << " (press '1' for PolyVector, '2' for MBO, '3' for Medial Axis, '4' for SIPG)\n";
+              << " (press '1' for PolyVector, '2' for MBO, '3' for Medial Axis, '4' for SIPG, '5' for OASIS)\n";
 }
 
 // ── QOpenGLWidget overrides ───────────────────────────────────────────────────
@@ -258,8 +273,13 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
         break;
 
     case Qt::Key_C:
-        if (mode_ != Mode::Unselected)
+        if (mode_ == Mode::OASIS) {
+            // 'c' re-opens the dialog so lambda can be swept without a reset.
+            if (promptOASISParameters())
+                runOASIS();
+        } else if (mode_ != Mode::Unselected) {
             advancePhase();
+        }
         break;
 
     case Qt::Key_1:
@@ -291,6 +311,21 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
             mode_ = Mode::SIPG;
             std::cerr << "[Viewer] Selected mode: " << modeName(mode_) << " (press 'c' to advance)\n";
             console_.log("Selected mode: SIPG");
+        }
+        break;
+
+    case Qt::Key_5:
+        if (mode_ == Mode::Unselected && phase_ == Phase::MeshOnly) {
+            // Unlike the other modes, OASIS needs a parameter before it can do
+            // anything, so selecting it opens the dialog immediately. Backing
+            // out of the dialog leaves the mode unselected.
+            if (promptOASISParameters()) {
+                mode_ = Mode::OASIS;
+                std::cerr << "[Viewer] Selected mode: " << modeName(mode_)
+                          << " (press 'c' to change lambda)\n";
+                console_.log("Selected mode: OASIS");
+                runOASIS();
+            }
         }
         break;
 
@@ -380,12 +415,16 @@ void CrossGenWidget::doReset() {
     separatrixTrace_.reset();
     delaunayMesh_.reset();
     medialAxis_.reset();
+    oasis_.reset();
 
     mode_     = Mode::Unselected;
     phase_    = Phase::MeshOnly;
     mboPhase_ = MBOPhase::MeshOnly;
     sipgPhase_ = SIPGPhase::MeshOnly;
     maPhase_  = MedialAxisPhase::MeshOnly;
+    oasisPhase_ = OASISPhase::MeshOnly;
+    // oasisLambda_ deliberately survives a reset so it can be reused as the
+    // dialog's default on the next run.
 
     singularitiesLogged_  = false;
     mboSteppingStarted_   = false;
@@ -416,7 +455,117 @@ void CrossGenWidget::doReset() {
     }
     console_.log("[Reset] Restarted viewer.");
     std::cerr << "[Viewer] Reset. Phase " << phaseName(phase_)
-              << " (press '1' for PolyVector, '2' for MBO, '3' for Medial Axis, '4' for SIPG)\n";
+              << " (press '1' for PolyVector, '2' for MBO, '3' for Medial Axis, '4' for SIPG, '5' for OASIS)\n";
+}
+
+// ── OASIS parameter dialog ───────────────────────────────────────────────────
+
+bool CrossGenWidget::promptOASISParameters() {
+    // lambda is the only genuinely required input. The density field r of Eq. 8
+    // is left uniform: a *constant* r is redundant with lambda, since the
+    // modulated operator is grad^2/r and only the product lambda*r sets the
+    // local wavelength. A spatially varying r is the real feature, and needs a
+    // field editor rather than a spin box.
+    //
+    // A quasi-eigenfunction oscillates like cos(u*sqrt(-lambda)), so its
+    // critical points — and hence the quad cells of the Morse-Smale complex —
+    // sit a distance pi/sqrt(-lambda) apart. That is the number the user
+    // actually cares about, so the dialog shows it live alongside the ratio to
+    // the background triangle size, which the paper needs at 0.25 or below for
+    // the critical points to be resolved at all (Sec. 3.3).
+    const double defaultQuad = 8.0 * avgEdge_;
+    const double defaultLambda =
+        (oasisLambda_ < 0.0) ? oasisLambda_
+                             : -(M_PI / defaultQuad) * (M_PI / defaultQuad);
+
+    QDialog dlg(this);
+    dlg.setWindowTitle("OASIS quasi-eigenfunction");
+
+    auto *lambdaBox = new QDoubleSpinBox(&dlg);
+    lambdaBox->setRange(-1e9, -1e-6);
+    lambdaBox->setDecimals(2);
+    lambdaBox->setValue(defaultLambda);
+    lambdaBox->setSingleStep(10.0);
+    lambdaBox->setToolTip("Helmholtz parameter of Eq. 1. Must be negative.\n"
+                          "It does not have to be an eigenvalue.");
+
+    auto *derived = new QLabel(&dlg);
+    derived->setTextFormat(Qt::PlainText);
+
+    auto updateDerived = [this, lambdaBox, derived]() {
+        const double lam = lambdaBox->value();
+        const double quad = M_PI / std::sqrt(-lam);
+        const double ratio = avgEdge_ / quad;
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(4)
+            << "quad edge  pi/sqrt(-lambda) = " << quad << "\n"
+            << "mesh edge / quad edge       = " << std::setprecision(3) << ratio;
+        if (ratio > 0.25)
+            oss << "   <-- too coarse (want <= 0.25)";
+        derived->setText(QString::fromStdString(oss.str()));
+    };
+    QObject::connect(lambdaBox, &QDoubleSpinBox::valueChanged, &dlg, updateDerived);
+    updateDerived();
+
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    QObject::connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    QObject::connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+
+    auto *form = new QFormLayout(&dlg);
+    form->addRow("lambda", lambdaBox);
+    form->addRow("implied sizing", derived);
+    form->addRow(new QLabel(QString("mesh: %1 vertices, mean edge %2")
+                                .arg(mesh_->vertices.size())
+                                .arg(avgEdge_, 0, 'f', 4),
+                            &dlg));
+    form->addRow(buttons);
+
+    if (dlg.exec() != QDialog::Accepted) return false;
+
+    oasisLambda_ = lambdaBox->value();
+    return true;
+}
+
+void CrossGenWidget::runOASIS() {
+    auto t0 = Clock::now();
+    try {
+        oasis_.emplace(mesh_, oasisLambda_);
+        oasis_->assemble();
+        oasis_->solve();
+    } catch (const std::exception &e) {
+        oasis_.reset();
+        oasisPhase_ = OASISPhase::MeshOnly;
+        console_.log(std::string("[OASIS] FAILED: ") + e.what());
+        std::cerr << "[Viewer] OASIS failed: " << e.what() << "\n";
+        return;
+    }
+    auto t1 = Clock::now();
+
+    const Eigen::VectorXd &f = oasis_->f;
+    // The ramp is diverging, so the range must be symmetric about zero.
+    oasisAbsMax_ = std::max(std::fabs(f.minCoeff()), std::fabs(f.maxCoeff()));
+    if (!(oasisAbsMax_ > 0.0)) oasisAbsMax_ = 1.0;
+
+    oasisPhase_ = OASISPhase::Field;
+
+    {
+        std::ostringstream oss;
+        oss << "[OASIS] lambda=" << oasisLambda_ << ", "
+            << oasis_->numConstraints() << " constraints, solved in "
+            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+    }
+    {
+        const double bcErr = (oasis_->getConstraintMatrix() * f -
+                              oasis_->getConstraintRhs()).cwiseAbs().maxCoeff();
+        std::ostringstream oss;
+        oss << std::scientific << std::setprecision(2)
+            << "[OASIS] |Bf-C|inf=" << bcErr
+            << "  |Lf-lambda f|=" << oasis_->residual()
+            << "  quad edge ~" << std::fixed << std::setprecision(4)
+            << M_PI / std::sqrt(-oasisLambda_);
+        console_.log(oss.str());
+    }
 }
 
 // ── phase advancement ────────────────────────────────────────────────────────
@@ -1066,6 +1215,21 @@ void CrossGenWidget::renderNormal() {
             }
             glLineWidth(1.0f);
         }
+    } else if (mode_ == Mode::OASIS) {
+        if (oasisPhase_ == OASISPhase::Field && oasis_.has_value()) {
+            // Field first, then the wireframe over it. The wireframe is kept
+            // translucent and light: at these mesh densities an opaque one
+            // buries the structure it is drawn over, and a light tint stays
+            // visible against both the saturated lobes and the near-black
+            // neutral around the zero level. The boundary goes on top last,
+            // since the alignment claim is about it: the extrema should run
+            // square to the boundary.
+            viewer::drawScalarField(*mesh_, oasis_->f, oasisAbsMax_);
+            viewer::drawMeshOverlay(*mesh_, 0.85f, 0.85f, 0.85f, 0.22f, 1.0f);
+            viewer::drawBoundaryEdges(*mesh_);
+        } else {
+            viewer::drawMesh(*mesh_);
+        }
     } else if (mode_ == Mode::MedialAxis) {
         if (maPhase_ != MedialAxisPhase::Classify) {
             if (delaunayMesh_)
@@ -1172,12 +1336,22 @@ void CrossGenWidget::renderNormal() {
         }
     }
 
+    // Colour legend for the scalar field, before the text overlay so the
+    // console keeps drawing on top.
+    if (mode_ == Mode::OASIS && oasisPhase_ == OASISPhase::Field && oasis_.has_value()) {
+        viewer::drawScalarFieldLegend(fbw(), fbh(), -oasisAbsMax_, oasisAbsMax_,
+                                      "quasi-eigenfunction");
+    }
+
     // Overlay text
     if (mode_ == Mode::Unselected) {
         renderOverlay("press '1' for PolyVector mode\npress '2' for MBO mode\n"
                       "press '3' for Medial Axis mode\npress '4' for SIPG mode\n"
+                      "press '5' for OASIS mode\n"
                       "right-drag to pan, scroll to zoom\n"
                       "press 'r' to restart\npress 'q' to quit");
+    } else if (mode_ == Mode::OASIS) {
+        renderOverlay("press 'c' to change lambda\npress 'r' to restart\npress 'q' to quit");
     } else {
         renderOverlay("press 'c' to continue\npress 'r' to restart\npress 'q' to quit");
     }
