@@ -417,6 +417,7 @@ void CrossGenWidget::doReset() {
     delaunayMesh_.reset();
     medialAxis_.reset();
     oasis_.reset();
+    oasisGuide_.reset();
 
     mode_     = Mode::Unselected;
     phase_    = Phase::MeshOnly;
@@ -508,9 +509,11 @@ bool CrossGenWidget::promptOASISParameters() {
     QObject::connect(lambdaBox, &QDoubleSpinBox::valueChanged, &dlg, updateDerived);
     updateDerived();
 
-    // Vibration enhancement (Sec. 3.4). Off by default: it is a second,
-    // nonlinear pass, and on a field whose amplitudes are already balanced it
-    // costs time without changing much.
+    // Vibration enhancement (Sec. 3.4). On by default. It is a second,
+    // nonlinear pass, so it costs time and buys nothing on a field whose
+    // amplitudes are already balanced — but where it matters (a rotationally
+    // symmetric region, which vibrates radially and shows rings rather than
+    // isolated critical points) the Morse-Smale complex is unusable without it.
     auto *vibrationBox = new QCheckBox("run vibration enhancement (Sec. 3.4)", &dlg);
     vibrationBox->setChecked(oasisVibrationIterations_ > 0);
     vibrationBox->setToolTip(
@@ -525,6 +528,56 @@ bool CrossGenWidget::promptOASISParameters() {
     iterBox->setEnabled(vibrationBox->isChecked());
     QObject::connect(vibrationBox, &QCheckBox::toggled, iterBox, &QSpinBox::setEnabled);
 
+    // Orientation control (Sec. 5.1). On by default, which means pressing '5'
+    // runs an MBO solve before the KKT one — a fraction of the KKT cost on the
+    // meshes here. Untick it to get the plain 2014 system back, which is what
+    // the boundary conditions alone give.
+    auto *orientBox = new QCheckBox("guide orientation with an MBO cross field (Sec. 5.1)", &dlg);
+    orientBox->setChecked(oasisOrientationWeight_ > 0.0);
+    orientBox->setToolTip(
+        "Adds gamma * E_Orient to the objective, so the principal directions\n"
+        "of the field — and with them the arcs of the Morse-Smale complex —\n"
+        "follow a cross field computed by MBO on this mesh.");
+
+    auto *gammaBox = new QDoubleSpinBox(&dlg);
+    gammaBox->setRange(0.01, 1e6);
+    gammaBox->setDecimals(2);
+    gammaBox->setSingleStep(1.0);
+    gammaBox->setValue(oasisOrientationWeight_ > 0.0 ? oasisOrientationWeight_ : 10.0);
+    gammaBox->setToolTip(
+        "Weight of the orientation energy against the Helmholtz term,\n"
+        "after both have been normalized by operator magnitude.\n"
+        "10 follows the guiding field closely; below ~1 it barely turns,\n"
+        "and far above it the cells stop being square.");
+
+    // MBO stops as soon as the field stops moving, so this is a ceiling on the
+    // wait rather than a target. The whole solve blocks the viewer.
+    auto *mboIterBox = new QSpinBox(&dlg);
+    mboIterBox->setRange(1, 5000);
+    mboIterBox->setValue(oasisMBOIterations_);
+    mboIterBox->setToolTip("Iteration cap for the MBO cross-field solve.\n"
+                           "It exits early once the field converges.");
+
+    auto *clearanceBox = new QDoubleSpinBox(&dlg);
+    clearanceBox->setRange(0.0, 50.0);
+    clearanceBox->setDecimals(1);
+    clearanceBox->setSingleStep(0.5);
+    clearanceBox->setValue(oasisGuideClearanceQuads_);
+    clearanceBox->setToolTip(
+        "Keeps the guiding field this many quad cells clear of the boundary,\n"
+        "as the paper does. Within the band the Eq. 11 conditions already fix\n"
+        "the orientation, and a guiding direction that disagrees with them is\n"
+        "paid for in cell shape. 0 guides everywhere.");
+
+    auto syncOrientation = [orientBox, gammaBox, mboIterBox, clearanceBox]() {
+        const bool on = orientBox->isChecked();
+        gammaBox->setEnabled(on);
+        mboIterBox->setEnabled(on);
+        clearanceBox->setEnabled(on);
+    };
+    QObject::connect(orientBox, &QCheckBox::toggled, &dlg, syncOrientation);
+    syncOrientation();
+
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
     QObject::connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
     QObject::connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
@@ -534,6 +587,10 @@ bool CrossGenWidget::promptOASISParameters() {
     form->addRow("implied sizing", derived);
     form->addRow(vibrationBox);
     form->addRow("iterations", iterBox);
+    form->addRow(orientBox);
+    form->addRow("gamma", gammaBox);
+    form->addRow("MBO max iterations", mboIterBox);
+    form->addRow("boundary clearance (quads)", clearanceBox);
     form->addRow(new QLabel(QString("mesh: %1 vertices, mean edge %2")
                                 .arg(mesh_->vertices.size())
                                 .arg(avgEdge_, 0, 'f', 4),
@@ -544,13 +601,62 @@ bool CrossGenWidget::promptOASISParameters() {
 
     oasisLambda_ = lambdaBox->value();
     oasisVibrationIterations_ = vibrationBox->isChecked() ? iterBox->value() : 0;
+    oasisOrientationWeight_ = orientBox->isChecked() ? gammaBox->value() : 0.0;
+    oasisMBOIterations_ = mboIterBox->value();
+    oasisGuideClearanceQuads_ = clearanceBox->value();
+    return true;
+}
+
+// The guiding field is a full MBO run, blocking: the KKT solve that follows
+// needs the finished field, and there is nothing useful to draw in between.
+bool CrossGenWidget::buildOASISGuidingField() {
+    auto t0 = Clock::now();
+    try {
+        oasisGuide_ = std::make_shared<CrossField>(mesh_, oasisMBOIterations_);
+        oasisGuide_->initialize(1);
+        oasisGuide_->runMBO();
+        oasisGuide_->computeSingularities();
+    } catch (const std::exception &e) {
+        oasisGuide_.reset();
+        console_.log(std::string("[OASIS] guiding field FAILED: ") + e.what());
+        std::cerr << "[Viewer] MBO for the OASIS guiding field failed: " << e.what() << "\n";
+        return false;
+    }
+    auto t1 = Clock::now();
+
+    std::ostringstream oss;
+    oss << "[OASIS] guiding field: MBO <=" << oasisMBOIterations_ << " iters, error "
+        << std::scientific << std::setprecision(2) << oasisGuide_->error << ", "
+        << oasisGuide_->singularTriangles.size() << " singularities, "
+        << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+    console_.log(oss.str());
     return true;
 }
 
 void CrossGenWidget::runOASIS() {
+    // Drop the previous solution before rebuilding the field it points into.
+    oasis_.reset();
+    if (oasisOrientationWeight_ <= 0.0) {
+        oasisGuide_.reset();
+    } else if (!buildOASISGuidingField()) {
+        // Fall through without orientation rather than leaving the user with
+        // nothing: the unguided QE is still the paper's result.
+        console_.log("[OASIS] continuing without orientation control");
+    }
+
     auto t0 = Clock::now();
     try {
-        oasis_.emplace(mesh_, oasisLambda_);
+        if (oasisGuide_) {
+            oasis_.emplace(oasisGuide_, oasisLambda_);
+            oasis_->setOrientationWeight(oasisOrientationWeight_);
+            // The clearance is in quad cells, and one quad cell is
+            // pi/sqrt(-lambda) across (the QE's half period).
+            const double clearance =
+                oasisGuideClearanceQuads_ * M_PI / std::sqrt(-oasisLambda_);
+            oasis_->setOrientationMask(oasis_->boundaryClearanceMask(clearance));
+        } else {
+            oasis_.emplace(mesh_, oasisLambda_);
+        }
         oasis_->assemble();
         oasis_->solve();
         if (oasisVibrationIterations_ > 0) {
@@ -591,6 +697,18 @@ void CrossGenWidget::runOASIS() {
             << "  |Lf-lambda f|=" << oasis_->residual()
             << "  quad edge ~" << std::fixed << std::setprecision(4)
             << M_PI / std::sqrt(-oasisLambda_);
+        console_.log(oss.str());
+    }
+    if (oasisGuide_) {
+        // The misalignment against the guiding field, which is what the
+        // orientation term is there to reduce. A guiding field that agrees with
+        // the boundary conditions — an MBO one does — lands well under a
+        // degree; several degrees means the two are pulling against each other.
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(2)
+            << "[OASIS] orientation gamma=" << oasisOrientationWeight_
+            << ", misalignment " << oasis_->orientationError()
+            << " deg (0 = aligned, 45 = worst)";
         console_.log(oss.str());
     }
     if (vibrationBefore_ >= 0.0) {
@@ -1262,6 +1380,11 @@ void CrossGenWidget::renderNormal() {
             // square to the boundary.
             viewer::drawScalarField(*mesh_, oasis_->f, oasisAbsMax_);
             viewer::drawMeshOverlay(*mesh_, 0.85f, 0.85f, 0.85f, 0.22f, 1.0f);
+            // The guiding crosses go over the field, since the whole claim of
+            // the orientation term is that the two line up: the lobes should
+            // run along the crosses wherever the guiding field is active.
+            if (oasisGuide_)
+                viewer::drawVertexCrossFieldUK(*mesh_, *oasisGuide_, scale_);
             viewer::drawBoundaryEdges(*mesh_);
         } else {
             viewer::drawMesh(*mesh_);
@@ -1387,7 +1510,8 @@ void CrossGenWidget::renderNormal() {
                       "right-drag to pan, scroll to zoom\n"
                       "press 'r' to restart\npress 'q' to quit");
     } else if (mode_ == Mode::OASIS) {
-        renderOverlay("press 'c' to change lambda\npress 'r' to restart\npress 'q' to quit");
+        renderOverlay("press 'c' to change lambda / orientation\n"
+                      "press 'r' to restart\npress 'q' to quit");
     } else {
         renderOverlay("press 'c' to continue\npress 'r' to restart\npress 'q' to quit");
     }

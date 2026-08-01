@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
@@ -27,6 +28,14 @@ constexpr double kXi = 1.0;
 
 constexpr double kEps = 1e-14;
 
+double maxAbsEntry(const Eigen::SparseMatrix<double> &A) {
+    double m = 0.0;
+    for (int k = 0; k < A.outerSize(); ++k)
+        for (Eigen::SparseMatrix<double>::InnerIterator it(A, k); it; ++it)
+            m = std::max(m, std::fabs(it.value()));
+    return m;
+}
+
 } // namespace
 
 OASIS::OASIS(std::shared_ptr<CrossField> crossField, double lambda)
@@ -45,6 +54,8 @@ OASIS::OASIS(std::shared_ptr<Mesh> mesh, double lambda)
         throw std::invalid_argument("OASIS: null mesh");
     }
     r = Eigen::VectorXd::Ones(static_cast<int>(mesh->vertices.size()));
+    // No guiding field, so no orientation term: this is the pure 2014 system.
+    orientationWeight = 0.0;
 }
 
 void OASIS::setDensity(const Eigen::VectorXd &density) {
@@ -58,12 +69,42 @@ void OASIS::setDensity(const Eigen::VectorXd &density) {
     assembled = false;
 }
 
+void OASIS::setOrientationMask(const Eigen::VectorXd &mask) {
+    if (mask.size() != static_cast<Eigen::Index>(mesh->vertices.size())) {
+        throw std::invalid_argument("OASIS::setOrientationMask: expected one entry per vertex");
+    }
+    if (mask.minCoeff() < 0.0) {
+        throw std::invalid_argument("OASIS::setOrientationMask: mask must be non-negative");
+    }
+    orientationMask = mask;
+    assembled = false;
+}
+
+Eigen::VectorXd OASIS::boundaryClearanceMask(double clearance) const {
+    const int numVertices = static_cast<int>(mesh->vertices.size());
+    Eigen::VectorXd mask = Eigen::VectorXd::Ones(numVertices);
+    if (clearance <= 0.0) return mask;
+
+    // Brute force against every boundary vertex. |V| * |dV| is a few million
+    // distance evaluations on the meshes this runs on, once per assembly.
+    for (int v = 0; v < numVertices; ++v) {
+        double best = std::numeric_limits<double>::max();
+        for (int b : mesh->boundaryVertices) {
+            best = std::min(best, normP(mesh->vertices[v] - mesh->vertices[b]));
+            if (best <= clearance) break;
+        }
+        mask[v] = (best > clearance) ? 1.0 : 0.0;
+    }
+    return mask;
+}
+
 void OASIS::assemble() {
     if (lambda >= 0.0) {
         std::cerr << "OASIS: lambda should be negative (Eq. 1), got " << lambda << std::endl;
     }
     buildDensityLaplacian();
     buildConstraints();
+    buildOrientation();
     buildKKT();
     assembled = true;
 }
@@ -107,6 +148,27 @@ double OASIS::residual() const {
     return (Lr * f - lambda * f).norm();
 }
 
+std::vector<double> OASIS::computeVertexAreas() const {
+    const int numVertices = static_cast<int>(mesh->vertices.size());
+    const int numTriangles = static_cast<int>(mesh->triangles.size());
+
+    std::vector<double> areas(numVertices, 0.0);
+    for (int t = 0; t < numTriangles; ++t) {
+        const Triangle &tri = mesh->triangles[t];
+        const Point &p0 = mesh->vertices[tri[0]];
+        const Point &p1 = mesh->vertices[tri[1]];
+        const Point &p2 = mesh->vertices[tri[2]];
+
+        const double area = 0.5 * std::fabs(cross2(p1 - p0, p2 - p0));
+        if (area < kEps) continue;
+
+        for (int k = 0; k < 3; ++k) {
+            areas[tri[k]] += area / 3.0;
+        }
+    }
+    return areas;
+}
+
 // Eq. 8: the cotangent formula modulated by the density r,
 //
 //   (grad^2_r f)_i = 3 / (2 * Area_i * r_i) * sum_{j in N(i)} (cot a_ij + cot b_ij) (f_j - f_i)
@@ -118,21 +180,7 @@ void OASIS::buildDensityLaplacian() {
     const int numVertices = static_cast<int>(mesh->vertices.size());
     const int numTriangles = static_cast<int>(mesh->triangles.size());
 
-    // Total incident area per vertex.
-    std::vector<double> vertexArea(numVertices, 0.0);
-    for (int t = 0; t < numTriangles; ++t) {
-        const Triangle &tri = mesh->triangles[t];
-        const Point &p0 = mesh->vertices[tri[0]];
-        const Point &p1 = mesh->vertices[tri[1]];
-        const Point &p2 = mesh->vertices[tri[2]];
-
-        const double area = 0.5 * std::fabs(cross2(p1 - p0, p2 - p0));
-        if (area < kEps) continue;
-
-        for (int k = 0; k < 3; ++k) {
-            vertexArea[tri[k]] += area;
-        }
-    }
+    const std::vector<double> vertexArea = computeVertexAreas();
 
     // Unscaled cotangent weights.
     std::vector<Eigen::Triplet<double>> trips;
@@ -169,11 +217,12 @@ void OASIS::buildDensityLaplacian() {
     Lr.resize(numVertices, numVertices);
     Lr.setFromTriplets(trips.begin(), trips.end());
 
-    // Row scaling 3 / (2 * Area_i * r_i).
+    // Row scaling 3 / (2 * Area_i * r_i) of Eq. 8, written as 1 / (2 D_i r_i)
+    // since D_i is a third of the total incident area Area_i.
     Eigen::VectorXd rowScale(numVertices);
     for (int v = 0; v < numVertices; ++v) {
         const double denom = 2.0 * vertexArea[v] * r[v];
-        rowScale[v] = (denom > kEps) ? (3.0 / denom) : 0.0;
+        rowScale[v] = (denom > kEps) ? (1.0 / denom) : 0.0;
     }
     Lr = rowScale.asDiagonal() * Lr;
     Lr.makeCompressed();
@@ -468,6 +517,172 @@ void OASIS::dropDependentConstraints() {
     C = newC;
 }
 
+// ─── Orientation control, Huang et al. 2008 Sec. 3.4 / 2014 Sec. 5.1 ────────
+
+bool OASIS::crossFrame(int v, double &cos2t, double &sin2t) const {
+    if (!crossField) return false;
+
+    const Eigen::VectorXcd &u =
+        (crossField->u_k.size() == static_cast<Eigen::Index>(mesh->vertices.size()))
+            ? crossField->u_k
+            : crossField->u_k_prev;
+    if (u.size() != static_cast<Eigen::Index>(mesh->vertices.size())) return false;
+
+    const std::complex<double> z = u[v];
+    if (std::abs(z) < 1e-12) return false;  // singularity: no direction here
+
+    // u = e^{4 i t}, so the guiding direction is t = arg(u)/4 modulo pi/2 and
+    // the frame rotation the Hessian needs is 2t = arg(u)/2. Which of the four
+    // branches arg() lands on is irrelevant: they differ by pi/2 in t, hence by
+    // pi in 2t, which only flips the sign of the row built below.
+    const double twoT = 0.5 * std::arg(z);
+    cos2t = std::cos(twoT);
+    sin2t = std::sin(twoT);
+    return true;
+}
+
+// Eq. 10 of Huang et al. 2008. The paper re-parameterizes the neighborhood of
+// every vertex with its u-axis along the guiding direction and then penalizes
+// the mixed coefficient c_uv of the Eq. 9 fit. Refitting per vertex is not
+// necessary here: the Hessian is a tensor, so its entries in the guiding frame
+// are a fixed linear combination of the entries in the frame the fit already
+// uses. With the fit frame axes (x, y), the guiding direction at angle t and
+// H = [[h_xx, h_xy], [h_xy, h_yy]],
+//
+//   c_uv = e_u^T H e_v = cos(2t) h_xy - 1/2 sin(2t) (h_xx - h_yy),
+//
+// which stays a linear form in f, exactly as the paper needs. Each row is
+// scaled by sqrt(D_i) so that ||Q_orient f||^2 is the area-weighted sum.
+void OASIS::buildOrientation() {
+    const int numVertices = static_cast<int>(mesh->vertices.size());
+
+    Qorient.resize(0, numVertices);
+    QtQorient.resize(numVertices, numVertices);
+    orientedVertices.clear();
+    orientationScale = 0.0;
+
+    if (orientationWeight <= 0.0) return;
+    if (!crossField) {
+        std::cerr << "OASIS: orientation weight is set but there is no cross "
+                     "field; the orientation term is off" << std::endl;
+        return;
+    }
+
+    precomputeFits();
+    const std::vector<double> areas = computeVertexAreas();
+
+    std::vector<Eigen::Triplet<double>> trips;
+    trips.reserve(static_cast<size_t>(numVertices) * 8);
+    int noDirection = 0;
+
+    for (int v = 0; v < numVertices; ++v) {
+        if (!fits[v].valid) continue;
+
+        const double mask = (orientationMask.size() == static_cast<Eigen::Index>(numVertices)) ? orientationMask[v] : 1.0;
+        const double weight = areas[v] * mask;
+        if (weight <= kEps) continue;
+
+        double cos2t, sin2t;
+        if (!crossFrame(v, cos2t, sin2t)) {
+            ++noDirection;
+            continue;
+        }
+
+        const VertexFit &fit = fits[v];
+        const int row = static_cast<int>(orientedVertices.size());
+        const double rowScale = std::sqrt(weight);
+
+        for (size_t k = 0; k < fit.stencil.size(); ++k) {
+            const Eigen::Index ki = static_cast<Eigen::Index>(k);
+            const double q = cos2t * fit.auv[ki] - 0.5 * sin2t * (fit.auu[ki] - fit.avv[ki]);
+            if (q != 0.0) trips.emplace_back(row, fit.stencil[k], rowScale * q);
+        }
+        orientedVertices.push_back(v);
+    }
+
+    if (orientedVertices.empty()) {
+        std::cerr << "OASIS: the cross field yields no usable guiding direction; "
+                     "the orientation term is off" << std::endl;
+        return;
+    }
+    if (noDirection > 0) {
+        // Singularities of the cross field, where the representation vector
+        // vanishes and there is no direction to follow. Leaving those vertices
+        // out is the right thing: it lets the singularity sit wherever the
+        // Helmholtz term prefers.
+        std::cerr << "OASIS: no guiding direction at " << noDirection
+                  << " vertices (cross-field singularities); they carry no "
+                     "orientation penalty" << std::endl;
+    }
+
+    Qorient.resize(static_cast<Eigen::Index>(orientedVertices.size()), numVertices);
+    Qorient.setFromTriplets(trips.begin(), trips.end());
+    Qorient.makeCompressed();
+
+    QtQorient = Eigen::SparseMatrix<double>(Qorient.transpose()) * Qorient;
+    QtQorient.makeCompressed();
+}
+
+double OASIS::orientationError() const {
+    if (f.size() != static_cast<Eigen::Index>(mesh->vertices.size())) return -1.0;
+    if (!crossField) return -1.0;
+    precomputeFits();
+
+    const int numVertices = static_cast<int>(mesh->vertices.size());
+    const std::vector<double> areas = computeVertexAreas();
+
+    // Per vertex: the deviatoric part of the Hessian in the guiding frame,
+    //   q = 1/2 (h_uu - h_vv),  s = h_uv,
+    // whose polar angle is twice the angle from the guiding frame to the
+    // Hessian principal frame. R = sqrt(q^2 + s^2) is the anisotropy, and where
+    // it vanishes the Hessian is umbilic and has no principal directions to
+    // compare against.
+    std::vector<double> deviation, weight, anisotropy;
+    double maxR = 0.0;
+    Eigen::VectorXd values;
+
+    for (int v = 0; v < numVertices; ++v) {
+        if (!fits[v].valid) continue;
+        const double mask = (orientationMask.size() == static_cast<Eigen::Index>(numVertices)) ? orientationMask[v] : 1.0;
+        if (areas[v] * mask <= kEps) continue;
+
+        double cos2t, sin2t;
+        if (!crossFrame(v, cos2t, sin2t)) continue;
+
+        const VertexFit &fit = fits[v];
+        values.resize(static_cast<Eigen::Index>(fit.stencil.size()));
+        for (size_t k = 0; k < fit.stencil.size(); ++k)
+            values[static_cast<Eigen::Index>(k)] = f[fit.stencil[k]];
+
+        const double hxx = fit.auu.dot(values);
+        const double hxy = fit.auv.dot(values);
+        const double hyy = fit.avv.dot(values);
+
+        const double qg = 0.5 * (hxx - hyy);
+        const double q = cos2t * qg + sin2t * hxy;
+        const double s = cos2t * hxy - sin2t * qg;
+
+        // Half the polar angle, folded into [-45, 45] degrees: the two
+        // principal directions are interchangeable, so a 90 degree offset is
+        // the same alignment (and gives the same s = 0).
+        double angle = 0.5 * std::atan2(s, q) * 180.0 / M_PI;
+        angle -= 90.0 * std::round(angle / 90.0);
+
+        deviation.push_back(std::fabs(angle));
+        weight.push_back(areas[v] * mask);
+        anisotropy.push_back(std::sqrt(q * q + s * s));
+        maxR = std::max(maxR, anisotropy.back());
+    }
+
+    double total = 0.0, totalWeight = 0.0;
+    for (size_t k = 0; k < deviation.size(); ++k) {
+        if (anisotropy[k] <= 1e-6 * maxR) continue;  // umbilic, no frame to compare
+        total += weight[k] * deviation[k];
+        totalWeight += weight[k];
+    }
+    return (totalWeight > kEps) ? total / totalWeight : 0.0;
+}
+
 // Eq. 14 then Eq. 13.
 void OASIS::buildKKT() {
     const int numVertices = static_cast<int>(mesh->vertices.size());
@@ -483,6 +698,28 @@ void OASIS::buildKKT() {
     HLr -= lambda * (Lr + LrT);
     HLr += (lambda * lambda) * identity;
     HLr.makeCompressed();
+
+    // Sec. 5.1: minimizing E_Lr(f) + gamma E_Orient(f) under the same
+    // constraints only changes the (1,1) block, since the orientation energy is
+    // ||Q_orient f||^2 and its normal-equation block is Q^T Q.
+    //
+    // gamma is applied to a *normalized* Q^T Q rather than to the raw one. The
+    // two terms are not commensurable as written: H_Lr carries entries of order
+    // 1/h^4 while Q^T Q, being an area-weighted second derivative, carries
+    // h^2/h^4 = 1/h^2, so the same gamma would mean something different on
+    // every mesh and at every lambda. Matching their largest entries first
+    // makes gamma a scale-free knob, at the price of the paper's number not
+    // transferring.
+    orientationScale = 0.0;
+    if (Qorient.rows() > 0) {
+        const double nH = maxAbsEntry(HLr);
+        const double nQ = maxAbsEntry(QtQorient);
+        if (nH > kEps && nQ > kEps) {
+            orientationScale = orientationWeight * nH / nQ;
+            HLr += orientationScale * QtQorient;
+            HLr.makeCompressed();
+        }
+    }
 
     // [ H_Lr  B^T ] [ f  ]   [ 0 ]
     // [ B      0  ] [ nu ] = [ C ]
@@ -744,30 +981,30 @@ void OASIS::enhanceVibration(int iterations) {
     Eigen::SparseMatrix<double> G0;
     evaluate(f, vibRes, &G0);
 
-    auto maxEntry = [](const Eigen::SparseMatrix<double> &A) {
-        double m = 0.0;
-        for (int k = 0; k < A.outerSize(); ++k)
-            for (Eigen::SparseMatrix<double>::InnerIterator it(A, k); it; ++it)
-                m = std::max(m, std::fabs(it.value()));
-        return m;
-    };
-
     const Eigen::SparseMatrix<double> H0 = Mt * M;
     const Eigen::SparseMatrix<double> G0t = Eigen::SparseMatrix<double>(G0.transpose());
     const Eigen::SparseMatrix<double> GtG0 = G0t * G0;
 
-    const double nH = maxEntry(H0);
-    const double nG = maxEntry(GtG0);
-    const double nB = (numRows > 0) ? maxEntry(BtB) : 0.0;
+    const double nH = maxAbsEntry(H0);
+    const double nG = maxAbsEntry(GtG0);
+    const double nB = (numRows > 0) ? maxAbsEntry(BtB) : 0.0;
 
     const double wVib = (nG > kEps) ? vibrationWeight * nH / nG : 0.0;
     const double wBnd = (nB > kEps) ? boundaryPenaltyWeight * nH / nB : 0.0;
+
+    // The orientation term of Sec. 5.1 rides along at the weight assemble()
+    // already normalized, so this pass minimizes the same combined energy the
+    // KKT solve did. Left out, it would be free for the vibration term to trade
+    // the orientation away; included, evening out the two local amplitudes has
+    // to pay for any misalignment it introduces.
+    const bool useOrient = orientationScale > 0.0 && Qorient.rows() > 0;
 
     auto totalEnergy = [&](const Eigen::VectorXd &x, const Eigen::VectorXd &res) {
         const double eHelm = (M * x).squaredNorm();
         const double eVib = wVib * res.squaredNorm();
         const double eBnd = (numRows > 0) ? wBnd * (B * x - C).squaredNorm() : 0.0;
-        return eHelm + eVib + eBnd;
+        const double eOri = useOrient ? orientationScale * (Qorient * x).squaredNorm() : 0.0;
+        return eHelm + eVib + eBnd + eOri;
     };
 
     double energy = totalEnergy(f, vibRes);
@@ -790,9 +1027,11 @@ void OASIS::enhanceVibration(int iterations) {
         Eigen::SparseMatrix<double> normal = Mt * M;
         normal += wVib * (Gt * G);
         if (numRows > 0) normal += wBnd * BtB;
+        if (useOrient) normal += orientationScale * QtQorient;
 
         Eigen::VectorXd grad = Mt * (M * f) + wVib * (Gt * vibRes);
         if (numRows > 0) grad += wBnd * (Bt * (B * f - C));
+        if (useOrient) grad += orientationScale * (QtQorient * f);
 
         bool stepTaken = false;
         for (int attempt = 0; attempt < 8; ++attempt) {

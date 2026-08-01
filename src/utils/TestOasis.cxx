@@ -18,6 +18,7 @@
 
 #include "OASIS/OASIS.hxx"
 #include "TestHelper.hxx"
+#include "crossfield/CrossField.hxx"
 #include "mesh/Mesh.hxx"
 
 // The quad edge length implied by lambda is pi / sqrt(-lambda), since the QE
@@ -41,6 +42,15 @@ static const double DISK_RADIUS_FULL = 1.5;
 
 // Gauss-Newton iterations for the vibration pass.
 static const int VIBRATION_ITERATIONS = 10;
+
+// Orientation control (Sec. 5.1, following Huang et al. 2008). The guiding
+// field is a constant cross rotated off the axes of the square, which is the
+// 2008 Fig. 5 experiment: nothing about the domain prefers that direction, so
+// any alignment in the result comes from the orientation energy alone. 30
+// degrees is deliberately not 45, where a cross field is indistinguishable from
+// its own diagonal.
+static const double GUIDE_ANGLE_DEG = 30.0;
+static const double ORIENTATION_GAMMAS[] = {0.0, 0.01, 0.1, 1.0, 10.0, 100.0};
 
 // Write an unstructured grid of triangles with one scalar per point.
 static void writeVTK(const std::string &filename,
@@ -168,6 +178,124 @@ static bool runCase(const std::string &label,
     return true;
 }
 
+// A cross field pointing the same way everywhere, prescribed rather than
+// solved: CrossField stores the 4-symmetry representation vector e^{4 i t} per
+// vertex, so a constant field is one constant complex number.
+static std::shared_ptr<CrossField> constantCrossField(const std::shared_ptr<Mesh> &mesh,
+                                                      double degrees) {
+    auto field = std::make_shared<CrossField>(mesh);
+    const double t = degrees * M_PI / 180.0;
+    field->u_k = Eigen::VectorXcd::Constant(static_cast<Eigen::Index>(mesh->vertices.size()),
+                                            std::polar(1.0, 4.0 * t));
+    field->u_k_prev = field->u_k;
+    return field;
+}
+
+// Sweep gamma on a square carrying that field. The two numbers that matter pull
+// against each other: the misalignment the orientation term is there to remove,
+// and the Helmholtz residual that keeps the cells square and evenly spaced.
+static bool runOrientationCase(const std::shared_ptr<Mesh> &mesh,
+                               double lambda,
+                               const std::string &prefix) {
+    std::cout << "=== Orientation control, square with a constant cross field at "
+              << GUIDE_ANGLE_DEG << " degrees ===\n";
+
+    auto field = constantCrossField(mesh, GUIDE_ANGLE_DEG);
+
+    // Keep the guiding field two quad cells clear of the boundary. The 2014
+    // paper guides orientation only "in regions away from boundary curves or
+    // features": inside that band the Eq. 11 conditions already dictate which
+    // way the field runs, and a guiding direction that disagrees with them can
+    // only be bought at the cost of the Helmholtz term, i.e. of cell shape.
+    const double band = 2.0 * M_PI / std::sqrt(-lambda);
+    const Eigen::VectorXd mask = OASIS(mesh, lambda).boundaryClearanceMask(band);
+    std::cout << "Guided      : " << static_cast<int>(mask.sum()) << " of "
+              << mesh->vertices.size() << " vertices (everything more than "
+              << band << " from the boundary)\n";
+
+    std::cout << "  gamma     misalign(deg)   |L_r f - lambda f|\n";
+    bool ok = true;
+
+    for (double gamma : ORIENTATION_GAMMAS) {
+        OASIS oasis(field, lambda);
+        oasis.setOrientationWeight(gamma);
+        oasis.setOrientationMask(mask);
+        try {
+            oasis.solve();
+        } catch (const std::exception &e) {
+            std::cout << "\033[31m[FAIL]\033[0m gamma = " << gamma << ": " << e.what() << "\n\n";
+            return false;
+        }
+
+        std::cout << "  " << std::setw(7) << gamma
+                  << "   " << std::setw(11) << std::fixed << std::setprecision(2)
+                  << oasis.orientationError()
+                  << "   " << std::setw(16) << std::setprecision(3) << oasis.residual()
+                  << std::defaultfloat << "\n";
+
+        // Keep the two ends of the sweep to look at: no guidance, and the
+        // default weight.
+        if (gamma == 0.0 || gamma == oasis.getOrientationWeight()) {
+            const std::string path = prefix + (gamma == 0.0 ? "_orient_off.vtk"
+                                                            : "_orient_on.vtk");
+            try {
+                writeVTK(path, *mesh, oasis.f, "quasi_eigenfunction");
+            } catch (const std::exception &e) {
+                std::cout << "\033[31m[FAIL]\033[0m " << e.what() << "\n\n";
+                ok = false;
+            }
+        }
+    }
+
+    // The term is only worth having if it actually turns the field: check the
+    // default weight against the unguided solve rather than trusting the table
+    // to be read.
+    OASIS off(field, lambda), on(field, lambda);
+    off.setOrientationWeight(0.0);
+    off.setOrientationMask(mask);  // measure over the same region
+    on.setOrientationMask(mask);
+    try {
+        off.solve();
+        on.solve();  // default gamma
+    } catch (const std::exception &e) {
+        std::cout << "\033[31m[FAIL]\033[0m " << e.what() << "\n\n";
+        return false;
+    }
+    const double errOff = off.orientationError();
+    const double errOn = on.orientationError();
+    if (!(errOn < 0.5 * errOff)) {
+        std::cout << "\033[31m[FAIL]\033[0m the default weight barely moved the "
+                     "misalignment (" << errOff << " -> " << errOn << " degrees)\n\n";
+        return false;
+    }
+
+    std::cout << "  misalignment at the default gamma = " << on.getOrientationWeight()
+              << ": " << errOff << " -> " << errOn << " degrees\n";
+
+    // The vibration pass minimizes the same combined energy, so it should even
+    // out the two local amplitudes without giving the orientation back.
+    const double eaBefore = on.vibrationEnergy();
+    try {
+        on.enhanceVibration(VIBRATION_ITERATIONS);
+    } catch (const std::exception &e) {
+        std::cout << "\033[31m[FAIL]\033[0m vibration enhancement: " << e.what() << "\n\n";
+        return false;
+    }
+    const double errVib = on.orientationError();
+    std::cout << "  after vibration enhancement: mean E_a " << eaBefore << " -> "
+              << on.vibrationEnergy() << ", misalignment " << errOn << " -> "
+              << errVib << " degrees\n";
+    if (errVib > 1.5 * errOn) {
+        std::cout << "\033[31m[FAIL]\033[0m the vibration pass undid the orientation\n\n";
+        return false;
+    }
+
+    if (!ok) return false;
+    std::cout << "\033[32m[OK]\033[0m Wrote " << prefix << "_orient_off.vtk and "
+              << prefix << "_orient_on.vtk\n\n";
+    return true;
+}
+
 int main(int argc, char **argv) {
     if (argc >= 2 && std::string(argv[1]) == "-h") {
         std::cerr << "Usage: " << argv[0] << " [lambda] [h] [output_prefix]\n";
@@ -219,6 +347,7 @@ int main(int argc, char **argv) {
     ok &= runCase("Full disk, radius " + std::to_string(DISK_RADIUS_FULL) +
                       " (the Sec. 3.4 rings-vs-spots case)",
                   disk, lambda, prefix + "_disk.vtk", prefix + "_disk_vib.vtk");
+    ok &= runOrientationCase(square, lambda, prefix);
 
     if (!ok) {
         std::cout << "\033[31mOne or more cases failed.\033[0m\n";

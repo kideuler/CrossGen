@@ -42,8 +42,15 @@
 //
 // i.e. (L_r - lambda I)^T (L_r - lambda I), the normal equations of Eq. 12.
 //
+// Sec. 5.1 adds one optional term to that objective, taken over unchanged from
+//   Huang, Zhang, Ma, Liu, Kobbelt and Bao, "Spectral Quadrangulation with
+//   Orientation and Alignment Control", ACM TOG 27(5), 2008, Sec. 3.4:
+// a guiding direction field steers the mesh orientation where the boundary
+// conditions do not, by minimizing E_Lr(f) + gamma * E_Orient(f) subject to the
+// same Eq. 11 constraints. See setOrientationWeight().
+//
 // This class only assembles that system. Extraction of the Morse-Smale complex
-// and the vibration enhancement pass of Sec. 3.4 are not implemented here.
+// is not implemented here.
 class OASIS {
 public:
     // The quasi-eigenfunction, one value per vertex. Filled by solve().
@@ -56,11 +63,12 @@ public:
 
     std::shared_ptr<Mesh> mesh;
 
-    // Guiding cross field. Unused by the Eq. 13 assembly, which is the whole
-    // point of the paper's boundary conditions: feature alignment needs no
-    // direction field. It is kept for the optional orientation term E_Orient of
-    // Sec. 5.1, where the combined energy E_Lr(f) + gamma * E_Orient(f) steers
-    // mesh orientation away from boundaries and features.
+    // Guiding cross field, read per vertex from CrossField::u_k (the 4-symmetry
+    // representation vector e^{4 i theta}, so the guiding direction is
+    // arg(u_k)/4 modulo pi/2). Nothing in the Eq. 13 assembly needs it, which is
+    // the whole point of the paper's boundary conditions: feature alignment
+    // needs no direction field. It drives only the optional orientation term
+    // E_Orient of Sec. 5.1; see setOrientationWeight().
     std::shared_ptr<CrossField> crossField;
 
     // lambda < 0 is the Helmholtz parameter of Eq. 1. It need not be an
@@ -82,6 +90,60 @@ public:
     // See the defaults below for the measured values and why they were chosen.
     void setVibrationWeight(double omega) { vibrationWeight = omega; }
     void setBoundaryPenaltyWeight(double xi) { boundaryPenaltyWeight = xi; }
+
+    // gamma of the combined energy E_Lr(f) + gamma * E_Orient(f) of Sec. 5.1,
+    // with E_Orient the orientation energy of Huang et al. 2008, Eq. 10:
+    //
+    //     E_Orient(f) = sum_i D_i <Q^i_uv, f>^2 = ||Q_orient f||^2,
+    //
+    // where Q^i_uv is the mixed second derivative of the Eq. 9 quadratic fit at
+    // vertex i, expressed in the frame whose u-axis follows the guiding cross
+    // field, and D_i is the vertex area. It vanishes exactly when the Hessian of
+    // f is diagonal in that frame, i.e. when the principal directions of f --
+    // and with them the arcs of the Morse-Smale complex, which run along them
+    // (2008, Sec. 3.4) -- follow the cross field.
+    //
+    // The cross field enters only through the rotation of that frame, so its
+    // 4-symmetry is respected for free: rotating the guiding direction by pi/2
+    // flips the sign of Q^i_uv and leaves the energy untouched.
+    //
+    // As with the vibration weights, the paper's gamma = 100 does not carry
+    // over, because the term is normalized here against the magnitude of H_Lr
+    // rather than left in the paper's own scaling; see the default below.
+    // gamma <= 0, or a null cross field, disables the term entirely and
+    // restores the pure 2014 system.
+    void setOrientationWeight(double gamma) { orientationWeight = gamma; assembled = false; }
+    double getOrientationWeight() const { return orientationWeight; }
+
+    // Per-vertex multiplier on the orientation term, one entry per vertex, all
+    // >= 0. The 2014 paper applies its guiding field only "in regions away from
+    // boundary curves or features" -- its car hood uses it on the back part
+    // alone -- because near a boundary the Eq. 11 constraints already fix the
+    // orientation and a conflicting direction field would only pull against
+    // them. Defaults to 1 everywhere.
+    void setOrientationMask(const Eigen::VectorXd &mask);
+
+    // A ready-made mask for the usual case: 1 at vertices further than
+    // `clearance` from the boundary, 0 within it. Straight-line distance, not
+    // geodesic, so a thin neck is measured through the gap -- which errs
+    // towards guiding less, the safe direction.
+    Eigen::VectorXd boundaryClearanceMask(double clearance) const;
+
+    // Mean angle in degrees between the principal directions of the Hessian of
+    // f and the guiding cross field, area weighted over the vertices carrying
+    // an orientation row. Both frames are 4-symmetric, so this lies in [0, 45]:
+    // 0 is perfect alignment, 45 is as misaligned as a cross can get. This is
+    // the quantity E_Orient drives down, so comparing it across gamma is the
+    // direct measure of whether the term did anything. Returns -1 when there is
+    // no cross field or no solution yet.
+    //
+    // On a solved field it does reach 0 -- a guided solve on data/meshes at a
+    // large gamma reports 0.04 degrees. Only when a *continuous* field is
+    // sampled onto the mesh and pushed through the Eq. 9 fit does the fit noise
+    // put a floor under it, around 4 degrees on these meshes, because the mean
+    // is over absolute angles. So compare solves against each other, not a
+    // solve against an analytic reference.
+    double orientationError() const;
 
     // Builds L_r (Eq. 8), B and C (Eq. 11), H_Lr (Eq. 14) and finally the KKT
     // system of Eq. 13 together with its right-hand side [0; C].
@@ -122,7 +184,10 @@ public:
     const Eigen::SparseMatrix<double>& getKKT() const { return KKT; }
     const Eigen::VectorXd& getKKTRhs() const { return kktRhs; }
     const Eigen::SparseMatrix<double>& getLaplacian() const { return Lr; }
+    // Eq. 14, plus the weighted orientation block when that term is enabled --
+    // it is the (1,1) block of Eq. 13 either way.
     const Eigen::SparseMatrix<double>& getHessian() const { return HLr; }
+    const Eigen::SparseMatrix<double>& getOrientationMatrix() const { return Qorient; }
     const Eigen::SparseMatrix<double>& getConstraintMatrix() const { return B; }
     const Eigen::VectorXd& getConstraintRhs() const { return C; }
 
@@ -146,7 +211,19 @@ private:
 
     void buildDensityLaplacian(); // Eq. 8
     void buildConstraints();      // Eqs. 9-11
+    void buildOrientation();      // Eq. 10 of Huang et al. 2008
     void buildKKT();              // Eqs. 13-14
+
+    // Vertex areas D_i = 1/3 * sum of incident triangle areas, i.e. Eq. 2 of
+    // Huang et al. 2008 and the same quantity the row scaling of Eq. 8 divides
+    // by. Zero for a vertex with no incident area.
+    std::vector<double> computeVertexAreas() const;
+
+    // (cos 2t, sin 2t) for the guiding cross direction t at vertex v, which is
+    // all the frame rotation the orientation term needs. False when there is no
+    // usable direction there (no cross field, or a vanishing representation
+    // vector at a singularity).
+    bool crossFrame(int v, double &cos2t, double &sin2t) const;
 
     // Reduce B (and C) to a full-row-rank system. Eq. 13 is singular otherwise,
     // and SparseLU factorizes the singular matrix without complaining.
@@ -238,6 +315,48 @@ private:
     double vibrationWeight = 100.0;
     double boundaryPenaltyWeight = 1e7;
 
+    // gamma of Sec. 5.1. The paper's 100 is stated against its own scaling of
+    // E_Orient; here the term is normalized by operator magnitude first (see
+    // orientationScale), so this is a *relative* weight against the Helmholtz
+    // term. Measured on the 5x5 square of TestOasis carrying a constant cross
+    // field 30 degrees off its axes, guided everywhere more than two quads from
+    // the boundary -- mean misalignment (orientationError, in degrees) against
+    // the Helmholtz residual that keeps the cells square:
+    //
+    //   gamma      0      0.01   0.1    1      10     100
+    //   deg        28.4   28.3   27.1   15.9   9.7    5.6
+    //   residual   8.8    10.2   13.4   15.8   17.0   17.5
+    //
+    // That is the hard case: a constant guiding direction disagrees with the
+    // boundary conditions everywhere, so the two can only meet in the middle,
+    // and the alignment stalls at 5 degrees no matter what gamma buys. What it
+    // does show is where the cost lands -- the residual saturates by gamma = 1,
+    // in the band where the guided interior meets the boundary conditions, and
+    // further alignment past that is nearly free. (The table keeps the guiding
+    // field two quads clear of the boundary, as the paper does. Guiding the
+    // whole square instead, the residual never saturates: 21.4 / 33.7 / 69.9 at
+    // gamma = 1 / 10 / 100. Mask the boundary region, or expect distorted cells
+    // against it -- see setOrientationMask and boundaryClearanceMask.)
+    //
+    // The normal case is a guiding field that already agrees with the boundary,
+    // e.g. one solved by MBO on the same mesh, and there the term does what it
+    // says. On data/meshes/geom001.obj, guided by its own MBO cross field:
+    //
+    //   gamma      0      0.1    1      10     100
+    //   deg       12.6    5.7    1.4    0.35   0.04
+    //   residual   9.0    10.3   10.8   11.0   11.0
+    //
+    // Alignment keeps improving and the residual stops moving after gamma = 1,
+    // so 10 is the default: it lands at a third of a degree here, and it is
+    // where the cost has already saturated in the adversarial case too.
+    //
+    // The mesh-only constructor zeroes this: with no guiding field there is
+    // nothing to orient towards.
+    double orientationWeight = 10.0;
+
+    // Per-vertex multiplier on E_Orient. Empty means 1 everywhere.
+    Eigen::VectorXd orientationMask;
+
     std::vector<int> constrainedVertices;   // boundary (and later feature) vertices
     std::vector<Point> constrainedNormals;  // matching outward unit normals
 
@@ -247,6 +366,18 @@ private:
     Eigen::VectorXd C;               // Eq. 11 right-hand side, [0; 1]
     Eigen::SparseMatrix<double> KKT; // Eq. 13
     Eigen::VectorXd kktRhs;          // [0; C]
+
+    // Eq. 10 of Huang et al. 2008, one row per oriented vertex, and the
+    // Q^T Q block it contributes to H_Lr. Empty when the term is off.
+    Eigen::SparseMatrix<double> Qorient;
+    Eigen::SparseMatrix<double> QtQorient;
+    std::vector<int> orientedVertices;
+
+    // orientationWeight after normalizing Q^T Q against H_Lr, i.e. the factor
+    // actually multiplying the orientation block. Zero when the term is off.
+    // The vibration pass reuses it so that both phases minimize the same
+    // combined energy.
+    double orientationScale = 0.0;
 
     // The KKT matrix is symmetric *indefinite*, so a Cholesky-type solver
     // (SimplicialLDLT) is not applicable; the paper uses UMFPACK, and SparseLU

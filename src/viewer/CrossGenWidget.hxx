@@ -105,8 +105,14 @@ private:
     // Modal dialog collecting the OASIS parameters. Returns false if cancelled.
     bool promptOASISParameters();
 
-    // Assemble and solve the Eq. 13 KKT system at the current oasisLambda_.
+    // Assemble and solve the Eq. 13 KKT system at the current oasisLambda_,
+    // with the orientation term of Sec. 5.1 when a guiding field was asked for.
     void runOASIS();
+
+    // Run MBO to convergence (or oasisMBOIterations_) and leave the result in
+    // oasisGuide_, to be used as the guiding direction field. Returns false if
+    // the solve failed, in which case oasisGuide_ is cleared.
+    bool buildOASISGuidingField();
 
     // rendering sub-routines called from paintGL
     void renderMBOAnimation();
@@ -136,6 +142,10 @@ private:
     std::shared_ptr<Mesh>      delaunayMesh_;
     std::shared_ptr<MedialAxis> medialAxis_;
     std::optional<OASIS>       oasis_;
+    // Guiding field for the OASIS orientation term. Held by shared_ptr because
+    // OASIS keeps a reference to it for as long as it lives; separate from
+    // crossField_, which belongs to MBO mode and follows its own state machine.
+    std::shared_ptr<CrossField> oasisGuide_;
 
     // ── state machine ────────────────────────────────────────────────────────
     Mode           mode_     = Mode::Unselected;
@@ -148,8 +158,21 @@ private:
     // OASIS parameters and derived display range.
     double oasisLambda_  = 0.0;   // set by the dialog on first use
     double oasisAbsMax_  = 1.0;   // max|f|, the symmetric range for the ramp
-    int    oasisVibrationIterations_ = 0;  // 0 disables the Sec. 3.4 pass
+    // 0 disables the Sec. 3.4 pass. These two doubles as the dialog's initial
+    // state, so a nonzero value is what makes its checkbox start ticked.
+    int    oasisVibrationIterations_ = 10;
     double vibrationBefore_ = -1.0;        // mean E_a before the pass, for the log
+
+    // Orientation control (Sec. 5.1). gamma <= 0 disables it, and then no
+    // guiding field is computed at all.
+    double oasisOrientationWeight_ = 10.0;
+    // Iteration cap for the MBO solve that produces the guiding field. MBO
+    // stops early on convergence, so this only bounds the wait.
+    int    oasisMBOIterations_ = 100;
+    // How far the guiding field is kept clear of the boundary, in quad cells.
+    // 0 guides everywhere, which the boundary conditions will fight; see the
+    // note on setOrientationWeight().
+    double oasisGuideClearanceQuads_ = 2.0;
 
     bool singularitiesLogged_  = false;
     bool mboSteppingStarted_   = false;
