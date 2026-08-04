@@ -9,3 +9,5 @@ pkg/*
 *.mp4
 *.mov
 *.zip
+.cache/*
+.claude/*

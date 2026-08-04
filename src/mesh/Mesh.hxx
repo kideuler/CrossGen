@@ -92,6 +92,27 @@ inline Point rotateVector(const Point &u, int k) {
 }
 
 
+// Undirected edge key, normalized to (min, max) so that the two orientations
+// of an edge hash and compare equal. Shared by everything that keys a set or
+// map on mesh edges -- see CutMesh::EdgeKey and HarmonicCut::EdgeKey, which
+// are aliases of it, so cut edge sets from either are interchangeable.
+struct MeshEdgeKey {
+    int a = -1;
+    int b = -1;
+    MeshEdgeKey() = default;
+    MeshEdgeKey(int u, int v) {
+        if (u < v) { a = u; b = v; }
+        else       { a = v; b = u; }
+    }
+    bool operator==(const MeshEdgeKey &o) const { return a == o.a && b == o.b; }
+};
+
+struct MeshEdgeKeyHash {
+    std::size_t operator()(const MeshEdgeKey &k) const {
+        return static_cast<std::size_t>(k.a) * 73856093u ^ static_cast<std::size_t>(k.b) * 19349663u;
+    }
+};
+
 class Mesh {
  public:
     std::vector<Point> vertices; // List of 2D points

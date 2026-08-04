@@ -27,23 +27,10 @@ class SIPG;
 // adjacency and boundary lists.
 class CutMesh {
 public:
-    // Undirected edge key (min,max) suitable for hash containers.
-    struct EdgeKey {
-        int a = -1;
-        int b = -1;
-        EdgeKey() = default;
-        EdgeKey(int u, int v) {
-            if (u < v) { a = u; b = v; }
-            else       { a = v; b = u; }
-        }
-        bool operator==(const EdgeKey &o) const { return a == o.a && b == o.b; }
-    };
-
-    struct EdgeKeyHash {
-        std::size_t operator()(const EdgeKey &k) const {
-            return static_cast<std::size_t>(k.a) * 73856093u ^ static_cast<std::size_t>(k.b) * 19349663u;
-        }
-    };
+    // Undirected edge key (min,max) suitable for hash containers, defined in
+    // Mesh.hxx and aliased here so that older call sites keep working.
+    using EdgeKey = MeshEdgeKey;
+    using EdgeKeyHash = MeshEdgeKeyHash;
 
     struct SanityReport {
         bool trianglesConnected = false;

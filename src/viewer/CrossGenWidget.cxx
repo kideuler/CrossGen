@@ -74,6 +74,16 @@ SIPGPhase nextSIPGPhase(SIPGPhase p) {
     return SIPGPhase::UVMesh;
 }
 
+UMBERPhase nextUMBERPhase(UMBERPhase p) {
+    switch (p) {
+        case UMBERPhase::MeshOnly:   return UMBERPhase::CrossField;
+        case UMBERPhase::CrossField: return UMBERPhase::Stepping;
+        case UMBERPhase::Stepping:   return UMBERPhase::Frames;
+        case UMBERPhase::Frames:     return UMBERPhase::Frames;
+    }
+    return UMBERPhase::Frames;
+}
+
 MedialAxisPhase nextMedialAxisPhase(MedialAxisPhase p) {
     switch (p) {
         case MedialAxisPhase::MeshOnly:     return MedialAxisPhase::DelaunayMesh;
@@ -117,6 +127,16 @@ const char *sipgPhaseName(SIPGPhase p) {
     return "?";
 }
 
+const char *umberPhaseName(UMBERPhase p) {
+    switch (p) {
+        case UMBERPhase::MeshOnly:   return "1) mesh";
+        case UMBERPhase::CrossField: return "2) SIPG crossfield";
+        case UMBERPhase::Stepping:   return "3) SIPG stepping";
+        case UMBERPhase::Frames:     return "4) UMBER frame field";
+    }
+    return "?";
+}
+
 const char *medialAxisPhaseName(MedialAxisPhase p) {
     switch (p) {
         case MedialAxisPhase::MeshOnly:     return "1) mesh";
@@ -143,6 +163,7 @@ const char *modeName(Mode m) {
         case Mode::MedialAxis: return "Medial Axis";
         case Mode::SIPG:       return "SIPG";
         case Mode::OASIS:      return "OASIS";
+        case Mode::UMBER:      return "UMBER";
     }
     return "?";
 }
@@ -192,7 +213,7 @@ CrossGenWidget::CrossGenWidget(const std::string &meshPath, QWidget *parent)
     setFocusPolicy(Qt::StrongFocus);
 
     std::cerr << "[Viewer] Phase " << phaseName(phase_)
-              << " (press '1' for PolyVector, '2' for MBO, '3' for Medial Axis, '4' for SIPG, '5' for OASIS)\n";
+              << " (press '1' for PolyVector, '2' for MBO, '3' for Medial Axis, '4' for SIPG, '5' for OASIS, '6' for UMBER)\n";
 }
 
 // ── QOpenGLWidget overrides ───────────────────────────────────────────────────
@@ -231,8 +252,7 @@ void CrossGenWidget::paintGL() {
                           mboStepCount_ < MBO_MAX_STEPS &&
                           !mboConverged_);
 
-    bool isSIPGStepping = (mode_ == Mode::SIPG &&
-                           sipgPhase_ == SIPGPhase::Stepping &&
+    bool isSIPGStepping = (sipgStageIsStepping() &&
                            sipgSteppingStarted_ &&
                            !sipgConverged_);
 
@@ -330,6 +350,14 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
         }
         break;
 
+    case Qt::Key_6:
+        if (mode_ == Mode::Unselected && phase_ == Phase::MeshOnly) {
+            mode_ = Mode::UMBER;
+            std::cerr << "[Viewer] Selected mode: " << modeName(mode_) << " (press 'c' to advance)\n";
+            console_.log("Selected mode: UMBER");
+        }
+        break;
+
     default:
         QOpenGLWidget::keyPressEvent(event);
         break;
@@ -418,6 +446,10 @@ void CrossGenWidget::doReset() {
     medialAxis_.reset();
     oasis_.reset();
     oasisGuide_.reset();
+    umber_.reset();
+    umberCut_.reset();
+    umberCorners_.clear();
+    umberInternal_.clear();
 
     mode_     = Mode::Unselected;
     phase_    = Phase::MeshOnly;
@@ -425,6 +457,7 @@ void CrossGenWidget::doReset() {
     sipgPhase_ = SIPGPhase::MeshOnly;
     maPhase_  = MedialAxisPhase::MeshOnly;
     oasisPhase_ = OASISPhase::MeshOnly;
+    umberPhase_ = UMBERPhase::MeshOnly;
     // oasisLambda_ deliberately survives a reset so it can be reused as the
     // dialog's default on the next run.
 
@@ -437,6 +470,8 @@ void CrossGenWidget::doReset() {
     sipgSteppingStarted_  = false;
     sipgConverged_        = false;
     sipgStepCount_        = 0;
+    umberAnnounced_       = false;
+    umberAttempted_       = false;
 
     view_.cx    = 0.5 * (bounds_.minx + bounds_.maxx);
     view_.cy    = 0.5 * (bounds_.miny + bounds_.maxy);
@@ -457,7 +492,7 @@ void CrossGenWidget::doReset() {
     }
     console_.log("[Reset] Restarted viewer.");
     std::cerr << "[Viewer] Reset. Phase " << phaseName(phase_)
-              << " (press '1' for PolyVector, '2' for MBO, '3' for Medial Axis, '4' for SIPG, '5' for OASIS)\n";
+              << " (press '1' for PolyVector, '2' for MBO, '3' for Medial Axis, '4' for SIPG, '5' for OASIS, '6' for UMBER)\n";
 }
 
 // ── OASIS parameter dialog ───────────────────────────────────────────────────
@@ -722,6 +757,112 @@ void CrossGenWidget::runOASIS() {
     }
 }
 
+// ── UMBER (Wang et al. 2022, Secs. 4.1-4.2) ──────────────────────────────────
+
+// One blocking call: the cuts, then Eq. (1) over the whole l1 continuation
+// schedule. Splitting it across frames would mean stopping L-BFGS mid-stage,
+// and an intermediate iterate of a quartic energy is not a field worth drawing.
+void CrossGenWidget::runUMBER() {
+    umberAttempted_ = true;
+    if (!sipgField_.has_value()) return;
+
+    // Eq. (1) starts from a *converged* cross field: the comb in initialize()
+    // assumes neighbouring triangles already agree up to a k*90-degree turn,
+    // which a half-solved MBO field does not. Advancing out of the stepping
+    // phase early therefore finishes the solve here rather than optimizing a
+    // field that is still moving.
+    if (!sipgConverged_) {
+        auto t0 = Clock::now();
+        sipgField_->runMBO();
+        sipgField_->computeSingularities();
+        sipgConverged_ = true;
+        auto t1 = Clock::now();
+        std::ostringstream oss;
+        oss << "[UMBER] finished the SIPG solve first, error " << std::scientific
+            << std::setprecision(3) << sipgField_->error << ", "
+            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+    }
+
+    // --- Cuts, Sec. 4.1 -----------------------------------------------------
+    auto tc0 = Clock::now();
+    try {
+        umberCut_.emplace(mesh_);
+    } catch (const std::exception &e) {
+        umberCut_.reset();
+        console_.log(std::string("[UMBER] cutting FAILED: ") + e.what());
+        std::cerr << "[Viewer] HarmonicCut failed: " << e.what() << "\n";
+        return;
+    }
+    auto tc1 = Clock::now();
+    {
+        const auto &rep = umberCut_->getReport();
+        std::ostringstream oss;
+        oss << "[UMBER] cuts: " << rep.voids << " void(s), " << rep.cutsMade
+            << " cut(s), " << umberCut_->getCutEdges().size() << " edges, "
+            << (rep.isDisk ? "disk \033[32m[PASS]\033[0m" : "not a disk \033[31m[FAIL]\033[0m")
+            << ", " << formatMs(std::chrono::duration<double, std::milli>(tc1 - tc0).count());
+        console_.log(oss.str());
+    }
+
+    // --- Frame field, Eq. (1) ----------------------------------------------
+    UMBER::EnergyTerms before;
+    size_t internalBefore = 0;
+    auto t0 = Clock::now();
+    try {
+        umber_.emplace(*sipgField_, *umberCut_);
+        umber_->setMaxIterations(UMBER_LBFGS_ITERATIONS);
+        umber_->initialize();
+        before = umber_->energy();
+        internalBefore = umber_->internalSingularities().size();
+        umber_->optimize();
+    } catch (const std::exception &e) {
+        umber_.reset();
+        console_.log(std::string("[UMBER] FAILED: ") + e.what());
+        std::cerr << "[Viewer] UMBER failed: " << e.what() << "\n";
+        return;
+    }
+    auto t1 = Clock::now();
+
+    umberCorners_  = umber_->boundarySingularities();
+    umberInternal_ = umber_->internalSingularities();
+
+    const UMBER::EnergyTerms after = umber_->energy();
+    {
+        std::ostringstream oss;
+        oss << "[UMBER] E_total " << std::scientific << std::setprecision(3)
+            << before.total << " -> " << after.total
+            << " (smooth " << before.smooth << " -> " << after.smooth
+            << ", align " << after.align << ")";
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[UMBER] L-BFGS " << umber_->iterations() << " iters (cap "
+            << UMBER_LBFGS_ITERATIONS << "/stage), |grad| " << std::scientific
+            << std::setprecision(2) << umber_->gradientNorm() << ", "
+            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+    }
+    {
+        // The two numbers Sec. 4.2 is judged on: what left the interior, and
+        // what it turned into on the boundary.
+        int convex = 0, reflex = 0, other = 0;
+        for (const auto &[vid, k] : umberCorners_) {
+            if (k == 1) ++convex;
+            else if (k == -1) ++reflex;
+            else ++other;
+        }
+        std::ostringstream oss;
+        oss << "[UMBER] internal singularities " << internalBefore << " -> "
+            << umberInternal_.size() << "; boundary corners " << convex << " convex, "
+            << reflex << " reflex";
+        if (other > 0) oss << ", " << other << " higher order";
+        console_.log(oss.str());
+        std::cerr << "[Viewer] " << oss.str() << "\n";
+    }
+}
+
 // ── phase advancement ────────────────────────────────────────────────────────
 
 void CrossGenWidget::advancePhase() {
@@ -745,7 +886,24 @@ void CrossGenWidget::advancePhase() {
         sipgPhase_ = nextSIPGPhase(sipgPhase_);
         if (sipgPhase_ != old)
             std::cerr << "[Viewer] SIPG Phase " << sipgPhaseName(sipgPhase_) << "\n";
+    } else if (mode_ == Mode::UMBER) {
+        UMBERPhase old = umberPhase_;
+        umberPhase_ = nextUMBERPhase(umberPhase_);
+        if (umberPhase_ != old)
+            std::cerr << "[Viewer] UMBER Phase " << umberPhaseName(umberPhase_) << "\n";
     }
+}
+
+// ── stages shared with SIPG mode ─────────────────────────────────────────────
+
+bool CrossGenWidget::sipgStageWantsField() const {
+    return (mode_ == Mode::SIPG  && sipgPhase_  >= SIPGPhase::CrossField) ||
+           (mode_ == Mode::UMBER && umberPhase_ >= UMBERPhase::CrossField);
+}
+
+bool CrossGenWidget::sipgStageIsStepping() const {
+    return (mode_ == Mode::SIPG  && sipgPhase_  == SIPGPhase::Stepping) ||
+           (mode_ == Mode::UMBER && umberPhase_ == UMBERPhase::Stepping);
 }
 
 // ── lazy computations ────────────────────────────────────────────────────────
@@ -820,7 +978,7 @@ void CrossGenWidget::runComputations() {
     }
 
     // ── SIPG: Initialize ──────────────────────────────────────────────────────
-    if (mode_ == Mode::SIPG && sipgPhase_ >= SIPGPhase::CrossField && !sipgField_.has_value()) {
+    if (sipgStageWantsField() && !sipgField_.has_value()) {
         auto t0 = Clock::now();
         sipgField_.emplace(mesh_);
         sipgField_->initialize();
@@ -830,8 +988,7 @@ void CrossGenWidget::runComputations() {
     }
 
     // ── SIPG: Kick off stepping ───────────────────────────────────────────────
-    if (mode_ == Mode::SIPG && sipgPhase_ == SIPGPhase::Stepping &&
-        sipgField_.has_value() && !sipgSteppingStarted_) {
+    if (sipgStageIsStepping() && sipgField_.has_value() && !sipgSteppingStarted_) {
         sipgSteppingStarted_ = true;
         sipgStepCount_       = 0;
         console_.log("[SIPG] Starting MBO iterations (" +
@@ -839,8 +996,7 @@ void CrossGenWidget::runComputations() {
     }
 
     // ── SIPG: Run 2 stepping iterations per frame ─────────────────────────────
-    if (mode_ == Mode::SIPG && sipgPhase_ == SIPGPhase::Stepping &&
-        sipgSteppingStarted_ && !sipgConverged_) {
+    if (sipgStageIsStepping() && sipgSteppingStarted_ && !sipgConverged_) {
         double ntris = static_cast<double>(mesh_->triangles.size());
         for (int i = 0; i < 2 && sipgStepCount_ < 500; ++i) {
             sipgField_->step();
@@ -858,6 +1014,20 @@ void CrossGenWidget::runComputations() {
         stepMsg << "[SIPG] Step " << sipgStepCount_ << "  error=" << std::scientific
                 << std::setprecision(3) << sipgField_->error;
         console_.log(stepMsg.str());
+    }
+
+    // ── UMBER: cuts + Eq. (1) on top of the SIPG field ────────────────────────
+    if (mode_ == Mode::UMBER && umberPhase_ >= UMBERPhase::Frames &&
+        sipgField_.has_value() && !umberAttempted_) {
+        if (!umberAnnounced_) {
+            // runComputations() runs at the top of paintGL, so returning here
+            // lets this frame draw the notice; the solve, which holds the GUI
+            // thread for seconds, starts on the next one.
+            console_.log("[UMBER] optimizing the frame field (Eq. 1), this blocks...");
+            umberAnnounced_ = true;
+        } else {
+            runUMBER();
+        }
     }
 
     // ── SIPG: Cut seams from converged SIPG field ─────────────────────────────
@@ -1389,6 +1559,54 @@ void CrossGenWidget::renderNormal() {
         } else {
             viewer::drawMesh(*mesh_);
         }
+    } else if (mode_ == Mode::UMBER) {
+        viewer::drawMesh(*mesh_);
+
+        if (umberPhase_ < UMBERPhase::Frames || !umber_.has_value()) {
+            // The SIPG stages, drawn as SIPG mode draws them: the input field
+            // and the singularities Sec. 4.2 is about to move.
+            if (umberPhase_ >= UMBERPhase::CrossField && sipgField_.has_value()) {
+                viewer::drawTriangleCrossField(*mesh_, *sipgField_, scale_);
+                double ballRadius = 0.5 * avgEdge_;
+                for (const auto &[vertIdx, crossIndex] : sipgField_->singularVertices) {
+                    if (vertIdx < 0 || vertIdx >= static_cast<int>(mesh_->vertices.size())) continue;
+                    const Point &c = mesh_->vertices[vertIdx];
+                    if (crossIndex > 0)
+                        viewer::drawDisk3D(c, ballRadius, 0.2f, 0.2f, 0.95f);
+                    else
+                        viewer::drawDisk3D(c, ballRadius, 0.95f, 0.2f, 0.2f);
+                }
+            }
+        } else {
+            // The optimized frame. Both directions are drawn because the field
+            // is non-symmetric here: u and v are distinguishable, unlike the
+            // four indistinguishable arms of the cross field it came from.
+            viewer::drawUField(*mesh_, umber_->getUField(), scale_);
+            viewer::drawVField(*mesh_, umber_->getVField(), scale_);
+
+            // C of Eq. (2): the free transitions live on these edges, so a
+            // frame that appears to jump across one is not a defect.
+            if (umberCut_.has_value() && !umberCut_->getCutEdges().empty())
+                viewer::drawEdgeSetOnMesh(*mesh_, umberCut_->getCutEdges(), 1.0f, 0.2f, 0.9f, 3.5f);
+            viewer::drawBoundaryEdges(*mesh_);
+
+            double ballRadius = 0.5 * avgEdge_;
+            // The corners the field put on the boundary: blue convex (+1),
+            // red reflex (-1), yellow anything of higher order.
+            for (const auto &[vertIdx, k] : umberCorners_) {
+                if (vertIdx < 0 || vertIdx >= static_cast<int>(mesh_->vertices.size())) continue;
+                const Point &c = mesh_->vertices[vertIdx];
+                if (k == 1)       viewer::drawDisk3D(c, ballRadius, 0.2f, 0.2f, 0.95f);
+                else if (k == -1) viewer::drawDisk3D(c, ballRadius, 0.95f, 0.2f, 0.2f);
+                else              viewer::drawDisk3D(c, ballRadius, 0.95f, 0.85f, 0.1f);
+            }
+            // Anything still inside is a failure of Sec. 4.2 on this model, so
+            // it gets a colour of its own rather than sharing the corners'.
+            for (const auto &[vertIdx, winding] : umberInternal_) {
+                if (vertIdx < 0 || vertIdx >= static_cast<int>(mesh_->vertices.size())) continue;
+                viewer::drawDisk3D(mesh_->vertices[vertIdx], ballRadius, 0.1f, 0.9f, 0.2f);
+            }
+        }
     } else if (mode_ == Mode::MedialAxis) {
         if (maPhase_ != MedialAxisPhase::Classify) {
             if (delaunayMesh_)
@@ -1506,7 +1724,7 @@ void CrossGenWidget::renderNormal() {
     if (mode_ == Mode::Unselected) {
         renderOverlay("press '1' for PolyVector mode\npress '2' for MBO mode\n"
                       "press '3' for Medial Axis mode\npress '4' for SIPG mode\n"
-                      "press '5' for OASIS mode\n"
+                      "press '5' for OASIS mode\npress '6' for UMBER mode\n"
                       "right-drag to pan, scroll to zoom\n"
                       "press 'r' to restart\npress 'q' to quit");
     } else if (mode_ == Mode::OASIS) {

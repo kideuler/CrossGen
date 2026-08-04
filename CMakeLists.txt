@@ -45,6 +45,8 @@ add_library(PolyVector SHARED
     src/SIPG/SIPG.cxx
     src/Parameterization/CutMesh.hxx
     src/Parameterization/CutMesh.cxx
+    src/Parameterization/HarmonicCut.hxx
+    src/Parameterization/HarmonicCut.cxx
     src/Parameterization/MIQ.hxx
     src/Parameterization/MIQ.cxx
     src/Parameterization/UVGParam.hxx
@@ -53,6 +55,8 @@ add_library(PolyVector SHARED
     src/crossfield/CrossField.cxx
     src/OASIS/OASIS.hxx
     src/OASIS/OASIS.cxx
+    src/UMBER/UMBER.hxx
+    src/UMBER/UMBER.cxx
     src/tracing/SeparatrixTrace.hxx
     src/tracing/SeparatrixTrace.cxx
     src/triangle/triangle.cpp
@@ -98,6 +102,10 @@ target_link_libraries(TestOasis PRIVATE PolyVector)
 # Test p=0 DG/SIPG MBO cross-field solver
 add_executable(TestSIPG src/utils/TestSIPG.cxx)
 target_link_libraries(TestSIPG PRIVATE PolyVector)
+
+# Test the UMBER frame field optimization (Wang et al. 2022, Secs. 4.1-4.2)
+add_executable(TestUMBER src/utils/TestUMBER.cxx)
+target_link_libraries(TestUMBER PRIVATE PolyVector)
 
 # copy all meshes to build directory for easy access
 file(GLOB MESH_FILES "${CMAKE_CURRENT_SOURCE_DIR}/data/meshes/*")

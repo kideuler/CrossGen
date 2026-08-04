@@ -14,6 +14,7 @@
 
 #include "mesh/Mesh.hxx"
 #include "Parameterization/CutMesh.hxx"
+#include "Parameterization/HarmonicCut.hxx"
 #include "Parameterization/MIQ.hxx"
 #include "Parameterization/UVGParam.hxx"
 #include "polyvector/PolyVectors.hxx"
@@ -22,6 +23,7 @@
 #include "tracing/SeparatrixTrace.hxx"
 #include "medialaxis/MedialAxis.hxx"
 #include "OASIS/OASIS.hxx"
+#include "UMBER/UMBER.hxx"
 
 // ── Enumerations mirroring the original viewer state machine ──────────────────
 
@@ -32,6 +34,7 @@ enum class Mode {
     MedialAxis  = 3,
     SIPG        = 4,
     OASIS       = 5,
+    UMBER       = 6,
 };
 
 enum class Phase {
@@ -56,6 +59,17 @@ enum class SIPGPhase {
     Stepping   = 3,
     CutSeams   = 4,
     UVMesh     = 5,
+};
+
+// UMBER borrows the first three SIPG stages verbatim -- its input *is* a
+// converged SIPG cross field -- and then replaces the cutting and
+// parameterization stages with the one Sec. 4.2 solve, which is a single
+// blocking L-BFGS run rather than something to animate.
+enum class UMBERPhase {
+    MeshOnly   = 1,
+    CrossField = 2,
+    Stepping   = 3,
+    Frames     = 4,
 };
 
 // OASIS is a one-shot solve driven by a parameter dialog rather than a
@@ -114,6 +128,16 @@ private:
     // the solve failed, in which case oasisGuide_ is cleared.
     bool buildOASISGuidingField();
 
+    // Cut the mesh with HarmonicCut (Sec. 4.1) and optimize Eq. (1) on top of
+    // the SIPG field with L-BFGS. Blocking, like runOASIS: there is nothing to
+    // draw between the continuation stages.
+    void runUMBER();
+
+    // SIPG mode and UMBER mode share their first three stages, so the guards
+    // that drive the SIPG solve ask about the stage rather than the mode.
+    bool sipgStageWantsField() const;
+    bool sipgStageIsStepping() const;
+
     // rendering sub-routines called from paintGL
     void renderMBOAnimation();
     void renderSIPGAnimation();
@@ -142,6 +166,14 @@ private:
     std::shared_ptr<Mesh>      delaunayMesh_;
     std::shared_ptr<MedialAxis> medialAxis_;
     std::optional<OASIS>       oasis_;
+    // UMBER runs on the SIPG field held in sipgField_, so it needs no field of
+    // its own; the cuts and the optimized frames are all that is added.
+    std::optional<HarmonicCut>  umberCut_;
+    std::optional<UMBER>        umber_;
+    // Cached results of the solve: recomputing them per frame would walk every
+    // vertex star for nothing.
+    std::vector<std::pair<int, int>>    umberCorners_;   // (vertex, quarter turns)
+    std::vector<std::pair<int, double>> umberInternal_;  // what failed to reach the boundary
     // Guiding field for the OASIS orientation term. Held by shared_ptr because
     // OASIS keeps a reference to it for as long as it lives; separate from
     // crossField_, which belongs to MBO mode and follows its own state machine.
@@ -154,6 +186,7 @@ private:
     SIPGPhase      sipgPhase_ = SIPGPhase::MeshOnly;
     MedialAxisPhase maPhase_ = MedialAxisPhase::MeshOnly;
     OASISPhase     oasisPhase_ = OASISPhase::MeshOnly;
+    UMBERPhase     umberPhase_ = UMBERPhase::MeshOnly;
 
     // OASIS parameters and derived display range.
     double oasisLambda_  = 0.0;   // set by the dialog on first use
@@ -183,6 +216,12 @@ private:
     bool sipgSteppingStarted_  = false;
     bool sipgConverged_        = false;
     int  sipgStepCount_        = 0;
+    // The Eq. (1) solve is attempted once per run: a failure leaves umber_
+    // empty, and retrying it every frame would only stall the viewer again.
+    // It is announced one frame ahead so the notice is on screen while the
+    // GUI thread is inside L-BFGS.
+    bool umberAnnounced_       = false;
+    bool umberAttempted_       = false;
 
     // ── view / camera ────────────────────────────────────────────────────────
     viewer::ViewState view_;     // mesh-space view (left panel)
@@ -203,4 +242,11 @@ private:
     QTimer *timer_ = nullptr;
 
     static constexpr int MBO_MAX_STEPS = 500;
+
+    // L-BFGS iteration cap per continuation stage of Eq. (1). The paper stops
+    // on the gradient tolerance and so does every mesh in data/meshes at a few
+    // hundred to a couple of thousand iterations, so this is headroom rather
+    // than a target; the console reports the count so a run that hits it is
+    // visible.
+    static constexpr int UMBER_LBFGS_ITERATIONS = 3000;
 };
