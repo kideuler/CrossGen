@@ -140,6 +140,9 @@ int main(int argc, char **argv) {
         std::cout << "    boundary turns: " << pr.turns << " (field asked for "
                   << pr.expectedTurns << "), shortest straight run " << pr.shortestRun
                   << " edges\n";
+        std::cout << std::fixed << std::setprecision(2)
+                  << "    segments off axis before snapping: " << pr.suspectSegments
+                  << " past 10 deg, worst " << pr.worstSegmentDeg << " deg\n";
         std::cout << std::fixed << std::setprecision(3)
                   << "    boundary alignment: mean " << pr.meanAlignDeg << " deg, worst "
                   << pr.maxAlignDeg << " deg; length ratio " << pr.lengthRatio << "\n"

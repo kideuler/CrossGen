@@ -23,7 +23,8 @@
 // agree up to a k*90-degree rotation. The result is the polysquare: one (u, v)
 // per vertex of M_C.
 //
-// Three stages, following the paper:
+// Four stages: the three of Sec. 4.3, and the boundary half of the Sec. 5.5
+// re-solve, which is what makes the alignment exact rather than close.
 //
 //   Eq. (6)  A Poisson solve that asks the deformation gradient to be the
 //            frame, grad phi = (v v^perp)^T. Linear, and only an initial
@@ -40,6 +41,11 @@
 //            snaps each boundary edge onto an axis, and E_cor (Eq. 12) keeps
 //            the corners where the boundary actually turns instead of letting
 //            E_l1 place them on a straight run.
+//   Eq. (23) Each boundary segment put exactly on its axis and the interior
+//            re-solved with it held there. Eq. (9) aligns by a penalty, so it
+//            lands near an axis, and Sec. 5 needs the segments to be on one:
+//            its Eq. (13) defines a segment's projection h_i only for a
+//            segment that really is axis aligned. See snapBoundary().
 //
 // Four places where this departs from the paper, all deliberate:
 //
@@ -96,6 +102,14 @@ public:
         int turns = 0;
         int expectedTurns = 0;
         int shortestRun = 0;            // edges in the shortest straight run
+        // How far a boundary segment ran from its axis at the moment it was
+        // snapped onto it. A few degrees is discretization. A large one says
+        // Eq. (9) left a diagonal run, and the snap straightened something
+        // whose corners really belong somewhere else -- the alignment will
+        // read clean afterwards and the structure will still be wrong, so this
+        // is the number that catches it.
+        double worstSegmentDeg = 0.0;
+        int suspectSegments = 0;        // segments past 10 degrees
         double transitionDeg = 0.0;     // worst residual of Eq. (7) across a cut
         double lengthRatio = 1.0;       // image boundary length / input length
         double arap = 0.0, l1 = 0.0, cor = 0.0;
@@ -146,6 +160,22 @@ public:
     // perfectly aligned staircase is not a polysquare and a slightly rounded
     // corner is.
     void setCornerWeight(double w) { corWeight = w; }
+
+    // Whether to finish by putting every boundary segment exactly on its axis
+    // and re-solving the interior with it held there -- the boundary half of
+    // the paper's Sec. 5.5 re-parameterization, Eq. (23).
+    //
+    // On by default, because "axis aligned" is a property the rest of the
+    // pipeline needs to hold exactly rather than nearly: Eq. (13) defines a
+    // segment's projection h_i only for a segment that is genuinely axis
+    // aligned, and everything Sec. 5 does rests on that. Eq. (9) gets close --
+    // most edges to within a tenth of a degree -- but close is a different
+    // thing, and on one model in data/meshes it leaves a fourteen-edge run
+    // bulging out to 21 degrees where E_l1 and E_cor deadlock.
+    //
+    // Turning it off leaves the raw Eq. (9) result, which is what to look at
+    // when asking how well the soft alignment did on its own.
+    void setSnapBoundary(bool on) { snapBoundaryOn = on; }
 
     // L-BFGS iterations per continuation stage, and the gradient tolerance.
     void setMaxIterations(int n) { maxIterations = n; }
@@ -206,6 +236,7 @@ private:
     void extractTransitions();   // Eq. (7)
     void poissonInit();          // Eq. (6)
     void optimize();             // Eq. (9)
+    void snapBoundary();         // Eq. (23), the boundary constraint
     int countFlips() const;
 
     // The triangle that has the interior on its left when a -> b is walked,
@@ -257,12 +288,14 @@ private:
     int pinnedVertex = -1;
 
     Eigen::VectorXd x;        // 2*nIndep free coordinates, then 2*nCuts translations
+    std::vector<char> fixedX; // components snapBoundary() nailed down
     std::vector<Point> uv;    // per cut-mesh vertex
 
     std::vector<double> l1Schedule{0.125, 0.25, 0.5, 1.0, 2.0};
     double l1Weight = 0.125;  // the stage of that schedule currently running
     double l1Eps = 1e-2;
     double corWeight = 10.0;
+    bool snapBoundaryOn = true;
     double barrierWeight = 1.0;
     double detFloor = 0.05;
     double gradTolerance = 1e-6;

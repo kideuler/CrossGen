@@ -185,11 +185,22 @@ void Polysquare::buildTopology() {
                   << "their cut; those seams are left free.\n";
     }
 
-    nIndep = 0;
+    // One vertex is held at the origin to take out the global translation, and
+    // it is taken from the interior: snapBoundary() later fixes a coordinate of
+    // every boundary vertex, and a vertex already nailed to the origin could
+    // not accept one.
     pinnedVertex = -1;
+    for (int cv = 0; cv < nVc && pinnedVertex < 0; ++cv) {
+        if (depSrc[cv] < 0 && !cutMesh->isBoundaryVertex[cv]) pinnedVertex = cv;
+    }
+    for (int cv = 0; cv < nVc && pinnedVertex < 0; ++cv) {
+        if (depSrc[cv] < 0) pinnedVertex = cv;
+    }
+
+    nIndep = 0;
     for (int cv = 0; cv < nVc; ++cv) {
         if (depSrc[cv] >= 0) { varOf[cv] = -1; continue; }
-        if (pinnedVertex < 0) { pinnedVertex = cv; varOf[cv] = -2; continue; }
+        if (cv == pinnedVertex) { varOf[cv] = -2; continue; }
         varOf[cv] = nIndep++;
     }
 
@@ -579,6 +590,13 @@ double Polysquare::evaluate(const Eigen::VectorXd &state, Eigen::VectorXd &grad,
 
     fold(gradUV, grad);
 
+    // Whatever snapBoundary() fixed stays fixed: with these components of the
+    // gradient zero, every search direction L-BFGS builds out of them is zero
+    // there too, so the values never move.
+    for (int i = 0; i < static_cast<int>(fixedX.size()) && i < grad.size(); ++i) {
+        if (fixedX[i]) grad[i] = 0.0;
+    }
+
     if (arapOut) *arapOut = eArap;
     if (l1Out) *l1Out = eL1;
     if (corOut) *corOut = eCor;
@@ -683,8 +701,191 @@ void Polysquare::optimize() {
         report_.iterations += runLBFGS(x, maxIterations);
     }
 
+    // Eq. (23): put the boundary exactly on its axes and let the interior
+    // follow. E_l1 and E_cor have done their work by now -- the corners are
+    // where they are going to be -- and with the boundary held they have
+    // nothing left to say, so the re-solve is E_arap against the barrier.
+    if (snapBoundaryOn) {
+        expand(x);
+        snapBoundary();
+
+        report_.iterations += runLBFGS(x, maxIterations);
+        for (int round = 0; round < 4; ++round) {
+            expand(x);
+            if (countFlips() == 0) break;
+            barrierWeight *= 10.0;
+            report_.iterations += runLBFGS(x, maxIterations);
+        }
+    }
+
     expand(x);
     measure();
+}
+
+// ---------------------------------------------------------------------------
+// snapBoundary()  --  Eq. (23), the boundary half of it
+//
+// Eq. (9) aligns the boundary by a penalty, so it lands near an axis rather
+// than on one: across data/meshes most edges finish inside a tenth of a
+// degree, but one model keeps a fourteen-edge run bulging out to 21 degrees
+// where E_l1 and E_cor deadlock. That residual is not something the rest of
+// the pipeline can absorb. Sec. 5 needs every boundary segment to have one
+// normal and one projection h_i -- Eq. (13) asks for <c_i+ - c_i-, N_i> = 0
+// outright -- and a curved run has neither, so its anti-degeneracy constraints
+// cannot even be written down. Tracing iso-lines does not help: the motorcycle
+// graph partitions the interior from the corners it is given and leaves the
+// boundary exactly as it found it.
+//
+// The paper does not ask Eq. (9) to be exact either. Its Sec. 5.5 re-solve,
+// Eq. (23), minimizes E_arap alone subject to det > 0 and M psi = 0, where the
+// second constraint pins every boundary vertex of a segment to that segment's
+// projection. So the alignment is imposed, not optimized for, and Eq. (9)'s
+// job is only to settle where the corners go. This is that step without the
+// simplification in front of it: the corners are the ones already found, each
+// segment between them gets a single coordinate, and the interior is re-solved
+// with those held fixed.
+//
+// Segments break at corners and also at the seams, since the two sides of a
+// cut are different copies of a vertex and their images do not meet -- they
+// are separate segments of the boundary of the polysquare, however continuous
+// they look on the model.
+// ---------------------------------------------------------------------------
+void Polysquare::snapBoundary() {
+    fixedX.assign(2 * nIndep + 2 * nCuts, 0);
+    report_.worstSegmentDeg = 0.0;
+    report_.suspectSegments = 0;
+    if (bEdges.empty()) return;
+
+    int conflicts = 0;
+    std::vector<double> fixedValue(fixedX.size(), 0.0);
+
+    auto pin = [&](int cv, int axis, double value) {
+        const int j = varOf[cv];
+        if (j < 0) return; // the gauge vertex, which is interior by construction
+        const int idx = 2 * j + axis;
+        if (fixedX[idx] && std::fabs(fixedValue[idx] - value) > 1e-9) {
+            ++conflicts; // two segments want the same coordinate of one vertex
+            return;
+        }
+        uv[cv][axis] = value;
+        x[idx] = value;
+        fixedX[idx] = 1;
+        fixedValue[idx] = value;
+    };
+
+    for (size_t l = 0; l + 1 < loopStart.size(); ++l) {
+        const int b0 = loopStart[l], b1 = loopStart[l + 1];
+        const int n = b1 - b0;
+        if (n < 1) continue;
+
+        // Where this loop breaks into segments.
+        std::vector<char> breakAfter(n, 0);
+        int breaks = 0;
+        for (int i = 0; i < n; ++i) {
+            const BoundaryEdge &ei = bEdges[b0 + i];
+            const BoundaryEdge &ej = bEdges[b0 + (i + 1) % n];
+
+            bool brk = (ei.cb != ej.ca); // a seam
+            if (!brk) {
+                const Point di = uv[ei.cb] - uv[ei.ca];
+                const Point dj = uv[ej.cb] - uv[ej.ca];
+                if (normP(di) > 1e-18 && normP(dj) > 1e-18) {
+                    const double turn = std::fabs(
+                        wrap_pi(computeAngle(dj) - computeAngle(di) - ei.seamTurn));
+                    brk = turn > 30.0 * M_PI / 180.0;
+                }
+            }
+            if (brk) { breakAfter[i] = 1; ++breaks; }
+        }
+
+        // Start on an edge that follows a break, so that a segment is never
+        // split across the seam of the walk. A loop with no break at all -- the
+        // two rings of an annulus, which a closed-form polysquare leaves
+        // cornerless -- is one segment, and correctly so: its image is a single
+        // straight line.
+        int first = 0;
+        if (breaks > 0) {
+            for (int i = 0; i < n; ++i) {
+                if (breakAfter[i]) { first = (i + 1) % n; break; }
+            }
+        }
+
+        int taken = 0;
+        while (taken < n) {
+            std::vector<int> seg;
+            while (taken < n) {
+                const int idx = (first + taken) % n;
+                seg.push_back(b0 + idx);
+                ++taken;
+                if (breaks > 0 && breakAfter[idx]) break;
+            }
+            if (seg.empty()) continue;
+
+            // The axis the segment runs along, and so the coordinate that is
+            // constant on it.
+            double spanX = 0.0, spanY = 0.0;
+            for (int e : seg) {
+                const Point d = uv[bEdges[e].cb] - uv[bEdges[e].ca];
+                spanX += std::fabs(d[0]);
+                spanY += std::fabs(d[1]);
+            }
+            const int axis = (spanX >= spanY) ? 1 : 0;
+
+            {   // How far the segment as a whole is from the axis it is about
+                // to be snapped onto. A few degrees is discretization; a large
+                // value means Eq. (9) left a genuinely diagonal run here and
+                // the snap is about to straighten something that should have
+                // been a staircase or a corner somewhere else.
+                Point chord{0.0, 0.0};
+                for (int e : seg) chord = chord + (uv[bEdges[e].cb] - uv[bEdges[e].ca]);
+                if (normP(chord) > 1e-12) {
+                    const double dev = std::fabs(axisDeviation(chord[0], chord[1])) * 180.0 / M_PI;
+                    report_.worstSegmentDeg = std::max(report_.worstSegmentDeg, dev);
+                    if (dev > 10.0) ++report_.suspectSegments;
+                }
+            }
+
+            // h_i: the least-squares constant over the segment, weighted by
+            // edge length so a fan of short edges cannot outvote a long one.
+            double num = 0.0, den = 0.0;
+            for (int e : seg) {
+                const BoundaryEdge &be = bEdges[e];
+                const double w = be.length;
+                num += w * 0.5 * (uv[be.ca][axis] + uv[be.cb][axis]);
+                den += w;
+            }
+            const double h = (den > 0.0) ? num / den : 0.0;
+
+            // A segment that reaches the far bank of a cut is left alone,
+            // which is the paper's own rule (Sec. 5.4: "we do not change the
+            // projection values of a cut and the segments adjacent to the
+            // cut"). The two banks are one rigid transition apart, so a cut's
+            // two ends cannot both be moved to wherever their segments want:
+            // that is two positions asked of two degrees of freedom, and it is
+            // over-determined as soon as both ends are pinned on the same
+            // axis. Snapping them anyway does not fail quietly -- it leaves
+            // one vertex stranded 37 degrees off its segment on geom011, with
+            // five turns that the frame field never asked for, and raising the
+            // weight from 1e3 to 1e6 does not move it, because the constraint
+            // is infeasible rather than weak. Left free, and with E_l1 and
+            // E_cor still acting on them through the re-solve, the same
+            // segments finish 0.65 degrees off.
+            bool touchesFarBank = false;
+            for (int e : seg) if (varOf[bEdges[e].ca] == -1) touchesFarBank = true;
+            if (varOf[bEdges[seg.back()].cb] == -1) touchesFarBank = true;
+            if (touchesFarBank) continue;
+
+            for (int e : seg) pin(bEdges[e].ca, axis, h);
+            pin(bEdges[seg.back()].cb, axis, h);
+        }
+    }
+
+    if (conflicts > 0) {
+        std::cerr << "Polysquare: " << conflicts << " boundary vertex(es) wanted two different "
+                  << "values for the same coordinate; the first was kept.\n";
+    }
+    // The dependent copies follow from the banks that were just moved.
+    expand(x);
 }
 
 int Polysquare::countFlips() const {
