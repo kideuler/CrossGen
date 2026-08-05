@@ -4,7 +4,7 @@
 #include <limits>
 #include <iostream>
 
-void CrossField::initialize(int method) {
+void CrossField::initialize(int method, unsigned seed) {
     // For all boundary vertices, set dirichlet boundary conditions to be (nx + i*ny)^4 where (nx, ny) is the outward normal of the boundary edge
 
     int numVertices = static_cast<int>(mesh->vertices.size());
@@ -245,7 +245,7 @@ void CrossField::initialize(int method) {
         // TODO: implement method 0 initialization
     } else if (method == 1) {
         // Set non-boundary vertices to random normalized complex numbers
-        std::srand(static_cast<unsigned>(std::time(nullptr)));
+        std::srand(seed ? seed : static_cast<unsigned>(std::time(nullptr)));
         for (int v = 0; v < numVertices; ++v) {
             if (boundarySet.find(v) == boundarySet.end()) {
                 // Generate random angle and create unit complex number

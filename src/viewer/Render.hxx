@@ -15,6 +15,7 @@
 #include "crossfield/CrossField.hxx"
 #include "sipg/SIPG.hxx"
 #include "medialaxis/MedialAxis.hxx"
+#include "tracing/QuadLayout.hxx"
 #include "UMBER/MotorcycleGraph.hxx"
 #include "UMBER/Polysquare.hxx"
 
@@ -165,6 +166,14 @@ void drawBlockBoundary(const Polysquare &ps, const HarmonicCut &hc,
 // yellow for a corner of the polysquare, green where a line leaves the model,
 // cyan where two lines cross.
 void drawBlockNodes(const MotorcycleGraph &mg, bool parameterDomain, double radius);
+
+// The arcs of a quad layout: the separatrices cut at the nodes they meet, plus
+// the pieces of the boundary that close the components. They are polylines
+// following the streamlines of the cross field, so they are drawn as they are
+// rather than as chords between their nodes -- the curvature between two nodes
+// is the shape of the component's side, and straightening it would show a
+// different layout from the one that was built.
+void drawQuadLayoutArcs(const QuadLayout &layout, float lineWidth);
 
 } // namespace viewer
 

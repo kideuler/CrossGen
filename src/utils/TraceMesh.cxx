@@ -1,137 +1,262 @@
-// Utility to load a mesh, compute the MBO cross field, and trace separatrices.
-#include <iostream>
+// Load a mesh, compute the MBO cross field, trace its separatrices and build
+// the quad layout with T-junctions they cut the model into -- steps 1 and 2 of
+// Algorithm 1 in Viertel, Osting and Staten, IMR 2019.
+//
+//   TraceMesh <mesh.obj> [more.obj ...]
+//
+// Per mesh it prints a line of counts and, unless --no-vtu is given, writes
+// <stem>_layout_arcs.vtu, <stem>_layout_faces.vtu and <stem>_layout_nodes.vtu
+// next to wherever it is run.
+#include <cmath>
+#include <cstdlib>
+#include <fstream>
+#include <cstring>
 #include <iomanip>
+#include <iostream>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "crossfield/CrossField.hxx"
+#include "tracing/QuadLayout.hxx"
 #include "tracing/SeparatrixTrace.hxx"
 
 static const int MBO_MAX_STEPS = 500;
 
-int main(int argc, char **argv) {
-    if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <mesh.obj>\n";
-        return 1;
+static const char *reasonName(TerminationReason r) {
+    switch (r) {
+        case TerminationReason::RUNNING:            return "RUNNING";
+        case TerminationReason::EXIT_BOUNDARY:      return "boundary";
+        case TerminationReason::CROSSED_TWICE:      return "crossed-twice";
+        case TerminationReason::CUT_AT_SINGULARITY: return "cut-at-singularity";
+        case TerminationReason::HETEROCLINIC:       return "heteroclinic";
+        case TerminationReason::LIMIT_CYCLE:        return "limit-cycle";
+        case TerminationReason::STUCK:              return "STUCK";
     }
+    return "?";
+}
 
-    std::string path = argv[1];
+static std::string stemOf(const std::string &path) {
+    size_t slash = path.find_last_of("/\\");
+    std::string base = (slash == std::string::npos) ? path : path.substr(slash + 1);
+    size_t dot = base.find_last_of('.');
+    return (dot == std::string::npos) ? base : base.substr(0, dot);
+}
+
+struct Outcome {
+    std::string name;
+    // Two separate questions. `sound` is whether the layout is a layout at all:
+    // a plane graph with no arcs crossing off-node, whose faces tile the model
+    // exactly, with every separatrix ending somewhere. That has to hold, and it
+    // is what the exit code is about. `allQuads` is whether every component
+    // came out four-sided, which is the quality of the partition -- what Sec. 4
+    // is for, and not something raw tracing is expected to reach on every
+    // model.
+    bool sound = false;
+    bool allQuads = false;
+    int singularities = 0;
+    int separatrices = 0;
+    int stuck = 0;
+    int dangling = 0;
+    int faces = 0;
+    int quads = 0;
+    int tJunctions = 0;
+    int skew = 0;
+    double areaRatio = 0.0;
+};
+
+// The raw traced curves, before the layout splits them, as one poly-line each.
+static void writeSeparatricesVTU(const std::string &file, const SeparatrixTrace &trace) {
+    std::ofstream out(file);
+    if (!out) return;
+    size_t nPts = 0, nCells = 0;
+    for (const auto &s : trace.separatrices) { if (s.path.size() < 2) continue; nPts += s.path.size(); ++nCells; }
+    out << "<?xml version=\"1.0\"?>\n<VTKFile type=\"UnstructuredGrid\" version=\"1.0\" byte_order=\"LittleEndian\">\n"
+        << "  <UnstructuredGrid>\n    <Piece NumberOfPoints=\"" << nPts << "\" NumberOfCells=\"" << nCells << "\">\n";
+    out << "      <Points>\n        <DataArray type=\"Float64\" NumberOfComponents=\"3\" format=\"ascii\">\n";
+    for (const auto &s : trace.separatrices) { if (s.path.size() < 2) continue;
+        for (const auto &p : s.path) out << "          " << p.global_pos[0] << " " << p.global_pos[1] << " 0.0\n"; }
+    out << "        </DataArray>\n      </Points>\n";
+    out << "      <CellData Scalars=\"id\">\n        <DataArray type=\"Int32\" Name=\"id\" format=\"ascii\">\n";
+    for (const auto &s : trace.separatrices) if (s.path.size() >= 2) out << "          " << s.id << "\n";
+    out << "        </DataArray>\n        <DataArray type=\"Int32\" Name=\"reason\" format=\"ascii\">\n";
+    for (const auto &s : trace.separatrices) if (s.path.size() >= 2) out << "          " << (int)s.termination_reason << "\n";
+    out << "        </DataArray>\n        <DataArray type=\"Int32\" Name=\"origin\" format=\"ascii\">\n";
+    for (const auto &s : trace.separatrices) if (s.path.size() >= 2)
+        out << "          " << (s.originKind == SeparatrixOrigin::Singularity ? s.origin_singularity_id : 100 + s.origin_singularity_id) << "\n";
+    out << "        </DataArray>\n      </CellData>\n";
+    out << "      <Cells>\n        <DataArray type=\"Int32\" Name=\"connectivity\" format=\"ascii\">\n";
+    size_t base = 0;
+    for (const auto &s : trace.separatrices) { if (s.path.size() < 2) continue;
+        out << "         "; for (size_t i = 0; i < s.path.size(); ++i) out << " " << base + i; out << "\n"; base += s.path.size(); }
+    out << "        </DataArray>\n        <DataArray type=\"Int32\" Name=\"offsets\" format=\"ascii\">\n";
+    size_t off = 0;
+    for (const auto &s : trace.separatrices) { if (s.path.size() < 2) continue; off += s.path.size(); out << "          " << off << "\n"; }
+    out << "        </DataArray>\n        <DataArray type=\"UInt8\" Name=\"types\" format=\"ascii\">\n";
+    for (size_t i = 0; i < nCells; ++i) out << "          4\n";
+    out << "        </DataArray>\n      </Cells>\n    </Piece>\n  </UnstructuredGrid>\n</VTKFile>\n";
+}
+
+static double gCutRadius = SeparatrixTrace::Settings().singularityCutRadius;
+static double gTangential = SeparatrixTrace::Settings().tangentialAngle;
+static bool gEvenRays = SeparatrixTrace::Settings().evenCornerRays;
+
+static Outcome processMesh(const std::string &path, bool writeVtu, bool verbose) {
+    Outcome out;
+    out.name = stemOf(path);
+
     std::shared_ptr<Mesh> mesh;
     try {
         mesh = std::make_shared<Mesh>(path);
     } catch (const std::exception &e) {
-        std::cerr << "Failed to load mesh: " << e.what() << "\n";
-        return 2;
+        std::cerr << "  failed to load " << path << ": " << e.what() << "\n";
+        return out;
     }
 
-    std::cerr << "Loaded mesh: " << mesh->triangles.size() << " triangles, "
-              << mesh->vertices.size() << " vertices\n";
-
-    // 1. Initialize and run MBO cross field
     auto crossField = std::make_shared<CrossField>(mesh);
-    crossField->initialize(1);
-
-    double nv = static_cast<double>(crossField->u_k.size());
-    int stepCount = 0;
-    bool converged = false;
-
-    std::cerr << "Running MBO iterations (max " << MBO_MAX_STEPS << ")...\n";
+    crossField->initialize(1, 12345);
+    const double nv = static_cast<double>(mesh->vertices.size());
     for (int i = 0; i < MBO_MAX_STEPS; ++i) {
         crossField->step();
-        stepCount++;
-        if (crossField->error < 2.0 * nv * 1e-7) {
-            converged = true;
-            break;
-        }
+        if (crossField->error < 2.0 * nv * 1e-9) break;
     }
     crossField->computeSingularities();
 
-    if (converged) {
-        std::cerr << "MBO converged at step " << stepCount
-                  << " with error " << crossField->error << "\n";
-    } else {
-        std::cerr << "MBO reached max steps (" << stepCount
-                  << ") with error " << crossField->error << "\n";
+    SeparatrixTrace::Settings settings;
+    settings.singularityCutRadius = gCutRadius;
+    settings.tangentialAngle = gTangential;
+    settings.evenCornerRays = gEvenRays;
+    SeparatrixTrace trace(crossField, true, settings);
+    trace.run();
+
+    QuadLayout layout(trace);
+    layout.build();
+    const auto &rep = layout.getReport();
+
+    out.singularities = static_cast<int>(trace.singularities.size());
+    out.separatrices = static_cast<int>(trace.separatrices.size());
+    for (const auto &s : trace.separatrices) {
+        if (s.termination_reason == TerminationReason::STUCK ||
+            s.termination_reason == TerminationReason::LIMIT_CYCLE) ++out.stuck;
     }
-    std::cerr << "Found " << crossField->singularTriangles.size() << " singularities\n";
+    out.dangling = rep.danglingEnds;
+    out.faces = rep.faces;
+    out.quads = rep.quadFaces;
+    out.tJunctions = rep.tJunctions;
+    out.skew = rep.skewNodes;
+    out.areaRatio = (rep.meshArea > 0.0) ? rep.totalArea / rep.meshArea : 0.0;
+    out.sound = (rep.danglingEnds == 0) && (out.stuck == 0) && (rep.arcCrossings == 0) &&
+                (std::fabs(out.areaRatio - 1.0) < 1e-9) && rep.faces > 0;
+    out.allQuads = out.sound && rep.badFaces == 0;
 
-    // 2. Initialize separatrix tracing
-    auto separatrixTrace = std::make_shared<SeparatrixTrace>(crossField, true);
-    std::cerr << "Initialized " << separatrixTrace->separatrices.size()
-              << " separatrices from " << separatrixTrace->singularities.size()
-              << " singularities\n";
-
-    // 3. Trace until all separatrices are finished
-    int traceStep = 0;
-    while (!separatrixTrace->finishedTracing) {
-        separatrixTrace->stepAndCheck();
-        traceStep++;
-        if (traceStep % 1000 == 0) {
-            int active = 0;
-            for (const auto &sep : separatrixTrace->separatrices) {
-                if (sep.active) active++;
-            }
-            std::cerr << "  Trace step " << traceStep << ": "
-                      << active << " active separatrices\n";
+    if (verbose) {
+        std::cout << "  mesh          " << mesh->triangles.size() << " triangles, "
+                  << mesh->vertices.size() << " vertices\n";
+        std::cout << "  cross field   " << trace.singularities.size() << " singularities, error "
+                  << crossField->error << "\n";
+        int byReason[7] = {0, 0, 0, 0, 0, 0, 0};
+        for (const auto &s : trace.separatrices) byReason[static_cast<int>(s.termination_reason)]++;
+        std::cout << "  separatrices  " << trace.separatrices.size() << " (";
+        bool first = true;
+        for (int i = 0; i < 7; ++i) {
+            if (!byReason[i]) continue;
+            if (!first) std::cout << ", ";
+            std::cout << byReason[i] << " " << reasonName(static_cast<TerminationReason>(i));
+            first = false;
         }
-    }
-
-    std::cerr << "Tracing complete after " << traceStep << " steps\n";
-
-    // 4. Print summary and detect angle jumps
-    for (const auto &sep : separatrixTrace->separatrices) {
-        const char *reason = "?";
-        switch (sep.termination_reason) {
-            case TerminationReason::RUNNING: reason = "RUNNING"; break;
-            case TerminationReason::EXIT_BOUNDARY: reason = "EXIT_BOUNDARY"; break;
-            case TerminationReason::CONNECT_TANGENTIAL_PRIMARY: reason = "CONNECT_TANGENTIAL_PRIMARY"; break;
-            case TerminationReason::CONNECT_TANGENTIAL_SECONDARY: reason = "CONNECT_TANGENTIAL_SECONDARY"; break;
-            case TerminationReason::LIMIT_CYCLE: reason = "LIMIT_CYCLE"; break;
-            case TerminationReason::ORTHOGONAL_TO_SINGULARITY_SEPARATRIX: reason = "ORTHOGONAL_TO_SINGULARITY_SEPARATRIX"; break;
-            case TerminationReason::MAX_STEPS_REACHED: reason = "MAX_STEPS_REACHED"; break;
-            case TerminationReason::UNDEFINED: reason = "UNDEFINED"; break;
+        std::cout << ")\n";
+        std::cout << "  corners       " << trace.boundaryCorners.size() << " on the boundary:";
+        for (const auto &c : trace.boundaryCorners)
+            std::cout << " " << (int)std::lround(c.interiorAngle * 180.0 / M_PI) << "(q" << c.quarters << ")";
+        std::cout << "\n";
+        for (size_t i = 0; i < trace.singularities.size() && i < 12; ++i) {
+            const auto &s = trace.singularities[i];
+            std::cout << "    sing " << i << " index " << s.singularityIndex << " at ("
+                      << s.coordinates[0] << ", " << s.coordinates[1] << ") residual "
+                      << (s.portResidual * 180.0 / M_PI) << " deg, ports";
+            for (double a : s.portAngles) std::cout << " " << (int)std::lround(a * 180.0 / M_PI);
+            std::cout << "\n";
         }
-        std::cerr << "  Separatrix " << sep.id
-                  << ": " << sep.path.size() << " points, "
-                  << reason << "\n";
-
-        // Detect large direction jumps between consecutive segments
-        for (size_t j = 2; j < sep.path.size(); ++j) {
-            Point v_prev = sep.path[j-1].global_pos - sep.path[j-2].global_pos;
-            Point v_curr = sep.path[j].global_pos - sep.path[j-1].global_pos;
-            double dir_prev = std::atan2(v_prev[1], v_prev[0]);
-            double dir_curr = std::atan2(v_curr[1], v_curr[0]);
-            double jump = std::abs(wrap_pi(dir_curr - dir_prev));
-            bool prevSingular = false;
-            for (const auto &sing : separatrixTrace->singularities) {
-                if (sing.triangleIndex == sep.path[j-1].face_id) { prevSingular = true; break; }
-            }
-            if (jump > M_PI / 3.0) {
-                std::cerr << "    ** JUMP at point " << j << "/" << sep.path.size()
-                          << ": angle change = " << (jump * 180.0 / M_PI) << " deg"
-                          << "\n      pt[" << j-2 << "] pos=(" << sep.path[j-2].global_pos[0] << "," << sep.path[j-2].global_pos[1] << ")"
-                          << " face=" << sep.path[j-2].face_id
-                          << " trace_dir=" << std::fixed << std::setprecision(4) << sep.path[j-2].trace_direction
-                          << " field_angle=" << sep.path[j-2].field_angle
-                          << " edge=" << sep.path[j-2].local_edge_index
-                          << " t=" << sep.path[j-2].edge_crossing_t
-                          << "\n      pt[" << j-1 << "] pos=(" << sep.path[j-1].global_pos[0] << "," << sep.path[j-1].global_pos[1] << ")"
-                          << " face=" << sep.path[j-1].face_id
-                          << (prevSingular ? " (SINGULAR)" : "")
-                          << " trace_dir=" << sep.path[j-1].trace_direction
-                          << " field_angle=" << sep.path[j-1].field_angle
-                          << " edge=" << sep.path[j-1].local_edge_index
-                          << " t=" << sep.path[j-1].edge_crossing_t
-                          << "\n      pt[" << j << "] pos=(" << sep.path[j].global_pos[0] << "," << sep.path[j].global_pos[1] << ")"
-                          << " face=" << sep.path[j].face_id
-                          << " trace_dir=" << sep.path[j].trace_direction
-                          << " field_angle=" << sep.path[j].field_angle
-                          << " edge=" << sep.path[j].local_edge_index
-                          << " t=" << sep.path[j].edge_crossing_t
-                          << "\n";
+        std::cout << "  layout        " << rep.nodes << " nodes, " << rep.arcs << " arcs, "
+                  << rep.faces << " faces, " << rep.tJunctions << " T-junctions, "
+                  << rep.danglingEnds << " loose ends, " << rep.arcCrossings
+                  << " un-noded arc crossings, " << rep.unboundedCycles << " outer cycles, "
+                  << rep.skewNodes << " skew nodes\n";
+        std::cout << "  faces         " << rep.quadFaces << " four-cornered, " << rep.badFaces
+                  << " not; area " << std::setprecision(10) << out.areaRatio
+                  << " of the model\n" << std::setprecision(6);
+        if (rep.badFaces) {
+            int shown = 0;
+            for (size_t i = 0; i < layout.getFaces().size() && shown < 8; ++i) {
+                const auto &f = layout.getFaces()[i];
+                if (f.corners == 4) continue;
+                std::cout << "      face " << i << ": " << f.corners << " corners, "
+                          << f.darts.size() << " arcs, area " << f.area << " |";
+                static const char *kindName[] = {"sing", "corn", "bhit", "xing", "hetc", "tjct", "loose"};
+                for (size_t k = 0; k < f.nodes.size(); ++k)
+                    std::cout << " " << (f.isCorner[k] ? "*" : "-")
+                              << kindName[static_cast<int>(layout.getNodes()[f.nodes[k]].kind)]
+                              << (int)std::lround(f.turn[k] * 180.0 / M_PI)
+                              << "/" << layout.getNodes()[f.nodes[k]].darts.size();
+                std::cout << "\n";
+                ++shown;
             }
         }
     }
 
-    return 0;
+    if (writeVtu) {
+        layout.writeArcsVTU(out.name + "_layout_arcs.vtu");
+        layout.writeFacesVTU(out.name + "_layout_faces.vtu");
+        layout.writeNodesVTU(out.name + "_layout_nodes.vtu");
+        writeSeparatricesVTU(out.name + "_separatrices.vtu", trace);
+    }
+    return out;
+}
+
+int main(int argc, char **argv) {
+    std::vector<std::string> meshes;
+    bool writeVtu = true;
+    bool verbose = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--no-vtu") == 0) writeVtu = false;
+        else if (std::strcmp(argv[i], "--cut-radius") == 0 && i + 1 < argc) gCutRadius = std::atof(argv[++i]);
+        else if (std::strcmp(argv[i], "--tangential") == 0 && i + 1 < argc) gTangential = std::atof(argv[++i]) * M_PI / 180.0;
+        else if (std::strcmp(argv[i], "--square-rays") == 0) gEvenRays = false;
+        else if (std::strcmp(argv[i], "-v") == 0) verbose = true;
+        else meshes.push_back(argv[i]);
+    }
+    if (meshes.empty()) {
+        std::cerr << "Usage: " << argv[0] << " [-v] [--no-vtu] <mesh.obj> [more.obj ...]\n";
+        return 1;
+    }
+
+    std::vector<Outcome> all;
+    for (const auto &m : meshes) {
+        if (meshes.size() > 1 || verbose) std::cout << stemOf(m) << "\n";
+        all.push_back(processMesh(m, writeVtu, verbose || meshes.size() == 1));
+    }
+
+    std::cout << "\n"
+              << std::left << std::setw(12) << "mesh" << std::right << std::setw(6) << "sing"
+              << std::setw(6) << "seps" << std::setw(7) << "faces" << std::setw(7) << "quads"
+              << std::setw(7) << "T-jct" << std::setw(7) << "loose" << std::setw(7) << "skew"
+              << std::setw(10) << "area" << "  sound  4-sided\n";
+    int sound = 0, allQuads = 0, faces = 0, quads = 0;
+    for (const auto &o : all) {
+        std::cout << std::left << std::setw(12) << o.name << std::right << std::setw(6)
+                  << o.singularities << std::setw(6) << o.separatrices << std::setw(7) << o.faces
+                  << std::setw(7) << o.quads << std::setw(7) << o.tJunctions << std::setw(7)
+                  << (o.stuck + o.dangling) << std::setw(7) << o.skew << std::setw(10) << std::fixed
+                  << std::setprecision(6) << o.areaRatio << (o.sound ? "    yes" : "     NO")
+                  << (o.allQuads ? "      yes" : "       no") << "\n";
+        if (o.sound) ++sound;
+        if (o.allQuads) ++allQuads;
+        faces += o.faces;
+        quads += o.quads;
+    }
+    std::cout << sound << "/" << all.size() << " layouts sound; " << allQuads << "/" << all.size()
+              << " have every component four-sided; " << quads << "/" << faces << " components ("
+              << std::setprecision(1) << (faces ? 100.0 * quads / faces : 0.0)
+              << "%) are four-sided\n";
+    return (sound == static_cast<int>(all.size())) ? 0 : 1;
 }

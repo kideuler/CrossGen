@@ -20,6 +20,7 @@
 #include "polyvector/PolyVectors.hxx"
 #include "crossfield/CrossField.hxx"
 #include "sipg/SIPG.hxx"
+#include "tracing/QuadLayout.hxx"
 #include "tracing/SeparatrixTrace.hxx"
 #include "medialaxis/MedialAxis.hxx"
 #include "OASIS/OASIS.hxx"
@@ -52,6 +53,7 @@ enum class MBOPhase {
     Stepping    = 3,
     Separatrices = 4,
     Trace       = 5,
+    Layout      = 6,
 };
 
 enum class SIPGPhase {
@@ -187,6 +189,9 @@ private:
     std::optional<CutMesh>     sipgCutMesh_;
     std::optional<UVGParam>    sipgUVParam_;
     std::shared_ptr<SeparatrixTrace> separatrixTrace_;
+    // Holds a pointer to the trace above, so it must not outlive it: both are
+    // cleared together in reset().
+    std::optional<QuadLayout>  quadLayout_;
     std::shared_ptr<Mesh>      delaunayMesh_;
     std::shared_ptr<MedialAxis> medialAxis_;
     std::optional<OASIS>       oasis_;

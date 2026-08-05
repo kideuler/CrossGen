@@ -1,140 +1,209 @@
 #ifndef __SEPARATRIX_TRACE_HXX__
 #define __SEPARATRIX_TRACE_HXX__
 
-#include "crossfield/CrossField.hxx"
-#include <deque>
-#include <optional>
-#include <queue>
-#include <set>
+#include <memory>
 #include <unordered_map>
-#include <utility>
-#include <iostream>
+#include <vector>
 
-// Robustness tolerances.
-static const double EPS_INTERSECT_T = 1e-10;      // param epsilon for segment intersections
-static const double EPS_BARY = 1e-9;              // barycentric inside tolerance
-static const double MIN_ADVANCE_REL = 1e-7;       // minimum accepted segment length as fraction of avg edge
-static const int MAX_STEPS = 1000;
+#include "tracing/FieldTracer.hxx"
 
+// ---------------------------------------------------------------------------
+// The separatrices of a cross field, traced until the stopping conditions of
+// Viertel, Osting and Staten, IMR 2019, Sec. 3.3 apply. What comes out is the
+// input to QuadLayout, which turns the arrangement of these curves into a quad
+// layout with T-junctions.
+//
+// Streamlines are launched from two kinds of place:
+//
+//   * every interior singularity, one along each of its 4 - d ports;
+//
+//   * every corner of the boundary, one along each axis direction of the field
+//     that points into the domain. A corner whose interior angle is m pi/2 has
+//     m - 1 of them: none at a convex 90-degree corner, whose two boundary
+//     edges are already sides of the layout, two at a 270-degree reflex corner,
+//     three at a slit. That count comes from the corner index of Table 1 and
+//     not from testing directions against the geometry, for the reason set out
+//     in MotorcycleGraph::launch(): a corner that measures 275 degrees rather
+//     than 270 admits a spurious third ray which then runs alongside the
+//     boundary for the length of the model.
+//
+// By the Poincare-Bendixson theorem a streamline on a bounded surface either
+// leaves through the boundary, joins singularities, or winds onto a limit
+// cycle; on a discrete field the middle case never happens exactly, so the
+// tracing has to be cut off by hand. Three conditions do it (Sec. 3.3):
+//
+//   1. it leaves through the boundary;
+//   2. it crosses the same separatrix a second time -- which is what a limit
+//      cycle does immediately, and what an honest streamline does not;
+//   3. it crosses a separatrix of a singularity orthogonally inside that
+//      singularity's own triangle, which is the near-miss that would otherwise
+//      leave two streamlines running side by side down the whole model.
+//
+// The last two end a separatrix in the interior, i.e. at a T-junction. Removing
+// those is what Sec. 4 is for and is deliberately not done here.
+// ---------------------------------------------------------------------------
 
-// FallbackResult stores the output of a ray–edge intersection attempt used
-// during the fallback chain in stepHeuns when the primary direction fails.
-struct FallbackResult {
-    Point pos;
-    int edge;
-    double t;
-    int neighbor;
-};
-
-// TracePoint represents a point along a separatrix trace, storing the triangle it is in, its barycentric coordinates, and its global position.
-struct TracePoint {
-    int face_id;
-    std::array<double, 3> barycentric;
-    Point global_pos;
-    double field_angle; // interpolated cross field angle at this point from the current triangle
-    double trace_direction; // actual traced direction (angle from entry to exit), used for phase continuity
-    int edge_id = -1; // ID of the edge crossed to be used in the next iteration
-    int local_edge_index = -1; // local edge index (0,1,2) of the triangle for the edge crossed to be used in the next iteration
-    double edge_crossing_t = 0.0; // parametric t along the edge where the crossing occurred, used for interpolation
-};
-
-// Singularity represents a singularity in the cross field, storing its triangle index, cross field index, coordinates, field anfle, and the IDs of the separatrices that originate from it.
-struct Singularity {
-    int triangleIndex; // Triangle index where the singularity is located
-    double singularityIndex; // 1/4 index of the singularity (e.g., 0.25 for a +1/4 singularity)
-    Point coordinates; // Global coordinates of the singularity (can be computed from triangle vertices and barycentrics)
-    std::array<double, 3> barycentric;
-    double refAngle; // reference angle
-    double alpha; // angle offset for the first port direction
-    std::array<int, 5> portSeparatrixIds; // IDs of the separatrices originating from this singularity, can be max 5.
-    int numPorts; // Number of valid ports (3,5 for regular singularities)
-};
-
-// TerminationReason enumerates the possible reasons for a separatrix trace to terminate, such as hitting a boundary, self-intersection, or reaching a maximum step count.
 enum class TerminationReason {
-    RUNNING, // still running
-    EXIT_BOUNDARY, // Hit the mesh boundary
-    CONNECT_TANGENTIAL_PRIMARY, // Connected tangentially to another separatrix and is being kept
-    CONNECT_TANGENTIAL_SECONDARY, // Connected tangentially to another separatrix and is being removed
-    LIMIT_CYCLE,
-    ORTHOGONAL_TO_SINGULARITY_SEPARATRIX,
-    MAX_STEPS_REACHED,
-    UNDEFINED
+    RUNNING,
+    EXIT_BOUNDARY,      // condition 1
+    CROSSED_TWICE,      // condition 2
+    CUT_AT_SINGULARITY, // condition 3
+    HETEROCLINIC,       // met another separatrix head-on and was joined to it
+    LIMIT_CYCLE,        // ran past the step budget without ever meeting anything
+    STUCK               // the walk could not be continued; a bug or a broken mesh
 };
 
-// Separatrix represents a single separatrix trace, storing its path as a sequence of TracePoints, its origin singularity, and its termination status.
-struct Separatrix {
-    std::deque<TracePoint> path; // The sequence of points along the separatrix trace.
-    int id; // Unique identifier for the separatrix.
-    int origin_singularity_id; // ID of the singularity from which this separatrix originates.
-    int origin_singularity_port; // Port index at the singularity (0-4) corresponding to the initial direction.
-    bool active = true; // Indicates whether the trace is still active (not terminated).
-    bool in_singularity_zone = false; // Whether the trace is currently within the "singularity zone" of any singularity.
-    TerminationReason termination_reason = TerminationReason::RUNNING; // Reason for termination if not active.
+enum class SeparatrixOrigin { Singularity, BoundaryCorner };
 
-    std::set<int> visited_edges; // Set of edge IDs visited by this separatrix, used for self-intersection detection.
+struct Separatrix {
+    std::vector<TracePoint> path;   // path[0] is the origin; segment i runs path[i-1] -> path[i]
+    int id = -1;
+    SeparatrixOrigin originKind = SeparatrixOrigin::Singularity;
+    int origin_singularity_id = -1;  // index into singularities, or into boundaryCorners
+    int origin_singularity_port = -1;
+    bool active = true;
+    TerminationReason termination_reason = TerminationReason::RUNNING;
+
+    // Where it stopped, when it stopped on another separatrix (conditions 2
+    // and 3). `endOnSegment` indexes into that separatrix's path the same way.
+    int endOnSeparatrix = -1;
+    int endOnSegment = -1;
+
+    // Where it stopped, when it left through the boundary.
+    int endBoundaryEdge = -1;    // global mesh edge id, -1 if it left at a vertex
+    int endBoundaryVertex = -1;
+};
+
+// Two separatrices meeting transversally, recorded as they are traced so the
+// layout does not have to rediscover them.
+struct SeparatrixCrossing {
+    int sepA = -1, segA = -1;
+    int sepB = -1, segB = -1;
+    Point pos{0.0, 0.0};
+};
+
+// A corner of the boundary: a node of the layout whether or not anything is
+// launched from it.
+struct BoundaryCorner {
+    int vertex = -1;
+    int quarters = 2;          // interior angle in units of pi/2, rounded (Table 1)
+    double interiorAngle = 0.0;
+    std::vector<int> separatrixIds;
 };
 
 class SeparatrixTrace {
 public:
-    std::vector<Separatrix> separatrices; // List of all separatrices being traced
-    std::vector<Singularity> singularities; // List of singularities in the cross field, with their properties and associated separatrix ports
-    std::shared_ptr<CrossField> crossField; // Shared pointer to the cross field 
-    bool finishedTracing = false; // Flag to indicate when tracing is complete
+    // The knobs the stopping conditions leave open. They belong to the
+    // constructor because the launching and the per-singularity radii are
+    // settled there; setting them on a built object would be too late to have
+    // any effect.
+    struct Settings {
+        // Budget per separatrix, in triangles crossed. Only a streamline
+        // winding onto a limit cycle in a region no other separatrix reaches
+        // gets near it.
+        int maxStepsPerSeparatrix = 20000;
 
-    double dphi_singularity_zone = 0.01; // step size in the conformal domain when tracing within the singularity zone
-    int maxStepsInSingularityZone = 1000; // maximum number of steps to take when tracing within the singularity zone before giving up
+        // Third stopping condition. Turning it off traces streamlines straight
+        // past singularities, which is worth seeing when judging whether a
+        // T-junction was earned.
+        bool cutAtSingularities = true;
 
-    int steps = 0; // counter for total steps taken across all separatrices, used for termination condition
-    
-    SeparatrixTrace(std::shared_ptr<CrossField> cf, bool useActualSingularityCoordinates);
+        // How far from a singularity that condition still applies, in units of
+        // the singular triangle's own mean edge.
+        //
+        // The paper states it inside the singular triangle, which is where the
+        // sweep of Sec. 3.2.2 can watch the crossing happen. But whether a near
+        // miss lands inside that one triangle or just outside it is an accident
+        // of the mesh, and outside it the streamline runs on and ends up
+        // alongside the next separatrix of the same singularity -- a sliver of
+        // a component with three corners and its neighbour with five. What the
+        // condition is really about is a separatrix coming within
+        // discretisation error of a singularity, since in the continuum the two
+        // curves would have met, and discretisation error is measured in edge
+        // lengths.
+        //
+        // One edge is the smallest radius that leaves every model in
+        // data/meshes sound; at zero -- the condition exactly as the paper
+        // states it -- two of them keep a separatrix that winds onto a limit
+        // cycle no other separatrix ever reaches, and it ends nowhere. Above
+        // one the partition gets steadily coarser without the number of
+        // components that are not four-sided changing, so there is nothing to
+        // be had by going further.
+        double singularityCutRadius = 1.0;
 
-    // Convert global coordinates to barycentric coordinates for a given triangle
-    std::array<double, 3> globalToBarycentric(int triangleIndex, const Point& p);
+        // In the continuum two streamlines of a cross field can only cross each
+        // other orthogonally. A crossing at a shallow angle is therefore not a
+        // crossing at all but two separatrices following what is really one
+        // curve, pushed apart by the discretisation. Anything within this many
+        // radians of anti-parallel counts as one of those and is joined up.
+        double tangentialAngle = M_PI_4;
 
-    // Compute the intersection of a ray from a point inside a triangle with one of its edges
-    // Returns: (intersection point, local edge index, edge parameter t, neighbor triangle index)
-    // excludeEdge: optional edge index to exclude (e.g., the entry edge when tracing)
-    std::tuple<Point, int, double, int> rayEdgeIntersection(int triangleIndex, const Point& origin, double direction, int excludeEdge = -1);
+        // Divide a corner's wedge into `quarters` equal parts rather than into
+        // exact right angles measured off the boundary. On a corner that really
+        // is 270 degrees the two agree; on one that measures 226 they do not,
+        // and right angles leave a 46-degree scrap of wedge whose component is
+        // a sliver running along the boundary.
+        bool evenCornerRays = true;
+    };
 
-    // Try a ray in the given direction from entryPos inside triangleIndex, returning a
-    // FallbackResult if the ray exits through a valid edge, or std::nullopt otherwise.
-    std::optional<FallbackResult> tryRayDirection(int triangleIndex, const Point& entryPos, double angle, int excludeEdge);
+    // `useActualSingularityCoordinates` is passed through to FieldTracer: solve
+    // for the point where the representation vector vanishes rather than taking
+    // the barycentre of the singular triangle.
+    SeparatrixTrace(std::shared_ptr<CrossField> cf, bool useActualSingularityCoordinates,
+                    const Settings &settings);
+    explicit SeparatrixTrace(std::shared_ptr<CrossField> cf,
+                             bool useActualSingularityCoordinates = true)
+        : SeparatrixTrace(std::move(cf), useActualSingularityCoordinates, Settings()) {}
 
-    // find the intersection edge of another edge using the barycentric coordinates of the 2 points.
-    // Returns the local edge index (0, 1, or 2) that was crossed, or -1 if no edge was crossed.
-    int findCrossedEdge(const std::array<double, 3>& b_prev, const std::array<double, 3>& b_next, double& t_exit);
-
-    // sister method which takes a direction vector instead of an angle
-    std::tuple<Point, int, double, int> rayEdgeIntersection(int triangleIndex, const Point& origin, const Point& direction, int excludeEdge = -1);
-
-    // Compute the intersection of two edges defined by their endpoints line 1: p0->p1, line 2: p2->p3/ Returns (bool intersects, intersection point if intersects)
-    std::tuple<bool, Point> edgeEdgeIntersection(const Point& p0, const Point& p1, const Point& p2, const Point& p3);
-
-    // For a given reference angle and another angle, compute the angle that is closest to the reference angle but still matches the cross field direction at that point
-    double makeAngleSamePhase(double referenceAngle, double angleCandidate);
-
-    // Find phase difference between two angles and return k such that angleCandidate + k*(pi/2) is closest to referenceAngle
-    int findPhaseDifference(double referenceAngle, double angleCandidate);
-
-    // Perform one tracing step using Heun's method, appending the next TracePoint to the separatrix's path.
-    // Sets sep.active = false and sep.termination_reason if the trace terminates (boundary, error, etc.).
-    void stepHeuns(Separatrix& sep);
-
-    // step separatrix using the Viertel IMR 2019 method, which includes special handling for singularities.
-    void stepViertel(Separatrix& sep, bool stopAtOrthogonal = true);
-
-    // step and check function, the main function which is called repeatedly to step the separatrix and check for intersections, singularity zone, and max steps.
+    // Advance every live separatrix by one triangle and test what it met.
+    // Tracing them together rather than one after another is what makes the
+    // "crossed the same separatrix twice" test independent of the order the
+    // separatrices happen to be numbered in.
     void stepAndCheck();
 
-private:
-    // Private members for internal use during tracing
-    std::vector<bool> isSingularTriangle; // Precomputed lookup for whether a triangle is singular
-    std::unordered_map<int, std::pair<std::vector<int>, bool>> triangleSeparatrixMap; // triangle index -> (list of separatrix IDs passing through, is an intersection present)
-    std::queue<int> Intersections; // Queue of triangle indices where intersections have been detected, to be processed.
-    std::set<int> IntersectionsSet; // Set of triangle indices already in the Intersections queue, for O(1) deduplication.
-    std::unordered_map<int,int> singularityMap; // triangle index -> singularity index for quick lookup during tracing
-};
+    // stepAndCheck() until nothing is live.
+    void run();
 
+    std::vector<Separatrix> separatrices;
+    std::vector<Singularity> singularities;    // mirror of the tracer's, with ports filled in
+    std::vector<BoundaryCorner> boundaryCorners;
+    std::vector<SeparatrixCrossing> crossings;
+
+    // Boundary loops as vertex rings, oriented with the interior on the left.
+    std::vector<std::vector<int>> boundaryLoops;
+
+    std::shared_ptr<CrossField> crossField;
+    bool finishedTracing = false;
+    int steps = 0;
+
+    const FieldTracer &getTracer() const { return *tracer; }
+    const Settings &getSettings() const { return settings; }
+
+    int countActive() const;
+
+private:
+    struct SegRef { int sep; int seg; };
+
+    void buildBoundary();
+    void launchFromSingularities();
+    void launchFromCorners();
+
+    // Register the segments a step just added and act on what they crossed.
+    // Returns false when the separatrix was terminated part way through them.
+    bool registerNewSegments(Separatrix &sep, int firstNewIndex);
+
+    void terminateAt(Separatrix &sep, int segIndex, const Point &at, TerminationReason why,
+                     int onSep, int onSeg);
+
+    Settings settings;
+    std::unique_ptr<FieldTracer> tracer;
+    const Mesh *mesh = nullptr;
+
+    std::vector<Walker> walkers;                     // one per separatrix
+    std::vector<int> stepsTaken;
+    std::vector<double> cutRadius;                   // per singularity, in model units
+    std::vector<std::vector<SegRef>> segmentsOfTriangle;
+    std::vector<std::unordered_map<int, int>> crossCount;  // per separatrix: other id -> times met
+};
 
 #endif // __SEPARATRIX_TRACE_HXX__

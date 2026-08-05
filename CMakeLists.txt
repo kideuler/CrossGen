@@ -61,8 +61,12 @@ add_library(PolyVector SHARED
     src/UMBER/Polysquare.cxx
     src/UMBER/MotorcycleGraph.hxx
     src/UMBER/MotorcycleGraph.cxx
+    src/tracing/FieldTracer.hxx
+    src/tracing/FieldTracer.cxx
     src/tracing/SeparatrixTrace.hxx
     src/tracing/SeparatrixTrace.cxx
+    src/tracing/QuadLayout.hxx
+    src/tracing/QuadLayout.cxx
     src/triangle/triangle.cpp
     src/triangle/triangle.h
     src/triangle/TriangleMesher.hpp
@@ -193,10 +197,17 @@ target_link_libraries(TestTracingComponents PRIVATE PolyVector)
 add_test(NAME Tracing_ConstantFieldTrace COMMAND TestTracingComponents 1)
 add_test(NAME Tracing_RigidBodyRotation COMMAND TestTracingComponents 2)
 add_test(NAME Tracing_ParabolicStreamline COMMAND TestTracingComponents 3)
-add_test(NAME Tracing_SingularTriangleViertelTrace_3port_center COMMAND TestTracingComponents 4)
-add_test(NAME Tracing_SingularTriangleViertelTrace_3port_offcenter COMMAND TestTracingComponents 5)
-add_test(NAME Tracing_SingularTriangleViertelTrace_5port_center COMMAND TestTracingComponents 6)
-add_test(NAME Tracing_SingularTriangleViertelTrace_5port_offcenter COMMAND TestTracingComponents 7)
+add_test(NAME Tracing_SingularSweep_3port_center COMMAND TestTracingComponents 4)
+add_test(NAME Tracing_SingularSweep_3port_offcenter COMMAND TestTracingComponents 5)
+add_test(NAME Tracing_SingularSweep_5port_center COMMAND TestTracingComponents 6)
+add_test(NAME Tracing_SingularSweep_5port_offcenter COMMAND TestTracingComponents 7)
+
+# End-to-end: trace every model in data/meshes and check each layout is a plane
+# graph whose faces tile the model exactly with nothing left dangling. How many
+# of the components come out four-sided is printed but not asserted -- that is
+# the part Sec. 4 of the paper is for.
+add_test(NAME Tracing_LayoutsOnAllMeshes
+         COMMAND TraceMesh --no-vtu ${MESH_OBJ_FILES})
 # Optional Qt6 OpenGL viewer (replaces the old GLFW-based viewer)
 option(BUILD_OPENGL_VIEWER "Build the Qt6 OpenGL mesh/field viewer" OFF)
 if (BUILD_OPENGL_VIEWER)

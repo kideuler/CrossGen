@@ -1102,5 +1102,17 @@ void drawBlockNodes(const MotorcycleGraph &mg, bool parameterDomain, double radi
     }
 }
 
+void drawQuadLayoutArcs(const QuadLayout &layout, float lineWidth) {
+    glColor3f(0.25f, 0.55f, 1.0f);
+    glLineWidth(lineWidth);
+    for (const auto &arc : layout.getArcs()) {
+        if (arc.pts.size() < 2) continue;
+        glBegin(GL_LINE_STRIP);
+        for (const Point &p : arc.pts) glVertex2d(p[0], p[1]);
+        glEnd();
+    }
+    glLineWidth(1.0f);
+}
+
 } // namespace viewer
 

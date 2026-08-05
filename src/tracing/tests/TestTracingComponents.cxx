@@ -1,792 +1,417 @@
-#include "triangle/TriangleMesher.hpp"
+// Unit tests for the streamline tracer, on fields whose streamlines are known
+// in closed form, so that what is being checked is the tracer and not another
+// piece of the pipeline.
+//
+//   1  a constant field: the streamline is a straight line
+//   2  a rigid rotation: the streamline is a circle, and never leaves it
+//   3  v = (1, 2x): the streamline through the origin is y = x^2
+//   4-7  the model of Sec. 3.2.2 imposed exactly on one singular triangle, at
+//        both indices and with the singularity both centred and off-centre:
+//        the ports must come out where the model puts them, and every
+//        streamline crossing the triangle must stay on its hyperbola
+//
+// Test 3 is the one that catches a wrong branch: a cross field is only defined
+// modulo pi/2, and picking the wrong quarter turn anywhere along the trace
+// sends it off at a right angle, which shows up immediately as a large
+// deviation from the parabola.
 #include "crossfield/CrossField.hxx"
+#include "tracing/FieldTracer.hxx"
 #include "tracing/SeparatrixTrace.hxx"
 #include "TestHelper.hxx"
-#include <fstream>
-#include <iostream>
-#include <vector>
+
 #include <cmath>
+#include <cstdlib>
+#include <fstream>
 #include <functional>
+#include <iostream>
 #include <map>
+#include <vector>
 
-// Write a traced path to an OBJ file as a polyline
-void writePathToOBJ(const std::string& filename, const std::vector<TracePoint>& path) {
+namespace {
+
+void writePathToOBJ(const std::string &filename, const std::vector<TracePoint> &path) {
     std::ofstream out(filename);
-    if (!out.is_open()) {
-        std::cerr << "Error: Could not open file " << filename << " for writing." << std::endl;
-        return;
-    }
-
-    out << "# Traced path with " << path.size() << " points\n";
-
-    // Write vertices
-    for (const auto& tp : path) {
-        out << "v " << tp.global_pos[0] << " " << tp.global_pos[1] << " 0\n";
-    }
-
-    // Write polyline as edges
+    if (!out) return;
+    for (const auto &tp : path) out << "v " << tp.global_pos[0] << " " << tp.global_pos[1] << " 0\n";
     out << "l";
-    for (size_t i = 1; i <= path.size(); ++i) {
-        out << " " << i;
-    }
+    for (size_t i = 1; i <= path.size(); ++i) out << " " << i;
     out << "\n";
-
-    out.close();
-    std::cout << "Wrote traced path to " << filename << std::endl;
 }
 
-// Helper function to trace from a starting point to the boundary
-std::vector<TracePoint> traceTowardsBoundary(
-    SeparatrixTrace& tracer,
-    std::shared_ptr<Mesh> mesh,
-    const Point& startPos,
-    double startAngle,
-    int maxSteps = 10000
-) {
+// Give every vertex the field u = e^{4 i theta(v)}.
+void setField(const std::shared_ptr<CrossField> &cf, const std::shared_ptr<Mesh> &mesh,
+              const std::function<double(const Point &)> &theta) {
+    cf->u_k.resize(mesh->vertices.size());
+    for (int i = 0; i < static_cast<int>(mesh->vertices.size()); ++i)
+        cf->u_k[i] = std::polar(1.0, 4.0 * theta(mesh->vertices[i]));
+}
+
+// Follow the field from `start` in direction `dir` until it leaves the mesh.
+std::vector<TracePoint> traceToBoundary(const FieldTracer &tracer, const Mesh &mesh,
+                                        const Point &start, double dir, int maxSteps = 100000) {
     std::vector<TracePoint> path;
+    const int f = mesh.findTriangleContainingPoint(start);
+    if (f < 0) return path;
 
-    // Find triangle containing the starting point
-    int startTri = mesh->findTriangleContainingPoint(startPos);
-    if (startTri < 0) {
-        std::cerr << "Error: Starting point is not inside any triangle!" << std::endl;
-        return path;
-    }
+    TracePoint p0;
+    p0.global_pos = start;
+    p0.face_id = f;
+    p0.theta = dir;
+    path.push_back(p0);
 
-    // Compute barycentric coordinates of start point
-    std::array<double, 3> startBary = tracer.globalToBarycentric(startTri, startPos);
-
-    // Find where the ray exits the starting triangle
-    auto [exitPos, exitEdge, exitT, exitNeighbor] = tracer.rayEdgeIntersection(startTri, startPos, startAngle);
-
-    if (exitEdge < 0) {
-        std::cerr << "Error: Could not find exit edge from starting triangle!" << std::endl;
-        return path;
-    }
-
-    // Add the starting point
-    TracePoint start;
-    start.face_id = startTri;
-    start.barycentric = startBary;
-    start.global_pos = startPos;
-    start.field_angle = startAngle;
-    start.trace_direction = startAngle; // Initial trace direction matches field direction
-    start.edge_id = mesh->triangleEdges[startTri][exitEdge];
-    start.local_edge_index = exitEdge;
-    start.edge_crossing_t = exitT;
-    path.push_back(start);
-
-    // Add the first exit point
-    TracePoint firstExit;
-    firstExit.face_id = startTri;
-    firstExit.barycentric = tracer.globalToBarycentric(startTri, exitPos);
-    firstExit.global_pos = exitPos;
-    firstExit.field_angle = startAngle;
-    // Compute actual trace direction from start to exit
-    Point traceVec = exitPos - startPos;
-    firstExit.trace_direction = std::atan2(traceVec[1], traceVec[0]);
-    firstExit.edge_id = mesh->triangleEdges[startTri][exitEdge];
-    firstExit.local_edge_index = exitEdge;
-    firstExit.edge_crossing_t = exitT;
-    path.push_back(firstExit);
-
-    // Check if we hit boundary immediately
-    if (exitNeighbor < 0) {
-        return path;
-    }
-
-    // Build a temporary Separatrix to use with stepHeuns
-    Separatrix sep;
-    sep.id = -1;
-    sep.origin_singularity_id = -1;
-    sep.origin_singularity_port = -1;
-    sep.active = true;
-    sep.termination_reason = TerminationReason::RUNNING;
-    sep.path.push_back(start);
-    sep.path.push_back(firstExit);
-
-    // Trace until we hit the boundary using stepHeuns
-    for (int step = 0; step < maxSteps; ++step) {
-        if (!sep.active) break;
-
-        tracer.stepHeuns(sep);
-    }
-
-    // Copy path out of the separatrix
-    path.assign(sep.path.begin(), sep.path.end());
-
+    Walker w = tracer.startAt(f, start, dir);
+    for (int i = 0; i < maxSteps; ++i)
+        if (tracer.advance(w, path) != FieldTracer::Status::Ok) break;
     return path;
 }
 
-//=============================================================================
-// Test 1: Constant cross field (1,1) direction, trace from origin
-//=============================================================================
-bool test1_ConstantFieldTrace() {
-        std::cout << "\n=== Test 1: Constant Field Trace ===" << std::endl;
-
-        // Create a unit-disk mesh
-        auto mesh = TestHelper::createEllipse(0.0, 0.0, 1.0, 1.0, 360.0, 0.05);
-        std::cout << "Mesh created: " << mesh->vertices.size() << " vertices, " 
-                << mesh->triangles.size() << " triangles" << std::endl;
-
-        // Create crossfield with constant direction (1,1)
-        auto crossField = std::make_shared<CrossField>(mesh);
-        std::complex<double> u = {1.0, 1.0};
-        u /= std::abs(u);
-        std::complex<double> u_val = u*u*u*u;
-        
-        crossField->u_k.resize(mesh->vertices.size());
-        for (int i = 0; i < (int)mesh->vertices.size(); ++i) {
-            crossField->u_k[i] = u_val;
-        }
-
-        // Create tracer and trace
-        SeparatrixTrace tracer(crossField, false);
-        Point startPos = {0.0, 0.0};
-        double startAngle = M_PI / 4.0; // direction (1,1)
-
-        auto path = traceTowardsBoundary(tracer, mesh, startPos, startAngle);
-        
-        std::cout << "Traced " << path.size() << " points" << std::endl;
-        writePathToOBJ("test1_constant_field.obj", path);
-
-        // Verify: path should end near boundary (radius ~1)
-        if (path.empty()) {
-            std::cerr << "FAIL: Empty path" << std::endl;
-            return false;
-        }
-
-        Point endPos = path.back().global_pos;
-        double endRadius = std::sqrt(endPos[0]*endPos[0] + endPos[1]*endPos[1]);
-        std::cout << "End position: (" << endPos[0] << ", " << endPos[1] << "), radius: " << endRadius << std::endl;
-
-        if (std::abs(endRadius - 1.0) > 0.05) {
-            std::cerr << "FAIL: End point not near boundary" << std::endl;
-            return false;
-        }
-
-        std::cout << "PASS" << std::endl;
-        return true;
+bool nearBoundary(const std::vector<TracePoint> &path, double radius, double tol) {
+    if (path.empty()) return false;
+    const Point &p = path.back().global_pos;
+    return std::fabs(normP(p) - radius) <= tol;
 }
 
-//=============================================================================
-// Test 2: Rigid Body Rotation [-y, x] field, trace from (0.5,0.0)
-//=============================================================================
-bool test2_RigidBodyRotation() {
-    std::cout << "\n=== Test 2: Rigid Body Rotation ===" << std::endl;
+} // namespace
 
-    // Create a unit-disk mesh
+//=============================================================================
+// 1: a constant field
+//=============================================================================
+static bool test1_ConstantFieldTrace() {
+    std::cout << "\n=== Test 1: constant field ===\n";
     auto mesh = TestHelper::createEllipse(0.0, 0.0, 1.0, 1.0, 360.0, 0.05);
-    std::cout << "Mesh created: " << mesh->vertices.size() << " vertices, " 
-            << mesh->triangles.size() << " triangles" << std::endl;
+    auto cf = std::make_shared<CrossField>(mesh);
+    setField(cf, mesh, [](const Point &) { return M_PI_4; });
 
-    // Create crossfield with rigid body rotation [-y, x] (tangent to circles centered at origin)
-    auto crossField = std::make_shared<CrossField>(mesh);
-    
-    crossField->u_k.resize(mesh->vertices.size());
-    for (int i = 0; i < (int)mesh->vertices.size(); ++i) {
-        double x = mesh->vertices[i][0];
-        double y = mesh->vertices[i][1];
-        // Field direction is [-y, x] (tangent to circle)
-        // For vertices at origin, use default direction
-        double r = std::sqrt(x*x + y*y);
-        std::complex<double> u;
-        if (r < 1e-10) {
-            u = {0.0, 1.0}; // default to vertical at origin
-        } else {
-            u = {-y/r, x/r}; // normalized tangent
-        }
-        crossField->u_k[i] = u*u*u*u;
-    }
+    FieldTracer tracer(cf, false);
+    auto path = traceToBoundary(tracer, *mesh, Point{0.0, 0.0}, M_PI_4);
+    writePathToOBJ("test1_constant_field.obj", path);
+    std::cout << "  " << path.size() << " points, end ("
+              << path.back().global_pos[0] << ", " << path.back().global_pos[1] << ")\n";
 
-    // Create tracer and trace
-    SeparatrixTrace tracer(crossField, false);
-    Point startPos = {0.5, 0.0};
-    // At (0.5, 0), the tangent direction is [-0, 0.5] = [0, 1], angle = pi/2
-    double startAngle = M_PI / 2.0;
-    
-    // Set up the initial trace points
-    int startTri = mesh->findTriangleContainingPoint(startPos);
-    if (startTri < 0) {
-        std::cerr << "Error: Starting point is not inside any triangle!" << std::endl;
+    if (!nearBoundary(path, 1.0, 0.05)) {
+        std::cerr << "FAIL: did not reach the boundary\n";
         return false;
     }
-
-    std::array<double, 3> startBary = tracer.globalToBarycentric(startTri, startPos);
-    auto [exitPos, exitEdge, exitT, exitNeighbor] = tracer.rayEdgeIntersection(startTri, startPos, startAngle);
-
-    if (exitEdge < 0) {
-        std::cerr << "Error: Could not find exit edge from starting triangle!" << std::endl;
+    // A constant field has straight streamlines, so every point must sit on the
+    // ray y = x.
+    double worst = 0.0;
+    for (const auto &tp : path)
+        worst = std::max(worst, std::fabs(tp.global_pos[1] - tp.global_pos[0]));
+    std::cout << "  max |y - x| = " << worst << "\n";
+    if (worst > 1e-9) {
+        std::cerr << "FAIL: streamline is not straight\n";
         return false;
     }
-
-    // Add the starting point
-    TracePoint start;
-    start.face_id = startTri;
-    start.barycentric = startBary;
-    start.global_pos = startPos;
-    start.field_angle = startAngle;
-    start.trace_direction = startAngle;
-    start.edge_id = mesh->triangleEdges[startTri][exitEdge];
-    start.local_edge_index = exitEdge;
-    start.edge_crossing_t = exitT;
-
-    // Add the first exit point
-    TracePoint firstExit;
-    firstExit.face_id = startTri;
-    firstExit.barycentric = tracer.globalToBarycentric(startTri, exitPos);
-    firstExit.global_pos = exitPos;
-    firstExit.field_angle = startAngle;
-    Point traceVec = exitPos - startPos;
-    firstExit.trace_direction = std::atan2(traceVec[1], traceVec[0]);
-    firstExit.edge_id = mesh->triangleEdges[startTri][exitEdge];
-    firstExit.local_edge_index = exitEdge;
-    firstExit.edge_crossing_t = exitT;
-
-    // Build a temporary Separatrix to use with stepHeuns
-    Separatrix sep;
-    sep.id = -1;
-    sep.origin_singularity_id = -1;
-    sep.origin_singularity_port = -1;
-    sep.active = true;
-    sep.termination_reason = TerminationReason::RUNNING;
-    sep.path.push_back(start);
-    sep.path.push_back(firstExit);
-
-    // Trace
-    int maxSteps = 10000;
-    bool verbose = true;
-    for (int step = 0; step < maxSteps; ++step) {
-        if (!sep.active) break;
-
-        const TracePoint& current = sep.path.back();
-
-        // Debug: print expected vs actual field angle
-        if (verbose && step < 30) {
-            double x = current.global_pos[0];
-            double y = current.global_pos[1];
-            double r = std::sqrt(x*x + y*y);
-            double expected = std::atan2(x/r, -y/r); // expected tangent angle
-            double diff = current.field_angle - expected;
-            while (diff > M_PI) diff -= 2*M_PI;
-            while (diff < -M_PI) diff += 2*M_PI;
-            std::cout << "Step " << step << ": pos=(" << x << "," << y 
-                      << ") expected=" << expected << " actual=" << current.field_angle 
-                      << " diff=" << diff << std::endl;
-        }
-
-        tracer.stepHeuns(sep);
-    }
-
-    // Copy path out of the separatrix
-    std::vector<TracePoint> path(sep.path.begin(), sep.path.end());
-    
-    std::cout << "Traced " << path.size() << " points" << std::endl;
-    writePathToOBJ("test2_rigid_body_rotation.obj", path);
-
-    // Analyze radius drift
-    if (path.empty()) {
-        std::cerr << "FAIL: Empty path" << std::endl;
-        return false;
-    }
-
-    double startRadius = std::sqrt(startPos[0]*startPos[0] + startPos[1]*startPos[1]);
-    double maxRadiusDrift = 0.0;
-    int worstStep = 0;
-    
-    for (size_t i = 0; i < path.size(); ++i) {
-        double r = std::sqrt(path[i].global_pos[0]*path[i].global_pos[0] + 
-                            path[i].global_pos[1]*path[i].global_pos[1]);
-        double drift = std::abs(r - startRadius);
-        if (drift > maxRadiusDrift) {
-            maxRadiusDrift = drift;
-            worstStep = i;
-        }
-    }
-
-    Point endPos = path.back().global_pos;
-    double endRadius = std::sqrt(endPos[0]*endPos[0] + endPos[1]*endPos[1]);
-    
-    std::cout << "Start radius: " << startRadius << std::endl;
-    std::cout << "End radius: " << endRadius << std::endl;
-    std::cout << "Max radius drift: " << maxRadiusDrift << " at step " << worstStep << std::endl;
-    std::cout << "End position: (" << endPos[0] << ", " << endPos[1] << ")" << std::endl;
-
-    // For a good circular trace, radius should stay within ~10% of original
-    if (maxRadiusDrift > 0.1 * startRadius) {
-        std::cerr << "FAIL: Radius drifted too much (>" << 0.1*startRadius << ")" << std::endl;
-        return false;
-    }
-
-    std::cout << "PASS" << std::endl;
+    std::cout << "PASS\n";
     return true;
 }
 
 //=============================================================================
-// Test 3: Field v(x,y) = [1, 2x], exact streamline y = x^2 + C
+// 2: a rigid rotation -- the streamline is a circle and closes on itself
 //=============================================================================
-bool test3_ParabolicStreamline() {
-    std::cout << "\n=== Test 3: Parabolic Streamline v=[1,2x], y=x^2 ===" << std::endl;
-
-    // Create a unit-disk mesh using TestHelper
+static bool test2_RigidBodyRotation() {
+    std::cout << "\n=== Test 2: rigid rotation ===\n";
     auto mesh = TestHelper::createEllipse(0.0, 0.0, 1.0, 1.0, 360.0, 0.05);
-    std::cout << "Mesh created: " << mesh->vertices.size() << " vertices, " 
-              << mesh->triangles.size() << " triangles" << std::endl;
+    auto cf = std::make_shared<CrossField>(mesh);
+    setField(cf, mesh, [](const Point &p) {
+        return (normP(p) < 1e-12) ? M_PI_2 : std::atan2(p[1], p[0]) + M_PI_2;
+    });
 
-    // Create cross field encoding v(x,y) = [1, 2x]
-    // At each vertex the representative angle is theta = atan2(2x, 1)
-    auto crossField = std::make_shared<CrossField>(mesh);
-    crossField->u_k.resize(mesh->vertices.size());
-    for (int i = 0; i < (int)mesh->vertices.size(); ++i) {
-        double x = mesh->vertices[i][0];
-        double theta = std::atan2(2.0 * x, 1.0);
-        std::complex<double> u = std::exp(std::complex<double>(0.0, theta));
-        crossField->u_k[i] = u * u * u * u;   // 4-RoSy representation
+    FieldTracer tracer(cf, false);
+    const double r0 = 0.5;
+    // The field is tangent to the circle of radius r0 there, so the streamline
+    // is that circle: it never reaches the boundary and the walk runs until the
+    // step budget stops it.
+    auto path = traceToBoundary(tracer, *mesh, Point{r0, 0.0}, M_PI_2, 4000);
+    writePathToOBJ("test2_rotation.obj", path);
+
+    if (path.size() < 100) {
+        std::cerr << "FAIL: only " << path.size() << " points; a closed streamline should run on\n";
+        return false;
     }
+    double worst = 0.0;
+    for (const auto &tp : path) worst = std::max(worst, std::fabs(normP(tp.global_pos) - r0));
+    std::cout << "  " << path.size() << " points, max |r - " << r0 << "| = " << worst << "\n";
+    if (worst > 0.01) {
+        std::cerr << "FAIL: the streamline drifted off its circle\n";
+        return false;
+    }
+    std::cout << "PASS\n";
+    return true;
+}
 
-    // Trace from the origin; at (0,0) the field is [1,0], angle = 0
-    SeparatrixTrace tracer(crossField, false);
-    Point startPos = {0.0, 0.0};
-    double startAngle = 0.0;       // atan2(0,1) = 0
+//=============================================================================
+// 3: v = (1, 2x) -- the streamline through the origin is y = x^2
+//=============================================================================
+static bool test3_ParabolicStreamline() {
+    std::cout << "\n=== Test 3: v = (1, 2x), y = x^2 ===\n";
+    auto mesh = TestHelper::createEllipse(0.0, 0.0, 1.0, 1.0, 360.0, 0.05);
+    auto cf = std::make_shared<CrossField>(mesh);
+    setField(cf, mesh, [](const Point &p) { return std::atan2(2.0 * p[0], 1.0); });
 
-    auto path = traceTowardsBoundary(tracer, mesh, startPos, startAngle);
-
-    std::cout << "Traced " << path.size() << " points" << std::endl;
+    FieldTracer tracer(cf, false);
+    auto path = traceToBoundary(tracer, *mesh, Point{0.0, 0.0}, 0.0);
     writePathToOBJ("test3_parabolic.obj", path);
 
-    if (path.empty()) {
-        std::cerr << "FAIL: Empty path" << std::endl;
+    if (path.size() < 2) {
+        std::cerr << "FAIL: empty path\n";
         return false;
     }
-
-    // Exact streamline through (0,0): y = x^2  (C = 0)
-    // Measure max deviation |y_i - x_i^2| along the trace
-    double maxErr = 0.0;
-    int worstStep = 0;
-    for (size_t i = 0; i < path.size(); ++i) {
-        double x = path[i].global_pos[0];
-        double y = path[i].global_pos[1];
-        double err = std::abs(y - x * x);
-        if (err > maxErr) {
-            maxErr = err;
-            worstStep = (int)i;
-        }
+    double worst = 0.0;
+    for (const auto &tp : path) {
+        const double x = tp.global_pos[0], y = tp.global_pos[1];
+        worst = std::max(worst, std::fabs(y - x * x));
     }
+    const double endR = normP(path.back().global_pos);
+    std::cout << "  " << path.size() << " points, end radius " << endR
+              << ", max |y - x^2| = " << worst << "\n";
 
-    Point endPos = path.back().global_pos;
-    double endR  = std::sqrt(endPos[0] * endPos[0] + endPos[1] * endPos[1]);
-
-    std::cout << "End position: (" << endPos[0] << ", " << endPos[1] << "), radius: " << endR << std::endl;
-    std::cout << "Max |y - x^2| error: " << maxErr << " at step " << worstStep << std::endl;
-
-    // The trace should reach near the boundary (radius ≈ 1)
     if (endR < 0.7) {
-        std::cerr << "FAIL: Trace did not reach near boundary (endR = " << endR << ")" << std::endl;
+        std::cerr << "FAIL: did not reach the boundary\n";
         return false;
     }
-
-    // Allow ≤ 0.05 deviation from the exact parabola
-    if (maxErr > 0.05) {
-        std::cerr << "FAIL: Max streamline error " << maxErr << " exceeds tolerance 0.05" << std::endl;
+    if (worst > 0.01) {
+        std::cerr << "FAIL: deviation from the exact streamline is too large\n";
         return false;
     }
-
-    std::cout << "PASS" << std::endl;
+    std::cout << "PASS\n";
     return true;
 }
 
 //=============================================================================
-// Test 4: Singular Triangle Viertel Trace
+// 4-7: one singular triangle carrying the model of Sec. 3.2.2 exactly
+//
+// The field is set to f = e^{i d theta / 4} with theta the polar angle about
+// the singularity measured from the positive x axis, so the separatrices are at
+// 0, 2 pi/(4-d), ... by construction and the ports the tracer fits are checked
+// against those. Then a fan of streamlines is sent in through each edge and
+// each one is checked against the hyperbola it is supposed to be on: under
+// w = z^M with M = (4-d)/8, rho^2 sin(phi) cos(phi) is constant along it.
 //=============================================================================
-bool test4_SingularTriangleViertelTrace(double singularityIndex, std::array<double, 3> singularityBarycenter) {
-    std::cout << "\n=== Test n: Singular Triangle Viertel Trace ===" << std::endl;
+static bool test4_SingularTriangleSweep(double singularityIndex,
+                                        std::array<double, 3> singularityBarycenter) {
+    std::cout << "\n=== Singular triangle, index " << singularityIndex << ", singularity at ("
+              << singularityBarycenter[0] << ", " << singularityBarycenter[1] << ", "
+              << singularityBarycenter[2] << ") ===\n";
 
-    auto mesh = std::make_shared<Mesh>();
-    double R = 1.0;
-    
-    // T0 vertices (equilateral triangle)
-    Point v0 = {0.0, R};
-    Point v1 = {-R * std::sqrt(3.0) / 2.0, -R / 2.0};
-    Point v2 = { R * std::sqrt(3.0) / 2.0, -R / 2.0};
-    
-    // Outer dummy vertices to form neighbor triangles
-    Point v3 = {-R * std::sqrt(3.0), R};
-    Point v4 = {0.0, -R * 1.5};
-    Point v5 = {R * std::sqrt(3.0), R};
+    const double R = 1.0;
+    const Point v0{0.0, R};
+    const Point v1{-R * std::sqrt(3.0) / 2.0, -R / 2.0};
+    const Point v2{R * std::sqrt(3.0) / 2.0, -R / 2.0};
+    const Point v3{-R * std::sqrt(3.0), R};
+    const Point v4{0.0, -R * 1.5};
+    const Point v5{R * std::sqrt(3.0), R};
 
-    mesh->vertices = {v0, v1, v2, v3, v4, v5};
-    mesh->triangles = {
-        {0, 1, 2}, // T0: The singular triangle
-        {1, 0, 3}, // T1: Neighbor sharing (0,1)
-        {2, 1, 4}, // T2: Neighbor sharing (1,2)
-        {0, 2, 5}  // T3: Neighbor sharing (2,0)
-    };
-    mesh->triangleEdges = {
-        {0, 1, 2},
-        {0, 3, 4},
-        {1, 5, 6},
-        {2, 7, 8}
-    };
-    mesh->triangleAdjacency = {
-        {1, 2, 3},   // T0 adjacent to T1, T2, T3
-        {0, -1, -1}, // T1 adjacent back to T0
-        {0, -1, -1}, // T2 adjacent back to T0
-        {0, -1, -1}  // T3 adjacent back to T0
-    };
+    auto mesh = std::make_shared<Mesh>(std::vector<Point>{v0, v1, v2, v3, v4, v5},
+                                       std::vector<Triangle>{{0, 1, 2},   // the singular one
+                                                             {1, 0, 3},
+                                                             {2, 1, 4},
+                                                             {0, 2, 5}});
 
-    auto crossField = std::make_shared<CrossField>(mesh);
-    crossField->u_k.resize(6);
-    
-    // Field setup: choose u_k values so the linear interpolant has its zero at
-    // the desired singularityBarycenter (λ0, λ1, λ2).
-    // We need λ0*u0 + λ1*u1 + λ2*u2 = 0.
-    // Pick u0 and u1 freely, then solve for u2.
-    double lam0 = singularityBarycenter[0];
-    double lam1 = singularityBarycenter[1];
-    double lam2 = singularityBarycenter[2];
+    const Point sc = v0 * singularityBarycenter[0] + v1 * singularityBarycenter[1] +
+                     v2 * singularityBarycenter[2];
+    const double d = (singularityIndex > 0.0) ? 1.0 : -1.0;
 
-    // 1. Compute the exact global coordinates of the singularity
-    Point sc;
-    sc[0] = v0[0]*lam0 + v1[0]*lam1 + v2[0]*lam2;
-    sc[1] = v0[1]*lam0 + v1[1]*lam1 + v2[1]*lam2;
+    auto cf = std::make_shared<CrossField>(mesh);
+    setField(cf, mesh, [&](const Point &p) {
+        return d * std::atan2(p[1] - sc[1], p[0] - sc[0]) / 4.0;
+    });
+    cf->singularTriangles.emplace_back(0, singularityIndex);
 
-    // 2. Define the analytical cross field (d = 1 for +1/4, d = -1 for -1/4)
-    double d = (singularityIndex > 0) ? 1.0 : -1.0;
+    FieldTracer tracer(cf, true);
+    if (tracer.getSingularities().size() != 1) {
+        std::cerr << "FAIL: the singularity was not picked up\n";
+        return false;
+    }
+    const Singularity &s = tracer.getSingularities()[0];
+    const int nPorts = s.numPorts();
+    const double sector = 2.0 * M_PI / nPorts;
+    const double M = nPorts / 8.0;
 
-    // Helper to compute the exact representation vector u_k for any vertex
-    auto calc_u = [&](Point v) {
-        // Find angle of vertex relative to singularity
-        double theta = std::atan2(v[1] - sc[1], v[0] - sc[0]);
-        // Analytical field angle
-        double field_angle = (d * theta) / 4.0;
-        // Convert to representation vector e^(i * 4 * field_angle)
-        return std::complex<double>(std::cos(4.0 * field_angle), std::sin(4.0 * field_angle));
-    };
+    std::cout << "  centre (" << s.coordinates[0] << ", " << s.coordinates[1] << ") vs exact ("
+              << sc[0] << ", " << sc[1] << "), residual "
+              << s.portResidual * 180.0 / M_PI << " deg\n  ports";
+    for (double a : s.portAngles) std::cout << " " << a * 180.0 / M_PI;
+    std::cout << "\n";
 
-    crossField->u_k[0] = calc_u(v0);
-    crossField->u_k[1] = calc_u(v1);
-    crossField->u_k[2] = calc_u(v2);
-    
-    // Apply the exact analytical field to the outer boundary vertices as well!
-    crossField->u_k[3] = calc_u(v3);
-    crossField->u_k[4] = calc_u(v4);
-    crossField->u_k[5] = calc_u(v5);
-
-    // Mark T0 as singular with the given singularity index
-    crossField->singularTriangles.emplace_back(0, singularityIndex);
-
-    // Initialize tracer with useActualSingularityCoordinates=true so the
-    // constructor solves for the singularity location from u_k, landing at singularityBarycenter
-    SeparatrixTrace tracer(crossField, true);
-    tracer.dphi_singularity_zone = 0.001;
-    tracer.maxStepsInSingularityZone = 3000;
-    std::vector<std::vector<TracePoint>> allPaths;
-    std::vector<int> pathEdgeIndex; // which edge (0,1,2) each path came from, -1 for separatrices
-
-    // Save separatrices for visualization
-    for (const auto& sep : tracer.separatrices) {
-        allPaths.emplace_back(sep.path.begin(), sep.path.end());
-        pathEdgeIndex.push_back(-1); // separatrices don't belong to an entry edge
+    if (nPorts != static_cast<int>(4 - d)) {
+        std::cerr << "FAIL: " << nPorts << " ports, expected " << (4 - d) << "\n";
+        return false;
+    }
+    // The centre is where the interpolated representation vector vanishes,
+    // which is near the model's singularity but not equal to it: the three
+    // vertex values are unit vectors, and where their affine interpolant
+    // vanishes is decided by their directions rather than by where the field
+    // they were sampled from is singular. So this checks it lands inside the
+    // triangle and close, not that it lands exactly.
+    const std::array<double, 3> bc = tracer.barycentric(0, s.coordinates);
+    if (std::min({bc[0], bc[1], bc[2]}) <= 0.0) {
+        std::cerr << "FAIL: the centre came out outside its own triangle\n";
+        return false;
+    }
+    if (normP(s.coordinates - sc) > 0.2 * R) {
+        std::cerr << "FAIL: the centre is " << normP(s.coordinates - sc) << " from the model's\n";
+        return false;
+    }
+    // The field was built with a separatrix along the positive x axis, so the
+    // ports must land on multiples of the sector angle. This is what pins down
+    // the recovery of beta from the corner values: reading the model without
+    // its rotation of the direction gives ports that are wrong by a factor of
+    // -d/(4-d) and this test says so.
+    for (double a : s.portAngles) {
+        const double off = std::fabs(wrap_pi(a - sector * std::round(a / sector)));
+        if (off > 1.0 * M_PI / 180.0) {
+            std::cerr << "FAIL: port at " << a * 180.0 / M_PI << " deg is " << off * 180.0 / M_PI
+                      << " deg off a multiple of " << sector * 180.0 / M_PI << "\n";
+            return false;
+        }
     }
 
-    // Define the boundaries we will shoot streamlines from
-    struct EntryDef {
-        int neighborTri;
-        int localEdge; 
-        Point A; 
-        Point B; 
-    };
-    std::vector<EntryDef> entries = {
-        {1, 0, v1, v0}, // Edge 0
-        {2, 0, v2, v1}, // Edge 1
-        {3, 0, v0, v2}  // Edge 2
-    };
+    // A fan of streamlines in through each edge, each entering along the field.
+    const std::array<std::array<Point, 2>, 3> edgeEnds{
+        {{v0, v1}, {v1, v2}, {v2, v0}}};  // local edge e runs tri[e] -> tri[e+1]
+    int traced = 0;
+    double worstDrift = 0.0;
 
-    int successfulTraces = 0;
-    int numTracesPerEdge = 50;
     for (int e = 0; e < 3; ++e) {
-        auto def = entries[e];
-        for (int i = 1; i <= numTracesPerEdge; ++i) {
-            double t = i / (numTracesPerEdge + 1.0);
-            Point P;
-            P[0] = def.A[0] + (def.B[0] - def.A[0]) * t;
-            P[1] = def.A[1] + (def.B[1] - def.A[1]) * t;
+        const Point &A = edgeEnds[e][0];
+        const Point &B = edgeEnds[e][1];
+        for (int i = 1; i <= 50; ++i) {
+            const double t = i / 51.0;
+            const Point P = A * (1.0 - t) + B * t;
 
-            Separatrix sep;
-            sep.id = 100 + e * 10 + i;
-            sep.active = true;
-
-            TracePoint entry;
-            entry.face_id = def.neighborTri;
-            entry.global_pos = P;
-            entry.local_edge_index = def.localEdge;
-            entry.edge_crossing_t = t;
-            
-            // Calculate the entry field angle: orthogonal to the edge, pointing inward
-            double entryfieldAngle;
-            
-            Point edgeDir = {def.B[0] - def.A[0], def.B[1] - def.A[1]};
-            // Inward normal: rotate edge direction by -90 degrees (clockwise)
-            Point inwardNormal = {edgeDir[1], -edgeDir[0]};
-            // Check that it points inward (toward the centroid of T0 at the origin)
-            Point toCenter = {-P[0], -P[1]};
-            if (inwardNormal[0] * toCenter[0] + inwardNormal[1] * toCenter[1] < 0) {
-                // Flip if pointing outward
-                inwardNormal[0] = -inwardNormal[0];
-                inwardNormal[1] = -inwardNormal[1];
+            // The branch of the model field at P that points into the triangle.
+            const Point rel = P - s.coordinates;
+            const double omega = std::atan2(rel[1], rel[0]);
+            const Point inward = normalizeP(s.coordinates - P);
+            double dir = 0.0;
+            double bestDot = -2.0;
+            for (int k = 0; k < 4; ++k) {
+                const double a = d * omega / 4.0 + k * M_PI_2;
+                const double dot = std::cos(a) * inward[0] + std::sin(a) * inward[1];
+                if (dot > bestDot) { bestDot = dot; dir = a; }
             }
-            entryfieldAngle = std::atan2(inwardNormal[1], inwardNormal[0]);
-         
-            entry.trace_direction = entryfieldAngle;
 
-            // interpolate the field angle at the entry point using barycentric coordinates
-            // First compute barycentric coordinates of P in the neighbor triangle
-            auto bary = tracer.globalToBarycentric(def.neighborTri, P);
+            Walker w;
+            w.tri = 0;
+            w.pos = P;
+            w.entryEdge = e;
+            w.atVertex = -1;
+            w.dir = dir;
+            w.crossDir = dir;
 
-            // Then interpolate the field angle using the barycentric coordinates and the u_k values at the vertices
-            double theta0 = std::arg(crossField->u_k[0]) / 4.0;
-            double theta1 = std::arg(crossField->u_k[1]) / 4.0;
-            double theta2 = std::arg(crossField->u_k[2]) / 4.0;
-            theta1 = tracer.makeAngleSamePhase(theta0, theta1);
-            theta2 = tracer.makeAngleSamePhase(theta0, theta2);
-            double thetaInterp = theta0 * bary[0] + theta1 * bary[1] + theta2 * bary[2];
-            entry.field_angle = thetaInterp;
+            std::vector<TracePoint> path;
+            path.push_back(TracePoint{P, 0, dir});
+            const FieldTracer::Status st = tracer.advance(w, path);
 
-            sep.path.push_back(entry);
-
-            // Execute the analytical hyperbolic step
-            tracer.stepViertel(sep, true);
-
-            if (sep.path.size() < 2) {
-                std::cerr << "FAIL: Streamline " << sep.id << " did not find an exit." << std::endl;
+            if (st == FieldTracer::Status::Stuck) {
+                std::cerr << "FAIL: streamline from edge " << e << " at t = " << t << " got stuck\n";
+                return false;
+            }
+            if (path.size() < 2) {
+                std::cerr << "FAIL: streamline from edge " << e << " at t = " << t
+                          << " produced nothing\n";
                 return false;
             }
 
-            if (sep.path.size() < 3 && sep.termination_reason != TerminationReason::ORTHOGONAL_TO_SINGULARITY_SEPARATRIX) {
-                std::cerr << "FAIL: Streamline " << sep.id << " is too short. likely on wrong hyperbola." << std::endl;
-                for (const auto& pt : sep.path) {
-                    std::cout << "  pos=(" << pt.global_pos[0] << "," << pt.global_pos[1] 
-                              << ") field_angle=" << pt.field_angle 
-                              << " trace_dir=" << pt.trace_direction << std::endl;
+            // Every point should be on one hyperbola of the family: with theta
+            // measured from whichever port the sweep referred to, rho^2 sin phi
+            // cos phi does not change along the curve. Which port that is comes
+            // out of the first point.
+            auto invariant = [&](const Point &q, double ref, double sigma) {
+                const Point r = q - s.coordinates;
+                const double rho = std::pow(normP(r), M);
+                double th = sigma * (std::atan2(r[1], r[0]) - ref);
+                th = std::fmod(th, 2.0 * M_PI);
+                if (th < 0.0) th += 2.0 * M_PI;
+                const double phi = M * th;
+                return rho * rho * std::sin(phi) * std::cos(phi);
+            };
+            // A streamline entering along a port runs straight out along it:
+            // there the hyperbola has degenerated to its own asymptote and the
+            // invariant is zero in every frame, so it is checked for being
+            // straight instead.
+            {
+                const Point d = path.back().global_pos - path.front().global_pos;
+                const double len = normP(d);
+                double bend = 0.0;
+                if (len > 1e-12) {
+                    const Point n{-d[1] / len, d[0] / len};
+                    for (const auto &tp : path)
+                        bend = std::max(bend, std::fabs(dotP(tp.global_pos - path.front().global_pos, n)));
                 }
+                if (bend < 1e-9 * std::max(len, 1e-12)) { ++traced; continue; }
+            }
 
+            // Otherwise keep whichever frame the curve is actually constant in.
+            double bestSpread = std::numeric_limits<double>::max();
+            for (int k = 0; k < nPorts; ++k) {
+                for (double sigma : {1.0, -1.0}) {
+                    const double ref = s.portAngles[k];
+                    double lo = std::numeric_limits<double>::max(), hi = -lo, mean = 0.0;
+                    bool usable = true;
+                    for (const auto &tp : path) {
+                        const double a = invariant(tp.global_pos, ref, sigma);
+                        if (!std::isfinite(a) || a < 0.0) { usable = false; break; }
+                        lo = std::min(lo, a);
+                        hi = std::max(hi, a);
+                        mean += a;
+                    }
+                    if (!usable || path.empty()) continue;
+                    mean /= static_cast<double>(path.size());
+                    if (mean < 1e-12) continue;
+                    bestSpread = std::min(bestSpread, (hi - lo) / mean);
+                }
+            }
+            if (bestSpread > 0.02) {
+                std::cerr << "FAIL: streamline from edge " << e << " at t = " << t
+                          << " is not on a hyperbola of the family (spread " << bestSpread << ")\n";
                 return false;
             }
-            
-            allPaths.emplace_back(sep.path.begin(), sep.path.end());
-            pathEdgeIndex.push_back(e);
-            successfulTraces++;
+            worstDrift = std::max(worstDrift, bestSpread);
+            ++traced;
         }
     }
 
-    std::cout << "Successfully traced " << successfulTraces << " custom streamlines through the singular triangle." << std::endl;
-
-    // Generate separate VTK files for triangle, separatrices, and streamlines
-    // so each can be styled independently in ParaView
-    std::string basename = "test4_singular_triangle_idx" + std::to_string(singularityIndex) 
-                         + "_bary" + std::to_string(singularityBarycenter[0]) 
-                         + "_" + std::to_string(singularityBarycenter[1])
-                         + "_" + std::to_string(singularityBarycenter[2]);
-
-    // --- File 1: Triangle mesh (uncolored) ---
-    {
-        std::string filename = basename + "_mesh.vtk";
-        std::ofstream out(filename);
-        if (out.is_open()) {
-            out << "# vtk DataFile Version 3.0\n";
-            out << "Singular Triangle Mesh\n";
-            out << "ASCII\n";
-            out << "DATASET POLYDATA\n";
-            out << "POINTS 3 double\n";
-            out << v0[0] << " " << v0[1] << " 0\n";
-            out << v1[0] << " " << v1[1] << " 0\n";
-            out << v2[0] << " " << v2[1] << " 0\n";
-            out << "POLYGONS 1 4\n";
-            out << "3 0 1 2\n";
-            out.close();
-            std::cout << "Wrote triangle mesh to " << filename << std::endl;
-        }
-    }
-
-    // --- File 2: Separatrices (uncolored) ---
-    {
-        std::string filename = basename + "_separatrices.vtk";
-        // Collect separatrix paths
-        std::vector<const std::vector<TracePoint>*> sepPaths;
-        for (size_t p = 0; p < allPaths.size(); ++p) {
-            if (pathEdgeIndex[p] < 0) {
-                sepPaths.push_back(&allPaths[p]);
-            }
-        }
-
-        if (!sepPaths.empty()) {
-            int totalPts = 0;
-            for (const auto* path : sepPaths) totalPts += static_cast<int>(path->size());
-
-            std::ofstream out(filename);
-            if (out.is_open()) {
-                out << "# vtk DataFile Version 3.0\n";
-                out << "Separatrices\n";
-                out << "ASCII\n";
-                out << "DATASET POLYDATA\n";
-                out << "POINTS " << totalPts << " double\n";
-                for (const auto* path : sepPaths) {
-                    for (const auto& pt : *path) {
-                        out << pt.global_pos[0] << " " << pt.global_pos[1] << " 0\n";
-                    }
-                }
-
-                int numLines = static_cast<int>(sepPaths.size());
-                int linesListSize = 0;
-                for (const auto* path : sepPaths) linesListSize += 1 + static_cast<int>(path->size());
-                out << "LINES " << numLines << " " << linesListSize << "\n";
-
-                int ptOffset = 0;
-                for (const auto* path : sepPaths) {
-                    out << path->size();
-                    for (size_t i = 0; i < path->size(); ++i) {
-                        out << " " << (ptOffset + i);
-                    }
-                    out << "\n";
-                    ptOffset += static_cast<int>(path->size());
-                }
-
-                out.close();
-                std::cout << "Wrote separatrices to " << filename << std::endl;
-            }
-        }
-    }
-
-    // --- File 3: Streamlines (colored by entry edge) ---
-    {
-        std::string filename = basename + "_streamlines.vtk";
-        // Collect streamline paths and their edge indices
-        std::vector<const std::vector<TracePoint>*> streamPaths;
-        std::vector<int> streamEdgeIndex;
-        for (size_t p = 0; p < allPaths.size(); ++p) {
-            if (pathEdgeIndex[p] >= 0) {
-                streamPaths.push_back(&allPaths[p]);
-                streamEdgeIndex.push_back(pathEdgeIndex[p]);
-            }
-        }
-
-        if (!streamPaths.empty()) {
-            int totalPts = 0;
-            for (const auto* path : streamPaths) totalPts += static_cast<int>(path->size());
-
-            std::ofstream out(filename);
-            if (out.is_open()) {
-                out << "# vtk DataFile Version 3.0\n";
-                out << "Streamlines\n";
-                out << "ASCII\n";
-                out << "DATASET POLYDATA\n";
-                out << "POINTS " << totalPts << " double\n";
-                for (const auto* path : streamPaths) {
-                    for (const auto& pt : *path) {
-                        out << pt.global_pos[0] << " " << pt.global_pos[1] << " 0\n";
-                    }
-                }
-
-                int numLines = static_cast<int>(streamPaths.size());
-                int linesListSize = 0;
-                for (const auto* path : streamPaths) linesListSize += 1 + static_cast<int>(path->size());
-                out << "LINES " << numLines << " " << linesListSize << "\n";
-
-                int ptOffset = 0;
-                for (const auto* path : streamPaths) {
-                    out << path->size();
-                    for (size_t i = 0; i < path->size(); ++i) {
-                        out << " " << (ptOffset + i);
-                    }
-                    out << "\n";
-                    ptOffset += static_cast<int>(path->size());
-                }
-
-                // Cell data: color by entry edge (0, 1, 2)
-                out << "CELL_DATA " << numLines << "\n";
-                out << "SCALARS EdgeGroup int 1\n";
-                out << "LOOKUP_TABLE default\n";
-                for (int idx : streamEdgeIndex) {
-                    out << idx << "\n";
-                }
-
-                out.close();
-                std::cout << "Wrote streamlines to " << filename << std::endl;
-            }
-        }
-    }
-
-    std::cout << "PASS" << std::endl;
+    std::cout << "  " << traced << " streamlines, worst relative drift off the hyperbola "
+              << worstDrift << "\n";
+    std::cout << "PASS\n";
     return true;
 }
 
 //=============================================================================
-// Test registry and main
-//=============================================================================
-using TestFunc = std::function<bool()>;
-
-int main(int argc, char** argv) {
-    // Register all tests
-    std::map<int, std::pair<std::string, TestFunc>> tests = {
+int main(int argc, char **argv) {
+    std::map<int, std::pair<std::string, std::function<bool()>>> tests = {
         {1, {"ConstantFieldTrace", test1_ConstantFieldTrace}},
         {2, {"RigidBodyRotation", test2_RigidBodyRotation}},
         {3, {"ParabolicStreamline", test3_ParabolicStreamline}},
-        {4, {"SingularTriangleViertelTrace_1", []() { return test4_SingularTriangleViertelTrace(0.25, {1.0/3.0, 1.0/3.0, 1.0/3.0}); }}},
-        {5, {"SingularTriangleViertelTrace_2", []() { return test4_SingularTriangleViertelTrace(0.25, {2.0/5.0, 2.0/5.0, 1.0/5.0}); }}},
-        {6, {"SingularTriangleViertelTrace_3", []() { return test4_SingularTriangleViertelTrace(-0.25, {1.0/3.0, 1.0/3.0, 1.0/3.0}); }}},
-        {7, {"SingularTriangleViertelTrace_4", []() { return test4_SingularTriangleViertelTrace(-0.25, {2.0/5.0, 2.0/5.0, 1.0/5.0}); }}}
+        {4, {"SingularSweep_3port_centred",
+             [] { return test4_SingularTriangleSweep(0.25, {1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0}); }}},
+        {5, {"SingularSweep_3port_offcentre",
+             [] { return test4_SingularTriangleSweep(0.25, {2.0 / 5.0, 2.0 / 5.0, 1.0 / 5.0}); }}},
+        {6, {"SingularSweep_5port_centred",
+             [] { return test4_SingularTriangleSweep(-0.25, {1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0}); }}},
+        {7, {"SingularSweep_5port_offcentre",
+             [] { return test4_SingularTriangleSweep(-0.25, {2.0 / 5.0, 2.0 / 5.0, 1.0 / 5.0}); }}},
     };
 
-    std::vector<int> testsToRun;
-
-    if (argc > 1) {
-        // Run specific tests
-        for (int i = 1; i < argc; ++i) {
-            int testNum = std::atoi(argv[i]);
-            if (tests.find(testNum) != tests.end()) {
-                testsToRun.push_back(testNum);
-            } else {
-                std::cerr << "Unknown test number: " << testNum << std::endl;
-            }
-        }
-    } else {
-        // Run all tests
-        for (const auto& [num, _] : tests) {
-            testsToRun.push_back(num);
-        }
+    std::vector<int> toRun;
+    for (int i = 1; i < argc; ++i) {
+        const int n = std::atoi(argv[i]);
+        if (tests.count(n)) toRun.push_back(n);
+        else std::cerr << "Unknown test number: " << argv[i] << "\n";
     }
+    if (argc == 1) for (const auto &kv : tests) toRun.push_back(kv.first);
 
-    if (testsToRun.empty()) {
-        std::cout << "Available tests:" << std::endl;
-        for (const auto& [num, test] : tests) {
-            std::cout << "  " << num << ": " << test.first << std::endl;
-        }
-        return 0;
-    }
-
-    int passed = 0;
-    int failed = 0;
-
-    for (int testNum : testsToRun) {
-        const auto& [name, func] = tests[testNum];
+    int passed = 0, failed = 0;
+    for (const int n : toRun) {
         try {
-            if (func()) {
-                passed++;
-            } else {
-                failed++;
-            }
-        } catch (const std::exception& e) {
-            std::cerr << "Test " << testNum << " (" << name << ") threw exception: " << e.what() << std::endl;
-            failed++;
+            tests[n].second() ? ++passed : ++failed;
+        } catch (const std::exception &e) {
+            std::cerr << "Test " << n << " (" << tests[n].first << ") threw: " << e.what() << "\n";
+            ++failed;
         }
     }
-
-    std::cout << "\n=== Summary ===" << std::endl;
-    std::cout << "Passed: " << passed << "/" << (passed + failed) << std::endl;
-    
-    if (failed > 0) {
-        std::cout << "Failed: " << failed << std::endl;
-        return 1;
-    }
-
-    return 0;
+    std::cout << "\nPassed " << passed << "/" << (passed + failed) << "\n";
+    return failed ? 1 : 0;
 }

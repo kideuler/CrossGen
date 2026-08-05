@@ -23,7 +23,11 @@ public:
     CrossField(std::shared_ptr<Mesh> mesh, int maxIterations = 100)
     : mesh(mesh), maxIterations(maxIterations) {}; 
 
-    void initialize(int method = 0);
+    // `seed` 0 takes the seed from the clock, as before; anything else makes
+    // the random start of method 1 reproducible, which is what lets two runs of
+    // the pipeline be compared against each other rather than against the
+    // clock.
+    void initialize(int method = 0, unsigned seed = 0);
 
     void step();
 

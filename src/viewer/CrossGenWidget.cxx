@@ -58,9 +58,10 @@ MBOPhase nextMBOPhase(MBOPhase p) {
         case MBOPhase::CrossField:   return MBOPhase::Stepping;
         case MBOPhase::Stepping:     return MBOPhase::Separatrices;
         case MBOPhase::Separatrices: return MBOPhase::Trace;
-        case MBOPhase::Trace:        return MBOPhase::Trace;
+        case MBOPhase::Trace:        return MBOPhase::Layout;
+        case MBOPhase::Layout:       return MBOPhase::Layout;
     }
-    return MBOPhase::Trace;
+    return MBOPhase::Layout;
 }
 
 SIPGPhase nextSIPGPhase(SIPGPhase p) {
@@ -114,6 +115,7 @@ const char *mboPhaseName(MBOPhase p) {
         case MBOPhase::Stepping:     return "3) MBO stepping";
         case MBOPhase::Separatrices: return "4) separatrices";
         case MBOPhase::Trace:        return "5) trace";
+        case MBOPhase::Layout:       return "6) quad layout";
     }
     return "?";
 }
@@ -442,6 +444,7 @@ void CrossGenWidget::doReset() {
     sipgCutMesh_.reset();
     sipgUVParam_.reset();
     separatrixTrace_.reset();
+    quadLayout_.reset();
     delaunayMesh_.reset();
     medialAxis_.reset();
     oasis_.reset();
@@ -1064,6 +1067,35 @@ void CrossGenWidget::runComputations() {
         }
     }
 
+    // ── MBO: Build the quad layout the separatrices cut out ───────────────────
+    if (mode_ == Mode::MBO && mboPhase_ >= MBOPhase::Layout && separatrixTrace_ &&
+        !quadLayout_.has_value()) {
+        // Skipping ahead past the trace animation is allowed, so finish the
+        // tracing here rather than assuming a frame of it has run.
+        if (!separatrixTrace_->finishedTracing) {
+            separatrixTrace_->run();
+            mboTracingFinished_ = true;
+        }
+        auto t0 = Clock::now();
+        quadLayout_.emplace(*separatrixTrace_);
+        quadLayout_->build();
+        auto t1 = Clock::now();
+
+        const QuadLayout::Report &r = quadLayout_->getReport();
+        std::ostringstream oss;
+        oss << "[Layout] " << r.faces << " component(s), " << r.quadFaces << " four-sided, "
+            << r.nodes << " node(s), " << r.arcs << " arc(s), " << r.tJunctions
+            << " T-junction(s), "
+            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+        if (r.arcCrossings || r.danglingEnds) {
+            std::ostringstream bad;
+            bad << "[Layout] not a valid layout: " << r.arcCrossings
+                << " arc crossing(s) with no node, " << r.danglingEnds << " loose end(s)";
+            console_.log(bad.str());
+        }
+    }
+
     // ── SIPG: Initialize ──────────────────────────────────────────────────────
     if (sipgStageWantsField() && !sipgField_.has_value()) {
         auto t0 = Clock::now();
@@ -1635,7 +1667,13 @@ void CrossGenWidget::renderNormal() {
             }
         }
 
-        if (mboPhase_ >= MBOPhase::Separatrices && separatrixTrace_) {
+        // Once the layout exists it replaces the raw separatrices: its arcs are
+        // the same curves cut at the nodes, plus the pieces of the boundary
+        // that close the components, so drawing both would only double the
+        // interior lines and still leave the outline out.
+        if (mboPhase_ >= MBOPhase::Layout && quadLayout_.has_value()) {
+            viewer::drawQuadLayoutArcs(*quadLayout_, 3.0f);
+        } else if (mboPhase_ >= MBOPhase::Separatrices && separatrixTrace_) {
             glLineWidth(3.0f);
             for (const auto &sep : separatrixTrace_->separatrices) {
                 if (sep.path.size() < 2) continue;
