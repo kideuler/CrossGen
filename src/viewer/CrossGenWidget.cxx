@@ -80,9 +80,10 @@ UMBERPhase nextUMBERPhase(UMBERPhase p) {
         case UMBERPhase::CrossField: return UMBERPhase::Stepping;
         case UMBERPhase::Stepping:   return UMBERPhase::Frames;
         case UMBERPhase::Frames:     return UMBERPhase::Polysquare;
-        case UMBERPhase::Polysquare: return UMBERPhase::Polysquare;
+        case UMBERPhase::Polysquare: return UMBERPhase::Blocks;
+        case UMBERPhase::Blocks:     return UMBERPhase::Blocks;
     }
-    return UMBERPhase::Polysquare;
+    return UMBERPhase::Blocks;
 }
 
 MedialAxisPhase nextMedialAxisPhase(MedialAxisPhase p) {
@@ -135,6 +136,7 @@ const char *umberPhaseName(UMBERPhase p) {
         case UMBERPhase::Stepping:   return "3) SIPG stepping";
         case UMBERPhase::Frames:     return "4) UMBER frame field";
         case UMBERPhase::Polysquare: return "5) polysquare (Sec. 4.3)";
+        case UMBERPhase::Blocks:     return "6) block structure (Sec. 5)";
     }
     return "?";
 }
@@ -447,6 +449,7 @@ void CrossGenWidget::doReset() {
     umber_.reset();
     umberCut_.reset();
     polysquare_.reset();
+    blocks_.reset();
     umberCorners_.clear();
     umberInternal_.clear();
 
@@ -473,6 +476,7 @@ void CrossGenWidget::doReset() {
     umberAttempted_       = false;
     polysquareAnnounced_  = false;
     polysquareAttempted_  = false;
+    blocksAttempted_      = false;
 
     view_.cx    = 0.5 * (bounds_.minx + bounds_.maxx);
     view_.cy    = 0.5 * (bounds_.miny + bounds_.maxy);
@@ -877,6 +881,7 @@ void CrossGenWidget::runPolysquare() {
         polysquare_->solve();
     } catch (const std::exception &e) {
         polysquare_.reset();
+    blocks_.reset();
         console_.log(std::string("[Polysquare] FAILED: ") + e.what());
         std::cerr << "[Viewer] Polysquare failed: " << e.what() << "\n";
         return;
@@ -916,6 +921,33 @@ void CrossGenWidget::runPolysquare() {
     uvView_.zoom = 1.0;
     uvView_.fbw = view_.fbw;
     uvView_.fbh = view_.fbh;
+}
+
+// The iso-line tracing of Sec. 5. Milliseconds, so it just runs.
+void CrossGenWidget::runBlocks() {
+    blocksAttempted_ = true;
+    if (!polysquare_.has_value()) return;
+
+    auto t0 = Clock::now();
+    try {
+        blocks_.emplace(*polysquare_);
+        blocks_->build();
+    } catch (const std::exception &e) {
+        blocks_.reset();
+        console_.log(std::string("[Blocks] FAILED: ") + e.what());
+        std::cerr << "[Viewer] MotorcycleGraph failed: " << e.what() << "\n";
+        return;
+    }
+    auto t1 = Clock::now();
+
+    const MotorcycleGraph::Report &r = blocks_->getReport();
+    std::ostringstream oss;
+    oss << "[Blocks] " << r.blocks << " block(s) from " << r.motorcycles << " iso-line(s), "
+        << r.crossings << " crossing(s), " << r.nodes << " node(s), "
+        << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+    console_.log(oss.str());
+    console_.log("[Blocks] yellow = polysquare corner, green = line leaving the model, "
+                 "cyan = crossing");
 }
 
 // ── phase advancement ────────────────────────────────────────────────────────
@@ -1094,6 +1126,12 @@ void CrossGenWidget::runComputations() {
         } else {
             runPolysquare();
         }
+    }
+
+    // ── UMBER: the block structure of Sec. 5 ─────────────────────────────────
+    if (mode_ == Mode::UMBER && umberPhase_ >= UMBERPhase::Blocks &&
+        polysquare_.has_value() && !blocksAttempted_) {
+        runBlocks();
     }
 
     // ── SIPG: Cut seams from converged SIPG field ─────────────────────────────
@@ -1638,8 +1676,24 @@ void CrossGenWidget::renderNormal() {
         const int w = fbw();
         const int halfW = w / 2;
 
+        // The block structure replaces the frame on the left once it exists:
+        // the iso-lines are drawn over the mesh they curve through, and the
+        // arrows underneath would only crowd them.
+        const bool showBlocks = (umberPhase_ >= UMBERPhase::Blocks && blocks_.has_value());
+
         applyHalfOrtho(0, halfW, view_);
-        renderUMBERField();
+        if (showBlocks) {
+            viewer::drawMesh(*mesh_);
+            if (umberCut_.has_value()) {
+                if (!umberCut_->getCutEdges().empty())
+                    viewer::drawEdgeSetOnMesh(*mesh_, umberCut_->getCutEdges(), 1.0f, 0.2f, 0.9f, 2.0f);
+                viewer::drawBlockBoundary(*polysquare_, *umberCut_, false, 4.0f);
+            }
+            viewer::drawBlockEdges(*blocks_, false, 4.0f);
+            viewer::drawBlockNodes(*blocks_, false, 0.3 * avgEdge_);
+        } else {
+            renderUMBERField();
+        }
 
         applyHalfOrtho(halfW, w - halfW, uvView_);
         viewer::drawFlippedPolysquareTriangles(*polysquare_);
@@ -1661,8 +1715,15 @@ void CrossGenWidget::renderNormal() {
             viewer::computeWorldBox(left, leftW, leftH);
             viewer::computeWorldBox(right, rightW, rightH);
 
-            const double uvRadius = 0.5 * avgEdge_ * (leftW > 0.0 ? rightW / leftW : 1.0);
-            viewer::drawPolysquareCorners(*polysquare_, *umberCut_, umberCorners_, uvRadius);
+            const double scaleToUV = (leftW > 0.0) ? rightW / leftW : 1.0;
+            const double uvRadius = 0.5 * avgEdge_ * scaleToUV;
+            if (showBlocks) {
+                viewer::drawBlockBoundary(*polysquare_, *umberCut_, true, 4.0f);
+                viewer::drawBlockEdges(*blocks_, true, 4.0f);
+                viewer::drawBlockNodes(*blocks_, true, 0.3 * avgEdge_ * scaleToUV);
+            } else {
+                viewer::drawPolysquareCorners(*polysquare_, *umberCut_, umberCorners_, uvRadius);
+            }
         }
 
         drawSplitDivider(halfW);

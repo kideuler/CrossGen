@@ -23,6 +23,7 @@
 #include "tracing/SeparatrixTrace.hxx"
 #include "medialaxis/MedialAxis.hxx"
 #include "OASIS/OASIS.hxx"
+#include "UMBER/MotorcycleGraph.hxx"
 #include "UMBER/UMBER.hxx"
 
 // ── Enumerations mirroring the original viewer state machine ──────────────────
@@ -73,6 +74,7 @@ enum class UMBERPhase {
     Stepping   = 3,
     Frames     = 4,
     Polysquare = 5,
+    Blocks     = 6,
 };
 
 // OASIS is a one-shot solve driven by a parameter dialog rather than a
@@ -140,6 +142,10 @@ private:
     // field (Sec. 4.3). Blocking for the same reason.
     void runPolysquare();
 
+    // Trace the iso-lines and label the blocks (Sec. 5). Fast enough not to
+    // need the announce-a-frame-ahead treatment the two solves get.
+    void runBlocks();
+
     // The mesh with the optimized frame, its cuts and its boundary corners --
     // the left half of the split screen, and the whole of the Frames phase.
     void renderUMBERField();
@@ -189,6 +195,7 @@ private:
     std::optional<HarmonicCut>  umberCut_;
     std::optional<UMBER>        umber_;
     std::optional<Polysquare>   polysquare_;
+    std::optional<MotorcycleGraph> blocks_;
     // Cached results of the solve: recomputing them per frame would walk every
     // vertex star for nothing.
     std::vector<std::pair<int, int>>    umberCorners_;   // (vertex, quarter turns)
@@ -243,6 +250,7 @@ private:
     bool umberAttempted_       = false;
     bool polysquareAnnounced_  = false;
     bool polysquareAttempted_  = false;
+    bool blocksAttempted_      = false;
 
     // ── view / camera ────────────────────────────────────────────────────────
     viewer::ViewState view_;     // mesh-space view (left panel)

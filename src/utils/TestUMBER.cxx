@@ -9,6 +9,7 @@
 
 #include "Parameterization/HarmonicCut.hxx"
 #include "SIPG/SIPG.hxx"
+#include "UMBER/MotorcycleGraph.hxx"
 #include "UMBER/Polysquare.hxx"
 #include "UMBER/UMBER.hxx"
 
@@ -180,11 +181,40 @@ int main(int argc, char **argv) {
         const size_t dot = stem.find_last_of('.');
         if (dot != std::string::npos) stem = stem.substr(0, dot);
 
+        // --- Meta-block structure, Sec. 5 (motorcycle graph only) -----------
+        MotorcycleGraph mg(poly);
+        mg.build();
+        const MotorcycleGraph::Report &mr = mg.getReport();
+        std::cout << std::defaultfloat
+                  << "  blocks: " << mr.blocks << " from " << mr.motorcycles << " motorcycle(s) ("
+                  << mr.reachedBoundary << " reached the boundary, "
+                  << mr.crossings << " crossing(s)";
+        if (mr.ranOut > 0) std::cout << ", " << mr.ranOut << " ran out";
+        if (mr.skippedCorners > 0)
+            std::cout << ", " << mr.skippedCorners << " direction(s) the polysquare had no room for";
+        std::cout << "), " << mr.nodes << " node(s), smallest block " << mr.smallestBlock << " triangles";
+        if (mr.mergedSlivers > 0)
+            std::cout << ", " << mr.mergedSlivers << " unresolved block(s) folded in";
+        std::cout << "\n";
+
+        if (mr.ranOut == 0)
+            std::cout << "\033[32m[PASS]\033[0m Every iso-line reached the boundary.\n";
+        else if (pr.flips > 0 || mr.skippedCorners > 0)
+            std::cout << "  (" << mr.ranOut << " ray(s) stopped early, where the parameterization "
+                      << "is already inconsistent)\n";
+        else
+            std::cout << "\033[31m[FAIL]\033[0m " << mr.ranOut
+                      << " iso-line(s) did not reach the boundary.\n";
+
         const std::string uvFile = stem + "_polysquare.vtu";
         const std::string srcFile = stem + "_source.vtu";
-        if (poly.writeVTU(uvFile) && poly.writeSourceVTU(srcFile))
-            std::cout << "  wrote " << uvFile << " (parameter domain) and " << srcFile
-                      << " (input domain, uv as a point field)\n";
+        const std::string blkFile = stem + "_blocks.vtu";
+        const std::string trcFile = stem + "_motorcycles.vtu";
+        if (poly.writeVTU(uvFile) && poly.writeSourceVTU(srcFile) &&
+            mg.writeBlocksVTU(blkFile) && mg.writeTracesVTU(trcFile))
+            std::cout << "  wrote " << uvFile << " (parameter domain), " << srcFile
+                      << " (input domain, uv as a point field),\n         " << blkFile
+                      << " (blocks as cell data) and " << trcFile << " (the traces)\n";
         else
             std::cout << "\033[31m[FAIL]\033[0m could not write the VTK output.\n";
     } catch (const std::exception &e) {

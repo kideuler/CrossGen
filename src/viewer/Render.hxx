@@ -15,6 +15,7 @@
 #include "crossfield/CrossField.hxx"
 #include "sipg/SIPG.hxx"
 #include "medialaxis/MedialAxis.hxx"
+#include "UMBER/MotorcycleGraph.hxx"
 #include "UMBER/Polysquare.hxx"
 
 namespace viewer {
@@ -144,6 +145,26 @@ void drawPolysquareStructure(const Polysquare &ps, const HarmonicCut &hc);
 // appears once on each bank.
 void drawPolysquareCorners(const Polysquare &ps, const HarmonicCut &hc,
                            const std::vector<std::pair<int, int>> &corners, double radius);
+
+// ── UMBER block structure ────────────────────────────────────────────────────
+
+// The edges of the block decomposition: the iso-lines, which are straight in
+// the parameter domain and curved on the model. `parameterDomain` picks which
+// of the two each segment is drawn in; the segments carry both, so the same
+// call serves either half of a split screen.
+void drawBlockEdges(const MotorcycleGraph &mg, bool parameterDomain, float lineWidth);
+
+// The boundary of the model is an edge of the block decomposition too -- the
+// blocks along it are closed by it -- so it is drawn in the same colour and
+// weight as the traced lines. The banks of the cuts are skipped: those are
+// interior seams that the blocks run straight through.
+void drawBlockBoundary(const Polysquare &ps, const HarmonicCut &hc,
+                       bool parameterDomain, float lineWidth);
+
+// The nodes where those edges meet, coloured by what kind of node it is:
+// yellow for a corner of the polysquare, green where a line leaves the model,
+// cyan where two lines cross.
+void drawBlockNodes(const MotorcycleGraph &mg, bool parameterDomain, double radius);
 
 } // namespace viewer
 

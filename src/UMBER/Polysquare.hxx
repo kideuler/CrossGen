@@ -191,6 +191,15 @@ public:
     // M_C, whose triangles carry the same indices as the input mesh's.
     const Mesh& getCutMesh() const { return *cutMesh; }
 
+    // The mesh the whole thing was built on.
+    const Mesh& getMesh() const { return *orig; }
+    std::shared_ptr<Mesh> getMeshPtr() const { return orig; }
+
+    // The frame field's corner index per original vertex, in quarter turns,
+    // which is where the boundary of the polysquare turns: +1 convex, -1
+    // reflex, 0 everywhere else.
+    const std::vector<int>& getBoundaryCorners() const { return boundaryCorner; }
+
     // k of Pi_gamma = R(k*90 degrees) per cut, in the order HarmonicCut made
     // them. All zero means the field asked for a common polysquare; anything
     // else is the closed form using its harmonic degrees of freedom.

@@ -1034,5 +1034,73 @@ void drawPolysquareCorners(const Polysquare &ps, const HarmonicCut &hc,
     }
 }
 
+// ── UMBER block structure ────────────────────────────────────────────────────
+
+namespace {
+// One colour for every edge of the block decomposition, traced or boundary.
+inline void blockEdgeColour() { glColor3f(1.0f, 0.75f, 0.15f); }
+} // namespace
+
+void drawBlockEdges(const MotorcycleGraph &mg, bool parameterDomain, float lineWidth) {
+    const auto &segs = mg.getSegments();
+    if (segs.empty()) return;
+
+    blockEdgeColour();
+    glLineWidth(lineWidth);
+    glBegin(GL_LINES);
+    for (const auto &s : segs) {
+        const Point &a = parameterDomain ? s.ua : s.a;
+        const Point &b = parameterDomain ? s.ub : s.b;
+        glVertex2d(a[0], a[1]);
+        glVertex2d(b[0], b[1]);
+    }
+    glEnd();
+    glLineWidth(1.0f);
+}
+
+void drawBlockBoundary(const Polysquare &ps, const HarmonicCut &hc,
+                       bool parameterDomain, float lineWidth) {
+    const auto &uv = ps.getUV();
+    const Mesh &cm = ps.getCutMesh();
+    if (uv.empty()) return;
+    const int nV = static_cast<int>(uv.size());
+    const auto &toOrig = hc.getCutVertexToOriginal();
+    const auto &cuts = hc.getCutEdges();
+
+    blockEdgeColour();
+    glLineWidth(lineWidth);
+    glBegin(GL_LINES);
+    for (int e : cm.boundaryEdges) {
+        const int a = cm.edges[e][0], b = cm.edges[e][1];
+        if (a < 0 || a >= nV || b < 0 || b >= nV) continue;
+        if (a >= static_cast<int>(toOrig.size()) || b >= static_cast<int>(toOrig.size())) continue;
+        if (cuts.count(MeshEdgeKey(toOrig[a], toOrig[b]))) continue; // a seam, not an edge
+
+        const Point &pa = parameterDomain ? uv[a] : cm.vertices[a];
+        const Point &pb = parameterDomain ? uv[b] : cm.vertices[b];
+        glVertex2d(pa[0], pa[1]);
+        glVertex2d(pb[0], pb[1]);
+    }
+    glEnd();
+    glLineWidth(1.0f);
+}
+
+void drawBlockNodes(const MotorcycleGraph &mg, bool parameterDomain, double radius) {
+    for (const auto &n : mg.getNodes()) {
+        const Point &p = parameterDomain ? n.uv : n.xy;
+        switch (n.kind) {
+            case MotorcycleGraph::Node::Corner:
+                drawDisk3D(p, radius, 0.95f, 0.85f, 0.1f);
+                break;
+            case MotorcycleGraph::Node::BoundaryEnd:
+                drawDisk3D(p, radius, 0.1f, 0.9f, 0.3f);
+                break;
+            case MotorcycleGraph::Node::Crossing:
+                drawDisk3D(p, radius, 0.1f, 0.85f, 0.95f);
+                break;
+        }
+    }
+}
+
 } // namespace viewer
 

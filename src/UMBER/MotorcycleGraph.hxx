@@ -1,0 +1,188 @@
+#ifndef __MOTORCYCLEGRAPH_HXX__
+#define __MOTORCYCLEGRAPH_HXX__
+
+#include <string>
+#include <unordered_set>
+#include <vector>
+
+#include "UMBER/Polysquare.hxx"
+#include "mesh/Mesh.hxx"
+
+// The meta-block structure of
+//   Wang, Ren, Fang, Lin, Xu, Bao and Huang, "IGA-suitable planar
+//   parameterization with patch structure simplification of closed-form
+//   polysquare", CMAME 392 (2022) 114678, Section 5, first paragraph:
+//   "we construct the meta-block of Omega via the motorcycle graph [60]. The
+//   resulting patch structure is made up of the tracing iso-lines (iso-curves)
+//   on Omega from the corners, which tessellate Omega into a set of
+//   non-degenerate quad patches."
+//
+// Only that: the blocks, not the simplification of Sec. 5.1 onwards.
+//
+// A polysquare boundary is made of axis-aligned segments, so its image is a
+// rectilinear domain, and cutting a rectilinear domain into rectangles is done
+// by sending a ray inward from each reflex corner. That is what the
+// motorcycles are. A convex corner needs nothing -- its two boundary segments
+// are already iso-lines -- and a straight run of boundary needs nothing
+// either, so the only sources are the corners the frame field marked with a
+// negative index. A reflex corner (270 degrees in the image) has two axis
+// directions pointing into the domain and a 360-degree one has three; each
+// gets a motorcycle.
+//
+// The rays are traced through the mesh rather than in the plane, which is what
+// makes the result independent of whether the parameterization's image happens
+// to overlap itself: a ray is a straight line in the parameter domain, so
+// inside one triangle it is a straight line in the model too (phi is affine
+// there), and crossing into the next triangle only needs the direction carried
+// over. Across a cut the two triangles disagree about which way the parameter
+// axes point, and the rotation between them is read off the shared edge --
+// its image has the same length on both banks and differs by exactly the
+// transition, so no bookkeeping of Pi_gamma is needed here.
+//
+// The rays are not stopped where they meet each other, which is the one place
+// this departs from the motorcycle graph of [60] as usually written. Every
+// iso-line is drawn from its corner until it leaves the model, and two of them
+// simply cross. The reason is the sentence Sec. 5 opens with: the meta-block
+// structure "has neither T-junction nor internal singularity". A ray halted on
+// another ray's trail ends in the middle of the domain, and that end is a
+// T-junction; only lines carried through to the boundary avoid them. It also
+// removes a dependence on arrival order that has nothing to do with the model:
+// two rays leaving one corner can be handed the same triangle of its star when
+// the mesh is coarse there -- they are 90 degrees apart but the wedge spans
+// enough for both -- and they can only leave it through its one free edge, so
+// whichever went second would die one step out. That is what cost
+// data/meshes/geom005 a trace and a block.
+class MotorcycleGraph {
+public:
+    using EdgeKey = MeshEdgeKey;
+    using EdgeKeyHash = MeshEdgeKeyHash;
+
+    struct Report {
+        int motorcycles = 0;    // rays launched, one per interior axis at a reflex corner
+        // Places two iso-lines actually cross, found by intersecting the steps
+        // that share a triangle rather than by counting edges twice marked --
+        // which overcounts, since two rays out of one corner share the first
+        // edge out of the triangle they start in.
+        int crossings = 0;
+        int reachedBoundary = 0;
+        // Rays that neither crashed nor left the model. On a locally
+        // injective parameterization this stays zero; a folded triangle
+        // reverses the direction a ray reads there, so one can circle instead
+        // of going anywhere, and the step cap is what ends it.
+        int ranOut = 0;
+        // Rays the corner index called for that the parameterization has no
+        // room for. Zero unless Sec. 4.3 left something inconsistent there.
+        int skippedCorners = 0;
+        int nodes = 0;         // corners, exits and crossings of the block structure
+        int blocks = 0;
+        int mergedSlivers = 0;  // blocks the mesh could not resolve, folded into a neighbour
+        int smallestBlock = 0;  // triangles in the smallest block
+        int tracedEdges = 0;
+    };
+
+    // The polysquare must have been solved; its corners and its (u, v) are
+    // what the tracing follows.
+    explicit MotorcycleGraph(const Polysquare &ps);
+
+    // Launch the rays, then label the triangles.
+    void build();
+
+    // Block index per triangle of the *original* mesh, which the cut mesh
+    // shares. -1 only if the mesh has a triangle no flood reached, which
+    // cannot happen on a connected mesh.
+    const std::vector<int>& getBlockOfTriangle() const { return blockOfTriangle; }
+    int numBlocks() const { return report_.blocks; }
+
+    // The rays, as polylines in model coordinates.
+    const std::vector<std::vector<Point>>& getTraces() const { return traces; }
+
+    // One step of one ray, carried in both domains. A segment lies inside a
+    // single triangle, which is what makes its image exact: phi is affine
+    // there, so the straight line in the parameter domain and the straight
+    // line in the model are the same segment seen twice. Keeping the two ends
+    // of a step together also keeps the seams right -- a point on a cut has an
+    // image on each bank, and the one that belongs to a step is the one taken
+    // in the triangle that step runs through.
+    struct Segment {
+        Point a{0.0, 0.0}, b{0.0, 0.0};    // model
+        Point ua{0.0, 0.0}, ub{0.0, 0.0};  // parameter domain
+        int tri = -1;
+        int ray = -1;
+    };
+    const std::vector<Segment>& getSegments() const { return segments; }
+
+    // A node of the block structure: where its edges meet.
+    struct Node {
+        Point xy{0.0, 0.0};
+        Point uv{0.0, 0.0};
+        enum Kind { Corner, BoundaryEnd, Crossing } kind = Corner;
+    };
+    // Every corner of the polysquare, every point an iso-line leaves the model
+    // at, and every point two of them cross. Corners include the convex ones,
+    // which launch no ray but are corners of a block all the same.
+    const std::vector<Node>& getNodes() const { return nodes; }
+
+    // Mesh edges a ray crossed. These are the walls the blocks are flooded
+    // between, so a block boundary follows mesh edges even though the ray
+    // itself cuts through triangle interiors -- see writeBlocksVTU().
+    const std::unordered_set<EdgeKey, EdgeKeyHash>& getTracedEdges() const { return tracedEdges; }
+
+    const Report& getReport() const { return report_; }
+
+    // The input mesh with the block index as cell data.
+    //
+    // A ray crosses triangles rather than following their edges, so a triangle
+    // the ray passes through belongs to whichever side reached it first and
+    // the block outlines are ragged at the scale of one triangle. The blocks
+    // themselves -- how many, which parts of the model they cover, what they
+    // are adjacent to -- do not depend on that.
+    bool writeBlocksVTU(const std::string &filename) const;
+
+    // The rays themselves, as polylines, to see where the block walls run
+    // without the triangle-level raggedness.
+    bool writeTracesVTU(const std::string &filename) const;
+
+private:
+    // A ray in flight: which triangle it is in, where, the parameter-domain
+    // direction it follows, and how far it has come.
+    struct Motorcycle {
+        int tri = -1;
+        Point pos{0.0, 0.0};    // model coordinates
+        Point dir{1.0, 0.0};    // parameter-domain direction, unit
+        double distance = 0.0;
+        int id = -1;
+        int steps = 0;
+        bool alive = true;
+    };
+
+    void launch();
+    void run();
+    void findNodes();
+    void floodBlocks();
+
+    // Where a point of triangle f lands in the parameter domain.
+    Point imageOfPoint(int f, const Point &p) const;
+
+    // grad phi of one triangle, and its inverse.
+    void triangleJacobian(int f, double J[2][2]) const;
+    // Where the ray leaves triangle f, and through which edge.
+    bool exitPoint(int f, const Point &from, const Point &meshDir,
+                   Point &hit, int &edge, double &along) const;
+
+    const Polysquare *poly = nullptr;
+    const Mesh *mesh = nullptr;      // the original mesh
+    const Mesh *cut = nullptr;       // M_C, same triangles
+    const std::vector<Point> *uv = nullptr;
+
+    std::vector<Motorcycle> bikes;
+    std::vector<std::vector<Point>> traces;
+    std::vector<Segment> segments;
+    std::vector<Node> nodes;
+    std::unordered_set<EdgeKey, EdgeKeyHash> tracedEdges;
+    std::vector<int> blockOfTriangle;
+    std::vector<char> onWall;   // a ray passed through this triangle
+
+    Report report_;
+};
+
+#endif // __MOTORCYCLEGRAPH_HXX__
