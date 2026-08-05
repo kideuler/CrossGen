@@ -79,9 +79,10 @@ UMBERPhase nextUMBERPhase(UMBERPhase p) {
         case UMBERPhase::MeshOnly:   return UMBERPhase::CrossField;
         case UMBERPhase::CrossField: return UMBERPhase::Stepping;
         case UMBERPhase::Stepping:   return UMBERPhase::Frames;
-        case UMBERPhase::Frames:     return UMBERPhase::Frames;
+        case UMBERPhase::Frames:     return UMBERPhase::Polysquare;
+        case UMBERPhase::Polysquare: return UMBERPhase::Polysquare;
     }
-    return UMBERPhase::Frames;
+    return UMBERPhase::Polysquare;
 }
 
 MedialAxisPhase nextMedialAxisPhase(MedialAxisPhase p) {
@@ -133,6 +134,7 @@ const char *umberPhaseName(UMBERPhase p) {
         case UMBERPhase::CrossField: return "2) SIPG crossfield";
         case UMBERPhase::Stepping:   return "3) SIPG stepping";
         case UMBERPhase::Frames:     return "4) UMBER frame field";
+        case UMBERPhase::Polysquare: return "5) polysquare (Sec. 4.3)";
     }
     return "?";
 }
@@ -386,9 +388,7 @@ void CrossGenWidget::mouseMoveEvent(QMouseEvent *event) {
 
     // Scale from logical pixels to physical pixels for pan calculation
     double dpr = devicePixelRatio();
-    bool inUVSplitScreen = (mode_ == Mode::SIPG && sipgPhase_ == SIPGPhase::UVMesh && sipgUVParam_.has_value()) ||
-                           (mode_ == Mode::PolyVector && phase_ == Phase::UVMesh && miqSolver_.has_value());
-    bool panRight = inUVSplitScreen && (lastMousePos_.x() * dpr > fbw() / 2);
+    bool panRight = inUVSplitScreen() && (lastMousePos_.x() * dpr > fbw() / 2);
     if (panRight)
         viewer::panView(uvView_, delta.x() * dpr, delta.y() * dpr);
     else
@@ -421,9 +421,7 @@ void CrossGenWidget::wheelEvent(QWheelEvent *event) {
     double cy = event->pos().y() * dpr;
 #endif
     // zoomView: positive scrollSteps => pow(0.9, positive) < 1 => zoom shrinks => zooms in ✓
-    bool inUVSplitScreen = (mode_ == Mode::SIPG && sipgPhase_ == SIPGPhase::UVMesh && sipgUVParam_.has_value()) ||
-                           (mode_ == Mode::PolyVector && phase_ == Phase::UVMesh && miqSolver_.has_value());
-    bool zoomRight = inUVSplitScreen && (cx > fbw() / 2);
+    bool zoomRight = inUVSplitScreen() && (cx > fbw() / 2);
     if (zoomRight)
         viewer::zoomView(uvView_, scrollSteps, cx - fbw() / 2, cy);
     else
@@ -448,6 +446,7 @@ void CrossGenWidget::doReset() {
     oasisGuide_.reset();
     umber_.reset();
     umberCut_.reset();
+    polysquare_.reset();
     umberCorners_.clear();
     umberInternal_.clear();
 
@@ -472,6 +471,8 @@ void CrossGenWidget::doReset() {
     sipgStepCount_        = 0;
     umberAnnounced_       = false;
     umberAttempted_       = false;
+    polysquareAnnounced_  = false;
+    polysquareAttempted_  = false;
 
     view_.cx    = 0.5 * (bounds_.minx + bounds_.maxx);
     view_.cy    = 0.5 * (bounds_.miny + bounds_.maxy);
@@ -863,6 +864,60 @@ void CrossGenWidget::runUMBER() {
     }
 }
 
+// The frame field guided deformation of Sec. 4.3. Blocking like runUMBER, and
+// on the same scale: the Poisson solve of Eq. (6) is one factorization and the
+// Eq. (9) continuation is a few thousand L-BFGS iterations.
+void CrossGenWidget::runPolysquare() {
+    polysquareAttempted_ = true;
+    if (!umber_.has_value() || !umberCut_.has_value()) return;
+
+    auto t0 = Clock::now();
+    try {
+        polysquare_.emplace(*umber_, *umberCut_);
+        polysquare_->solve();
+    } catch (const std::exception &e) {
+        polysquare_.reset();
+        console_.log(std::string("[Polysquare] FAILED: ") + e.what());
+        std::cerr << "[Viewer] Polysquare failed: " << e.what() << "\n";
+        return;
+    }
+    auto t1 = Clock::now();
+
+    const Polysquare::Report &r = polysquare_->getReport();
+    {
+        std::ostringstream oss;
+        oss << "[Polysquare] " << r.iterations << " L-BFGS iterations, transitions";
+        for (int k : polysquare_->getTransitions()) oss << " " << k * 90 << "deg";
+        if (polysquare_->getTransitions().empty()) oss << " none";
+        oss << ", " << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+    }
+    {
+        // The turn count is the readout that says whether this is a polysquare
+        // at all: the boundary should turn once per corner of the frame field
+        // and nowhere else. Alignment cannot tell -- a staircase is axis
+        // aligned too.
+        std::ostringstream oss;
+        oss << "[Polysquare] boundary turns " << r.turns << " (field asked for "
+            << r.expectedTurns << "), alignment " << std::fixed << std::setprecision(2)
+            << r.meanAlignDeg << " deg mean / " << r.maxAlignDeg << " worst";
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Polysquare] scaled Jacobian min " << std::fixed << std::setprecision(3)
+            << r.minScaledJacobian << ", avg " << r.avgScaledJacobian
+            << ", flipped triangles " << r.flips;
+        console_.log(oss.str());
+    }
+
+    viewer::computePolysquareBounds(*polysquare_, uvView_.cx, uvView_.cy,
+                                    uvView_.baseW, uvView_.baseH);
+    uvView_.zoom = 1.0;
+    uvView_.fbw = view_.fbw;
+    uvView_.fbh = view_.fbh;
+}
+
 // ── phase advancement ────────────────────────────────────────────────────────
 
 void CrossGenWidget::advancePhase() {
@@ -1027,6 +1082,17 @@ void CrossGenWidget::runComputations() {
             umberAnnounced_ = true;
         } else {
             runUMBER();
+        }
+    }
+
+    // ── UMBER: the polysquare of Sec. 4.3 on top of the frame field ──────────
+    if (mode_ == Mode::UMBER && umberPhase_ >= UMBERPhase::Polysquare &&
+        umber_.has_value() && !polysquareAttempted_) {
+        if (!polysquareAnnounced_) {
+            console_.log("[Polysquare] deforming the cut mesh (Eq. 6, 9), this blocks...");
+            polysquareAnnounced_ = true;
+        } else {
+            runPolysquare();
         }
     }
 
@@ -1321,6 +1387,80 @@ void CrossGenWidget::renderTraceAnimation() {
     renderOverlay("Tracing separatrices...\npress 'q' to quit");
 }
 
+// ── split-screen helpers ─────────────────────────────────────────────────────
+
+// Whether the right half of the window is showing a parameter domain, which is
+// what decides where a drag or a scroll lands.
+bool CrossGenWidget::inUVSplitScreen() const {
+    return (mode_ == Mode::PolyVector && phase_ == Phase::UVMesh && miqSolver_.has_value()) ||
+           (mode_ == Mode::SIPG && sipgPhase_ == SIPGPhase::UVMesh && sipgUVParam_.has_value()) ||
+           (mode_ == Mode::UMBER && umberPhase_ >= UMBERPhase::Polysquare && polysquare_.has_value());
+}
+
+void CrossGenWidget::applyHalfOrtho(int x, int vpW, const viewer::ViewState &vs) const {
+    const int h = fbh();
+    viewer::ViewState tmp = vs;
+    tmp.fbw = vpW;
+    tmp.fbh = h;
+    double worldW = 1.0, worldH = 1.0;
+    viewer::computeWorldBox(tmp, worldW, worldH);
+    glViewport(x, 0, vpW, h);
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    glOrtho(tmp.cx - 0.5 * worldW, tmp.cx + 0.5 * worldW,
+            tmp.cy - 0.5 * worldH, tmp.cy + 0.5 * worldH, -1, 1);
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+}
+
+void CrossGenWidget::drawSplitDivider(int halfW) const {
+    const int w = fbw(), h = fbh();
+    glViewport(0, 0, w, h);
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    glOrtho(0.0, static_cast<double>(w), 0.0, static_cast<double>(h), -1, 1);
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+    glLineWidth(2.0f);
+    glColor3f(0.55f, 0.55f, 0.55f);
+    glBegin(GL_LINES);
+    glVertex2f(static_cast<float>(halfW), 0.0f);
+    glVertex2f(static_cast<float>(halfW), static_cast<float>(h));
+    glEnd();
+    glLineWidth(1.0f);
+    glViewport(0, 0, w, h);
+}
+
+// The mesh under the optimized frame: both directions of the frame, the cuts
+// whose transitions the polysquare will use, and the corners the field put on
+// the boundary. Shown on its own in the Frames phase and as the left half of
+// the split screen once the parameterization exists, so that a corner can be
+// found on the model and in the parameter domain at the same time.
+void CrossGenWidget::renderUMBERField() {
+    viewer::drawMesh(*mesh_);
+    if (!umber_.has_value()) return;
+
+    viewer::drawUField(*mesh_, umber_->getUField(), scale_);
+    viewer::drawVField(*mesh_, umber_->getVField(), scale_);
+
+    if (umberCut_.has_value() && !umberCut_->getCutEdges().empty())
+        viewer::drawEdgeSetOnMesh(*mesh_, umberCut_->getCutEdges(), 1.0f, 0.2f, 0.9f, 3.5f);
+    viewer::drawBoundaryEdges(*mesh_);
+
+    const double ballRadius = 0.5 * avgEdge_;
+    for (const auto &[vertIdx, k] : umberCorners_) {
+        if (vertIdx < 0 || vertIdx >= static_cast<int>(mesh_->vertices.size())) continue;
+        const Point &c = mesh_->vertices[vertIdx];
+        if (k == 1)       viewer::drawDisk3D(c, ballRadius, 0.2f, 0.2f, 0.95f);
+        else if (k == -1) viewer::drawDisk3D(c, ballRadius, 0.95f, 0.2f, 0.2f);
+        else              viewer::drawDisk3D(c, ballRadius, 0.95f, 0.85f, 0.1f);
+    }
+    for (const auto &[vertIdx, winding] : umberInternal_) {
+        if (vertIdx < 0 || vertIdx >= static_cast<int>(mesh_->vertices.size())) continue;
+        viewer::drawDisk3D(mesh_->vertices[vertIdx], ballRadius, 0.1f, 0.9f, 0.2f);
+    }
+}
+
 // ── normal render ─────────────────────────────────────────────────────────────
 
 void CrossGenWidget::renderNormal() {
@@ -1328,25 +1468,6 @@ void CrossGenWidget::renderNormal() {
         // ── Split-screen: left = original mesh, right = UV mesh ───────────────
         int w = fbw(), h = fbh();
         int halfW = w / 2;
-
-        // Helper: set viewport + ortho projection for a sub-rectangle
-        auto applyHalfOrtho = [&](int x, int vpW, const viewer::ViewState &vs) {
-            viewer::ViewState tmp = vs;
-            tmp.fbw = vpW;
-            tmp.fbh = h;
-            double worldW = 1.0, worldH = 1.0;
-            viewer::computeWorldBox(tmp, worldW, worldH);
-            double left   = tmp.cx - 0.5 * worldW;
-            double right  = tmp.cx + 0.5 * worldW;
-            double bottom = tmp.cy - 0.5 * worldH;
-            double top    = tmp.cy + 0.5 * worldH;
-            glViewport(x, 0, vpW, h);
-            glMatrixMode(GL_PROJECTION);
-            glLoadIdentity();
-            glOrtho(left, right, bottom, top, -1, 1);
-            glMatrixMode(GL_MODELVIEW);
-            glLoadIdentity();
-        };
 
         // ── Left panel: mesh with cut seams & singularities ───────────────────
         applyHalfOrtho(0, halfW, view_);
@@ -1379,46 +1500,12 @@ void CrossGenWidget::renderNormal() {
             viewer::drawSingularitiesOnUV(*miqSolver_, *cutMesh_, *field_, uvRadius);
         }
 
-        // ── Dividing line (pixel-space) ───────────────────────────────────────
-        glViewport(0, 0, w, h);
-        glMatrixMode(GL_PROJECTION);
-        glLoadIdentity();
-        glOrtho(0.0, static_cast<double>(w), 0.0, static_cast<double>(h), -1, 1);
-        glMatrixMode(GL_MODELVIEW);
-        glLoadIdentity();
-        glLineWidth(2.0f);
-        glColor3f(0.55f, 0.55f, 0.55f);
-        glBegin(GL_LINES);
-        glVertex2f(static_cast<float>(halfW), 0.0f);
-        glVertex2f(static_cast<float>(halfW), static_cast<float>(h));
-        glEnd();
-        glLineWidth(1.0f);
-
-        // Restore full viewport for overlay
-        glViewport(0, 0, w, h);
+        drawSplitDivider(halfW);
     } else if (mode_ == Mode::SIPG) {
         if (sipgPhase_ == SIPGPhase::UVMesh && sipgUVParam_.has_value()) {
             // ── Split-screen: left = mesh with cut seams, right = UVGParam ────
             int w = fbw(), h = fbh();
             int halfW = w / 2;
-
-            auto applyHalfOrtho = [&](int x, int vpW, const viewer::ViewState &vs) {
-                viewer::ViewState tmp = vs;
-                tmp.fbw = vpW;
-                tmp.fbh = h;
-                double worldW = 1.0, worldH = 1.0;
-                viewer::computeWorldBox(tmp, worldW, worldH);
-                double left   = tmp.cx - 0.5 * worldW;
-                double right  = tmp.cx + 0.5 * worldW;
-                double bottom = tmp.cy - 0.5 * worldH;
-                double top    = tmp.cy + 0.5 * worldH;
-                glViewport(x, 0, vpW, h);
-                glMatrixMode(GL_PROJECTION);
-                glLoadIdentity();
-                glOrtho(left, right, bottom, top, -1, 1);
-                glMatrixMode(GL_MODELVIEW);
-                glLoadIdentity();
-            };
 
             // Left panel: mesh with combed field + cut seams
             applyHalfOrtho(0, halfW, view_);
@@ -1452,21 +1539,7 @@ void CrossGenWidget::renderNormal() {
                 viewer::drawSingularitiesOnUVG(*sipgUVParam_, sipgField_->singularVertices, uvRadius);
             }
 
-            // Dividing line
-            glViewport(0, 0, w, h);
-            glMatrixMode(GL_PROJECTION);
-            glLoadIdentity();
-            glOrtho(0.0, static_cast<double>(w), 0.0, static_cast<double>(h), -1, 1);
-            glMatrixMode(GL_MODELVIEW);
-            glLoadIdentity();
-            glLineWidth(2.0f);
-            glColor3f(0.55f, 0.55f, 0.55f);
-            glBegin(GL_LINES);
-            glVertex2f(static_cast<float>(halfW), 0.0f);
-            glVertex2f(static_cast<float>(halfW), static_cast<float>(h));
-            glEnd();
-            glLineWidth(1.0f);
-            glViewport(0, 0, w, h);
+            drawSplitDivider(halfW);
         } else {
         viewer::drawMesh(*mesh_);
         if (sipgPhase_ >= SIPGPhase::CrossField && sipgField_.has_value()) {
@@ -1559,10 +1632,43 @@ void CrossGenWidget::renderNormal() {
         } else {
             viewer::drawMesh(*mesh_);
         }
-    } else if (mode_ == Mode::UMBER) {
-        viewer::drawMesh(*mesh_);
+    } else if (mode_ == Mode::UMBER && umberPhase_ >= UMBERPhase::Polysquare &&
+               polysquare_.has_value()) {
+        // ── Split-screen: left = mesh and frame, right = the polysquare ─────
+        const int w = fbw();
+        const int halfW = w / 2;
 
+        applyHalfOrtho(0, halfW, view_);
+        renderUMBERField();
+
+        applyHalfOrtho(halfW, w - halfW, uvView_);
+        viewer::drawFlippedPolysquareTriangles(*polysquare_);
+        viewer::drawPolysquare(*polysquare_);
+        if (umberCut_.has_value()) {
+            viewer::drawPolysquareStructure(*polysquare_, *umberCut_);
+            // A corner should look the same size on both halves, and the two
+            // halves are fit to different world boxes, so the model-space
+            // radius is carried over by the ratio between them. Taking it from
+            // the live view states rather than the mesh extents keeps the two
+            // matched while either panel is zoomed.
+            viewer::ViewState left = view_;
+            left.fbw = halfW;
+            left.fbh = fbh();
+            viewer::ViewState right = uvView_;
+            right.fbw = w - halfW;
+            right.fbh = fbh();
+            double leftW = 1.0, leftH = 1.0, rightW = 1.0, rightH = 1.0;
+            viewer::computeWorldBox(left, leftW, leftH);
+            viewer::computeWorldBox(right, rightW, rightH);
+
+            const double uvRadius = 0.5 * avgEdge_ * (leftW > 0.0 ? rightW / leftW : 1.0);
+            viewer::drawPolysquareCorners(*polysquare_, *umberCut_, umberCorners_, uvRadius);
+        }
+
+        drawSplitDivider(halfW);
+    } else if (mode_ == Mode::UMBER) {
         if (umberPhase_ < UMBERPhase::Frames || !umber_.has_value()) {
+            viewer::drawMesh(*mesh_);
             // The SIPG stages, drawn as SIPG mode draws them: the input field
             // and the singularities Sec. 4.2 is about to move.
             if (umberPhase_ >= UMBERPhase::CrossField && sipgField_.has_value()) {
@@ -1578,34 +1684,13 @@ void CrossGenWidget::renderNormal() {
                 }
             }
         } else {
-            // The optimized frame. Both directions are drawn because the field
-            // is non-symmetric here: u and v are distinguishable, unlike the
-            // four indistinguishable arms of the cross field it came from.
-            viewer::drawUField(*mesh_, umber_->getUField(), scale_);
-            viewer::drawVField(*mesh_, umber_->getVField(), scale_);
-
-            // C of Eq. (2): the free transitions live on these edges, so a
-            // frame that appears to jump across one is not a defect.
-            if (umberCut_.has_value() && !umberCut_->getCutEdges().empty())
-                viewer::drawEdgeSetOnMesh(*mesh_, umberCut_->getCutEdges(), 1.0f, 0.2f, 0.9f, 3.5f);
-            viewer::drawBoundaryEdges(*mesh_);
-
-            double ballRadius = 0.5 * avgEdge_;
-            // The corners the field put on the boundary: blue convex (+1),
-            // red reflex (-1), yellow anything of higher order.
-            for (const auto &[vertIdx, k] : umberCorners_) {
-                if (vertIdx < 0 || vertIdx >= static_cast<int>(mesh_->vertices.size())) continue;
-                const Point &c = mesh_->vertices[vertIdx];
-                if (k == 1)       viewer::drawDisk3D(c, ballRadius, 0.2f, 0.2f, 0.95f);
-                else if (k == -1) viewer::drawDisk3D(c, ballRadius, 0.95f, 0.2f, 0.2f);
-                else              viewer::drawDisk3D(c, ballRadius, 0.95f, 0.85f, 0.1f);
-            }
-            // Anything still inside is a failure of Sec. 4.2 on this model, so
-            // it gets a colour of its own rather than sharing the corners'.
-            for (const auto &[vertIdx, winding] : umberInternal_) {
-                if (vertIdx < 0 || vertIdx >= static_cast<int>(mesh_->vertices.size())) continue;
-                viewer::drawDisk3D(mesh_->vertices[vertIdx], ballRadius, 0.1f, 0.9f, 0.2f);
-            }
+            // The optimized frame, its cuts and its corners. Both directions
+            // are drawn because the field is non-symmetric here: u and v are
+            // distinguishable, unlike the four indistinguishable arms of the
+            // cross field it came from. Corners are blue convex (+1), red
+            // reflex (-1), yellow higher order; a green disk is a defect that
+            // failed to leave the interior.
+            renderUMBERField();
         }
     } else if (mode_ == Mode::MedialAxis) {
         if (maPhase_ != MedialAxisPhase::Classify) {

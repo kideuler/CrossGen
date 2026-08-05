@@ -62,14 +62,17 @@ enum class SIPGPhase {
 };
 
 // UMBER borrows the first three SIPG stages verbatim -- its input *is* a
-// converged SIPG cross field -- and then replaces the cutting and
-// parameterization stages with the one Sec. 4.2 solve, which is a single
-// blocking L-BFGS run rather than something to animate.
+// converged SIPG cross field -- and then adds the two solves of the paper:
+// the frame field of Sec. 4.2 and the polysquare of Sec. 4.3. Neither is
+// animated; both are one blocking L-BFGS run with nothing worth drawing in
+// between. The last phase splits the window, model on the left and parameter
+// domain on the right, the way PolyVector and SIPG show their UV meshes.
 enum class UMBERPhase {
     MeshOnly   = 1,
     CrossField = 2,
     Stepping   = 3,
     Frames     = 4,
+    Polysquare = 5,
 };
 
 // OASIS is a one-shot solve driven by a parameter dialog rather than a
@@ -133,6 +136,21 @@ private:
     // draw between the continuation stages.
     void runUMBER();
 
+    // Deform the cut mesh into the parameter domain under the optimized frame
+    // field (Sec. 4.3). Blocking for the same reason.
+    void runPolysquare();
+
+    // The mesh with the optimized frame, its cuts and its boundary corners --
+    // the left half of the split screen, and the whole of the Frames phase.
+    void renderUMBERField();
+
+    // Whether a parameter domain occupies the right half of the window.
+    bool inUVSplitScreen() const;
+
+    // Projection for one half of a split screen, and the line between them.
+    void applyHalfOrtho(int x, int vpW, const viewer::ViewState &vs) const;
+    void drawSplitDivider(int halfW) const;
+
     // SIPG mode and UMBER mode share their first three stages, so the guards
     // that drive the SIPG solve ask about the stage rather than the mode.
     bool sipgStageWantsField() const;
@@ -170,6 +188,7 @@ private:
     // its own; the cuts and the optimized frames are all that is added.
     std::optional<HarmonicCut>  umberCut_;
     std::optional<UMBER>        umber_;
+    std::optional<Polysquare>   polysquare_;
     // Cached results of the solve: recomputing them per frame would walk every
     // vertex star for nothing.
     std::vector<std::pair<int, int>>    umberCorners_;   // (vertex, quarter turns)
@@ -222,6 +241,8 @@ private:
     // GUI thread is inside L-BFGS.
     bool umberAnnounced_       = false;
     bool umberAttempted_       = false;
+    bool polysquareAnnounced_  = false;
+    bool polysquareAttempted_  = false;
 
     // ── view / camera ────────────────────────────────────────────────────────
     viewer::ViewState view_;     // mesh-space view (left panel)

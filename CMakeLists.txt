@@ -57,6 +57,8 @@ add_library(PolyVector SHARED
     src/OASIS/OASIS.cxx
     src/UMBER/UMBER.hxx
     src/UMBER/UMBER.cxx
+    src/UMBER/Polysquare.hxx
+    src/UMBER/Polysquare.cxx
     src/tracing/SeparatrixTrace.hxx
     src/tracing/SeparatrixTrace.cxx
     src/triangle/triangle.cpp

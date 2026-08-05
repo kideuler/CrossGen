@@ -15,6 +15,7 @@
 #include "crossfield/CrossField.hxx"
 #include "sipg/SIPG.hxx"
 #include "medialaxis/MedialAxis.hxx"
+#include "UMBER/Polysquare.hxx"
 
 namespace viewer {
 
@@ -119,6 +120,30 @@ void drawFlippedUVTriangles(const UVGParam &uvp);
 void drawSingularitiesOnUVG(const UVGParam &uvp,
                              const std::vector<std::pair<int, double>> &singularVertices,
                              double radius);
+
+// ── UMBER polysquare, in the parameter domain ────────────────────────────────
+
+// View bounds for the polysquare (call once, before drawing it).
+void computePolysquareBounds(const Polysquare &ps, double &cx, double &cy,
+                             double &baseW, double &baseH);
+
+// The deformed mesh as a wireframe at its (u, v) coordinates.
+void drawPolysquare(const Polysquare &ps);
+
+// Fill any triangle whose image is inverted. Nothing drawn on a valid map.
+void drawFlippedPolysquareTriangles(const Polysquare &ps);
+
+// The two kinds of edge on the boundary of the cut mesh, which look alike in
+// the parameter domain and mean opposite things: the boundary of the model,
+// which is what the axis alignment applies to, and the banks of the cuts,
+// which are interior seams identified by a transition and are free to wander.
+void drawPolysquareStructure(const Polysquare &ps, const HarmonicCut &hc);
+
+// The frame field's boundary corners at their images, coloured as on the mesh.
+// Every copy of a corner vertex is drawn, so a corner at the end of a cut
+// appears once on each bank.
+void drawPolysquareCorners(const Polysquare &ps, const HarmonicCut &hc,
+                           const std::vector<std::pair<int, int>> &corners, double radius);
 
 } // namespace viewer
 

@@ -1,0 +1,922 @@
+#include "Polysquare.hxx"
+
+#include <algorithm>
+#include <cmath>
+#include <deque>
+#include <fstream>
+#include <iostream>
+#include <limits>
+#include <stdexcept>
+#include <unordered_map>
+
+namespace {
+
+// The closest rotation to a 2x2 matrix, i.e. the rotation part of its polar
+// decomposition: the angle that maximizes tr(R^T J).
+inline void polarRotation(const double J[2][2], double R[2][2]) {
+    const double c = J[0][0] + J[1][1];
+    const double s = J[1][0] - J[0][1];
+    const double n = std::sqrt(c * c + s * s);
+    if (n < 1e-14) { R[0][0] = 1.0; R[0][1] = 0.0; R[1][0] = 0.0; R[1][1] = 1.0; return; }
+    const double cc = c / n, ss = s / n;
+    R[0][0] = cc; R[0][1] = -ss;
+    R[1][0] = ss; R[1][1] = cc;
+}
+
+inline double det2(const double J[2][2]) {
+    return J[0][0] * J[1][1] - J[0][1] * J[1][0];
+}
+
+// Angle to the nearest axis, in (-45, 45] degrees.
+inline double axisDeviation(double dx, double dy) {
+    double a = std::atan2(dy, dx);
+    a = std::fmod(a, M_PI_2);
+    if (a > M_PI_4) a -= M_PI_2;
+    if (a <= -M_PI_4) a += M_PI_2;
+    return a;
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// Construction
+// ---------------------------------------------------------------------------
+Polysquare::Polysquare(const UMBER &frames, const HarmonicCut &cut) {
+    orig = frames.getMeshPtr();
+    if (!orig) throw std::runtime_error("Polysquare: the frame field carries no mesh");
+    if (cut.getOriginalMeshPtr() != orig) {
+        throw std::runtime_error("Polysquare: the HarmonicCut was not built on the frame field's mesh");
+    }
+    if (frames.getUField().size() != orig->triangles.size()) {
+        throw std::runtime_error("Polysquare: the frame field has not been optimized yet");
+    }
+
+    harmonicCut = &cut;
+    cutMesh = &cut.getCutMesh();
+    frameU = frames.getUField();
+    frameV = frames.getVField();
+
+    // theta_i of Eq. (12) at each boundary vertex, in quarter turns: the corner
+    // index the frame field already decided on.
+    boundaryCorner.assign(orig->vertices.size(), 0);
+    for (const auto &[v, k] : frames.boundarySingularities()) {
+        if (v >= 0 && v < static_cast<int>(boundaryCorner.size())) boundaryCorner[v] = k;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Local topology helpers
+// ---------------------------------------------------------------------------
+int Polysquare::leftTriangleOf(int a, int b) const {
+    // The triangle that lists a -> b in its own winding order.
+    int found = -1;
+    const auto &vt = orig->vertexTriangles;
+    for (int k = vt.rowPtr[a]; k < vt.rowPtr[a + 1] && found < 0; ++k) {
+        const int t = vt.colIdx[k];
+        const Triangle &tri = orig->triangles[t];
+        for (int i = 0; i < 3; ++i) {
+            if (tri[i] == a && tri[(i + 1) % 3] == b) { found = t; break; }
+        }
+    }
+    if (found < 0) return -1;
+
+    // If that triangle is wound the other way the interior is on its right
+    // instead, and the left one is the neighbour across the edge.
+    const Triangle &tri = orig->triangles[found];
+    const double s = cross2(orig->vertices[tri[1]] - orig->vertices[tri[0]],
+                            orig->vertices[tri[2]] - orig->vertices[tri[0]]);
+    if (s > 0.0) return found;
+    return oppositeTriangle(found, a, b);
+}
+
+int Polysquare::oppositeTriangle(int f, int a, int b) const {
+    for (int k = 0; k < 3; ++k) {
+        const int e = orig->triangleEdges[f][k];
+        if (e < 0) continue;
+        if ((orig->edges[e][0] == a && orig->edges[e][1] == b) ||
+            (orig->edges[e][0] == b && orig->edges[e][1] == a)) {
+            const int o0 = orig->edgeTriangles[e][0];
+            const int o1 = orig->edgeTriangles[e][1];
+            return (o0 == f) ? o1 : o0;
+        }
+    }
+    return -1;
+}
+
+int Polysquare::cornerOf(int f, int origVertex) const {
+    const Triangle &t = orig->triangles[f];
+    for (int i = 0; i < 3; ++i) if (t[i] == origVertex) return cutMesh->triangles[f][i];
+    return -1;
+}
+
+// ---------------------------------------------------------------------------
+// buildTopology()
+//
+// Hat gradients per triangle, the variable layout that eliminates Eq. (8), and
+// the boundary edges of Eqs. (11) and (12) in loop order.
+// ---------------------------------------------------------------------------
+void Polysquare::buildTopology() {
+    const int nT = static_cast<int>(orig->triangles.size());
+    const int nVc = static_cast<int>(cutMesh->vertices.size());
+
+    // --- grad lambda_i and areas -------------------------------------------
+    // For a linear function on a triangle, grad lambda_i is the inward normal
+    // of the opposite edge over twice the area.
+    triGrad.assign(nT, TriGrad());
+    totalArea = 0.0;
+    for (int f = 0; f < nT; ++f) {
+        const Triangle &t = orig->triangles[f];
+        const Point &p0 = orig->vertices[t[0]];
+        const Point &p1 = orig->vertices[t[1]];
+        const Point &p2 = orig->vertices[t[2]];
+        const double area2 = cross2(p1 - p0, p2 - p0); // signed
+        TriGrad &g = triGrad[f];
+        g.area = 0.5 * std::fabs(area2);
+        if (std::fabs(area2) < 1e-18) {
+            g.g[0] = g.g[1] = g.g[2] = Point{0.0, 0.0};
+            continue;
+        }
+        const Point p[3] = {p0, p1, p2};
+        for (int i = 0; i < 3; ++i) {
+            const Point e = p[(i + 2) % 3] - p[(i + 1) % 3];
+            g.g[i] = Point{-e[1] / area2, e[0] / area2}; // perp(e) / (2A)
+        }
+        totalArea += g.area;
+    }
+    if (totalArea <= 0.0) throw std::runtime_error("Polysquare: mesh has no area");
+    for (int f = 0; f < nT; ++f) triGrad[f].weight = triGrad[f].area / totalArea;
+
+    // --- Variable layout ----------------------------------------------------
+    // One bank of each cut is free, the other follows it through Eq. (8).
+    const auto &cuts = harmonicCut->getCuts();
+    nCuts = static_cast<int>(cuts.size());
+    varOf.assign(nVc, 0);
+    depSrc.assign(nVc, -1);
+    depCut.assign(nVc, -1);
+
+    const auto &origToCut = harmonicCut->getOriginalToCutVertices();
+    int unresolved = 0;
+
+    for (int c = 0; c < nCuts; ++c) {
+        const auto &path = cuts[c].path;
+        for (size_t i = 0; i < path.size(); ++i) {
+            const int p = path[i];
+            const auto &copies = origToCut[p];
+            if (copies.size() != 2) { ++unresolved; continue; }
+
+            // A path edge at p, taken in path order, so the left bank is the
+            // same side for every vertex of the cut.
+            const int a = (i + 1 < path.size()) ? path[i] : path[i - 1];
+            const int b = (i + 1 < path.size()) ? path[i + 1] : path[i];
+            const int fL = leftTriangleOf(a, b);
+            if (fL < 0) { ++unresolved; continue; }
+
+            const int cvL = cornerOf(fL, p);
+            if (cvL < 0) { ++unresolved; continue; }
+            const int cvR = (copies[0] == cvL) ? copies[1] : copies[0];
+            if (cvR == cvL) { ++unresolved; continue; }
+
+            depSrc[cvR] = cvL;
+            depCut[cvR] = c;
+        }
+    }
+    if (unresolved > 0) {
+        std::cerr << "Polysquare: " << unresolved << " cut vertex(es) could not be paired across "
+                  << "their cut; those seams are left free.\n";
+    }
+
+    nIndep = 0;
+    pinnedVertex = -1;
+    for (int cv = 0; cv < nVc; ++cv) {
+        if (depSrc[cv] >= 0) { varOf[cv] = -1; continue; }
+        if (pinnedVertex < 0) { pinnedVertex = cv; varOf[cv] = -2; continue; }
+        varOf[cv] = nIndep++;
+    }
+
+    // --- Boundary edges of Eq. (11), in loop order -------------------------
+    // The boundary of M_C minus the cuts is the boundary of M, so the loops of
+    // the input mesh are what is walked; each edge is mapped to the copies its
+    // one adjacent triangle uses.
+    bEdges.clear();
+    loopStart.clear();
+
+    std::vector<char> isCutEndpoint(orig->vertices.size(), 0);
+    for (const auto &cut : cuts) {
+        if (!cut.path.empty()) {
+            isCutEndpoint[cut.path.front()] = 1;
+            isCutEndpoint[cut.path.back()] = 1;
+        }
+    }
+
+    const auto &loops = harmonicCut->getBoundaryLoops();
+    const int outerLoop = harmonicCut->getOuterLoop();
+
+    for (size_t li = 0; li < loops.size(); ++li) {
+        std::vector<int> ring = loops[li];
+        if (ring.size() < 3) continue;
+
+        // Walk with the interior on the left: counter-clockwise around the
+        // outer loop, clockwise around a void. That is the convention the
+        // corner index of Eq. (12) is measured in.
+        double area2 = 0.0;
+        for (size_t i = 0; i < ring.size(); ++i) {
+            const Point &a = orig->vertices[ring[i]];
+            const Point &b = orig->vertices[ring[(i + 1) % ring.size()]];
+            area2 += a[0] * b[1] - b[0] * a[1];
+        }
+        const bool wantPositive = (static_cast<int>(li) == outerLoop);
+        if ((area2 > 0.0) != wantPositive) std::reverse(ring.begin(), ring.end());
+
+        loopStart.push_back(static_cast<int>(bEdges.size()));
+
+        for (size_t i = 0; i < ring.size(); ++i) {
+            const int a = ring[i];
+            const int b = ring[(i + 1) % ring.size()];
+
+            const int f = leftTriangleOf(a, b);
+            if (f < 0) continue;
+
+            BoundaryEdge be;
+            be.ca = cornerOf(f, a);
+            be.cb = cornerOf(f, b);
+            if (be.ca < 0 || be.cb < 0) continue;
+            be.length = normP(orig->vertices[b] - orig->vertices[a]);
+
+            // Eq. (12) acts on this edge and the next, which meet at b.
+            be.sharedOrigVertex = b;
+            be.targetTurn = boundaryCorner[b] * M_PI_2;
+            be.cornerPair = true;
+
+            bEdges.push_back(be);
+        }
+    }
+    loopStart.push_back(static_cast<int>(bEdges.size()));
+
+    // Where a cut lands on the boundary the two edges meeting there use
+    // different copies of that vertex, so their images are in frames a
+    // transition apart. Comparing them as they stand is meaningless, and
+    // dropping the pair is what leaves the boundary free to kink at exactly
+    // the point a cut arrives -- worth two extra turns per cut, measurably.
+    // The paper's answer is to carry the transition into the target angle,
+    // theta_i -> theta_i -/+ theta_gamma, which is what this does; the sign is
+    // whichever bank the second edge is on.
+    for (size_t l = 0; l + 1 < loopStart.size(); ++l) {
+        const int b0 = loopStart[l], b1 = loopStart[l + 1];
+        const int n = b1 - b0;
+        if (n < 2) continue;
+        for (int i = 0; i < n; ++i) {
+            BoundaryEdge &ei = bEdges[b0 + i];
+            const BoundaryEdge &ej = bEdges[b0 + (i + 1) % n];
+            if (ei.cb == ej.ca) continue; // same copy: no seam here
+
+            // One of the two is the dependent copy, and its image carries
+            // Pi_gamma^-1 relative to the other.
+            if (varOf[ej.ca] == -1) {
+                ei.seamTurn = -transitionK[depCut[ej.ca]] * M_PI_2;
+            } else if (varOf[ei.cb] == -1) {
+                ei.seamTurn = transitionK[depCut[ei.cb]] * M_PI_2;
+            } else {
+                ei.cornerPair = false; // unpaired seam: nothing to compare
+                continue;
+            }
+            ei.targetTurn += ei.seamTurn;
+        }
+    }
+
+    totalBoundaryLength = 0.0;
+    for (const auto &be : bEdges) totalBoundaryLength += be.length;
+    if (totalBoundaryLength <= 0.0) throw std::runtime_error("Polysquare: mesh has no boundary");
+}
+
+// ---------------------------------------------------------------------------
+// extractTransitions()  --  Eq. (7)
+//
+// One rotation per cut, the multiple of 90 degrees that best carries the frame
+// on the left bank onto the frame on the right. Trying all four and keeping
+// the smallest error is what the paper does; there are only four.
+// ---------------------------------------------------------------------------
+void Polysquare::extractTransitions() {
+    const auto &cuts = harmonicCut->getCuts();
+    transitionK.assign(cuts.size(), 0);
+
+    for (size_t c = 0; c < cuts.size(); ++c) {
+        double best = std::numeric_limits<double>::max();
+        int bestK = 0;
+
+        for (int k = 0; k < 4; ++k) {
+            double err = 0.0;
+            const auto &path = cuts[c].path;
+            for (size_t i = 0; i + 1 < path.size(); ++i) {
+                const int a = path[i], b = path[i + 1];
+                const int fL = leftTriangleOf(a, b);
+                if (fL < 0) continue;
+                const int fR = oppositeTriangle(fL, a, b);
+                if (fR < 0) continue;
+
+                const double len = normP(orig->vertices[b] - orig->vertices[a]);
+                const Point rotated = rotateVector(frameU[fL], k);
+                const Point d = rotated - frameU[fR];
+                err += len * dotP(d, d);
+            }
+            if (err < best) { best = err; bestK = k; }
+        }
+        transitionK[c] = bestK;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// expand() / fold()  --  the elimination of Eq. (8)
+//
+// phi on the right bank is Pi_gamma^-1 phi on the left plus a translation. The
+// inverse is what Eq. (8) asks for: Eq. (7) aligns the *frames*, and the frame
+// is the gradient of phi, so the map transitions the other way (the paper
+// writes it as Pi_ab = Pi_gamma^-1).
+// ---------------------------------------------------------------------------
+void Polysquare::expand(const Eigen::VectorXd &state) {
+    const int nVc = static_cast<int>(cutMesh->vertices.size());
+    uv.assign(nVc, Point{0.0, 0.0});
+
+    for (int cv = 0; cv < nVc; ++cv) {
+        const int j = varOf[cv];
+        if (j >= 0) uv[cv] = Point{state[2 * j], state[2 * j + 1]};
+        else if (j == -2) uv[cv] = Point{0.0, 0.0};
+    }
+    for (int cv = 0; cv < nVc; ++cv) {
+        if (varOf[cv] != -1) continue;
+        const int c = depCut[cv];
+        const int inv = (4 - transitionK[c]) % 4;
+        const int base = 2 * nIndep + 2 * c;
+        uv[cv] = rotateVector(uv[depSrc[cv]], inv) + Point{state[base], state[base + 1]};
+    }
+}
+
+void Polysquare::fold(std::vector<Point> &gradUV, Eigen::VectorXd &grad) const {
+    grad.setZero(2 * nIndep + 2 * nCuts);
+
+    // The dependent copies first, so their share reaches the bank they follow.
+    const int nVc = static_cast<int>(cutMesh->vertices.size());
+    for (int cv = 0; cv < nVc; ++cv) {
+        if (varOf[cv] != -1) continue;
+        const int c = depCut[cv];
+        const Point g = gradUV[cv];
+        // d uv[cv] / d uv[src] = R(-k*90), whose transpose is R(+k*90).
+        gradUV[depSrc[cv]] = gradUV[depSrc[cv]] + rotateVector(g, transitionK[c]);
+        const int base = 2 * nIndep + 2 * c;
+        grad[base] += g[0];
+        grad[base + 1] += g[1];
+    }
+    for (int cv = 0; cv < nVc; ++cv) {
+        const int j = varOf[cv];
+        if (j < 0) continue;
+        grad[2 * j] += gradUV[cv][0];
+        grad[2 * j + 1] += gradUV[cv][1];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// poissonInit()  --  Eq. (6)
+//
+// min_phi \int ||grad phi - (v v^perp)^T||_F^2, as a linear least squares in
+// the reduced variables. The paper solves it without the seamless condition
+// and takes the result as an initial value; imposing Eq. (8) here as well
+// costs nothing (the elimination is already built) and starts the non-linear
+// stage on a seamless map rather than one that has to be dragged onto the
+// constraint.
+// ---------------------------------------------------------------------------
+void Polysquare::poissonInit() {
+    const int nT = static_cast<int>(orig->triangles.size());
+    const int nX = 2 * nIndep + 2 * nCuts;
+
+    std::vector<Eigen::Triplet<double>> trips;
+    trips.reserve(static_cast<size_t>(nT) * 36);
+    Eigen::VectorXd rhs = Eigen::VectorXd::Zero(4 * nT);
+
+    // Row (f, r, c) is grad phi[r][c] - T[r][c], weighted by sqrt(area).
+    for (int f = 0; f < nT; ++f) {
+        const TriGrad &tg = triGrad[f];
+        const double sw = std::sqrt(tg.area);
+        if (sw <= 0.0) continue;
+
+        const Point target[2] = {frameU[f], frameV[f]};
+
+        for (int r = 0; r < 2; ++r) {
+            for (int cc = 0; cc < 2; ++cc) {
+                const int row = 4 * f + 2 * r + cc;
+                rhs[row] = sw * target[r][cc];
+
+                for (int i = 0; i < 3; ++i) {
+                    const int cv = cutMesh->triangles[f][i];
+                    const double g = sw * tg.g[i][cc];
+
+                    // uv[cv] = M * x[src] + t, so row picks up M's r-th row.
+                    int src = cv;
+                    double m[2] = {0.0, 0.0};
+                    m[r] = 1.0;
+                    if (varOf[cv] == -1) {
+                        src = depSrc[cv];
+                        const int inv = (4 - transitionK[depCut[cv]]) % 4;
+                        // r-th row of R(inv*90)
+                        const Point e0 = rotateVector(Point{1.0, 0.0}, inv);
+                        const Point e1 = rotateVector(Point{0.0, 1.0}, inv);
+                        m[0] = e0[r];
+                        m[1] = e1[r];
+                        const int base = 2 * nIndep + 2 * depCut[cv];
+                        trips.emplace_back(row, base + r, g);
+                    }
+                    const int j = varOf[src];
+                    if (j < 0) continue; // pinned, or an unpaired seam vertex
+                    if (m[0] != 0.0) trips.emplace_back(row, 2 * j + 0, g * m[0]);
+                    if (m[1] != 0.0) trips.emplace_back(row, 2 * j + 1, g * m[1]);
+                }
+            }
+        }
+    }
+
+    Eigen::SparseMatrix<double> C(4 * nT, nX);
+    C.setFromTriplets(trips.begin(), trips.end());
+
+    Eigen::SparseMatrix<double> A = C.transpose() * C;
+    for (int i = 0; i < nX; ++i) A.coeffRef(i, i) += 1e-10; // the map is affine, not linear
+    const Eigen::VectorXd b = C.transpose() * rhs;
+
+    Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> solver;
+    solver.compute(A);
+    if (solver.info() != Eigen::Success) {
+        throw std::runtime_error("Polysquare: the Eq. (6) system could not be factorized");
+    }
+    x = solver.solve(b);
+    if (solver.info() != Eigen::Success) {
+        throw std::runtime_error("Polysquare: the Eq. (6) system could not be solved");
+    }
+    expand(x);
+}
+
+// ---------------------------------------------------------------------------
+// evaluate()  --  Eq. (9) and its gradient
+// ---------------------------------------------------------------------------
+double Polysquare::evaluate(const Eigen::VectorXd &state, Eigen::VectorXd &grad,
+                            double *arapOut, double *l1Out, double *corOut) {
+    expand(state);
+
+    const int nT = static_cast<int>(orig->triangles.size());
+    std::vector<Point> gradUV(cutMesh->vertices.size(), Point{0.0, 0.0});
+
+    double eArap = 0.0, eBar = 0.0;
+
+    // --- E_arap, Eq. (10), and the positive-Jacobian penalty ---------------
+    for (int f = 0; f < nT; ++f) {
+        const TriGrad &tg = triGrad[f];
+        if (tg.area <= 0.0) continue;
+
+        double J[2][2] = {{0.0, 0.0}, {0.0, 0.0}};
+        for (int i = 0; i < 3; ++i) {
+            const Point &p = uv[cutMesh->triangles[f][i]];
+            for (int r = 0; r < 2; ++r)
+                for (int c = 0; c < 2; ++c) J[r][c] += p[r] * tg.g[i][c];
+        }
+
+        double R[2][2];
+        polarRotation(J, R);
+
+        double D[2][2];
+        for (int r = 0; r < 2; ++r)
+            for (int c = 0; c < 2; ++c) D[r][c] = J[r][c] - R[r][c];
+
+        eArap += tg.weight * (D[0][0] * D[0][0] + D[0][1] * D[0][1] +
+                              D[1][0] * D[1][0] + D[1][1] * D[1][1]);
+
+        double dEdJ[2][2];
+        for (int r = 0; r < 2; ++r)
+            for (int c = 0; c < 2; ++c) dEdJ[r][c] = 2.0 * tg.weight * D[r][c];
+
+        // det(grad phi) > 0, as a penalty on whatever falls below the floor.
+        const double d = det2(J);
+        if (d < detFloor) {
+            const double s = (detFloor - d) / detFloor;
+            eBar += barrierWeight * tg.weight * s * s;
+            const double dEdDet = -2.0 * barrierWeight * tg.weight * s / detFloor;
+            // d det / dJ is the cofactor matrix
+            dEdJ[0][0] += dEdDet * J[1][1];
+            dEdJ[0][1] += dEdDet * -J[1][0];
+            dEdJ[1][0] += dEdDet * -J[0][1];
+            dEdJ[1][1] += dEdDet * J[0][0];
+        }
+
+        for (int i = 0; i < 3; ++i) {
+            const int cv = cutMesh->triangles[f][i];
+            for (int r = 0; r < 2; ++r)
+                gradUV[cv][r] += dEdJ[r][0] * tg.g[i][0] + dEdJ[r][1] * tg.g[i][1];
+        }
+    }
+
+    // --- E_l1, Eq. (11): the boundary onto an axis -------------------------
+    // |t| is replaced by sqrt(t^2 + eps^2) as in Sec. 4.2, and the direction
+    // is normalized so the term measures the angle and not the length.
+    double eL1 = 0.0;
+    const double eps2 = l1Eps * l1Eps;
+    for (const auto &be : bEdges) {
+        const Point d = uv[be.cb] - uv[be.ca];
+        const double n2 = dotP(d, d);
+        if (n2 < 1e-24) continue;
+        const double n = std::sqrt(n2);
+        const double w = be.length / totalBoundaryLength;
+
+        const double sx = std::sqrt(d[0] * d[0] + eps2);
+        const double sy = std::sqrt(d[1] * d[1] + eps2);
+        const double S = sx + sy;
+        eL1 += w * S / n;
+
+        const Point g{w * ((d[0] / sx) / n - S * d[0] / (n2 * n)),
+                      w * ((d[1] / sy) / n - S * d[1] / (n2 * n))};
+        gradUV[be.cb] = gradUV[be.cb] + g * l1Weight;
+        gradUV[be.ca] = gradUV[be.ca] - g * l1Weight;
+    }
+
+    // --- E_cor, Eq. (12): where the boundary is allowed to turn ------------
+    double eCor = 0.0;
+    if (corWeight > 0.0) {
+        for (size_t l = 0; l + 1 < loopStart.size(); ++l) {
+            const int b0 = loopStart[l], b1 = loopStart[l + 1];
+            const int n = b1 - b0;
+            if (n < 2) continue;
+
+            for (int i = 0; i < n; ++i) {
+                const BoundaryEdge &ei = bEdges[b0 + i];
+                const BoundaryEdge &ej = bEdges[b0 + (i + 1) % n];
+                if (!ei.cornerPair) continue;
+
+                const Point di = uv[ei.cb] - uv[ei.ca];
+                const Point dj = uv[ej.cb] - uv[ej.ca];
+                const double ni2 = dotP(di, di), nj2 = dotP(dj, dj);
+                if (ni2 < 1e-24 || nj2 < 1e-24) continue;
+                const double ni = std::sqrt(ni2), nj = std::sqrt(nj2);
+                const Point ui = di / ni, uj = dj / nj;
+
+                const double ct = std::cos(ei.targetTurn), st = std::sin(ei.targetTurn);
+                const Point rui{ct * ui[0] - st * ui[1], st * ui[0] + ct * ui[1]};
+
+                const double wgeom = (ei.length + ej.length) / totalBoundaryLength;
+                const double w = corWeight * wgeom;
+                const Point diff = rui - uj;
+                eCor += wgeom * dotP(diff, diff);
+
+                // dE/d ui = -2 R^T uj, dE/d uj = -2 R ui, then through the
+                // normalization: d u / d d = (I - u u^T)/n.
+                const Point dEdui{-2.0 * (ct * uj[0] + st * uj[1]),
+                                  -2.0 * (-st * uj[0] + ct * uj[1])};
+                const Point dEduj{-2.0 * rui[0], -2.0 * rui[1]};
+
+                const Point gi = (dEdui - ui * dotP(ui, dEdui)) / ni;
+                const Point gj = (dEduj - uj * dotP(uj, dEduj)) / nj;
+
+                gradUV[ei.cb] = gradUV[ei.cb] + gi * w;
+                gradUV[ei.ca] = gradUV[ei.ca] - gi * w;
+                gradUV[ej.cb] = gradUV[ej.cb] + gj * w;
+                gradUV[ej.ca] = gradUV[ej.ca] - gj * w;
+            }
+        }
+    }
+
+    fold(gradUV, grad);
+
+    if (arapOut) *arapOut = eArap;
+    if (l1Out) *l1Out = eL1;
+    if (corOut) *corOut = eCor;
+
+    return eArap + l1Weight * eL1 + corWeight * eCor + eBar;
+}
+
+// ---------------------------------------------------------------------------
+// runLBFGS()  --  the same quasi-Newton loop UMBER uses on Eq. (1)
+// ---------------------------------------------------------------------------
+int Polysquare::runLBFGS(Eigen::VectorXd &state, int maxIter) {
+    const int m = 10;
+    const double c1 = 1e-4;
+    const int maxBacktracks = 60;
+
+    const int n = static_cast<int>(state.size());
+    Eigen::VectorXd g(n), gNew(n), d(n), xNew(n);
+
+    double f = evaluate(state, g);
+    double gnorm = g.norm();
+
+    std::deque<Eigen::VectorXd> S, Y;
+    std::deque<double> rho;
+    std::vector<double> alpha(m, 0.0);
+
+    int iter = 0;
+    for (; iter < maxIter; ++iter) {
+        if (gnorm <= gradTolerance) break;
+
+        Eigen::VectorXd q = g;
+        const int k = static_cast<int>(S.size());
+        for (int i = k - 1; i >= 0; --i) {
+            alpha[i] = rho[i] * S[i].dot(q);
+            q -= alpha[i] * Y[i];
+        }
+        if (k > 0) {
+            const double yy = Y[k - 1].squaredNorm();
+            if (yy > 1e-300) q *= S[k - 1].dot(Y[k - 1]) / yy;
+        }
+        for (int i = 0; i < k; ++i) {
+            const double beta = rho[i] * Y[i].dot(q);
+            q += S[i] * (alpha[i] - beta);
+        }
+        d = -q;
+
+        double dg = d.dot(g);
+        if (!(dg < 0.0)) { d = -g; dg = -g.squaredNorm(); }
+
+        double step = (k == 0) ? std::min(1.0, 1.0 / std::max(gnorm, 1e-12)) : 1.0;
+        bool progressed = false;
+        double fNew = f;
+        for (int bt = 0; bt < maxBacktracks; ++bt) {
+            xNew = state + step * d;
+            fNew = evaluate(xNew, gNew);
+            if (std::isfinite(fNew) && fNew <= f + c1 * step * dg) { progressed = true; break; }
+            step *= 0.5;
+        }
+        if (!progressed) break;
+
+        Eigen::VectorXd s = xNew - state;
+        Eigen::VectorXd y = gNew - g;
+        const double sy = s.dot(y);
+        if (sy > 1e-12) {
+            if (static_cast<int>(S.size()) == m) { S.pop_front(); Y.pop_front(); rho.pop_front(); }
+            S.push_back(std::move(s));
+            Y.push_back(std::move(y));
+            rho.push_back(1.0 / sy);
+        }
+
+        state = xNew;
+        f = fNew;
+        g = gNew;
+        gnorm = g.norm();
+    }
+
+    return iter;
+}
+
+// ---------------------------------------------------------------------------
+// optimize()  --  Eq. (9) over the w_l1 continuation
+// ---------------------------------------------------------------------------
+void Polysquare::optimize() {
+    report_.iterations = 0;
+
+    const std::vector<double> schedule = l1Schedule.empty() ? std::vector<double>{1.0} : l1Schedule;
+    for (size_t s = 0; s < schedule.size(); ++s) {
+        l1Weight = schedule[s];
+        // The smoothing follows the weight down: a rounded corner is what lets
+        // the early stages move, a sharp one is what finally snaps the edges
+        // onto an axis.
+        l1Eps = std::max(1e-3, 1e-2 * std::pow(0.5, static_cast<double>(s)));
+        report_.iterations += runLBFGS(x, maxIterations);
+    }
+
+    // Anything still folded gets the penalty raised on it. The paper keeps the
+    // map feasible throughout with a log barrier; this cannot, so it leans on
+    // the penalty afterwards instead, and says so when that is not enough.
+    for (int round = 0; round < 4; ++round) {
+        expand(x);
+        if (countFlips() == 0) break;
+        barrierWeight *= 10.0;
+        report_.iterations += runLBFGS(x, maxIterations);
+    }
+
+    expand(x);
+    measure();
+}
+
+int Polysquare::countFlips() const {
+    const int nT = static_cast<int>(orig->triangles.size());
+    int flips = 0;
+    for (int f = 0; f < nT; ++f) {
+        if (triGrad[f].area <= 0.0) continue;
+        double J[2][2] = {{0.0, 0.0}, {0.0, 0.0}};
+        for (int i = 0; i < 3; ++i) {
+            const Point &p = uv[cutMesh->triangles[f][i]];
+            for (int r = 0; r < 2; ++r)
+                for (int c = 0; c < 2; ++c) J[r][c] += p[r] * triGrad[f].g[i][c];
+        }
+        if (det2(J) <= 0.0) ++flips;
+    }
+    return flips;
+}
+
+// ---------------------------------------------------------------------------
+// solve()
+// ---------------------------------------------------------------------------
+void Polysquare::solve() {
+    // The transitions come first: buildTopology() needs them, both to define
+    // the dependent bank of each cut and to carry theta_gamma into the corner
+    // targets where a cut meets the boundary.
+    extractTransitions();
+    buildTopology();
+    poissonInit();
+    optimize();
+}
+
+// ---------------------------------------------------------------------------
+// measure()
+// ---------------------------------------------------------------------------
+void Polysquare::measure() {
+    const int nT = static_cast<int>(orig->triangles.size());
+
+    report_.flips = 0;
+    report_.minScaledJacobian = std::numeric_limits<double>::max();
+    double sjSum = 0.0;
+    int sjCount = 0;
+
+    for (int f = 0; f < nT; ++f) {
+        if (triGrad[f].area <= 0.0) continue;
+        double J[2][2] = {{0.0, 0.0}, {0.0, 0.0}};
+        for (int i = 0; i < 3; ++i) {
+            const Point &p = uv[cutMesh->triangles[f][i]];
+            for (int r = 0; r < 2; ++r)
+                for (int c = 0; c < 2; ++c) J[r][c] += p[r] * triGrad[f].g[i][c];
+        }
+        const double d = det2(J);
+        if (d <= 0.0) ++report_.flips;
+
+        const double c0 = std::sqrt(J[0][0] * J[0][0] + J[1][0] * J[1][0]);
+        const double c1 = std::sqrt(J[0][1] * J[0][1] + J[1][1] * J[1][1]);
+        const double sj = (c0 * c1 > 1e-18) ? d / (c0 * c1) : 0.0;
+        report_.minScaledJacobian = std::min(report_.minScaledJacobian, sj);
+        sjSum += sj;
+        ++sjCount;
+    }
+    report_.avgScaledJacobian = sjCount ? sjSum / sjCount : 0.0;
+    if (sjCount == 0) report_.minScaledJacobian = 0.0;
+
+    // Turns of the image boundary. A quarter turn is 90 degrees and the noise
+    // is a fraction of one, so anything past 30 counts.
+    report_.turns = 0;
+    report_.expectedTurns = 0;
+    report_.shortestRun = std::numeric_limits<int>::max();
+    for (size_t l = 0; l + 1 < loopStart.size(); ++l) {
+        const int b0 = loopStart[l], b1 = loopStart[l + 1];
+        const int n = b1 - b0;
+        if (n < 2) continue;
+        int run = 0;
+        for (int i = 0; i < n; ++i) {
+            const BoundaryEdge &ei = bEdges[b0 + i];
+            const BoundaryEdge &ej = bEdges[b0 + (i + 1) % n];
+            if (boundaryCorner[ei.sharedOrigVertex] != 0) ++report_.expectedTurns;
+
+            const Point di = uv[ei.cb] - uv[ei.ca];
+            const Point dj = uv[ej.cb] - uv[ej.ca];
+            if (normP(di) < 1e-18 || normP(dj) < 1e-18) continue;
+            const double turn =
+                std::fabs(wrap_pi(computeAngle(dj) - computeAngle(di) - ei.seamTurn));
+            if (turn > 30.0 * M_PI / 180.0) {
+                ++report_.turns;
+                report_.shortestRun = std::min(report_.shortestRun, run);
+                run = 0;
+            } else {
+                ++run;
+            }
+        }
+    }
+    if (report_.turns == 0) report_.shortestRun = static_cast<int>(bEdges.size());
+
+    // Boundary alignment and length.
+    double devSum = 0.0, devMax = 0.0, imageLen = 0.0;
+    for (const auto &be : bEdges) {
+        const Point d = uv[be.cb] - uv[be.ca];
+        const double n = normP(d);
+        imageLen += n;
+        if (n < 1e-18) continue;
+        const double dev = std::fabs(axisDeviation(d[0], d[1])) * 180.0 / M_PI;
+        devSum += dev;
+        devMax = std::max(devMax, dev);
+    }
+    report_.meanAlignDeg = bEdges.empty() ? 0.0 : devSum / bEdges.size();
+    report_.maxAlignDeg = devMax;
+    report_.lengthRatio = imageLen / totalBoundaryLength;
+
+    // Eq. (8) holds by construction, so there is nothing to measure there.
+    // What is worth measuring is the assumption underneath it: that a single
+    // k*90-degree rotation really does line the frames up across each cut. A
+    // large residual here means the cut runs through a part of the field that
+    // is not smooth, and the parameterization inherits that.
+    report_.transitionDeg = 0.0;
+    for (size_t c = 0; c < harmonicCut->getCuts().size(); ++c) {
+        const auto &path = harmonicCut->getCuts()[c].path;
+        for (size_t i = 0; i + 1 < path.size(); ++i) {
+            const int fL = leftTriangleOf(path[i], path[i + 1]);
+            if (fL < 0) continue;
+            const int fR = oppositeTriangle(fL, path[i], path[i + 1]);
+            if (fR < 0) continue;
+            const Point rotated = rotateVector(frameU[fL], transitionK[c]);
+            const double deg = std::fabs(wrap_pi(computeAngle(rotated) - computeAngle(frameU[fR]))) *
+                               180.0 / M_PI;
+            report_.transitionDeg = std::max(report_.transitionDeg, deg);
+        }
+    }
+
+    Eigen::VectorXd g(x.size());
+    evaluate(x, g, &report_.arap, &report_.l1, &report_.cor);
+}
+
+// ---------------------------------------------------------------------------
+// VTK output
+// ---------------------------------------------------------------------------
+namespace {
+
+void writeHeader(std::ofstream &out, size_t nPoints, size_t nCells) {
+    out << "<?xml version=\"1.0\"?>\n";
+    out << "<VTKFile type=\"UnstructuredGrid\" version=\"1.0\" byte_order=\"LittleEndian\">\n";
+    out << "  <UnstructuredGrid>\n";
+    out << "    <Piece NumberOfPoints=\"" << nPoints << "\" NumberOfCells=\"" << nCells << "\">\n";
+}
+
+void writeCells(std::ofstream &out, const std::vector<Triangle> &tris) {
+    out << "      <Cells>\n";
+    out << "        <DataArray type=\"Int32\" Name=\"connectivity\" format=\"ascii\">\n";
+    for (const auto &t : tris) out << "          " << t[0] << " " << t[1] << " " << t[2] << "\n";
+    out << "        </DataArray>\n";
+    out << "        <DataArray type=\"Int32\" Name=\"offsets\" format=\"ascii\">\n";
+    for (size_t i = 1; i <= tris.size(); ++i) out << "          " << i * 3 << "\n";
+    out << "        </DataArray>\n";
+    out << "        <DataArray type=\"UInt8\" Name=\"types\" format=\"ascii\">\n";
+    for (size_t i = 0; i < tris.size(); ++i) out << "          5\n";
+    out << "        </DataArray>\n";
+    out << "      </Cells>\n";
+}
+
+void writeFooter(std::ofstream &out) {
+    out << "    </Piece>\n";
+    out << "  </UnstructuredGrid>\n";
+    out << "</VTKFile>\n";
+}
+
+} // namespace
+
+bool Polysquare::writeVTU(const std::string &filename) const {
+    if (uv.empty()) return false;
+    std::ofstream out(filename);
+    if (!out) return false;
+
+    const int nT = static_cast<int>(orig->triangles.size());
+    writeHeader(out, uv.size(), cutMesh->triangles.size());
+
+    out << "      <Points>\n";
+    out << "        <DataArray type=\"Float64\" NumberOfComponents=\"3\" format=\"ascii\">\n";
+    for (const auto &p : uv) out << "          " << p[0] << " " << p[1] << " 0.0\n";
+    out << "        </DataArray>\n";
+    out << "      </Points>\n";
+
+    out << "      <PointData Vectors=\"source\">\n";
+    out << "        <DataArray type=\"Float64\" Name=\"source\" NumberOfComponents=\"3\" format=\"ascii\">\n";
+    for (size_t i = 0; i < uv.size(); ++i) {
+        const Point &s = cutMesh->vertices[i];
+        out << "          " << s[0] << " " << s[1] << " 0.0\n";
+    }
+    out << "        </DataArray>\n";
+    out << "      </PointData>\n";
+
+    out << "      <CellData Scalars=\"scaledJacobian\">\n";
+    out << "        <DataArray type=\"Float64\" Name=\"scaledJacobian\" format=\"ascii\">\n";
+    for (int f = 0; f < nT; ++f) {
+        double J[2][2] = {{0.0, 0.0}, {0.0, 0.0}};
+        for (int i = 0; i < 3; ++i) {
+            const Point &p = uv[cutMesh->triangles[f][i]];
+            for (int r = 0; r < 2; ++r)
+                for (int c = 0; c < 2; ++c) J[r][c] += p[r] * triGrad[f].g[i][c];
+        }
+        const double d = det2(J);
+        const double c0 = std::sqrt(J[0][0] * J[0][0] + J[1][0] * J[1][0]);
+        const double c1 = std::sqrt(J[0][1] * J[0][1] + J[1][1] * J[1][1]);
+        out << "          " << ((c0 * c1 > 1e-18) ? d / (c0 * c1) : 0.0) << "\n";
+    }
+    out << "        </DataArray>\n";
+    out << "      </CellData>\n";
+
+    writeCells(out, cutMesh->triangles);
+    writeFooter(out);
+    return true;
+}
+
+bool Polysquare::writeSourceVTU(const std::string &filename) const {
+    if (uv.empty()) return false;
+    std::ofstream out(filename);
+    if (!out) return false;
+
+    writeHeader(out, cutMesh->vertices.size(), cutMesh->triangles.size());
+
+    out << "      <Points>\n";
+    out << "        <DataArray type=\"Float64\" NumberOfComponents=\"3\" format=\"ascii\">\n";
+    for (const auto &p : cutMesh->vertices) out << "          " << p[0] << " " << p[1] << " 0.0\n";
+    out << "        </DataArray>\n";
+    out << "      </Points>\n";
+
+    out << "      <PointData Vectors=\"uv\">\n";
+    out << "        <DataArray type=\"Float64\" Name=\"uv\" NumberOfComponents=\"3\" format=\"ascii\">\n";
+    for (const auto &p : uv) out << "          " << p[0] << " " << p[1] << " 0.0\n";
+    out << "        </DataArray>\n";
+    out << "      </PointData>\n";
+
+    writeCells(out, cutMesh->triangles);
+    writeFooter(out);
+    return true;
+}

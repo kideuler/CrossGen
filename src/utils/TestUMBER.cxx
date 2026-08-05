@@ -9,6 +9,7 @@
 
 #include "Parameterization/HarmonicCut.hxx"
 #include "SIPG/SIPG.hxx"
+#include "UMBER/Polysquare.hxx"
 #include "UMBER/UMBER.hxx"
 
 static const int MBO_MAX_STEPS = 500;
@@ -124,6 +125,65 @@ int main(int argc, char **argv) {
         else
             std::cout << "\033[31m[FAIL]\033[0m " << singAfter.size()
                       << " internal singularity(ies) remain.\n";
+
+        // --- Polysquare parameterization, Sec. 4.3 --------------------------
+        Polysquare poly(umber, hc);
+        poly.solve();
+        const Polysquare::Report &pr = poly.getReport();
+
+        std::cout << std::defaultfloat << "  polysquare: L-BFGS " << pr.iterations
+                  << " iterations, transitions";
+        for (int k : poly.getTransitions()) std::cout << " " << k * 90 << "deg";
+        if (poly.getTransitions().empty()) std::cout << " none";
+        std::cout << " (Eq. 7 residual " << std::fixed << std::setprecision(1)
+                  << pr.transitionDeg << " deg)\n";
+        std::cout << "    boundary turns: " << pr.turns << " (field asked for "
+                  << pr.expectedTurns << "), shortest straight run " << pr.shortestRun
+                  << " edges\n";
+        std::cout << std::fixed << std::setprecision(3)
+                  << "    boundary alignment: mean " << pr.meanAlignDeg << " deg, worst "
+                  << pr.maxAlignDeg << " deg; length ratio " << pr.lengthRatio << "\n"
+                  << "    scaled Jacobian: min " << pr.minScaledJacobian << ", avg "
+                  << pr.avgScaledJacobian << "; flipped triangles " << pr.flips << "\n"
+                  << "    E_arap " << pr.arap << "  E_l1 " << pr.l1 << "  E_cor ";
+        if (pr.cor > 0.0) std::cout << std::scientific << std::setprecision(2) << pr.cor << "\n";
+        else std::cout << "(off)\n";
+
+        if (pr.flips == 0)
+            std::cout << "\033[32m[PASS]\033[0m Parameterization has no flipped triangles.\n";
+        else
+            std::cout << "\033[31m[FAIL]\033[0m " << pr.flips
+                      << " flipped triangle(s) in the parameterization.\n";
+        if (pr.meanAlignDeg < 5.0)
+            std::cout << "\033[32m[PASS]\033[0m Boundary is axis aligned.\n";
+        else
+            std::cout << "\033[31m[FAIL]\033[0m Boundary is " << pr.meanAlignDeg
+                      << " deg off axis on average.\n";
+        // On a holed model the count also picks up the seams, where the cut
+        // banks meet the boundary, so it is only exact when there are no cuts.
+        if (pr.turns == pr.expectedTurns)
+            std::cout << "\033[32m[PASS]\033[0m Boundary turns exactly where the field has a corner.\n";
+        else if (hc.getCutEdges().empty())
+            std::cout << "\033[31m[FAIL]\033[0m Boundary turns " << pr.turns << " times, but the "
+                      << "field asked for " << pr.expectedTurns << ".\n";
+        else
+            std::cout << "  (" << pr.turns - pr.expectedTurns
+                      << " turns beyond the field's corners, at the seams)\n";
+
+        // Strip the directory and the extension for the output names.
+        std::string stem = path;
+        const size_t slash = stem.find_last_of("/\\");
+        if (slash != std::string::npos) stem = stem.substr(slash + 1);
+        const size_t dot = stem.find_last_of('.');
+        if (dot != std::string::npos) stem = stem.substr(0, dot);
+
+        const std::string uvFile = stem + "_polysquare.vtu";
+        const std::string srcFile = stem + "_source.vtu";
+        if (poly.writeVTU(uvFile) && poly.writeSourceVTU(srcFile))
+            std::cout << "  wrote " << uvFile << " (parameter domain) and " << srcFile
+                      << " (input domain, uv as a point field)\n";
+        else
+            std::cout << "\033[31m[FAIL]\033[0m could not write the VTK output.\n";
     } catch (const std::exception &e) {
         std::cout << "\033[31m[FAIL]\033[0m UMBER failed: " << e.what() << "\n";
         return 3;

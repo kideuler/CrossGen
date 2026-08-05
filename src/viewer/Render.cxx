@@ -913,5 +913,126 @@ void drawSingularitiesOnUVG(const UVGParam &uvp,
     }
 }
 
+// ── UMBER polysquare ─────────────────────────────────────────────────────────
+
+void computePolysquareBounds(const Polysquare &ps, double &cx, double &cy,
+                             double &baseW, double &baseH) {
+    const auto &uv = ps.getUV();
+    if (uv.empty()) {
+        cx = 0.0; cy = 0.0; baseW = 1.0; baseH = 1.0;
+        return;
+    }
+
+    double minU = uv[0][0], maxU = uv[0][0];
+    double minV = uv[0][1], maxV = uv[0][1];
+    for (const auto &p : uv) {
+        minU = std::min(minU, p[0]); maxU = std::max(maxU, p[0]);
+        minV = std::min(minV, p[1]); maxV = std::max(maxV, p[1]);
+    }
+
+    const double du = maxU - minU;
+    const double dv = maxV - minV;
+    double ext = std::max(du, dv);
+    if (ext <= 0) ext = 1.0;
+    const double pad = 0.1 * ext;
+
+    cx = 0.5 * (minU + maxU);
+    cy = 0.5 * (minV + maxV);
+    baseW = du + 2.0 * pad;
+    baseH = dv + 2.0 * pad;
+    if (baseW <= 0.0) baseW = 1.0;
+    if (baseH <= 0.0) baseH = 1.0;
+}
+
+void drawPolysquare(const Polysquare &ps) {
+    const auto &uv = ps.getUV();
+    const Mesh &cm = ps.getCutMesh();
+    if (uv.empty()) return;
+    const int nV = static_cast<int>(uv.size());
+
+    glColor3f(0.3f, 0.8f, 0.9f);
+    glLineWidth(1.0f);
+    glBegin(GL_LINES);
+    for (const auto &tri : cm.triangles) {
+        for (int e = 0; e < 3; ++e) {
+            const int a = tri[e], b = tri[(e + 1) % 3];
+            if (a < 0 || a >= nV || b < 0 || b >= nV) continue;
+            glVertex2d(uv[a][0], uv[a][1]);
+            glVertex2d(uv[b][0], uv[b][1]);
+        }
+    }
+    glEnd();
+}
+
+void drawFlippedPolysquareTriangles(const Polysquare &ps) {
+    const auto &uv = ps.getUV();
+    const Mesh &cm = ps.getCutMesh();
+    if (uv.empty()) return;
+    const int nV = static_cast<int>(uv.size());
+
+    glColor4f(0.9f, 0.1f, 0.1f, 0.45f);
+    glBegin(GL_TRIANGLES);
+    for (const auto &tri : cm.triangles) {
+        const int i = tri[0], j = tri[1], k = tri[2];
+        if (i < 0 || i >= nV || j < 0 || j >= nV || k < 0 || k >= nV) continue;
+        const double area2 = (uv[j][0] - uv[i][0]) * (uv[k][1] - uv[i][1]) -
+                             (uv[k][0] - uv[i][0]) * (uv[j][1] - uv[i][1]);
+        if (area2 < 0.0) {
+            glVertex2d(uv[i][0], uv[i][1]);
+            glVertex2d(uv[j][0], uv[j][1]);
+            glVertex2d(uv[k][0], uv[k][1]);
+        }
+    }
+    glEnd();
+}
+
+void drawPolysquareStructure(const Polysquare &ps, const HarmonicCut &hc) {
+    const auto &uv = ps.getUV();
+    const Mesh &cm = ps.getCutMesh();
+    if (uv.empty()) return;
+    const int nV = static_cast<int>(uv.size());
+    const auto &toOrig = hc.getCutVertexToOriginal();
+    const auto &cuts = hc.getCutEdges();
+
+    // The banks first, so the boundary of the model draws over them.
+    for (int pass = 0; pass < 2; ++pass) {
+        if (pass == 0) { glColor3f(1.0f, 0.2f, 0.9f); glLineWidth(2.5f); }
+        else           { glColor3f(1.0f, 0.85f, 0.3f); glLineWidth(3.5f); }
+
+        glBegin(GL_LINES);
+        for (int e : cm.boundaryEdges) {
+            const int a = cm.edges[e][0], b = cm.edges[e][1];
+            if (a < 0 || a >= nV || b < 0 || b >= nV) continue;
+            if (a >= static_cast<int>(toOrig.size()) || b >= static_cast<int>(toOrig.size())) continue;
+
+            const bool onCut = cuts.count(MeshEdgeKey(toOrig[a], toOrig[b])) > 0;
+            if (onCut != (pass == 0)) continue;
+
+            glVertex2d(uv[a][0], uv[a][1]);
+            glVertex2d(uv[b][0], uv[b][1]);
+        }
+        glEnd();
+    }
+    glLineWidth(1.0f);
+}
+
+void drawPolysquareCorners(const Polysquare &ps, const HarmonicCut &hc,
+                           const std::vector<std::pair<int, int>> &corners, double radius) {
+    const auto &uv = ps.getUV();
+    if (uv.empty()) return;
+    const int nV = static_cast<int>(uv.size());
+    const auto &origToCut = hc.getOriginalToCutVertices();
+
+    for (const auto &[origVtx, k] : corners) {
+        if (origVtx < 0 || origVtx >= static_cast<int>(origToCut.size())) continue;
+        for (int cv : origToCut[origVtx]) {
+            if (cv < 0 || cv >= nV) continue;
+            if (k == 1)       drawDisk3D(uv[cv], radius, 0.2f, 0.2f, 0.95f);
+            else if (k == -1) drawDisk3D(uv[cv], radius, 0.95f, 0.2f, 0.2f);
+            else              drawDisk3D(uv[cv], radius, 0.95f, 0.85f, 0.1f);
+        }
+    }
+}
+
 } // namespace viewer
 
