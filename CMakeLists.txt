@@ -67,6 +67,8 @@ add_library(PolyVector SHARED
     src/tracing/SeparatrixTrace.cxx
     src/tracing/QuadLayout.hxx
     src/tracing/QuadLayout.cxx
+    src/tracing/PartitionSimplify.hxx
+    src/tracing/PartitionSimplify.cxx
     src/triangle/triangle.cpp
     src/triangle/triangle.h
     src/triangle/TriangleMesher.hpp

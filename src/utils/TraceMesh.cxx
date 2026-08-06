@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "crossfield/CrossField.hxx"
+#include "tracing/PartitionSimplify.hxx"
 #include "tracing/QuadLayout.hxx"
 #include "tracing/SeparatrixTrace.hxx"
 
@@ -63,6 +64,10 @@ struct Outcome {
     int tJunctions = 0;
     int skew = 0;
     double areaRatio = 0.0;
+    // after Sec. 4
+    int sFaces = 0, sQuads = 0, sTJunctions = 0, sCollapses = 0, sRolledBack = 0;
+    double sAreaRatio = 0.0;
+    bool sSound = false;
 };
 
 // The raw traced curves, before the layout splits them, as one poly-line each.
@@ -97,6 +102,7 @@ static void writeSeparatricesVTU(const std::string &file, const SeparatrixTrace 
     out << "        </DataArray>\n      </Cells>\n    </Piece>\n  </UnstructuredGrid>\n</VTKFile>\n";
 }
 
+static bool gSimplify = true;
 static double gCutRadius = SeparatrixTrace::Settings().singularityCutRadius;
 static double gTangential = SeparatrixTrace::Settings().tangentialAngle;
 static bool gEvenRays = SeparatrixTrace::Settings().evenCornerRays;
@@ -149,6 +155,19 @@ static Outcome processMesh(const std::string &path, bool writeVtu, bool verbose)
                 (std::fabs(out.areaRatio - 1.0) < 1e-9) && rep.faces > 0;
     out.allQuads = out.sound && rep.badFaces == 0;
 
+    PartitionSimplify simp(layout);
+    if (gSimplify) simp.run();
+    const auto &sr = simp.getReport();
+    const auto &sl = simp.getLayout().getReport();
+    out.sFaces = sl.faces;
+    out.sQuads = sl.quadFaces;
+    out.sTJunctions = sl.tJunctions;
+    out.sCollapses = sr.collapses;
+    out.sRolledBack = sr.rolledBack;
+    out.sAreaRatio = (rep.meshArea > 0.0) ? sl.totalArea / rep.meshArea : 0.0;
+    out.sSound = sl.arcCrossings == 0 && sl.danglingEnds == 0 && sl.faces > 0 &&
+                 std::fabs(out.sAreaRatio - 1.0) < 1e-9;
+
     if (verbose) {
         std::cout << "  mesh          " << mesh->triangles.size() << " triangles, "
                   << mesh->vertices.size() << " vertices\n";
@@ -185,6 +204,18 @@ static Outcome processMesh(const std::string &path, bool writeVtu, bool verbose)
         std::cout << "  faces         " << rep.quadFaces << " four-cornered, " << rep.badFaces
                   << " not; area " << std::setprecision(10) << out.areaRatio
                   << " of the model\n" << std::setprecision(6);
+        std::cout << "  simplified    " << sl.faces << " components (" << sl.quadFaces
+                  << " four-sided), " << sl.tJunctions << " T-junctions, after " << sr.collapses
+                  << " chord collapse(s); " << sr.blockedByConditions << " chord(s) blocked by the "
+                     "conditions, " << sr.blockedByEnergy << " by the energy, " << sr.rolledBack
+                  << " rolled back; area " << std::setprecision(10) << out.sAreaRatio << "\n"
+                  << std::setprecision(6);
+        if (sr.rolledBack)
+            std::cout << "  rollbacks     " << sr.rbFailed << " could not be applied, "
+                      << sr.rbCrossings << " non-planar, " << sr.rbDangling << " loose ends, "
+                      << sr.rbNotFewer << " no fewer components, " << sr.rbMoreT
+                      << " more T-junctions, " << sr.rbSing << " lost a singularity, "
+                      << sr.rbArea << " changed area, " << sr.rbWorse << " more bad faces\n";
         if (rep.badFaces) {
             int shown = 0;
             for (size_t i = 0; i < layout.getFaces().size() && shown < 8; ++i) {
@@ -208,6 +239,9 @@ static Outcome processMesh(const std::string &path, bool writeVtu, bool verbose)
         layout.writeArcsVTU(out.name + "_layout_arcs.vtu");
         layout.writeFacesVTU(out.name + "_layout_faces.vtu");
         layout.writeNodesVTU(out.name + "_layout_nodes.vtu");
+        simp.getLayout().writeArcsVTU(out.name + "_simple_arcs.vtu");
+        simp.getLayout().writeFacesVTU(out.name + "_simple_faces.vtu");
+        simp.getLayout().writeNodesVTU(out.name + "_simple_nodes.vtu");
         writeSeparatricesVTU(out.name + "_separatrices.vtu", trace);
     }
     return out;
@@ -222,6 +256,7 @@ int main(int argc, char **argv) {
         else if (std::strcmp(argv[i], "--cut-radius") == 0 && i + 1 < argc) gCutRadius = std::atof(argv[++i]);
         else if (std::strcmp(argv[i], "--tangential") == 0 && i + 1 < argc) gTangential = std::atof(argv[++i]) * M_PI / 180.0;
         else if (std::strcmp(argv[i], "--square-rays") == 0) gEvenRays = false;
+        else if (std::strcmp(argv[i], "--no-simplify") == 0) gSimplify = false;
         else if (std::strcmp(argv[i], "-v") == 0) verbose = true;
         else meshes.push_back(argv[i]);
     }
@@ -240,23 +275,36 @@ int main(int argc, char **argv) {
               << std::left << std::setw(12) << "mesh" << std::right << std::setw(6) << "sing"
               << std::setw(6) << "seps" << std::setw(7) << "faces" << std::setw(7) << "quads"
               << std::setw(7) << "T-jct" << std::setw(7) << "loose" << std::setw(7) << "skew"
-              << std::setw(10) << "area" << "  sound  4-sided\n";
+              << "  |" << std::setw(6) << "coll" << std::setw(7) << "faces" << std::setw(7)
+              << "quads" << std::setw(7) << "T-jct" << std::setw(6) << "back" << "  sound\n";
     int sound = 0, allQuads = 0, faces = 0, quads = 0;
     for (const auto &o : all) {
         std::cout << std::left << std::setw(12) << o.name << std::right << std::setw(6)
                   << o.singularities << std::setw(6) << o.separatrices << std::setw(7) << o.faces
                   << std::setw(7) << o.quads << std::setw(7) << o.tJunctions << std::setw(7)
-                  << (o.stuck + o.dangling) << std::setw(7) << o.skew << std::setw(10) << std::fixed
-                  << std::setprecision(6) << o.areaRatio << (o.sound ? "    yes" : "     NO")
-                  << (o.allQuads ? "      yes" : "       no") << "\n";
+                  << (o.stuck + o.dangling) << std::setw(7) << o.skew << "  |" << std::setw(6)
+                  << o.sCollapses << std::setw(7) << o.sFaces << std::setw(7) << o.sQuads
+                  << std::setw(7) << o.sTJunctions << std::setw(6) << o.sRolledBack
+                  << ((o.sound && o.sSound) ? "    yes" : "     NO") << "\n";
         if (o.sound) ++sound;
         if (o.allQuads) ++allQuads;
         faces += o.faces;
         quads += o.quads;
     }
-    std::cout << sound << "/" << all.size() << " layouts sound; " << allQuads << "/" << all.size()
-              << " have every component four-sided; " << quads << "/" << faces << " components ("
-              << std::setprecision(1) << (faces ? 100.0 * quads / faces : 0.0)
-              << "%) are four-sided\n";
-    return (sound == static_cast<int>(all.size())) ? 0 : 1;
+    int sSound = 0, sFaces = 0, sQuads = 0, collapses = 0, rolled = 0;
+    for (const auto &o : all) {
+        if (o.sound && o.sSound) ++sSound;
+        sFaces += o.sFaces;
+        sQuads += o.sQuads;
+        collapses += o.sCollapses;
+        rolled += o.sRolledBack;
+    }
+    std::cout << std::fixed << std::setprecision(1) << sound << "/" << all.size() << " layouts sound before "
+              << "simplification, " << sSound << "/" << all.size() << " after; " << allQuads << "/"
+              << all.size() << " all four-sided before\n"
+              << "components " << faces << " -> " << sFaces << " over " << collapses
+              << " chord collapses (" << rolled << " rolled back); four-sided " << quads << "/"
+              << faces << " (" << (faces ? 100.0 * quads / faces : 0.0) << "%) -> " << sQuads << "/"
+              << sFaces << " (" << (sFaces ? 100.0 * sQuads / sFaces : 0.0) << "%)\n";
+    return (sound == static_cast<int>(all.size()) && sSound == static_cast<int>(all.size())) ? 0 : 1;
 }

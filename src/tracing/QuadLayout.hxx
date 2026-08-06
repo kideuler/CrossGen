@@ -74,6 +74,12 @@ public:
         std::vector<double> turn;    // how far it turns there, signed, in radians
         int corners = 0;
         double area = 0.0;
+        // The component's sides: the runs of darts between one corner and the
+        // next, in the same order the darts are in. A four-sided component has
+        // four of them however many arcs each is made of -- a side carrying
+        // T-junctions is several arcs and still one side, which is the whole
+        // point of allowing T-junctions.
+        std::vector<std::vector<int>> sides;
     };
 
     struct Report {
@@ -103,7 +109,21 @@ public:
 
     explicit QuadLayout(const SeparatrixTrace &trace);
 
+    // For an arrangement handed over directly rather than read off a trace.
+    // `tol` is the distance below which two nodes are the same place.
+    explicit QuadLayout(double tol);
+
     void build();
+
+    // Take an arrangement as given and work out its faces. Partition
+    // simplification rewrites nodes and arcs and needs the faces of what it
+    // has rewritten; everything from the sorting of darts onwards is the same
+    // work as build() does.
+    void rebuild(std::vector<Node> newNodes, std::vector<Arc> newArcs);
+
+    // The mesh the layout was traced on; null for one handed over directly to
+    // rebuild(), which keeps no reference to a model.
+    const Mesh *getMesh() const { return mesh; }
 
     static int arcOfDart(int dart) { return dart >> 1; }
 
@@ -132,6 +152,7 @@ private:
     void sortAroundNodes();
     void traceFaces();
     void checkEmbedding();
+    void finish();   // the tail shared by build() and rebuild()
     int addArc(std::vector<Point> pts, int a, int b, int separatrix, bool onBoundary);
 
     const SeparatrixTrace *trace = nullptr;

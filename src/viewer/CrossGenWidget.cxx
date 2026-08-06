@@ -59,9 +59,10 @@ MBOPhase nextMBOPhase(MBOPhase p) {
         case MBOPhase::Stepping:     return MBOPhase::Separatrices;
         case MBOPhase::Separatrices: return MBOPhase::Trace;
         case MBOPhase::Trace:        return MBOPhase::Layout;
-        case MBOPhase::Layout:       return MBOPhase::Layout;
+        case MBOPhase::Layout:       return MBOPhase::Simplified;
+        case MBOPhase::Simplified:   return MBOPhase::Simplified;
     }
-    return MBOPhase::Layout;
+    return MBOPhase::Simplified;
 }
 
 SIPGPhase nextSIPGPhase(SIPGPhase p) {
@@ -116,6 +117,7 @@ const char *mboPhaseName(MBOPhase p) {
         case MBOPhase::Separatrices: return "4) separatrices";
         case MBOPhase::Trace:        return "5) trace";
         case MBOPhase::Layout:       return "6) quad layout";
+        case MBOPhase::Simplified:   return "7) simplified partition";
     }
     return "?";
 }
@@ -445,6 +447,7 @@ void CrossGenWidget::doReset() {
     sipgUVParam_.reset();
     separatrixTrace_.reset();
     quadLayout_.reset();
+    simplified_.reset();
     delaunayMesh_.reset();
     medialAxis_.reset();
     oasis_.reset();
@@ -1096,6 +1099,29 @@ void CrossGenWidget::runComputations() {
         }
     }
 
+    // ── MBO: Sec. 4, collapse the chords the layout does not need ─────────────
+    if (mode_ == Mode::MBO && mboPhase_ >= MBOPhase::Simplified && quadLayout_.has_value() &&
+        !simplified_.has_value()) {
+        auto t0 = Clock::now();
+        simplified_.emplace(*quadLayout_);
+        simplified_->run();
+        auto t1 = Clock::now();
+
+        const PartitionSimplify::Report &r = simplified_->getReport();
+        const QuadLayout::Report &sl = simplified_->getLayout().getReport();
+        std::ostringstream oss;
+        oss << "[Simplify] " << r.componentsBefore << " -> " << sl.faces << " component(s) ("
+            << sl.quadFaces << " four-sided), " << r.tJunctionsBefore << " -> " << sl.tJunctions
+            << " T-junction(s), over " << r.collapses << " chord collapse(s): "
+            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+        std::ostringstream why;
+        why << "[Simplify] " << r.blockedByConditions << " chord(s) blocked by Sec. 4's conditions, "
+            << r.blockedByEnergy << " by the energy, " << r.rolledBack
+            << " collapse(s) undone for breaking Proposition 2";
+        console_.log(why.str());
+    }
+
     // ── SIPG: Initialize ──────────────────────────────────────────────────────
     if (sipgStageWantsField() && !sipgField_.has_value()) {
         auto t0 = Clock::now();
@@ -1671,8 +1697,10 @@ void CrossGenWidget::renderNormal() {
         // the same curves cut at the nodes, plus the pieces of the boundary
         // that close the components, so drawing both would only double the
         // interior lines and still leave the outline out.
-        if (mboPhase_ >= MBOPhase::Layout && quadLayout_.has_value()) {
-            viewer::drawQuadLayoutArcs(*quadLayout_, 3.0f);
+        if (mboPhase_ >= MBOPhase::Simplified && simplified_.has_value()) {
+            viewer::drawQuadLayoutArcs(simplified_->getLayout(), 3.0f, 0.95f, 0.2f, 0.2f);
+        } else if (mboPhase_ >= MBOPhase::Layout && quadLayout_.has_value()) {
+            viewer::drawQuadLayoutArcs(*quadLayout_, 3.0f, 0.95f, 0.2f, 0.2f);
         } else if (mboPhase_ >= MBOPhase::Separatrices && separatrixTrace_) {
             glLineWidth(3.0f);
             for (const auto &sep : separatrixTrace_->separatrices) {

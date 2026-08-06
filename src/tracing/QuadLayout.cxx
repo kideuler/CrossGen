@@ -71,6 +71,17 @@ QuadLayout::QuadLayout(const SeparatrixTrace &t) : trace(&t) {
     tol = 1e-6 * t.getTracer().averageEdgeLength();
 }
 
+QuadLayout::QuadLayout(double tolerance) : tol(tolerance) {}
+
+void QuadLayout::rebuild(std::vector<Node> newNodes, std::vector<Arc> newArcs) {
+    nodes = std::move(newNodes);
+    arcs = std::move(newArcs);
+    faces.clear();
+    nodeHash.clear();
+    report_ = Report{};
+    finish();
+}
+
 // ---------------------------------------------------------------------------
 // addNode()  --  with merging of coincident ones
 //
@@ -477,7 +488,14 @@ void QuadLayout::traceFaces() {
             // by angle instead miscounts every place the model itself is not
             // square -- a 67-degree corner of the geometry is still one corner
             // of one component, and so is a 17-degree spike.
+            // What the node is, structurally, rather than what it was labelled
+            // when it was created: partition simplification merges nodes, and a
+            // label that was right before the merge need not survive it.
             const Node &nd = nodes[at];
+            const bool boundary = [&] {
+                for (const int d : nd.darts) if (arcs[d >> 1].onBoundary) return true;
+                return false;
+            }();
             bool corner = true;
             if (nd.kind == NodeKind::BoundaryCorner) {
                 // A corner of the model is a corner of whatever component sits
@@ -489,10 +507,12 @@ void QuadLayout::traceFaces() {
                 // which is what a heteroclinic joint is; one arc is a loose end
                 // the face runs out to and back from.
                 corner = false;
-            } else if (nd.kind == NodeKind::TJunction && nd.darts.size() == 3) {
-                // A separatrix stopping on another one leaves the side it
-                // stopped against unbroken: of the three sectors, the widest is
-                // that side and the other two are corners.
+            } else if (nd.darts.size() == 3 && !boundary && nd.kind != NodeKind::Singularity) {
+                // Three arcs meeting away from the boundary, at a node the
+                // field has no irregularity at, is a separatrix stopped against
+                // a side. The side it stopped against runs past unbroken, so of
+                // the three sectors the widest is not a corner and the other two
+                // are.
                 int widest = 0;
                 double best = -1.0;
                 for (size_t k = 0; k < nd.darts.size(); ++k) {
@@ -506,6 +526,22 @@ void QuadLayout::traceFaces() {
                 face.isCorner[i] = 1;
                 ++face.corners;
             }
+        }
+
+        // Cut the cycle into sides at the corners, starting at one of them so
+        // that a side is never split across the seam.
+        int first = -1;
+        for (size_t i = 0; i < cycle.size(); ++i) if (face.isCorner[i]) { first = static_cast<int>(i); break; }
+        if (first < 0) {
+            face.sides.push_back(face.darts);   // a component with no corner at all
+        } else {
+            std::vector<int> side;
+            for (size_t k = 0; k < cycle.size(); ++k) {
+                const size_t i = (first + k) % cycle.size();
+                if (face.isCorner[i] && !side.empty()) { face.sides.push_back(side); side.clear(); }
+                side.push_back(cycle[i]);
+            }
+            if (!side.empty()) face.sides.push_back(side);
         }
         faces.push_back(std::move(face));
     }
@@ -584,6 +620,10 @@ void QuadLayout::build() {
     collectNodes();
     buildSeparatrixArcs();
     buildBoundaryArcs();
+    finish();
+}
+
+void QuadLayout::finish() {
     sortAroundNodes();
     traceFaces();
     checkEmbedding();
@@ -593,8 +633,14 @@ void QuadLayout::build() {
     report_.faces = static_cast<int>(faces.size());
     for (const auto &n : nodes) {
         if (n.kind == NodeKind::Singularity) ++report_.singularities;
-        if (n.kind == NodeKind::TJunction) ++report_.tJunctions;
         if (n.kind == NodeKind::Dangling) ++report_.danglingEnds;
+        // Counted by what the node is: three arcs meeting in the interior at
+        // something that is not a singularity is a T-junction whatever it was
+        // called when it was made.
+        if (n.darts.size() != 3 || n.kind == NodeKind::Singularity) continue;
+        bool boundary = false;
+        for (const int d : n.darts) if (arcs[d >> 1].onBoundary) boundary = true;
+        if (!boundary) ++report_.tJunctions;
     }
     // Whether the layout is a valid T-layout is combinatorial, and reported by
     // the corner counts. Whether it is a *good* one is separate: a crossing
@@ -609,7 +655,9 @@ void QuadLayout::build() {
             const double w = wrapTwoPi(n.angles[(k + 1) % n.darts.size()] - n.angles[k]);
             worst = std::max(worst, std::fabs(w - want));
         }
-        if (n.kind == NodeKind::TJunction) {
+        bool boundaryHere = false;
+        for (const int d : n.darts) if (arcs[d >> 1].onBoundary) boundaryHere = true;
+        if (n.darts.size() == 3 && !boundaryHere && n.kind != NodeKind::Singularity) {
             // Two right angles and a straight side, not three equal sectors.
             worst = 0.0;
             std::vector<double> w(n.darts.size());
@@ -630,9 +678,10 @@ void QuadLayout::build() {
     }
     if (faces.empty()) report_.smallestArea = 0.0;
 
-    for (const auto &t : mesh->triangles)
-        report_.meshArea += 0.5 * std::fabs(cross2(mesh->vertices[t[1]] - mesh->vertices[t[0]],
-                                                   mesh->vertices[t[2]] - mesh->vertices[t[0]]));
+    if (mesh)
+        for (const auto &t : mesh->triangles)
+            report_.meshArea += 0.5 * std::fabs(cross2(mesh->vertices[t[1]] - mesh->vertices[t[0]],
+                                                       mesh->vertices[t[2]] - mesh->vertices[t[0]]));
 }
 
 // ---------------------------------------------------------------------------

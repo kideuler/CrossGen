@@ -20,6 +20,7 @@
 #include "polyvector/PolyVectors.hxx"
 #include "crossfield/CrossField.hxx"
 #include "sipg/SIPG.hxx"
+#include "tracing/PartitionSimplify.hxx"
 #include "tracing/QuadLayout.hxx"
 #include "tracing/SeparatrixTrace.hxx"
 #include "medialaxis/MedialAxis.hxx"
@@ -54,6 +55,7 @@ enum class MBOPhase {
     Separatrices = 4,
     Trace       = 5,
     Layout      = 6,
+    Simplified  = 7,
 };
 
 enum class SIPGPhase {
@@ -192,6 +194,10 @@ private:
     // Holds a pointer to the trace above, so it must not outlive it: both are
     // cleared together in reset().
     std::optional<QuadLayout>  quadLayout_;
+    // Sec. 4 run on the layout above. It keeps a copy of what it was handed, so
+    // the layout before simplification survives alongside it and the two can be
+    // drawn together.
+    std::optional<PartitionSimplify> simplified_;
     std::shared_ptr<Mesh>      delaunayMesh_;
     std::shared_ptr<MedialAxis> medialAxis_;
     std::optional<OASIS>       oasis_;

@@ -1102,8 +1102,8 @@ void drawBlockNodes(const MotorcycleGraph &mg, bool parameterDomain, double radi
     }
 }
 
-void drawQuadLayoutArcs(const QuadLayout &layout, float lineWidth) {
-    glColor3f(0.25f, 0.55f, 1.0f);
+void drawQuadLayoutArcs(const QuadLayout &layout, float lineWidth, float r, float g, float b) {
+    glColor3f(r, g, b);
     glLineWidth(lineWidth);
     for (const auto &arc : layout.getArcs()) {
         if (arc.pts.size() < 2) continue;

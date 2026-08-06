@@ -173,7 +173,7 @@ void drawBlockNodes(const MotorcycleGraph &mg, bool parameterDomain, double radi
 // rather than as chords between their nodes -- the curvature between two nodes
 // is the shape of the component's side, and straightening it would show a
 // different layout from the one that was built.
-void drawQuadLayoutArcs(const QuadLayout &layout, float lineWidth);
+void drawQuadLayoutArcs(const QuadLayout &layout, float lineWidth, float r, float g, float b);
 
 } // namespace viewer
 
