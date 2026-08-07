@@ -41,6 +41,23 @@ std::vector<Point> sampleAt(const std::vector<Point> &p, const std::vector<doubl
 
 } // namespace
 
+const char *PartitionSimplify::blockName(Block b) {
+    switch (b) {
+        case Block::None: return "none";
+        case Block::RungNotContractible: return "a node sits along a rung";
+        case Block::RungJoinsSingularities: return "rung joins two singularities";
+        case Block::RungSingularityToBoundary: return "rung joins a singularity to the boundary";
+        case Block::StripBetweenBoundaries: return "strip between two boundaries";
+        case Block::ZipAgainstBoundary: return "zip against the boundary";
+        case Block::WouldDeleteBoundary: return "would delete the boundary";
+        case Block::TJunctionHasNowhereToGo: return "T-junction has nowhere to go";
+        case Block::NoPatches: return "no patches";
+        case Block::Energy: return "energy (Sec. 4.1)";
+        case Block::Drag: return "wider than maxDrag";
+    }
+    return "?";
+}
+
 PartitionSimplify::PartitionSimplify(const QuadLayout &layout, const Settings &settings)
     : layout_(1e-9), settings_(settings) {
     // A copy is taken and worked on: the caller's layout is the input and stays
@@ -262,11 +279,23 @@ void PartitionSimplify::analyse(Chord &c) const {
         c.maxWidth = std::max(c.maxWidth, r.length);
     }
 
+    // A T-junction at either end of the chord is one the collapse would put on
+    // top of whatever the rung's other end is, which is how a collapse gets rid
+    // of one; see Sec. 4 condition 3 and Settings::tJunctionsFirst.
+    c.tJunctionEnds = 0;
+    if (!c.rungs.empty() && !c.cyclic) {
+        const auto &nodes = layout_.getNodes();
+        for (const int i : {0, static_cast<int>(c.rungs.size()) - 1})
+            for (const int e : {c.rungs[i].endL, c.rungs[i].endR})
+                if (e >= 0 && nodes[e].kind == QuadLayout::NodeKind::TJunction) ++c.tJunctionEnds;
+    }
+
     auto patches = patchesOf(c);
     c.collapsible = !patches.empty();
+    if (patches.empty()) c.block = Block::NoPatches;
     c.energy = std::numeric_limits<double>::max();
     for (auto &p : patches) {
-        if (!patchOk(c, p)) { c.collapsible = false; break; }
+        if (!patchOk(c, p, c.block)) { c.collapsible = false; break; }
         p.energy = patchEnergy(c, p);
         c.energy = std::min(c.energy, p.energy);
     }
@@ -319,21 +348,26 @@ std::vector<PartitionSimplify::Patch> PartitionSimplify::patchesOf(const Chord &
 // ---------------------------------------------------------------------------
 // patchOk()  --  Sec. 4's three conditions, plus what the boundary allows
 // ---------------------------------------------------------------------------
-bool PartitionSimplify::patchOk(const Chord &c, Patch &p) const {
+bool PartitionSimplify::patchOk(const Chord &c, Patch &p, Block &why) const {
     const int nr = static_cast<int>(c.rungs.size());
     auto rung = [&](int i) -> const Rung & { return c.rungs[i % nr]; };
 
     for (int i = p.first; i <= p.last; ++i) {
         const Rung &r = rung(i);
-        if (!r.contractible) return false;
+        if (!r.contractible && !settings_.contractRungsWithNodes) {
+            why = Block::RungNotContractible;
+            return false;
+        }
         // 1. Contracting a rung merges its two ends, so two singularities on
         //    one rung would have to become one.
-        if (isSingularity(r.endL) && isSingularity(r.endR)) return false;
+        if (isSingularity(r.endL) && isSingularity(r.endR)) { why = Block::RungJoinsSingularities; return false; }
         // 2. And a singularity on a rung whose other end is on the boundary
         //    would have to move onto the boundary.
         if ((isSingularity(r.endL) && isOnBoundary(r.endR)) ||
-            (isSingularity(r.endR) && isOnBoundary(r.endL)))
+            (isSingularity(r.endR) && isOnBoundary(r.endL))) {
+            why = Block::RungSingularityToBoundary;
             return false;
+        }
     }
 
     // Which side carries the singularities decides zip against non-zip.
@@ -355,11 +389,11 @@ bool PartitionSimplify::patchOk(const Chord &c, Patch &p) const {
         for (const int d : c.sideL[comp]) if (arcs[d >> 1].onBoundary) boundaryL = true;
         for (const int d : c.sideR[comp]) if (arcs[d >> 1].onBoundary) boundaryR = true;
     }
-    if (boundaryL && boundaryR) return false;   // a strip between two boundaries
-    if (p.zip && (boundaryL || boundaryR)) return false;
+    if (boundaryL && boundaryR) { why = Block::StripBetweenBoundaries; return false; }
+    if (p.zip && (boundaryL || boundaryR)) { why = Block::ZipAgainstBoundary; return false; }
     if (!p.zip) {
-        if (boundaryL && !p.keepL && (sRp || sRq)) return false;  // would delete the boundary
-        if (boundaryR && p.keepL && (sLp || sLq)) return false;
+        if (boundaryL && !p.keepL && (sRp || sRq)) { why = Block::WouldDeleteBoundary; return false; }
+        if (boundaryR && p.keepL && (sLp || sLq)) { why = Block::WouldDeleteBoundary; return false; }
         if (boundaryL) p.keepL = true;
         if (boundaryR) p.keepL = false;
     }
@@ -391,6 +425,7 @@ bool PartitionSimplify::patchOk(const Chord &c, Patch &p) const {
             const Rung &far = rung(i == p.first ? p.last : p.first);
             const int diag = side ? far.endL : far.endR;                       // (c)
             if (isSingularity(diag)) continue;
+            why = Block::TJunctionHasNowhereToGo;
             return false;
         }
     }
@@ -769,6 +804,188 @@ bool PartitionSimplify::collapse(const Chord &c) {
     return true;
 }
 
+bool PartitionSimplify::hasSpur() const {
+    std::vector<int> faceOfDart(2 * layout_.getArcs().size(), -1);
+    const auto &fs = layout_.getFaces();
+    for (size_t f = 0; f < fs.size(); ++f)
+        for (const int d : fs[f].darts)
+            if (d >= 0 && d < static_cast<int>(faceOfDart.size()))
+                faceOfDart[d] = static_cast<int>(f);
+    for (size_t a = 0; a < layout_.getArcs().size(); ++a)
+        if (faceOfDart[2 * a] >= 0 && faceOfDart[2 * a] == faceOfDart[2 * a + 1]) return true;
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// mergeLenses()  --  a component bounded by two arcs is not a component
+//
+// Contracting a triangle's short side leaves its other two sides running
+// between the same pair of nodes with nothing between them. Deleting one of
+// them puts the two components that were either side of the pinched triangle
+// against each other, which is what the triangle was standing in the way of.
+// ---------------------------------------------------------------------------
+int PartitionSimplify::mergeLenses() {
+    int merged = 0;
+    for (int guard = 0; guard < 64; ++guard) {
+        const auto &faces = layout_.getFaces();
+        int drop = -1;
+        for (const auto &f : faces) {
+            if (f.darts.size() != 2) continue;
+            // Keep the longer of the two: it is the one the neighbouring
+            // components were traced against, and the shorter is the detour.
+            const int a0 = f.darts[0] >> 1, a1 = f.darts[1] >> 1;
+            if (a0 == a1) continue;
+            const auto &arcs = layout_.getArcs();
+            if (arcs[a0].onBoundary && arcs[a1].onBoundary) continue;
+            if (arcs[a0].onBoundary) { drop = a1; break; }
+            if (arcs[a1].onBoundary) { drop = a0; break; }
+            drop = (arcs[a0].length < arcs[a1].length) ? a0 : a1;
+            break;
+        }
+        if (drop < 0) break;
+
+        std::vector<QuadLayout::Arc> keep;
+        keep.reserve(layout_.getArcs().size());
+        for (size_t i = 0; i < layout_.getArcs().size(); ++i)
+            if (static_cast<int>(i) != drop) keep.push_back(layout_.getArcs()[i]);
+
+        std::vector<QuadLayout::Node> ns = layout_.getNodes();
+        for (auto &n : ns) { n.darts.clear(); n.angles.clear(); }
+        layout_.rebuild(std::move(ns), std::move(keep));
+        ++merged;
+    }
+    return merged;
+}
+
+// ---------------------------------------------------------------------------
+// removeOneSliver()  --  contract the shortest side the layout has no use for
+// ---------------------------------------------------------------------------
+bool PartitionSimplify::removeOneSliver() {
+    if (meshEdge_ <= 0.0) return false;
+    const double limit = settings_.sliverSide * meshEdge_;
+
+    // Candidates: an arc short enough that its two ends are the same place as
+    // far as the mesh can tell, which is a whole side of some component that is
+    // not four-sided. Restricting it to those keeps this to repairing the
+    // degenerate components rather than quietly re-running Sec. 4 with a
+    // different rule -- a short arc between two healthy quads is a real edge.
+    const auto &arcs = layout_.getArcs();
+    const auto &nodes = layout_.getNodes();
+    std::vector<char> wholeSideOfBadFace(arcs.size(), 0);
+    for (const auto &f : layout_.getFaces()) {
+        if (f.corners == 4) continue;
+        for (const auto &side : f.sides)
+            if (side.size() == 1) wholeSideOfBadFace[side[0] >> 1] = 1;
+    }
+
+    int best = -1;
+    double bestLen = limit;
+    for (size_t i = 0; i < arcs.size(); ++i) {
+        const auto &a = arcs[i];
+        if (!wholeSideOfBadFace[i]) continue;
+        if (a.a == a.b) continue;
+        if (a.length >= bestLen) continue;
+        const bool sA = isSingularity(a.a), sB = isSingularity(a.b);
+        if (sA && sB) continue;                  // Sec. 4 condition 1
+        if ((sA && isOnBoundary(a.b)) || (sB && isOnBoundary(a.a))) continue;  // condition 2
+        if (a.onBoundary) {
+            // A piece of the boundary may be contracted: the two nodes at its
+            // ends become one and the model keeps its shape, because the arc
+            // carrying on past the dying end swallows this one's geometry. What
+            // may not go is a corner of the model itself, so a piece running
+            // between two of them stays.
+            if (nodes[a.a].kind == QuadLayout::NodeKind::BoundaryCorner &&
+                nodes[a.b].kind == QuadLayout::NodeKind::BoundaryCorner) continue;
+        } else if (isOnBoundary(a.a) && isOnBoundary(a.b)) {
+            continue;   // a chord across the model: contracting it pinches it shut
+        }
+        best = static_cast<int>(i);
+        bestLen = a.length;
+    }
+    if (best < 0) return false;
+
+    const auto &a = arcs[best];
+    // Whichever end may not move decides where the merged node goes.
+    int keep = a.a, die = a.b;
+    if (isSingularity(a.b) || (isOnBoundary(a.b) && !isOnBoundary(a.a))) { keep = a.b; die = a.a; }
+    if (a.onBoundary && nodes[a.b].kind == QuadLayout::NodeKind::BoundaryCorner) {
+        keep = a.b; die = a.a;    // a corner of the model stays put
+    } else if (a.onBoundary && nodes[a.a].kind == QuadLayout::NodeKind::BoundaryCorner) {
+        keep = a.a; die = a.b;
+    }
+    const Point at = nodes[keep].pos;
+
+    // Contracting a piece of the boundary must not shorten the model, so the
+    // boundary arc on the far side of the dying node takes over its geometry:
+    // the outline is the same curve afterwards, carried by one arc fewer.
+    int absorbInto = -1;
+    std::vector<Point> absorbed;
+    if (a.onBoundary) {
+        for (const int d : nodes[die].darts) {
+            const int arc = d >> 1;
+            if (arc == best || !arcs[arc].onBoundary) continue;
+            absorbInto = arc;
+            break;
+        }
+        if (absorbInto < 0) return false;
+        absorbed = a.pts;                       // oriented from `die` towards `keep`
+        if (a.a != die) std::reverse(absorbed.begin(), absorbed.end());
+    }
+
+    std::vector<QuadLayout::Node> ns = nodes;
+    ns[keep].kind = (static_cast<int>(nodes[keep].kind) < static_cast<int>(nodes[die].kind))
+                        ? nodes[keep].kind : nodes[die].kind;
+    for (auto &n : ns) { n.darts.clear(); n.angles.clear(); }
+
+    std::vector<QuadLayout::Arc> keptArcs;
+    keptArcs.reserve(arcs.size());
+    for (size_t i = 0; i < arcs.size(); ++i) {
+        if (static_cast<int>(i) == best) continue;
+        QuadLayout::Arc c = arcs[i];
+        if (static_cast<int>(i) == absorbInto) {
+            // Splice the dying piece on at whichever end met it, so the arc now
+            // runs all the way to the surviving node along the same curve.
+            std::vector<Point> extra = absorbed;   // die -> keep
+            if (c.a == die) {
+                std::reverse(extra.begin(), extra.end());   // keep -> die
+                extra.pop_back();
+                extra.insert(extra.end(), c.pts.begin(), c.pts.end());
+                c.pts = std::move(extra);
+                c.a = keep;
+            } else if (c.b == die) {
+                c.pts.pop_back();
+                c.pts.insert(c.pts.end(), extra.begin(), extra.end());
+                c.b = keep;
+            }
+            c.length = polylineLength(c.pts);
+            if (c.length > 0.0) keptArcs.push_back(std::move(c));
+            continue;
+        }
+        if (c.a == die) { c.a = keep; c.pts.front() = at; }
+        if (c.b == die) { c.b = keep; c.pts.back() = at; }
+        if (c.a == c.b && c.pts.size() < 3) continue;
+        c.length = polylineLength(c.pts);
+        if (c.length <= 0.0) continue;
+        keptArcs.push_back(std::move(c));
+    }
+
+    // Drop the node that died, and renumber.
+    std::vector<char> used(ns.size(), 0);
+    for (const auto &c : keptArcs) { used[c.a] = 1; used[c.b] = 1; }
+    std::vector<int> compact(ns.size(), -1);
+    std::vector<QuadLayout::Node> finalNodes;
+    for (size_t i = 0; i < ns.size(); ++i) {
+        if (!used[i]) continue;
+        compact[i] = static_cast<int>(finalNodes.size());
+        finalNodes.push_back(ns[i]);
+    }
+    for (auto &c : keptArcs) { c.a = compact[c.a]; c.b = compact[c.b]; }
+
+    layout_.rebuild(std::move(finalNodes), std::move(keptArcs));
+    mergeLenses();
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // enumerateChords()  --  every strip, once
 //
@@ -799,6 +1016,44 @@ void PartitionSimplify::enumerateChords() {
 // run()  --  Algorithm 3
 // ---------------------------------------------------------------------------
 void PartitionSimplify::run() {
+    // The degenerate components go first and are re-checked after every
+    // collapse: each one removed is a chord that could not be walked before,
+    // so doing them first is what lets Sec. 4 see the layout it was meant to
+    // be handed.
+    auto sweepSlivers = [&]() {
+        while (settings_.removeSlivers) {
+            const QuadLayout before = layout_;
+            const auto &rb = before.getReport();
+            if (!removeOneSliver()) break;
+            const auto &ra = layout_.getReport();
+            const bool ok = !hasSpur() && ra.arcCrossings == 0 && ra.danglingEnds == 0 && ra.faces > 0 &&
+                            ra.faces < rb.faces && ra.singularities == rb.singularities &&
+                            std::fabs(ra.totalArea - rb.totalArea) <=
+                                1e-6 * std::max(1.0, rb.totalArea) &&
+                            (rb.faces - ra.faces) >= (rb.quadFaces - ra.quadFaces);
+            if (!ok) { layout_ = before; break; }
+            ++report_.slivers;
+        }
+    };
+    // A component bounded by two arcs is junk whatever produced it, so clear
+    // any the tracing handed over before looking for chords -- not only the
+    // ones a contraction creates.
+    if (settings_.removeSlivers) {
+        const QuadLayout before = layout_;
+        const int n = mergeLenses();
+        if (n > 0) {
+            const auto &rb = before.getReport();
+            const auto &ra = layout_.getReport();
+            if (hasSpur() || ra.arcCrossings != 0 || ra.danglingEnds != 0 || ra.faces <= 0 ||
+                ra.singularities != rb.singularities ||
+                std::fabs(ra.totalArea - rb.totalArea) > 1e-6 * std::max(1.0, rb.totalArea))
+                layout_ = before;
+            else
+                report_.slivers += n;
+        }
+    }
+    sweepSlivers();
+
     for (int iter = 0; iter < settings_.maxCollapses; ++iter) {
         enumerateChords();
 
@@ -806,12 +1061,18 @@ void PartitionSimplify::run() {
         report_.blockedByConditions = 0;
         report_.blockedByEnergy = 0;
         report_.blockedByDrag = 0;
+        for (int &b : report_.blockCount) b = 0;
         chordSummaries_.clear();
         std::vector<int> candidates;
         for (size_t i = 0; i < chords_.size(); ++i) {
             const Chord &c = chords_[i];
+            Block why = c.block;
+            if (c.collapsible && c.energy <= 0.0) why = Block::Energy;
+            else if (c.collapsible && meshEdge_ > 0.0 &&
+                     c.maxWidth > settings_.maxDrag * meshEdge_) why = Block::Drag;
             chordSummaries_.push_back(ChordSummary{c.faces, c.collapsible && c.energy > 0.0,
-                                                   c.energy, c.minWidth});
+                                                   c.energy, c.minWidth, why});
+            ++report_.blockCount[static_cast<int>(why)];
             if (!c.collapsible) { ++report_.blockedByConditions; continue; }
             if (c.energy <= 0.0) { ++report_.blockedByEnergy; continue; }
             if (meshEdge_ > 0.0 && c.maxWidth > settings_.maxDrag * meshEdge_) {
@@ -825,11 +1086,16 @@ void PartitionSimplify::run() {
         // simplifies, and taking the thin ones first tends to leave the wide
         // ones no longer collapsible at all.
         std::sort(candidates.begin(), candidates.end(), [&](int a, int b) {
+            if (settings_.tJunctionsFirst && (chords_[a].tJunctionEnds > 0) !=
+                                             (chords_[b].tJunctionEnds > 0))
+                return chords_[a].tJunctionEnds > chords_[b].tJunctionEnds;
             return chords_[a].minWidth < chords_[b].minWidth;
         });
 
         const QuadLayout before = layout_;
         const auto &rb = before.getReport();
+        int lensesBefore = 0;
+        for (const auto &f : before.getFaces()) if (f.corners < 3) ++lensesBefore;
         bool done = false;
         for (const int ci : candidates) {
             if (!collapse(chords_[ci])) {
@@ -840,8 +1106,30 @@ void PartitionSimplify::run() {
             }
             const auto &ra = layout_.getReport();
             // Proposition 2, as a test rather than an assumption.
+            //
+            // Plus one thing Proposition 2 takes for granted: that every arc
+            // still has a different component on each side. An arc with the
+            // same one on both is a spur hanging into it rather than a wall
+            // between two, so that component is not a disc -- its walk goes out
+            // along the spur and back, turning 180 degrees at the tip and
+            // picking up two more corners each time, which is where the seven-
+            // to ten-cornered components came from. It happens where a node the
+            // collapse merges sits a fifth of an element from a corner of the
+            // model: the arc between them survives with both its ends on the
+            // same merged node.
+            const bool spur = hasSpur();
+
+            // A component with fewer than three corners is a lens between two
+            // arcs that share both ends -- not something a four-sided region
+            // can degenerate into by losing a strip, so a collapse that leaves
+            // one has merged two sides that were not the two sides of a strip.
+            int lenses = 0;
+            for (const auto &f : layout_.getFaces()) if (f.corners < 3) ++lenses;
+
             bool ok = true;
-            if (ra.arcCrossings != 0) { ++report_.rbCrossings; ok = false; }
+            if (spur) { ++report_.rbSpur; ok = false; }
+            else if (lenses > lensesBefore) { ++report_.rbLens; ok = false; }
+            else if (ra.arcCrossings != 0) { ++report_.rbCrossings; ok = false; }
             else if (ra.danglingEnds != 0) { ++report_.rbDangling; ok = false; }
             else if (ra.faces <= 0 || ra.faces >= rb.faces) { ++report_.rbNotFewer; ok = false; }
             else if (ra.tJunctions > rb.tJunctions) { ++report_.rbMoreT; ok = false; }
@@ -851,7 +1139,7 @@ void PartitionSimplify::run() {
             else if ((rb.faces - ra.faces) < (rb.quadFaces - ra.quadFaces)) {
                 ++report_.rbWorse; ok = false;
             }
-            if (ok) { ++report_.collapses; done = true; break; }
+            if (ok) { ++report_.collapses; done = true; sweepSlivers(); break; }
             ++report_.rolledBack;
             layout_ = before;
         }

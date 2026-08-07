@@ -68,7 +68,36 @@ void CrossField::initialize(int method, unsigned seed) {
         weights[v1] += len;
     }
 
-    // Now set Dirichlet BCs for boundary vertices
+    // The interior angle at each boundary vertex: the tip angles of the
+    // triangles meeting there, added up. This is what Table 1 of Viertel,
+    // Osting and Staten (IMR 2019) classifies the vertex by.
+    std::vector<double> interiorAngle(numVertices, 0.0);
+    for (const Triangle &tri : mesh->triangles) {
+        for (int k = 0; k < 3; ++k) {
+            const int v = tri[k];
+            if (!mesh->isBoundaryVertex[v]) continue;
+            const Point &a = mesh->vertices[v];
+            const Point u = mesh->vertices[tri[(k + 1) % 3]] - a;
+            const Point w = mesh->vertices[tri[(k + 2) % 3]] - a;
+            const double nu = normP(u), nw = normP(w);
+            if (nu < 1e-15 || nw < 1e-15) continue;
+            interiorAngle[v] += std::acos(std::max(-1.0, std::min(1.0, dotP(u, w) / (nu * nw))));
+        }
+    }
+
+    // Now set Dirichlet BCs for boundary vertices, Sec. 2.2 and Table 1.
+    //
+    // d is the bisector of the outward normals of the boundary edges meeting
+    // at the vertex. On a smooth stretch of boundary the two normals agree, so
+    // d is the normal and a cross aligned to it has an arm along the boundary,
+    // which is what boundary alignment means. At a corner they do not: at a
+    // ninety degree one they are ninety degrees apart, so d sits forty-five
+    // degrees from each, and a cross aligned to d has its arms forty-five
+    // degrees off *both* boundary edges -- the worst possible alignment,
+    // exactly where alignment matters most. Turning d by a further π/4 at a
+    // vertex whose index is ±1/4 puts the arms back along the two edges.
+    //
+    // Since u = d^4, that quarter turn is just a change of sign.
     for (int v : mesh->boundaryVertices) {
         if (weights[v] > 1e-14) {
             // Compute normalized weighted average normal
@@ -82,11 +111,19 @@ void CrossField::initialize(int method, unsigned seed) {
                 ny /= nlen;
             }
 
-            // Set u_k_prev[v] = (nx + i*ny)^4
+            const double a = interiorAngle[v];
+            int quarters;                                   // the index, times four
+            if (a < 0.75 * M_PI)       quarters =  1;       // a convex corner
+            else if (a <= 1.25 * M_PI) quarters =  0;       // effectively straight
+            else if (a <= 1.75 * M_PI) quarters = -1;       // reflex
+            else                       quarters = -2;
+
             std::complex<double> n(nx, ny);
             // normalize
             n /= std::abs(n);
-            u_k_prev[v] = std::pow(n, 4);
+            std::complex<double> u = std::pow(n, 4);
+            if (quarters == 1 || quarters == -1) u = -u;
+            u_k_prev[v] = u;
         }
     }
 

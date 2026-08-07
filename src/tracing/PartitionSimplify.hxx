@@ -48,6 +48,25 @@
 
 class PartitionSimplify {
 public:
+    // Why a chord could not be collapsed, for reporting: which of Sec. 4's
+    // conditions -- or which of the extra ones the boundary imposes -- stopped
+    // it. Knowing this is what tells a partition that is as coarse as the
+    // operation allows from one that is merely stuck.
+    enum class Block {
+        None = 0,
+        RungNotContractible,   // a node sits along a rung and would be squashed
+        RungJoinsSingularities,// Sec. 4 condition 1
+        RungSingularityToBoundary, // condition 2
+        StripBetweenBoundaries,
+        ZipAgainstBoundary,
+        WouldDeleteBoundary,
+        TJunctionHasNowhereToGo,   // condition 3
+        NoPatches,
+        Energy,                // Sec. 4.1
+        Drag                   // Settings::maxDrag
+    };
+    static const char *blockName(Block b);
+
     struct Settings {
         // Sec. 4.1: a zip patch is worth collapsing when the angle its
         // diagonal makes with its base is under this, i.e. when the strip is
@@ -82,6 +101,43 @@ public:
         double maxDrag = 1.5;
 
 
+        // Contract a rung even when a node sits along it rather than only at
+        // its ends. That node -- a separatrix that ended on this side -- is
+        // squashed onto the merged node, which is the paper's "the hanging
+        // separatrix is simply extended after the collapse operation until it
+        // crosses the next separatrix" applied to a rung instead of a
+        // longitudinal side. Safe only because maxDrag bounds how far the
+        // squash can move it; without that it is a licence to fold the layout.
+        //
+        // Off by default because it buys nothing measurable: over the sixteen
+        // models it frees 23 chords and every one of them is then stopped by
+        // maxDrag or undone by Proposition 2, leaving the same 825 components
+        // and one more T-junction for 9 more rolled-back attempts.
+        bool contractRungsWithNodes = false;
+
+        // Sec. 6: "in each case that we observed, all T-junctions could have
+        // been removed from the initial partition by collapsing the chords in a
+        // different order, which suggests that perhaps a better collapse order
+        // would prioritize or even require collapsing chords that end in
+        // T-junctions". Algorithm 3 orders on width alone; this takes the
+        // chords that would resolve a T-junction first and orders on width
+        // within each group.
+        bool tJunctionsFirst = true;
+
+        // A component the tracing pinched to nothing: two separatrices that
+        // cross twice within a fraction of an element leave a triangle a
+        // seventh of an element on its short side and a quarter of a square
+        // element in area. Sec. 4 cannot reach one -- a chord is a run of
+        // four-sided components, so a three-sided one is not on any chord, and
+        // worse, it stops every chord that would otherwise run through it.
+        // Contracting its short side removes it and unblocks them.
+        //
+        // In mean mesh edges. Below the mesh resolution the two nodes are one
+        // node as far as the discretisation can tell, which is the same
+        // argument maxDrag rests on.
+        double sliverSide = 0.5;
+        bool removeSlivers = true;
+
         int maxCollapses = 100000;
     };
 
@@ -97,10 +153,13 @@ public:
         int blockedByConditions = 0; // at the last pass: Sec. 4's three conditions
         int blockedByEnergy = 0;     // at the last pass: Sec. 4.1
         int blockedByDrag = 0;       // at the last pass: wider than Settings::maxDrag
+        int slivers = 0;             // degenerate components contracted away
         int rolledBack = 0;          // collapses undone for breaking Proposition 2
+        // How many chords each reason accounted for, at the last pass.
+        int blockCount[12] = {0};
         // Which part of Proposition 2 the rolled-back ones broke.
         int rbCrossings = 0, rbDangling = 0, rbNotFewer = 0, rbMoreT = 0, rbSing = 0, rbArea = 0,
-            rbWorse = 0, rbFailed = 0;
+            rbWorse = 0, rbFailed = 0, rbSpur = 0, rbLens = 0;
     };
 
     PartitionSimplify(const QuadLayout &layout, const Settings &settings);
@@ -120,6 +179,7 @@ public:
         bool collapsible = false;
         double energy = 0.0;
         double minWidth = 0.0;
+        Block block = Block::None;
     };
     const std::vector<ChordSummary> &getChords() const { return chordSummaries_; }
 
@@ -143,8 +203,10 @@ private:
         bool cyclic = false;
         double minWidth = 0.0;
         double maxWidth = 0.0;   // the widest rung: how far a collapse would drag things
+        int tJunctionEnds = 0;   // T-junctions at the ends of the chord that it would resolve
         double energy = 0.0;
         bool collapsible = false;
+        Block block = Block::None;
     };
 
     // A run of components of one chord between two rungs carrying
@@ -165,7 +227,7 @@ private:
 
     void analyse(Chord &c) const;
     std::vector<Patch> patchesOf(const Chord &c) const;
-    bool patchOk(const Chord &c, Patch &p) const;
+    bool patchOk(const Chord &c, Patch &p, Block &why) const;
     double patchEnergy(const Chord &c, const Patch &p) const;
 
     bool collapse(const Chord &c);
@@ -186,6 +248,20 @@ private:
     double meshEdge_ = 0.0;   // mean edge of the model, the scale maxDrag is in
 
     void indexDarts();
+
+    // Contract the shortest degenerate side in the layout, and merge away any
+    // two-sided component that leaves. Returns false when there is none left
+    // that may be contracted.
+    bool removeOneSliver();
+
+    // Whether the layout has an arc with the same component on both sides: a
+    // spur hanging into it rather than a wall between two, so that component is
+    // not a disc. Neither operation may leave one.
+    bool hasSpur() const;
+
+    // Delete one arc of every two-arc component, which is what a contraction
+    // leaves where it pinched a triangle shut. Returns how many it merged.
+    int mergeLenses();
 
     friend class QuadLayout;
 };

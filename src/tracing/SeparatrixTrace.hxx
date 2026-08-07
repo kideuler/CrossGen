@@ -138,6 +138,56 @@ public:
         // radians of anti-parallel counts as one of those and is joined up.
         double tangentialAngle = M_PI_4;
 
+        // A separatrix that reaches the boundary this close to running along it
+        // has not really arrived there.
+        //
+        // The field is boundary aligned, so in the continuum a streamline meets
+        // the boundary square or runs parallel to it; there is no such thing as
+        // a five degree arrival. One happens where the mesh is too coarse to
+        // resolve a curved boundary -- Sec. 3.3's "few crosses that are
+        // actually aligned with the discrete boundary of the triangle mesh" --
+        // and the paper assumes it away ("assuming a sufficiently fine triangle
+        // mesh along the boundary such that no separatrices exit tangentially").
+        //
+        // It cannot be assumed away here, and it is not harmless: the landing
+        // splits the boundary at a place that means nothing, giving the
+        // component on one side a corner where the boundary in fact runs
+        // straight past, and the one on the other side a splinter of no area.
+        // That is one pentagon and one sliver triangle from every occurrence,
+        // and it is the whole of what stops these layouts being four-sided.
+        //
+        // Over the sixteen models, 420 of 424 landings arrive between 77 and 90
+        // degrees and four arrive between 5 and 20, so there is nothing in
+        // between for the threshold to cut through.
+        //
+        // Off by default, because it does not work. At pi/6 it moves all four
+        // and leaves no landing under 30 degrees, and the layout is no better
+        // for it: 1116 of 1124 components are four-sided either way, and after
+        // Sec. 4 it is 818 of 824 against 820 of 825. The degeneracy does not
+        // go, it changes shape. The region between where the streamline landed
+        // and the corner it was heading for has no area whichever end the node
+        // sits at: planting it at the landing makes that region a splinter
+        // triangle, planting it on the corner makes it a two-sided lens, and
+        // meanwhile the corner collects every streamline that was running
+        // alongside the boundary -- three of them on one 124-degree corner of
+        // geom013, splitting its wedge into four 31-degree sectors.
+        //
+        // What the region needs is contracting, not relabelling, and that is
+        // PartitionSimplify's sliver removal -- which skips it only because its
+        // short side lies on the boundary and shortening the model is not
+        // allowed. Absorbing that side into the neighbouring boundary arcs, the
+        // way chord collapse already handles a rung on the boundary, is the fix
+        // this was standing in for.
+        double boundaryTangentialAngle = 0.0;
+
+        // Where such a landing belongs instead. Each of those four is within an
+        // element of a corner of the model, which is what a streamline running
+        // alongside the boundary is heading for: at a convex corner the field
+        // turns through ninety degrees, so the streamline that came in parallel
+        // to one edge leaves along the other, and the corner is where it goes.
+        // In mean mesh edges.
+        double boundaryCornerSnap = 1.5;
+
         // Divide a corner's wedge into `quarters` equal parts rather than into
         // exact right angles measured off the boundary. On a corner that really
         // is 270 degrees the two agree; on one that measures 226 they do not,
@@ -163,6 +213,9 @@ public:
 
     // stepAndCheck() until nothing is live.
     void run();
+
+    // How many landings the tangential rule moved onto a corner.
+    int tangentialLandings = 0;
 
     std::vector<Separatrix> separatrices;
     std::vector<Singularity> singularities;    // mirror of the tracer's, with ports filled in
@@ -191,6 +244,11 @@ private:
     // Register the segments a step just added and act on what they crossed.
     // Returns false when the separatrix was terminated part way through them.
     bool registerNewSegments(Separatrix &sep, int firstNewIndex);
+
+    // A separatrix that has just reached the boundary: if it arrived tangentially
+    // and a corner of the model is within reach, move its last point onto that
+    // corner, so no node is planted where the arrival happened to land.
+    bool snapTangentialLanding(Separatrix &sep);
 
     void terminateAt(Separatrix &sep, int segIndex, const Point &at, TerminationReason why,
                      int onSep, int onSeg);

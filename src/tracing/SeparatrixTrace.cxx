@@ -350,6 +350,69 @@ bool SeparatrixTrace::registerNewSegments(Separatrix &sep, int firstNewIndex) {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// snapTangentialLanding()  --  Sec. 3.3's tangential rule, at the boundary
+//
+// The paper applies it to two separatrices meeting head on: in the continuum
+// they could only cross squarely, so a shallow crossing is one curve the
+// discretisation split in two, and it joins them. A separatrix meeting the
+// *boundary* is the same statement -- the field is boundary aligned, so a
+// streamline either arrives square or runs alongside -- and the paper does not
+// apply it there, it assumes a mesh fine enough that the case cannot arise.
+//
+// Where it does arise the streamline is running alongside the boundary towards
+// a corner. At a convex corner the field turns through ninety degrees, so a
+// streamline that came in parallel to one edge leaves along the other: the
+// corner is where it is going, and where it lands otherwise is an accident of
+// which triangle the polyline happened to cross out of.
+// ---------------------------------------------------------------------------
+bool SeparatrixTrace::snapTangentialLanding(Separatrix &sep) {
+    if (sep.path.size() < 2) return false;
+    const Point &end = sep.path.back().global_pos;
+    const Point in = end - sep.path[sep.path.size() - 2].global_pos;
+    const double nin = normP(in);
+    if (nin < 1e-18) return false;
+
+    // The boundary it landed on: the edge it left through, or the two edges
+    // meeting at the vertex it left at.
+    std::vector<int> edges;
+    if (sep.endBoundaryEdge >= 0) {
+        edges.push_back(sep.endBoundaryEdge);
+    } else if (sep.endBoundaryVertex >= 0) {
+        for (const int e : mesh->boundaryEdges)
+            if (mesh->edges[e][0] == sep.endBoundaryVertex || mesh->edges[e][1] == sep.endBoundaryVertex)
+                edges.push_back(e);
+    }
+    if (edges.empty()) return false;
+
+    // How square the arrival is, taken against whichever boundary edge it is
+    // most nearly parallel to: running along one of the two edges meeting at a
+    // vertex is running along the boundary.
+    double bestSin = 1.0;
+    for (const int e : edges) {
+        const Point d = mesh->vertices[mesh->edges[e][1]] - mesh->vertices[mesh->edges[e][0]];
+        const double nd = normP(d);
+        if (nd < 1e-18) continue;
+        bestSin = std::min(bestSin, std::fabs(cross2(in, d)) / (nin * nd));
+    }
+    if (bestSin > std::sin(settings.boundaryTangentialAngle)) return false;   // arrived squarely
+
+    // The corner it was heading for.
+    const double reach = settings.boundaryCornerSnap * tracer->averageEdgeLength();
+    int bestVertex = -1;
+    double bestDist = reach;
+    for (const BoundaryCorner &c : boundaryCorners) {
+        const double d = normP(mesh->vertices[c.vertex] - end);
+        if (d < bestDist) { bestDist = d; bestVertex = c.vertex; }
+    }
+    if (bestVertex < 0) return false;
+
+    sep.path.back().global_pos = mesh->vertices[bestVertex];
+    sep.endBoundaryVertex = bestVertex;
+    sep.endBoundaryEdge = -1;
+    return true;
+}
+
 void SeparatrixTrace::stepAndCheck() {
     finishedTracing = true;
     ++steps;
@@ -375,6 +438,7 @@ void SeparatrixTrace::stepAndCheck() {
                     (walkers[k].atVertex < 0 && walkers[k].entryEdge >= 0)
                         ? mesh->triangleEdges[walkers[k].tri][walkers[k].entryEdge]
                         : -1;
+                if (snapTangentialLanding(sep)) ++tangentialLandings;
                 break;
 
             case FieldTracer::Status::Cut: {
