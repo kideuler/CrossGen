@@ -1706,6 +1706,11 @@ void CrossGenWidget::renderNormal() {
         // interior lines and still leave the outline out.
         if (mboPhase_ >= MBOPhase::Simplified && simplified_.has_value()) {
             viewer::drawQuadLayoutArcs(simplified_->getLayout(), 3.0f, 0.95f, 0.2f, 0.2f);
+            // view_.zoom is 1.0 at fit and shrinks as the view zooms in, so
+            // scaling the radius by it makes the markers shrink along with it
+            // rather than staying a fixed size in mesh space and so covering
+            // more and more of the screen as you zoom in on a component.
+            viewer::drawQuadLayoutNodes(simplified_->getLayout(), 0.12 * avgEdge_ * view_.zoom);
         } else if (mboPhase_ >= MBOPhase::Layout && quadLayout_.has_value()) {
             viewer::drawQuadLayoutArcs(*quadLayout_, 3.0f, 0.95f, 0.2f, 0.2f);
         } else if (mboPhase_ >= MBOPhase::Separatrices && separatrixTrace_) {

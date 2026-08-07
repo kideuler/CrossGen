@@ -175,5 +175,12 @@ void drawBlockNodes(const MotorcycleGraph &mg, bool parameterDomain, double radi
 // different layout from the one that was built.
 void drawQuadLayoutArcs(const QuadLayout &layout, float lineWidth, float r, float g, float b);
 
+// The nodes of a quad layout -- the corners of its blocks -- coloured by what
+// kind of node each is: yellow for an irregular node of the field, orange for
+// a corner of the model, green where a separatrix ran into the boundary
+// squarely, cyan where two separatrices cross, magenta where two were joined
+// head-on, and blue for a T-junction.
+void drawQuadLayoutNodes(const QuadLayout &layout, double radius);
+
 } // namespace viewer
 

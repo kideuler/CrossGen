@@ -1114,5 +1114,33 @@ void drawQuadLayoutArcs(const QuadLayout &layout, float lineWidth, float r, floa
     glLineWidth(1.0f);
 }
 
+void drawQuadLayoutNodes(const QuadLayout &layout, double radius) {
+    for (const auto &n : layout.getNodes()) {
+        switch (n.kind) {
+            case QuadLayout::NodeKind::Singularity:
+                drawDisk3D(n.pos, radius, 0.95f, 0.85f, 0.1f);
+                break;
+            case QuadLayout::NodeKind::BoundaryCorner:
+                drawDisk3D(n.pos, radius, 0.95f, 0.55f, 0.1f);
+                break;
+            case QuadLayout::NodeKind::BoundaryHit:
+                drawDisk3D(n.pos, radius, 0.1f, 0.9f, 0.3f);
+                break;
+            case QuadLayout::NodeKind::Crossing:
+                drawDisk3D(n.pos, radius, 0.1f, 0.85f, 0.95f);
+                break;
+            case QuadLayout::NodeKind::Heteroclinic:
+                drawDisk3D(n.pos, radius, 0.85f, 0.1f, 0.85f);
+                break;
+            case QuadLayout::NodeKind::TJunction:
+                drawDisk3D(n.pos, radius, 0.2f, 0.4f, 0.95f);
+                break;
+            case QuadLayout::NodeKind::Dangling:
+                drawDisk3D(n.pos, radius, 0.9f, 0.1f, 0.1f);
+                break;
+        }
+    }
+}
+
 } // namespace viewer
 
