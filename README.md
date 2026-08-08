@@ -12,6 +12,9 @@ TODO:
 - [X] Add options to solve MBO method using formula $(M+\tau L)u^{k+1}=Mu^k$ where M is diagonal triangle areas. L is standard laplacian. Therefore $u^{k+1} = (M+\tau L)^{-1} M u^k$
 - [X] Make step operations on separatrix instead of on tracePoints
 - [X] Test singular triangle, for 3,5 singularities, one with directions going towards singularity, 4 tests total.
-- [ ] Implement DG-SIPG to in P0 to get crosses on faces and singularities on nodes.
-- [ ] do isoline tracing using shepherd et al 2022.
-- [ ] test for planar geoms with no limit cycles.
+- [X] Implement DG-SIPG to in P0 to get crosses on faces and singularities on nodes.
+- [X] Implement basic polysquare stuff from 2023 paper
+- [X] Go back and try to fix tracing and simplification
+- [ ] See if we can do a chord collapse operation for complex polysquares
+- [ ] Padding?
+- [ ] Try medial axis again.
