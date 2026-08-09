@@ -18,3 +18,4 @@ TODO:
 - [X] See if we can do a chord collapse operation for complex polysquares
 - [ ] Padding?
 - [ ] Try medial axis again.
+- [ ] Multi-material

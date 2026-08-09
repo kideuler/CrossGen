@@ -232,6 +232,7 @@ void MotorcycleGraph::launch() {
 
             Motorcycle m;
             m.tri = host;
+            m.originVertex = v;
             m.pos = mesh->vertices[v];
             m.dir = e;
             m.id = static_cast<int>(bikes.size());
@@ -275,6 +276,63 @@ void MotorcycleGraph::run() {
     // anything past that is going in circles rather than getting anywhere.
     const int perRayCap = 4 * static_cast<int>(mesh->triangles.size()) + 64;
 
+    // The scale the tolerances in here are quoted in.
+    double meanEdge = 0.0;
+    for (const auto &e : mesh->edges) meanEdge += normP(mesh->vertices[e[1]] - mesh->vertices[e[0]]);
+    if (!mesh->edges.empty()) meanEdge /= static_cast<double>(mesh->edges.size());
+    const double arrivalDist = arrivalTol * meanEdge;
+
+    // How far a ray has to have gone before any of that applies.
+    //
+    // In a polysquare that closes up, a ray is a straight line in the parameter
+    // domain from a corner to a wall, so it cannot be longer than the domain is
+    // wide; the map is near isometric, so nor can its image in the model. A ray
+    // past twice the bounding box diagonal is therefore not a long ray, it is a
+    // ray in a parameterization that is not a polysquare -- and that, not the
+    // distance to a corner, is what separates the ray that should be stopped
+    // from the ones that are merely passing close to one.
+    Point lo{1e300, 1e300}, hi{-1e300, -1e300};
+    for (const auto &p : mesh->vertices) {
+        lo[0] = std::min(lo[0], p[0]); lo[1] = std::min(lo[1], p[1]);
+        hi[0] = std::max(hi[0], p[0]); hi[1] = std::max(hi[1], p[1]);
+    }
+    const double lostAfter = 2.0 * normP(hi - lo);
+
+    // The boundary vertex a ray is standing on, if it is standing on one. The
+    // tolerance is against the triangle it is in rather than the model, since
+    // that is the scale the arithmetic that got it here worked at; a ray that
+    // lands this near a vertex arrived at it exactly and the distance is
+    // rounding.
+    auto boundaryVertexAt = [&](int f, const Point &p) -> int {
+        const Triangle &t = mesh->triangles[f];
+        double longest = 0.0;
+        for (int i = 0; i < 3; ++i)
+            longest = std::max(longest,
+                               normP(mesh->vertices[t[(i + 1) % 3]] - mesh->vertices[t[i]]));
+        for (int i = 0; i < 3; ++i) {
+            if (!mesh->isBoundaryVertex[t[i]]) continue;
+            if (normP(mesh->vertices[t[i]] - p) <= 1e-6 * longest) return t[i];
+        }
+        return -1;
+    };
+
+    // A boundary edge at that vertex, and which end of it the vertex is in the
+    // edge's own orientation -- the same pair a crossing records, so that the
+    // block structure can place the node on its loop either way.
+    auto boundaryEdgeAt = [&](int v, double &alongOut) -> int {
+        const auto &vt = mesh->vertexTriangles;
+        for (int k = vt.rowPtr[v]; k < vt.rowPtr[v + 1]; ++k) {
+            const int f = vt.colIdx[k];
+            for (int i = 0; i < 3; ++i) {
+                const int e = mesh->triangleEdges[f][i];
+                if (e < 0 || !mesh->isBoundaryEdge[e]) continue;
+                if (mesh->edges[e][0] == v) { alongOut = 0.0; return e; }
+                if (mesh->edges[e][1] == v) { alongOut = 1.0; return e; }
+            }
+        }
+        return -1;
+    };
+
     for (size_t id = 0; id < bikes.size(); ++id) {
         Motorcycle &m = bikes[id];
         while (m.alive) {
@@ -289,9 +347,135 @@ void MotorcycleGraph::run() {
         int localEdge = -1;
         double along = 0.0;
         if (!exitPoint(m.tri, m.pos, meshDir, hit, localEdge, along)) {
+            // A ray standing exactly on a boundary vertex has left the model,
+            // through a vertex rather than through an edge. exitPoint() cannot
+            // say so: the ray is on a corner of the triangle it is in, so the
+            // two edges there hold the point it would be starting from and the
+            // third is behind it, and there is no crossing to return.
+            //
+            // That is what an iso-line landing on the corner it was aimed at
+            // looks like from in here, and it is the *intended* end of a trace:
+            // in a polysquare the line out of a reflex corner runs into another
+            // corner, and Polysquare::snapCorners() is what makes the two share
+            // a coordinate so that it lands rather than slips past. Counting it
+            // as a ray that got nowhere would report the good case as the bad
+            // one -- and worse, leave the trace with a free end, which costs
+            // the block structure a four-sided block right where it was most
+            // nearly right.
+            const int landed = boundaryVertexAt(m.tri, m.pos);
+            if (landed >= 0) {
+                double landedAlong = 0.0;
+                const int be = boundaryEdgeAt(landed, landedAlong);
+                if (be >= 0) {
+                    exitEdge[id] = be;
+                    exitAlong[id] = landedAlong;
+                }
+                // Exactly on the vertex, so the node the block structure makes
+                // here coincides with the corner instead of sitting a rounding
+                // error off it.
+                m.pos = mesh->vertices[landed];
+                if (!traces[id].empty()) traces[id].back() = m.pos;
+
+                // Seal the corner it stopped at, for the same reason launch()
+                // seals the one it started from: the ray's wall is the edges it
+                // crossed, and it crossed none at this end, so without this the
+                // flood walks from one side of the ray to the other through the
+                // triangle it stopped in.
+                for (int i = 0; i < 3; ++i) {
+                    const int ed = mesh->triangleEdges[m.tri][i];
+                    if (ed < 0) continue;
+                    if (mesh->edges[ed][0] == landed || mesh->edges[ed][1] == landed)
+                        tracedEdges.insert(EdgeKey(mesh->edges[ed][0], mesh->edges[ed][1]));
+                }
+
+                m.alive = false;
+                ++report_.reachedBoundary;
+                break;
+            }
             m.alive = false;
             ++report_.ranOut;
             break;
+        }
+
+        // Arriving at the corner another ray was launched from.
+        //
+        // In an exact polysquare the iso-line out of one reflex corner runs
+        // into another one, and once Polysquare::snapCorners() has put the two
+        // on a common coordinate that is what happens: the ray lands on the
+        // corner and the vertex test above ends it. Where the parameterization
+        // is not exact it lands a little to one side instead, slips past, and
+        // keeps going -- on geom035 for 7428 steps and 126 units of a model two
+        // units across, crossing the other lines 216 times on the way.
+        //
+        // So a ray that passes close enough to one of those corners is taken to
+        // have arrived at it. The catch is that "close enough" does not
+        // separate the two cases on its own, and it is worth recording why,
+        // because the test looks obvious until it is measured: rays that are
+        // doing exactly what they should also pass launch corners in mid
+        // flight, and closer than the lost ones do. geom008's ray 5 passes one
+        // at 3.2% of a mesh edge with a fifth of its length still to run,
+        // geom009's ray 9 at 40%, geom011's ray 0 at 35% -- while the first
+        // useful pass on geom035 is at 12.8%. The populations overlap the wrong
+        // way round. Direction does not help either: a corner launches two rays
+        // ninety degrees apart, so one of them is aligned with whatever is
+        // arriving, whatever that is.
+        //
+        // What does separate them is how far the ray has already come, which is
+        // what `lostAfter` is. A ray in a polysquare that closes up cannot be
+        // longer than the domain is wide; one that is has established that it
+        // is not in a polysquare, and nothing it does afterwards is worth
+        // preserving. So the snap is only offered to rays past that point, and
+        // the ones that are merely passing a corner never reach it.
+        if (arrivalTol > 0.0 && m.distance > lostAfter) {
+            int landedOn = -1;
+            Point landedAt{0.0, 0.0};
+            double bestT = 2.0;
+            for (const auto &other : bikes) {
+                if (other.originVertex < 0 || other.originVertex == m.originVertex) continue;
+                const Point &p = mesh->vertices[other.originVertex];
+                const Point d = hit - m.pos;
+                const double dd = dotP(d, d);
+                if (dd < 1e-30) continue;
+                double t = dotP(p - m.pos, d) / dd;
+                t = std::min(1.0, std::max(0.0, t));
+                if (normP(p - (m.pos + d * t)) > arrivalDist) continue;
+                if (t < bestT) { bestT = t; landedOn = other.originVertex; landedAt = p; }
+            }
+            if (landedOn >= 0) {
+                Segment last;
+                last.a = m.pos;
+                last.b = landedAt;
+                last.ua = imageOfPoint(m.tri, m.pos);
+                last.ub = imageOfPoint(m.tri, landedAt);
+                last.tri = m.tri;
+                last.ray = static_cast<int>(id);
+                last.step = m.steps - 1;
+                if (normP(last.b - last.a) > 1e-15) segments.push_back(last);
+
+                m.distance += normP(landedAt - m.pos);
+                m.pos = landedAt;
+                traces[id].push_back(landedAt);
+
+                double landedAlong = 0.0;
+                const int be = boundaryEdgeAt(landedOn, landedAlong);
+                if (be >= 0) {
+                    exitEdge[id] = be;
+                    exitAlong[id] = landedAlong;
+                }
+                // Seal the corner it stopped at, where the triangle it stopped
+                // in has it -- the same closing launch() does at the other end.
+                for (int i = 0; i < 3; ++i) {
+                    const int ed = mesh->triangleEdges[m.tri][i];
+                    if (ed < 0) continue;
+                    if (mesh->edges[ed][0] == landedOn || mesh->edges[ed][1] == landedOn)
+                        tracedEdges.insert(EdgeKey(mesh->edges[ed][0], mesh->edges[ed][1]));
+                }
+
+                m.alive = false;
+                ++report_.reachedBoundary;
+                ++report_.arrivals;
+                break;
+            }
         }
 
         const int e = mesh->triangleEdges[m.tri][localEdge];
@@ -350,6 +534,78 @@ void MotorcycleGraph::run() {
         onWall[next] = 1;
         m.tri = next;
         }
+    }
+
+    // An iso-line drawn from both of its ends is one iso-line.
+    //
+    // Two reflex corners that face each other across the domain each send a ray
+    // at the other, and they sit on a common coordinate, so the two rays run
+    // down the same line in opposite directions and each finishes on the corner
+    // the other started from. Before Polysquare::snapCorners() that could only
+    // happen by luck -- the two corners were a rounding error apart and the
+    // rays slid past each other -- so both were kept and neither was right.
+    // Now it is how the pair is supposed to end, and keeping both would put two
+    // coincident walls in the block structure: a pair of sides that lie on top
+    // of each other with a block of no width in between. So the second one goes.
+    //
+    // The test is that the two run between the same two points the opposite way
+    // round, are the same length, and pass through the same midpoint. Two
+    // different curves can share their endpoints -- they would bound a lens
+    // between them -- and the third condition is what tells that apart from one
+    // curve seen twice.
+    const double dupTol = 1e-6 * std::max(meanEdge, 1e-300);
+
+    auto traceLength = [](const std::vector<Point> &t) {
+        double l = 0.0;
+        for (size_t i = 1; i < t.size(); ++i) l += normP(t[i] - t[i - 1]);
+        return l;
+    };
+    auto traceMidpoint = [](const std::vector<Point> &t, double half) {
+        double l = 0.0;
+        for (size_t i = 1; i < t.size(); ++i) {
+            const double s = normP(t[i] - t[i - 1]);
+            if (l + s >= half) {
+                const double f = (s > 0.0) ? (half - l) / s : 0.0;
+                return t[i - 1] * (1.0 - f) + t[i] * f;
+            }
+            l += s;
+        }
+        return t.back();
+    };
+
+    std::vector<char> duplicate(traces.size(), 0);
+    for (size_t i = 0; i < traces.size(); ++i) {
+        if (duplicate[i] || traces[i].size() < 2) continue;
+        const double li = traceLength(traces[i]);
+        for (size_t j = i + 1; j < traces.size(); ++j) {
+            if (duplicate[j] || traces[j].size() < 2) continue;
+            if (normP(traces[i].front() - traces[j].back()) > dupTol) continue;
+            if (normP(traces[i].back() - traces[j].front()) > dupTol) continue;
+            const double lj = traceLength(traces[j]);
+            if (std::fabs(li - lj) > dupTol) continue;
+            if (normP(traceMidpoint(traces[i], 0.5 * li) - traceMidpoint(traces[j], 0.5 * lj)) >
+                dupTol) continue;
+
+            duplicate[j] = 1;
+            ++report_.duplicates;
+            if (exitEdge[j] >= 0) --report_.reachedBoundary; else --report_.ranOut;
+        }
+    }
+
+    if (report_.duplicates > 0) {
+        for (size_t j = 0; j < traces.size(); ++j) {
+            if (!duplicate[j]) continue;
+            traces[j].clear();
+            exitEdge[j] = -1;
+        }
+        // The walls the dropped ray put down stay: its twin crossed the same
+        // edges, so tracedEdges is already what it should be.
+        std::vector<Segment> keep;
+        keep.reserve(segments.size());
+        for (const auto &s : segments)
+            if (s.ray < 0 || s.ray >= static_cast<int>(duplicate.size()) || !duplicate[s.ray])
+                keep.push_back(s);
+        segments.swap(keep);
     }
 
     report_.tracedEdges = static_cast<int>(tracedEdges.size());

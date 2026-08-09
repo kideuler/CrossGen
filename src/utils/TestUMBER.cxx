@@ -29,7 +29,8 @@ static void printEnergy(const char *label, const UMBER::EnergyTerms &e) {
 int main(int argc, char **argv) {
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0]
-                  << " <mesh.obj> [gamma] [max_steps] [lbfgs_iters] [chord_max_width]\n";
+                  << " <mesh.obj> [gamma] [max_steps] [lbfgs_iters] [chord_max_width]"
+                  << " [arrival_tol]\n";
         return 1;
     }
 
@@ -41,6 +42,9 @@ int main(int argc, char **argv) {
     // chord has to be to be worth collapsing.
     const double chordMaxWidth =
         (argc >= 6) ? std::stod(argv[5]) : ChordCollapse::Settings().maxWidth;
+    // MotorcycleGraph::setArrivalTolerance, in mean mesh edges. 0 turns off the
+    // rescue for a ray that has lost its way; see the note on that setter.
+    const double arrivalTol = (argc >= 7) ? std::stod(argv[6]) : 0.20;
 
     std::shared_ptr<Mesh> mesh;
     try {
@@ -151,6 +155,13 @@ int main(int argc, char **argv) {
         std::cout << std::fixed << std::setprecision(2)
                   << "    segments off axis before snapping: " << pr.suspectSegments
                   << " past 10 deg, worst " << pr.worstSegmentDeg << " deg\n";
+        std::cout << "    boundary runs put on a shared iso-line: " << pr.runsAligned
+                  << ", worst move " << pr.worstRunAlign << " boundary edge(s)\n";
+        std::cout << "    corners snapped onto a shared iso-line: " << pr.cornersSnapped
+                  << ", worst move " << pr.worstCornerSnap << " boundary edge(s)";
+        if (pr.cornerSnapConflicts > 0)
+            std::cout << ", " << pr.cornerSnapConflicts << " cluster(s) left alone";
+        std::cout << "\n";
         std::cout << std::fixed << std::setprecision(3)
                   << "    boundary alignment: mean " << pr.meanAlignDeg << " deg, worst "
                   << pr.maxAlignDeg << " deg; length ratio " << pr.lengthRatio << "\n"
@@ -190,6 +201,7 @@ int main(int argc, char **argv) {
 
         // --- Meta-block structure, Sec. 5 (motorcycle graph only) -----------
         MotorcycleGraph mg(poly);
+        mg.setArrivalTolerance(arrivalTol);
         mg.build();
         const MotorcycleGraph::Report &mr = mg.getReport();
         std::cout << std::defaultfloat
@@ -199,6 +211,10 @@ int main(int argc, char **argv) {
         if (mr.ranOut > 0) std::cout << ", " << mr.ranOut << " ran out";
         if (mr.skippedCorners > 0)
             std::cout << ", " << mr.skippedCorners << " direction(s) the polysquare had no room for";
+        if (mr.arrivals > 0)
+            std::cout << ", " << mr.arrivals << " stopped on a corner they had lost their way past";
+        if (mr.duplicates > 0)
+            std::cout << ", " << mr.duplicates << " dropped as the same line drawn backwards";
         std::cout << "), " << mr.nodes << " node(s), smallest block " << mr.smallestBlock << " triangles";
         if (mr.mergedSlivers > 0)
             std::cout << ", " << mr.mergedSlivers << " unresolved block(s) folded in";

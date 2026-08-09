@@ -110,6 +110,18 @@ public:
         // is the number that catches it.
         double worstSegmentDeg = 0.0;
         int suspectSegments = 0;        // segments past 10 degrees
+        // Corner coordinates moved onto a shared iso-line by snapCorners(),
+        // the largest such move in mean image boundary edges, and the clusters
+        // it had to leave alone because two corners it could not move disagreed.
+        int cornersSnapped = 0;
+        double worstCornerSnap = 0.0;
+        int cornerSnapConflicts = 0;
+        // Straight runs of the boundary moved onto a coordinate they share with
+        // another run, and the largest such move in mean image boundary edges.
+        // A run moves rigidly, so this costs no alignment: it is the corners at
+        // its ends that it is for.
+        int runsAligned = 0;
+        double worstRunAlign = 0.0;
         double transitionDeg = 0.0;     // worst residual of Eq. (7) across a cut
         double lengthRatio = 1.0;       // image boundary length / input length
         double arap = 0.0, l1 = 0.0, cor = 0.0;
@@ -176,6 +188,31 @@ public:
     // Turning it off leaves the raw Eq. (9) result, which is what to look at
     // when asking how well the soft alignment did on its own.
     void setSnapBoundary(bool on) { snapBoundaryOn = on; }
+
+    // How close two corners have to be, in mean image boundary edges, for them
+    // to be treated as sharing an iso-line -- see snapCorners(). 0 disables it.
+    //
+    // The discrepancy this is for is small: on data/meshes/geom021 the two
+    // corners that should share an iso-line come out 1.4% of a boundary edge
+    // apart, and that is the one that costs a whole partition. So the default
+    // is a twentieth of an edge -- three times what is needed there and still
+    // far under anything the mesh can resolve.
+    //
+    // Larger is not better, and it is worth saying why, because the instinct is
+    // to leave headroom. Past a point the clusters stop being one corner seen
+    // twice and start being two corners, and merging those folds the boundary
+    // over itself. Measured over data/meshes: at 0.05 no model gains a block
+    // that is not four-sided; at 0.10 geom008 and geom009 both do; at 0.25
+    // geom008 also gains a pair of sides that cross each other.
+    //
+    // The trade is not free in the other direction either. On geom012 a wider
+    // tolerance leaves the chord collapse more to work with -- 110 blocks
+    // against 145 -- because at 0.05 the small shifts it makes are enough for
+    // six of that model's collapses to be rolled back for crossing rather than
+    // four. That is a heuristic yielding less, though, and the alternative is a
+    // structure with blocks in it that are not four-sided at all, so it is the
+    // narrower tolerance that is kept.
+    void setCornerSnapTolerance(double t) { cornerSnapTol = t; }
 
     // L-BFGS iterations per continuation stage, and the gradient tolerance.
     void setMaxIterations(int n) { maxIterations = n; }
@@ -245,8 +282,23 @@ private:
     void extractTransitions();   // Eq. (7)
     void poissonInit();          // Eq. (6)
     void optimize();             // Eq. (9)
+    // One straight run of the image boundary: the vertices on it, the axis it
+    // is perpendicular to, and the single coordinate they are all given.
+    struct Run {
+        int axis = 0;
+        double h = 0.0;
+        double weight = 0.0;      // image length, so a long run outvotes a short one
+        std::vector<int> verts;   // cut-mesh vertices
+    };
+
     void snapBoundary();         // Eq. (23), the boundary constraint
+    // Give runs that lie on one iso-line one coordinate between them.
+    void alignRuns(std::vector<Run> &runs);
+    void snapCorners();          // corners that share an iso-line put on one
     int countFlips() const;
+    // The mean length of a boundary edge in the image: the scale everything
+    // about "the same iso-line" is measured in.
+    double meanImageBoundaryEdge() const;
 
     // The triangle that has the interior on its left when a -> b is walked,
     // which is what makes "the left bank" mean the same thing along a whole
@@ -305,6 +357,7 @@ private:
     double l1Eps = 1e-2;
     double corWeight = 10.0;
     bool snapBoundaryOn = true;
+    double cornerSnapTol = 0.05;
     double barrierWeight = 1.0;
     double detFloor = 0.05;
     double gradTolerance = 1e-6;

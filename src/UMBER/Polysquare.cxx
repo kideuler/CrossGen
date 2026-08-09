@@ -708,6 +708,10 @@ void Polysquare::optimize() {
     if (snapBoundaryOn) {
         expand(x);
         snapBoundary();
+        // And then the corners that face each other across an iso-line onto
+        // one, which snapBoundary() cannot do: it works a segment at a time and
+        // this is a statement about two of them.
+        snapCorners();
 
         report_.iterations += runLBFGS(x, maxIterations);
         for (int round = 0; round < 4; ++round) {
@@ -758,6 +762,10 @@ void Polysquare::snapBoundary() {
 
     int conflicts = 0;
     std::vector<double> fixedValue(fixedX.size(), 0.0);
+    // The segments are collected first and pinned afterwards, because what a
+    // segment's coordinate should be is not a question about that segment
+    // alone -- see alignRuns().
+    std::vector<Run> runs;
 
     auto pin = [&](int cv, int axis, double value) {
         const int j = varOf[cv];
@@ -875,16 +883,244 @@ void Polysquare::snapBoundary() {
             if (varOf[bEdges[seg.back()].cb] == -1) touchesFarBank = true;
             if (touchesFarBank) continue;
 
-            for (int e : seg) pin(bEdges[e].ca, axis, h);
-            pin(bEdges[seg.back()].cb, axis, h);
+            Run run;
+            run.axis = axis;
+            run.h = h;
+            run.weight = den;
+            for (int e : seg) run.verts.push_back(bEdges[e].ca);
+            run.verts.push_back(bEdges[seg.back()].cb);
+            runs.push_back(std::move(run));
         }
     }
+
+    alignRuns(runs);
+    for (const Run &r : runs)
+        for (const int cv : r.verts) pin(cv, r.axis, r.h);
 
     if (conflicts > 0) {
         std::cerr << "Polysquare: " << conflicts << " boundary vertex(es) wanted two different "
                   << "values for the same coordinate; the first was kept.\n";
     }
     // The dependent copies follow from the banks that were just moved.
+    expand(x);
+}
+
+// ---------------------------------------------------------------------------
+// meanImageBoundaryEdge()
+// ---------------------------------------------------------------------------
+double Polysquare::meanImageBoundaryEdge() const {
+    if (bEdges.empty()) return 0.0;
+    double total = 0.0;
+    for (const auto &be : bEdges) total += normP(uv[be.cb] - uv[be.ca]);
+    return total / static_cast<double>(bEdges.size());
+}
+
+// ---------------------------------------------------------------------------
+// alignRuns()  --  runs that lie on one iso-line given one coordinate
+//
+// snapBoundary() puts each straight run of the boundary on a coordinate of its
+// own, computed from that run and nothing else. Two runs that are meant to be
+// the same iso-line therefore come out at two numbers, and a motorcycle sent
+// down one of them misses whatever sits on the other.
+//
+// data/meshes/geom031 is what that costs. It is a comb: thirty reflex corners
+// whose teeth all sit at one u in the shape they are meant to be. They come out
+// spread over nine different u, 2.6e-3 apart end to end -- a tenth of a boundary
+// edge -- so every iso-line launched from a tooth misses every other tooth, and
+// the sixty rays cross each other 4336 times instead of ending on one another.
+// The result is 4381 blocks for a shape that wants a few dozen.
+//
+// Doing this a run at a time rather than a corner at a time is the whole point.
+// A corner has its coordinate from the run it lies on, so moving the corner
+// alone would tilt that run off its axis -- and axis alignment is the property
+// Sec. 5 cannot do without. A run moves rigidly: every vertex on it shifts by
+// the same amount, it stays exactly as straight as it was, and only its
+// position changes. So this buys the corners without spending the alignment.
+//
+// What it must not do is merge two runs that really are at different
+// coordinates, and the guard is that nothing moves further than the tolerance:
+// runs join a cluster only while consecutive values are within it and the whole
+// cluster spans no more than twice it.
+// ---------------------------------------------------------------------------
+void Polysquare::alignRuns(std::vector<Run> &runs) {
+    if (cornerSnapTol <= 0.0 || runs.empty()) return;
+    const double meanEdge = meanImageBoundaryEdge();
+    if (!(meanEdge > 0.0)) return;
+    const double tol = cornerSnapTol * meanEdge;
+
+    for (int axis = 0; axis < 2; ++axis) {
+        std::vector<int> idx;
+        for (int i = 0; i < static_cast<int>(runs.size()); ++i)
+            if (runs[i].axis == axis) idx.push_back(i);
+        if (idx.size() < 2) continue;
+
+        std::sort(idx.begin(), idx.end(),
+                  [&](int a, int b) { return runs[a].h < runs[b].h; });
+
+        // Single linkage: runs join while each is within the tolerance of the
+        // one before it. It has to be the gap between neighbours rather than
+        // the width of the whole cluster, because the thing this is for is a
+        // chain -- geom031's nine values are 1% of a boundary edge apart in
+        // sequence and 10% apart end to end, and a cluster capped at twice the
+        // tolerance splits it down the middle and aligns neither half to the
+        // other. The cap is kept, ten times wider, only so that a genuine
+        // staircase of steps each under the tolerance cannot be linked into one
+        // line: at the default that is half a boundary edge, against the 0.08
+        // that is the widest any model here actually moves a run.
+        const double maxSpan = 10.0 * tol;
+        size_t i = 0;
+        while (i < idx.size()) {
+            size_t j = i + 1;
+            while (j < idx.size() && runs[idx[j]].h - runs[idx[j - 1]].h <= tol &&
+                   runs[idx[j]].h - runs[idx[i]].h <= maxSpan) ++j;
+            if (j - i >= 2) {
+                double num = 0.0, den = 0.0;
+                for (size_t k = i; k < j; ++k) {
+                    num += runs[idx[k]].weight * runs[idx[k]].h;
+                    den += runs[idx[k]].weight;
+                }
+                const double target = (den > 0.0) ? num / den : runs[idx[i]].h;
+                for (size_t k = i; k < j; ++k) {
+                    const double move = std::fabs(runs[idx[k]].h - target);
+                    if (move <= 1e-12) continue;
+                    runs[idx[k]].h = target;
+                    ++report_.runsAligned;
+                    report_.worstRunAlign = std::max(report_.worstRunAlign, move / meanEdge);
+                }
+            }
+            i = j;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// snapCorners()  --  corners that share an iso-line, put on one
+//
+// The motorcycle graph traces an axis-aligned line inward from every reflex
+// corner, and in a polysquare that line usually runs into another corner: two
+// corners of one notch face each other across it, and the u they sit at is the
+// same u. That is what makes the line stop where the structure says it should.
+//
+// Eq. (9) does not know it. E_l1 asks each boundary *edge* to lie on an axis
+// and E_cor asks consecutive edges on a run to be parallel; snapBoundary() then
+// puts each *segment* on a single coordinate of its own. Every one of those is
+// a statement about one segment, and none of them says that two segments which
+// ought to be collinear carry the same number. So two corners that face each
+// other come out a little apart, and "a little" is enough: the ray leaves one
+// of them, passes the other on the wrong side, and carries on into the model.
+//
+// data/meshes/geom021 is the case that shows what it costs. Its two reflex
+// corners sit at u = 0.125905 and u = 0.126426 -- 5.2e-4 apart, 1.4% of a mesh
+// edge -- because the segment they are on is the one the cut lands on, so
+// snapBoundary() leaves one half of it alone (see the note on the far bank
+// there) and the two halves keep different coordinates. The ray from the first
+// passes the second at 6.4e-4 and misses. On that model it then has nowhere
+// else to go and circles 71 times before the step cap stops it, but the miss
+// itself is the ordinary failure and the circling is a second defect on top.
+//
+// So: cluster the corners by each coordinate separately and give a cluster one
+// value. A corner whose coordinate snapBoundary() already fixed is the one that
+// says what the value is -- moving it would pull it off a segment that is
+// genuinely aligned -- and only the corners it left free are moved. That bounds
+// what this can do: no corner moves further than the tolerance, and no aligned
+// segment is touched at all.
+// ---------------------------------------------------------------------------
+void Polysquare::snapCorners() {
+    report_.cornersSnapped = 0;
+    report_.worstCornerSnap = 0.0;
+    report_.cornerSnapConflicts = 0;
+    if (cornerSnapTol <= 0.0 || bEdges.empty()) return;
+
+    // The scale to measure "the same iso-line" in: a boundary edge of the
+    // image. Two corners closer than a fraction of one are not two places as
+    // far as the mesh is concerned.
+    const double meanEdge = meanImageBoundaryEdge();
+    if (!(meanEdge > 0.0)) return;
+    const double tol = cornerSnapTol * meanEdge;
+
+    const std::vector<int> &toOrig = harmonicCut->getCutVertexToOriginal();
+
+    // A corner's coordinate, and whether anything may move it. Fixed means
+    // either snapBoundary() pinned it to a segment or the vertex is the far
+    // bank of a cut and follows its transition; both are already answerable to
+    // something else.
+    struct Corner {
+        double value = 0.0;
+        int cv = -1;
+        bool fixed = false;
+    };
+
+    for (int axis = 0; axis < 2; ++axis) {
+        std::vector<Corner> cs;
+        for (int cv = 0; cv < static_cast<int>(uv.size()); ++cv) {
+            if (cv >= static_cast<int>(toOrig.size())) continue;
+            const int ov = toOrig[cv];
+            if (ov < 0 || ov >= static_cast<int>(boundaryCorner.size())) continue;
+            if (boundaryCorner[ov] == 0) continue;
+            const int j = varOf[cv];
+            Corner c;
+            c.value = uv[cv][axis];
+            c.cv = cv;
+            c.fixed = (j < 0) || fixedX[2 * j + axis];
+            cs.push_back(c);
+        }
+        if (cs.size() < 2) continue;
+
+        std::sort(cs.begin(), cs.end(),
+                  [](const Corner &a, const Corner &b) { return a.value < b.value; });
+
+        // Single linkage at the tolerance, with the span of a cluster capped so
+        // that a chain of corners a tolerance apart cannot drag one of them
+        // across the model. Nothing moves further than the tolerance.
+        size_t i = 0;
+        while (i < cs.size()) {
+            size_t j = i + 1;
+            while (j < cs.size() && cs[j].value - cs[j - 1].value <= tol &&
+                   cs[j].value - cs[i].value <= 2.0 * tol) ++j;
+
+            // What the cluster's coordinate is: whatever the corners that
+            // cannot move already say, and the average otherwise.
+            double target = 0.0;
+            int fixedCount = 0;
+            double fixedLo = 0.0, fixedHi = 0.0;
+            for (size_t k = i; k < j; ++k) {
+                if (!cs[k].fixed) continue;
+                if (fixedCount == 0) { fixedLo = fixedHi = cs[k].value; }
+                fixedLo = std::min(fixedLo, cs[k].value);
+                fixedHi = std::max(fixedHi, cs[k].value);
+                ++fixedCount;
+            }
+            if (fixedCount > 0) {
+                // Two corners that cannot move and do not agree: there is no
+                // value that puts both on one line, so the cluster is left as
+                // it is rather than moved onto neither of them.
+                if (fixedHi - fixedLo > 1e-12) {
+                    ++report_.cornerSnapConflicts;
+                    i = j;
+                    continue;
+                }
+                target = fixedLo;
+            } else {
+                for (size_t k = i; k < j; ++k) target += cs[k].value;
+                target /= static_cast<double>(j - i);
+            }
+
+            for (size_t k = i; k < j; ++k) {
+                if (cs[k].fixed) continue;
+                const double move = std::fabs(cs[k].value - target);
+                if (move <= 1e-12) continue;
+                const int idx = 2 * varOf[cs[k].cv] + axis;
+                uv[cs[k].cv][axis] = target;
+                x[idx] = target;
+                fixedX[idx] = 1;
+                ++report_.cornersSnapped;
+                report_.worstCornerSnap = std::max(report_.worstCornerSnap, move / meanEdge);
+            }
+            i = j;
+        }
+    }
+
+    // The dependent copies follow the banks that were just moved.
     expand(x);
 }
 

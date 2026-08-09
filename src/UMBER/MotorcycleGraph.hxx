@@ -64,15 +64,31 @@ public:
         // which overcounts, since two rays out of one corner share the first
         // edge out of the triangle they start in.
         int crossings = 0;
+        // Rays that left the model, whether through a boundary edge or by
+        // landing exactly on a boundary vertex. The second is what an iso-line
+        // running into the corner it was aimed at looks like, and in a
+        // polysquare that is where a line out of a reflex corner is supposed to
+        // finish -- see the note in run() where exitPoint() comes back empty.
         int reachedBoundary = 0;
         // Rays that neither crashed nor left the model. On a locally
         // injective parameterization this stays zero; a folded triangle
         // reverses the direction a ray reads there, so one can circle instead
-        // of going anywhere, and the step cap is what ends it.
+        // of going anywhere, and the step cap is what ends it. A boundary loop
+        // whose image does not close does the same thing without any triangle
+        // being folded: the image is then an unbounded strip and a ray along it
+        // has no wall to hit.
         int ranOut = 0;
         // Rays the corner index called for that the parameterization has no
         // room for. Zero unless Sec. 4.3 left something inconsistent there.
         int skippedCorners = 0;
+        // Rays dropped for being another ray drawn backwards -- see the end of
+        // run(). Two reflex corners that face each other each aim at the other,
+        // so the iso-line between them gets traced from both ends, and one of
+        // the two is the line.
+        int duplicates = 0;
+        // Rays ended by arriving at the corner another ray was launched from,
+        // rather than by leaving the model -- see setArrivalTolerance().
+        int arrivals = 0;
         int nodes = 0;         // corners, exits and crossings of the block structure
         int blocks = 0;
         int mergedSlivers = 0;  // blocks the mesh could not resolve, folded into a neighbour
@@ -83,6 +99,28 @@ public:
     // The polysquare must have been solved; its corners and its (u, v) are
     // what the tracing follows.
     explicit MotorcycleGraph(const Polysquare &ps);
+
+    // How close a ray that is already lost has to pass to the corner another
+    // ray was launched from for it to count as having arrived there: the trace
+    // is snapped onto that corner and stops. In mean mesh edges; 0 turns it off.
+    //
+    // "Already lost" is doing as much work here as the distance is, and run()
+    // says why: rays that are behaving perfectly also pass launch corners in
+    // mid flight, closer than the ones that are lost do, so no tolerance
+    // separates the two on its own. The length does. Measured over
+    // data/meshes at the default, twenty-eight of the thirty models come out
+    // bit for bit as they do with this switched off, and the two that change
+    // are the two that had a ray going nowhere: geom031 from 7968 blocks to
+    // 371, geom035 from 241 to 51.
+    //
+    // It is not free on those two. Snapping the end of a trace sideways by up
+    // to the tolerance can push it across a neighbouring line, and it does:
+    // geom035 picks up two places where sides cross with no node between them
+    // and geom031 five. Against a trace that never terminated at all that is
+    // the better of the two, which is why this is on -- but it is a rescue for
+    // a parameterization that is already wrong, not a thing that improves a
+    // right one.
+    void setArrivalTolerance(double t) { arrivalTol = t; }
 
     // Launch the rays, then label the triangles.
     void build();
@@ -181,6 +219,7 @@ private:
     // direction it follows, and how far it has come.
     struct Motorcycle {
         int tri = -1;
+        int originVertex = -1;  // the corner it was launched from
         Point pos{0.0, 0.0};    // model coordinates
         Point dir{1.0, 0.0};    // parameter-domain direction, unit
         double distance = 0.0;
@@ -217,6 +256,7 @@ private:
     std::vector<char> onWall;   // a ray passed through this triangle
     std::vector<int> exitEdge;      // per ray, where it left the model
     std::vector<double> exitAlong;
+    double arrivalTol = 0.20;
 
     Report report_;
 };
