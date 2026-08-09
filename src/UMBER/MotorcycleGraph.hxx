@@ -108,14 +108,38 @@ public:
         Point ua{0.0, 0.0}, ub{0.0, 0.0};  // parameter domain
         int tri = -1;
         int ray = -1;
+        // Which step of that ray this is, so a point of the segment can be
+        // named as a parameter along the ray's polyline: getTraces()[ray][step]
+        // is a and [step + 1] is b.
+        int step = -1;
     };
     const std::vector<Segment>& getSegments() const { return segments; }
 
     // A node of the block structure: where its edges meet.
+    //
+    // A node carries where it sits as well as where it is, so that the block
+    // structure can be cut out of the traces without looking for it a second
+    // time -- see BlockLayout, which needs each node's place along the lines
+    // through it in order to split them into the sides of the blocks.
+    //
+    // A place along a ray is given as a parameter into its polyline: the index
+    // of the point before it plus the fraction of the way along that step, so
+    // that everything on one ray sorts on one number.
     struct Node {
         Point xy{0.0, 0.0};
         Point uv{0.0, 0.0};
         enum Kind { Corner, BoundaryEnd, Crossing } kind = Corner;
+
+        // Corner: the mesh vertex it stands on.
+        int vertex = -1;
+        // Crossing: the two rays and the parameter of the crossing along each.
+        // BoundaryEnd: ray[0] and its last parameter; ray[1] unused.
+        int ray[2] = {-1, -1};
+        double param[2] = {0.0, 0.0};
+        // BoundaryEnd: the boundary edge the ray left through, and how far
+        // along it, measured from edges[boundaryEdge][0] to [1].
+        int boundaryEdge = -1;
+        double alongEdge = 0.0;
     };
     // Every corner of the polysquare, every point an iso-line leaves the model
     // at, and every point two of them cross. Corners include the convex ones,
@@ -127,7 +151,17 @@ public:
     // itself cuts through triangle interiors -- see writeBlocksVTU().
     const std::unordered_set<EdgeKey, EdgeKeyHash>& getTracedEdges() const { return tracedEdges; }
 
+    // Per ray, the boundary edge it left the model through and how far along
+    // that edge, measured from edges[e][0] to edges[e][1]. -1 for a ray that
+    // never got out -- one of Report::ranOut -- whose trace therefore ends in
+    // the middle of the model and leaves the block structure open there.
+    const std::vector<int>& getRayExitEdge() const { return exitEdge; }
+    const std::vector<double>& getRayExitAlong() const { return exitAlong; }
+
     const Report& getReport() const { return report_; }
+
+    // The model the blocks were cut out of.
+    const Mesh& getMesh() const { return *mesh; }
 
     // The input mesh with the block index as cell data.
     //
@@ -181,6 +215,8 @@ private:
     std::unordered_set<EdgeKey, EdgeKeyHash> tracedEdges;
     std::vector<int> blockOfTriangle;
     std::vector<char> onWall;   // a ray passed through this triangle
+    std::vector<int> exitEdge;      // per ray, where it left the model
+    std::vector<double> exitAlong;
 
     Report report_;
 };

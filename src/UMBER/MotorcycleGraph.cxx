@@ -263,6 +263,8 @@ void MotorcycleGraph::launch() {
 void MotorcycleGraph::run() {
     traces.assign(bikes.size(), {});
     segments.clear();
+    exitEdge.assign(bikes.size(), -1);
+    exitAlong.assign(bikes.size(), 0.0);
     onWall.assign(mesh->triangles.size(), 0);
     for (size_t i = 0; i < bikes.size(); ++i) {
         traces[i].push_back(bikes[i].pos);
@@ -302,6 +304,7 @@ void MotorcycleGraph::run() {
         seg.ub = imageOfPoint(m.tri, hit);
         seg.tri = m.tri;
         seg.ray = static_cast<int>(id);
+        seg.step = m.steps - 1;
         segments.push_back(seg);
 
         m.distance += normP(hit - m.pos);
@@ -316,6 +319,12 @@ void MotorcycleGraph::run() {
 
         const int next = mesh->triangleAdjacency[m.tri][localEdge];
         if (next < 0) {                 // out at the boundary of the model
+            // Where on the boundary, in the edge's own orientation: exitPoint()
+            // measured `along` from the triangle's corner localEdge, which need
+            // not be the edge's first vertex.
+            exitEdge[id] = e;
+            exitAlong[id] = (mesh->edges[e][0] == mesh->triangles[m.tri][localEdge])
+                                ? along : 1.0 - along;
             m.alive = false;
             ++report_.reachedBoundary;
             break;
@@ -511,21 +520,25 @@ void MotorcycleGraph::findNodes() {
         n.xy = mesh->vertices[v];
         n.uv = imageOfPoint(vt.colIdx[vt.rowPtr[v]], mesh->vertices[v]);
         n.kind = Node::Corner;
+        n.vertex = v;
         nodes.push_back(n);
     }
 
-    // Where each line leaves the model.
-    for (const auto &tr : traces) {
-        if (tr.size() < 2) continue;
-        for (const auto &seg : segments) {
-            if (normP(seg.b - tr.back()) > 1e-12) continue;
-            Node n;
-            n.xy = seg.b;
-            n.uv = seg.ub;
-            n.kind = Node::BoundaryEnd;
-            nodes.push_back(n);
-            break;
-        }
+    // Where each line leaves the model. A ray that never got out has no node
+    // here: its trace stops in the middle of the model, and pretending its last
+    // point is a boundary end would hide that.
+    for (size_t r = 0; r < traces.size(); ++r) {
+        if (traces[r].size() < 2 || r >= exitEdge.size() || exitEdge[r] < 0) continue;
+        Node n;
+        n.xy = traces[r].back();
+        n.kind = Node::BoundaryEnd;
+        n.ray[0] = static_cast<int>(r);
+        n.param[0] = static_cast<double>(traces[r].size() - 1);
+        n.boundaryEdge = exitEdge[r];
+        n.alongEdge = exitAlong[r];
+        for (const auto &seg : segments)
+            if (seg.ray == static_cast<int>(r) && seg.step == n.param[0] - 1) { n.uv = seg.ub; break; }
+        nodes.push_back(n);
     }
 
     // Crossings, triangle by triangle.
@@ -556,6 +569,10 @@ void MotorcycleGraph::findNodes() {
                 n.uv = Point{s1.ua[0] + t1 * (s1.ub[0] - s1.ua[0]),
                              s1.ua[1] + t1 * (s1.ub[1] - s1.ua[1])};
                 n.kind = Node::Crossing;
+                n.ray[0] = s1.ray;
+                n.param[0] = s1.step + t1;
+                n.ray[1] = s2.ray;
+                n.param[1] = s2.step + t2;
                 nodes.push_back(n);
             }
         }

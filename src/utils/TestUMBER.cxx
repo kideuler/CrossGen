@@ -9,6 +9,8 @@
 
 #include "Parameterization/HarmonicCut.hxx"
 #include "SIPG/SIPG.hxx"
+#include "UMBER/BlockLayout.hxx"
+#include "UMBER/ChordCollapse.hxx"
 #include "UMBER/MotorcycleGraph.hxx"
 #include "UMBER/Polysquare.hxx"
 #include "UMBER/UMBER.hxx"
@@ -26,7 +28,8 @@ static void printEnergy(const char *label, const UMBER::EnergyTerms &e) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <mesh.obj> [gamma] [max_steps] [lbfgs_iters]\n";
+        std::cerr << "Usage: " << argv[0]
+                  << " <mesh.obj> [gamma] [max_steps] [lbfgs_iters] [chord_max_width]\n";
         return 1;
     }
 
@@ -34,6 +37,10 @@ int main(int argc, char **argv) {
     const double gamma = (argc >= 3) ? std::stod(argv[2]) : 10.0;
     const int maxSteps = (argc >= 4) ? std::stoi(argv[3]) : MBO_MAX_STEPS;
     const int lbfgsIters = (argc >= 5) ? std::stoi(argv[4]) : 0; // 0 = UMBER default
+    // ChordCollapse::Settings::maxWidth, the heuristic that says how thin a
+    // chord has to be to be worth collapsing.
+    const double chordMaxWidth =
+        (argc >= 6) ? std::stod(argv[5]) : ChordCollapse::Settings().maxWidth;
 
     std::shared_ptr<Mesh> mesh;
     try {
@@ -206,15 +213,85 @@ int main(int argc, char **argv) {
             std::cout << "\033[31m[FAIL]\033[0m " << mr.ranOut
                       << " iso-line(s) did not reach the boundary.\n";
 
+        // --- The blocks as a graph, and chord collapse -----------------------
+        BlockLayout bl(mg);
+        bl.build();
+        const BlockLayout::Report &br = bl.getReport();
+        const QuadLayout::Report lr = bl.getLayout().getReport();
+        std::cout << "  block structure: " << lr.faces << " block(s), " << lr.arcs
+                  << " side(s), " << lr.nodes << " node(s) on " << br.boundaryLoops
+                  << " boundary loop(s)";
+        if (br.danglingEnds > 0) std::cout << ", " << br.danglingEnds << " free end(s)";
+        if (br.degenerateArcs > 0) std::cout << ", " << br.degenerateArcs << " side(s) dropped";
+        if (br.unplacedNodes > 0) std::cout << ", " << br.unplacedNodes << " node(s) unplaced";
+        std::cout << "\n";
+
+        // A block that did not come out four-sided is a place the tracing left
+        // open, so it is only news where the tracing was clean: a ray the
+        // parameterization had no room for, or one that never got out, leaves a
+        // block that no number of sides can be right for.
+        const bool tracingClean = (pr.flips == 0 && mr.skippedCorners == 0 && mr.ranOut == 0);
+        if (lr.badFaces == 0 && lr.arcCrossings == 0)
+            std::cout << "\033[32m[PASS]\033[0m Every block came out four-sided ("
+                      << lr.faces << " against " << mr.blocks << " from the flood).\n";
+        else if (!tracingClean)
+            std::cout << "  (" << lr.badFaces << " block(s) not four-sided and "
+                      << lr.arcCrossings << " side(s) crossing, where the tracing is already "
+                      << "incomplete)\n";
+        else
+            std::cout << "\033[31m[FAIL]\033[0m " << lr.badFaces << " block(s) not four-sided, "
+                      << lr.arcCrossings << " side(s) crossing.\n";
+
+        ChordCollapse::Settings ccs;
+        ccs.maxWidth = chordMaxWidth;
+        ChordCollapse cc(bl.getLayout(), ccs);
+        cc.run();
+        const ChordCollapse::Report &cr = cc.getReport();
+        std::cout << std::fixed << std::setprecision(2)
+                  << "  chord collapse: " << cr.blocksBefore << " -> " << cr.blocksAfter
+                  << " block(s) in " << cr.collapses << " collapse(s)";
+        if (cr.widestCollapsed > 0.0)
+            std::cout << ", widest " << cr.widestCollapsed << " of a mean side";
+        if (cr.rolledBack > 0)
+            std::cout << ", " << cr.rolledBack << " undone (" << cr.rbBlocks << " block count, "
+                      << cr.rbBad << " not four-sided, " << cr.rbCrossings << " crossing, "
+                      << cr.rbArea << " area)";
+        std::cout << "\n    " << cr.chordsSeen << " chord(s) left, " << cr.collapsible
+                  << " still collapsible";
+        for (int i = 1; i < static_cast<int>(ChordCollapse::Block::Count); ++i) {
+            if (cr.blockCount[i] == 0) continue;
+            std::cout << ", " << cr.blockCount[i] << " "
+                      << ChordCollapse::blockName(static_cast<ChordCollapse::Block>(i));
+        }
+        std::cout << "\n";
+
+        // What the operation is answerable for is that it left the structure no
+        // worse than it found it, whatever state the tracing handed over.
+        const QuadLayout::Report &ar = cc.getLayout().getReport();
+        if (ar.badFaces <= lr.badFaces && ar.arcCrossings <= lr.arcCrossings &&
+            ar.danglingEnds <= lr.danglingEnds)
+            std::cout << "\033[32m[PASS]\033[0m Collapsing left the structure no worse: "
+                      << ar.badFaces << " block(s) not four-sided, " << ar.arcCrossings
+                      << " side(s) crossing.\n";
+        else
+            std::cout << "\033[31m[FAIL]\033[0m collapsing made the structure worse: "
+                      << lr.badFaces << " -> " << ar.badFaces << " block(s) not four-sided, "
+                      << lr.arcCrossings << " -> " << ar.arcCrossings << " side(s) crossing.\n";
+
         const std::string uvFile = stem + "_polysquare.vtu";
         const std::string srcFile = stem + "_source.vtu";
         const std::string blkFile = stem + "_blocks.vtu";
         const std::string trcFile = stem + "_motorcycles.vtu";
+        const std::string layFile = stem + "_blocklayout.vtu";
+        const std::string simFile = stem + "_simplified.vtu";
         if (poly.writeVTU(uvFile) && poly.writeSourceVTU(srcFile) &&
-            mg.writeBlocksVTU(blkFile) && mg.writeTracesVTU(trcFile))
+            mg.writeBlocksVTU(blkFile) && mg.writeTracesVTU(trcFile) &&
+            bl.getLayout().writeFacesVTU(layFile) && cc.getLayout().writeFacesVTU(simFile))
             std::cout << "  wrote " << uvFile << " (parameter domain), " << srcFile
                       << " (input domain, uv as a point field),\n         " << blkFile
-                      << " (blocks as cell data) and " << trcFile << " (the traces)\n";
+                      << " (blocks as cell data), " << trcFile << " (the traces),\n         "
+                      << layFile << " (the blocks as polygons) and " << simFile
+                      << " (after chord collapse)\n";
         else
             std::cout << "\033[31m[FAIL]\033[0m could not write the VTK output.\n";
     } catch (const std::exception &e) {

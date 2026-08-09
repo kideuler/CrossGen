@@ -83,9 +83,10 @@ UMBERPhase nextUMBERPhase(UMBERPhase p) {
         case UMBERPhase::Stepping:   return UMBERPhase::Frames;
         case UMBERPhase::Frames:     return UMBERPhase::Polysquare;
         case UMBERPhase::Polysquare: return UMBERPhase::Blocks;
-        case UMBERPhase::Blocks:     return UMBERPhase::Blocks;
+        case UMBERPhase::Blocks:     return UMBERPhase::Simplified;
+        case UMBERPhase::Simplified: return UMBERPhase::Simplified;
     }
-    return UMBERPhase::Blocks;
+    return UMBERPhase::Simplified;
 }
 
 MedialAxisPhase nextMedialAxisPhase(MedialAxisPhase p) {
@@ -141,6 +142,7 @@ const char *umberPhaseName(UMBERPhase p) {
         case UMBERPhase::Frames:     return "4) UMBER frame field";
         case UMBERPhase::Polysquare: return "5) polysquare (Sec. 4.3)";
         case UMBERPhase::Blocks:     return "6) block structure (Sec. 5)";
+        case UMBERPhase::Simplified: return "7) chord collapse";
     }
     return "?";
 }
@@ -455,6 +457,8 @@ void CrossGenWidget::doReset() {
     umber_.reset();
     umberCut_.reset();
     polysquare_.reset();
+    chordCollapse_.reset();
+    blockLayout_.reset();
     blocks_.reset();
     umberCorners_.clear();
     umberInternal_.clear();
@@ -934,6 +938,10 @@ void CrossGenWidget::runBlocks() {
     blocksAttempted_ = true;
     if (!polysquare_.has_value()) return;
 
+    // Both of these point into blocks_, so they go before it is replaced.
+    chordCollapse_.reset();
+    blockLayout_.reset();
+
     auto t0 = Clock::now();
     try {
         blocks_.emplace(*polysquare_);
@@ -954,6 +962,179 @@ void CrossGenWidget::runBlocks() {
     console_.log(oss.str());
     console_.log("[Blocks] yellow = polysquare corner, green = line leaving the model, "
                  "cyan = crossing");
+}
+
+// ── chord collapse ───────────────────────────────────────────────────────────
+
+void CrossGenWidget::buildBlockLayout() {
+    if (blockLayout_.has_value() || !blocks_.has_value()) return;
+
+    auto t0 = Clock::now();
+    try {
+        blockLayout_.emplace(*blocks_);
+        blockLayout_->build();
+    } catch (const std::exception &e) {
+        blockLayout_.reset();
+        console_.log(std::string("[BlockLayout] FAILED: ") + e.what());
+        std::cerr << "[Viewer] BlockLayout failed: " << e.what() << "\n";
+        return;
+    }
+    auto t1 = Clock::now();
+
+    const QuadLayout::Report &r = blockLayout_->getLayout().getReport();
+    std::ostringstream oss;
+    oss << "[BlockLayout] " << r.faces << " block(s), " << r.arcs << " side(s), " << r.nodes
+        << " node(s), " << r.quadFaces << " four-sided, "
+        << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+    console_.log(oss.str());
+    // A block that did not come out four-sided is a place the tracing left
+    // open, and no chord can be walked through one, so it is worth saying
+    // before the dialog reports fewer chords than the model looks like it has.
+    if (r.badFaces > 0 || r.arcCrossings > 0) {
+        std::ostringstream bad;
+        bad << "[BlockLayout] " << r.badFaces << " block(s) not four-sided, " << r.arcCrossings
+            << " side(s) crossing: chords through them are blocked";
+        console_.log(bad.str());
+    }
+}
+
+// The dialog reports what the settings would do before they are applied, which
+// is the only way to choose the width: the number itself means nothing, and
+// "how many chords does it let through, and how much thinner would the next one
+// need me to be" is the question actually being asked. Enumerating the chords
+// is a walk over the sides of the structure, so it is cheap enough to redo on
+// every keystroke.
+bool CrossGenWidget::promptChordCollapseParameters() {
+    if (!blockLayout_.has_value()) return false;
+    const QuadLayout &layout = blockLayout_->getLayout();
+
+    QDialog dlg(this);
+    dlg.setWindowTitle("Chord collapse");
+
+    auto *widthBox = new QDoubleSpinBox(&dlg);
+    widthBox->setRange(0.0, 10.0);
+    widthBox->setDecimals(3);
+    widthBox->setSingleStep(0.05);
+    widthBox->setValue(chordSettings_.maxWidth);
+    widthBox->setToolTip(
+        "Rule 1. A chord is collapsed only if every one of its rungs is\n"
+        "shorter than this, in units of the mean side length of the block\n"
+        "structure. Well under 1: a chord as wide as a block is a partition\n"
+        "of the model and not a sliver.");
+
+    auto *aspectBox = new QDoubleSpinBox(&dlg);
+    aspectBox->setRange(0.0, 100.0);
+    aspectBox->setDecimals(1);
+    aspectBox->setSingleStep(0.5);
+    aspectBox->setValue(chordSettings_.minAspect);
+    aspectBox->setToolTip(
+        "Rule 1 from the other side: how many times longer than wide a chord\n"
+        "has to be. A short fat chord and a long thin one can have the same\n"
+        "rungs and only the second is a sliver. 0 turns it off.");
+
+    auto *maxBox = new QSpinBox(&dlg);
+    maxBox->setRange(0, 100000);
+    maxBox->setValue(chordSettings_.maxCollapses);
+    maxBox->setToolTip("Cap on how many chords the greedy loop takes.\n"
+                       "0 leaves the structure alone, for comparison.");
+
+    auto *preview = new QLabel(&dlg);
+    preview->setTextFormat(Qt::PlainText);
+
+    auto updatePreview = [&layout, widthBox, aspectBox, preview]() {
+        ChordCollapse::Settings s;
+        s.maxWidth = widthBox->value();
+        s.minAspect = aspectBox->value();
+        ChordCollapse probe(layout, s);
+        probe.enumerateChords();
+        const ChordCollapse::Report &r = probe.getReport();
+
+        // The thinnest chord the width rule is currently turning away, which is
+        // exactly how far the threshold would have to move to take one more.
+        double nextWidth = -1.0;
+        for (const auto &c : probe.getChords()) {
+            if (c.block != ChordCollapse::Block::TooThick) continue;
+            if (nextWidth < 0.0 || c.width < nextWidth) nextWidth = c.width;
+        }
+
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(3)
+            << "mean side = " << probe.getWidthScale() << " in model units\n"
+            << r.blocksBefore << " block(s), " << r.chordsSeen << " chord(s), "
+            << r.collapsible << " collapsible here";
+        for (int i = 1; i < static_cast<int>(ChordCollapse::Block::Count); ++i) {
+            if (r.blockCount[i] == 0) continue;
+            oss << "\n  " << r.blockCount[i] << " "
+                << ChordCollapse::blockName(static_cast<ChordCollapse::Block>(i));
+        }
+        if (nextWidth >= 0.0)
+            oss << "\nthe next one needs a width of " << nextWidth;
+        preview->setText(QString::fromStdString(oss.str()));
+    };
+    QObject::connect(widthBox, &QDoubleSpinBox::valueChanged, &dlg, updatePreview);
+    QObject::connect(aspectBox, &QDoubleSpinBox::valueChanged, &dlg, updatePreview);
+    updatePreview();
+
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    QObject::connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    QObject::connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+
+    auto *form = new QFormLayout(&dlg);
+    form->addRow("max rung width (mean sides)", widthBox);
+    form->addRow("min length / width", aspectBox);
+    form->addRow("max collapses", maxBox);
+    form->addRow("at these settings", preview);
+    form->addRow(new QLabel("A chord is refused whole if any rung joins two\n"
+                            "boundaries or pinches one; a rung with one end on\n"
+                            "the boundary always contracts onto that end.",
+                            &dlg));
+    form->addRow(buttons);
+
+    if (dlg.exec() != QDialog::Accepted) return false;
+
+    chordSettings_.maxWidth = widthBox->value();
+    chordSettings_.minAspect = aspectBox->value();
+    chordSettings_.maxCollapses = maxBox->value();
+    return true;
+}
+
+void CrossGenWidget::runChordCollapse() {
+    if (!blockLayout_.has_value()) return;
+
+    auto t0 = Clock::now();
+    // From the structure the tracing left, every time: the settings are a
+    // heuristic being tuned, and collapsing on top of the last result would
+    // mean the answer depended on which thresholds had been tried before it.
+    chordCollapse_.emplace(blockLayout_->getLayout(), chordSettings_);
+    chordCollapse_->run();
+    auto t1 = Clock::now();
+
+    const ChordCollapse::Report &r = chordCollapse_->getReport();
+    std::ostringstream oss;
+    oss << "[Collapse] " << r.blocksBefore << " -> " << r.blocksAfter << " block(s) over "
+        << r.collapses << " chord collapse(s), widest " << std::fixed << std::setprecision(2)
+        << r.widestCollapsed << " of a mean side, "
+        << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+    console_.log(oss.str());
+
+    std::ostringstream why;
+    why << "[Collapse] " << r.chordsSeen << " chord(s) left, " << r.collapsible
+        << " still collapsible";
+    for (int i = 1; i < static_cast<int>(ChordCollapse::Block::Count); ++i) {
+        if (r.blockCount[i] == 0) continue;
+        why << ", " << r.blockCount[i] << " "
+            << ChordCollapse::blockName(static_cast<ChordCollapse::Block>(i));
+    }
+    console_.log(why.str());
+    if (r.rolledBack > 0) {
+        std::ostringstream rb;
+        rb << "[Collapse] " << r.rolledBack << " collapse(s) undone for leaving a broken layout ("
+           << r.rbBlocks << " block count, " << r.rbBad << " not four-sided, " << r.rbCrossings
+           << " crossing, " << r.rbArea << " area)";
+        console_.log(rb.str());
+    }
+    console_.log("[Collapse] grey = the structure before, red = after; "
+                 "press 'c' to try other settings");
 }
 
 // ── phase advancement ────────────────────────────────────────────────────────
@@ -984,6 +1165,19 @@ void CrossGenWidget::advancePhase() {
         umberPhase_ = nextUMBERPhase(umberPhase_);
         if (umberPhase_ != old)
             std::cerr << "[Viewer] UMBER Phase " << umberPhaseName(umberPhase_) << "\n";
+
+        // The last phase is a dialog rather than a picture to press on to, and
+        // it stays that way: 'c' at it re-opens the dialog, so a threshold can
+        // be tried, looked at, and tried again.
+        if (umberPhase_ == UMBERPhase::Simplified) {
+            // The blocks are normally built lazily by the frame after the one
+            // that asked for them, so make sure they are there rather than
+            // assuming a frame has been drawn since.
+            if (!blocksAttempted_) runBlocks();
+            buildBlockLayout();
+            if (blockLayout_.has_value() && promptChordCollapseParameters())
+                runChordCollapse();
+        }
     }
 }
 
@@ -1500,7 +1694,11 @@ void CrossGenWidget::renderTraceAnimation() {
 bool CrossGenWidget::inUVSplitScreen() const {
     return (mode_ == Mode::PolyVector && phase_ == Phase::UVMesh && miqSolver_.has_value()) ||
            (mode_ == Mode::SIPG && sipgPhase_ == SIPGPhase::UVMesh && sipgUVParam_.has_value()) ||
-           (mode_ == Mode::UMBER && umberPhase_ >= UMBERPhase::Polysquare && polysquare_.has_value());
+           // The chord collapse phase takes the whole window back: what it has
+           // to show is the structure before against the structure after, and
+           // both of those live in the model.
+           (mode_ == Mode::UMBER && umberPhase_ >= UMBERPhase::Polysquare &&
+            umberPhase_ <= UMBERPhase::Blocks && polysquare_.has_value());
 }
 
 void CrossGenWidget::applyHalfOrtho(int x, int vpW, const viewer::ViewState &vs) const {
@@ -1766,6 +1964,28 @@ void CrossGenWidget::renderNormal() {
         } else {
             viewer::drawMesh(*mesh_);
         }
+    } else if (mode_ == Mode::UMBER && umberPhase_ >= UMBERPhase::Simplified &&
+               blockLayout_.has_value()) {
+        // ── The structure the tracing left, against what the collapse made ──
+        //
+        // Both over the one mesh at the one scale, so that a chord that went is
+        // a grey line with no red on it and everything else is red over grey.
+        // The parameter domain is dropped here: the operation happens in the
+        // model, and the picture that answers "which blocks did that remove"
+        // is this one.
+        viewer::drawAxis(view_);
+        viewer::drawMesh(*mesh_);
+        if (umberCut_.has_value() && !umberCut_->getCutEdges().empty())
+            viewer::drawEdgeSetOnMesh(*mesh_, umberCut_->getCutEdges(), 1.0f, 0.2f, 0.9f, 2.0f);
+
+        viewer::drawQuadLayoutArcs(blockLayout_->getLayout(), 2.0f, 0.45f, 0.45f, 0.5f);
+        const QuadLayout &shown = chordCollapse_.has_value() ? chordCollapse_->getLayout()
+                                                             : blockLayout_->getLayout();
+        viewer::drawQuadLayoutArcs(shown, 4.0f, 0.95f, 0.25f, 0.2f);
+        // view_.zoom is 1.0 at fit and shrinks as the view zooms in, so scaling
+        // the radius by it keeps the markers the same size on screen instead of
+        // swallowing a block once you zoom in on one.
+        viewer::drawQuadLayoutNodes(shown, 0.12 * avgEdge_ * view_.zoom);
     } else if (mode_ == Mode::UMBER && umberPhase_ >= UMBERPhase::Polysquare &&
                polysquare_.has_value()) {
         // ── Split-screen: left = mesh and frame, right = the polysquare ─────
@@ -1980,6 +2200,9 @@ void CrossGenWidget::renderNormal() {
                       "press 'r' to restart\npress 'q' to quit");
     } else if (mode_ == Mode::OASIS) {
         renderOverlay("press 'c' to change lambda / orientation\n"
+                      "press 'r' to restart\npress 'q' to quit");
+    } else if (mode_ == Mode::UMBER && umberPhase_ == UMBERPhase::Simplified) {
+        renderOverlay("press 'c' to change the collapse settings\n"
                       "press 'r' to restart\npress 'q' to quit");
     } else {
         renderOverlay("press 'c' to continue\npress 'r' to restart\npress 'q' to quit");

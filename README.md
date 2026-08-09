@@ -15,6 +15,6 @@ TODO:
 - [X] Implement DG-SIPG to in P0 to get crosses on faces and singularities on nodes.
 - [X] Implement basic polysquare stuff from 2023 paper
 - [X] Go back and try to fix tracing and simplification
-- [ ] See if we can do a chord collapse operation for complex polysquares
+- [X] See if we can do a chord collapse operation for complex polysquares
 - [ ] Padding?
 - [ ] Try medial axis again.

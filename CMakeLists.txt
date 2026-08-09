@@ -61,6 +61,10 @@ add_library(PolyVector SHARED
     src/UMBER/Polysquare.cxx
     src/UMBER/MotorcycleGraph.hxx
     src/UMBER/MotorcycleGraph.cxx
+    src/UMBER/BlockLayout.hxx
+    src/UMBER/BlockLayout.cxx
+    src/UMBER/ChordCollapse.hxx
+    src/UMBER/ChordCollapse.cxx
     src/tracing/FieldTracer.hxx
     src/tracing/FieldTracer.cxx
     src/tracing/SeparatrixTrace.hxx

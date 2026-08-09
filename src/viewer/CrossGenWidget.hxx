@@ -25,6 +25,8 @@
 #include "tracing/SeparatrixTrace.hxx"
 #include "medialaxis/MedialAxis.hxx"
 #include "OASIS/OASIS.hxx"
+#include "UMBER/BlockLayout.hxx"
+#include "UMBER/ChordCollapse.hxx"
 #include "UMBER/MotorcycleGraph.hxx"
 #include "UMBER/UMBER.hxx"
 
@@ -70,8 +72,19 @@ enum class SIPGPhase {
 // converged SIPG cross field -- and then adds the two solves of the paper:
 // the frame field of Sec. 4.2 and the polysquare of Sec. 4.3. Neither is
 // animated; both are one blocking L-BFGS run with nothing worth drawing in
-// between. The last phase splits the window, model on the left and parameter
-// domain on the right, the way PolyVector and SIPG show their UV meshes.
+// between. The two middle phases split the window, model on the left and
+// parameter domain on the right, the way PolyVector and SIPG show their UV
+// meshes.
+//
+// Simplified is the odd one out in two ways. It is driven by a dialog rather
+// than by pressing on, the way OASIS mode is, because how thin a chord has to
+// be to be worth collapsing is a heuristic and the only way to settle it on a
+// given model is to try a number and look -- so 'c' at this phase re-opens the
+// dialog and runs the operation again from the structure the tracing left,
+// rather than advancing anywhere. And it takes the whole window instead of
+// splitting it: the collapse works in model space, and drawing the structure
+// before and after over the same mesh at the same scale is what shows which
+// blocks it took out.
 enum class UMBERPhase {
     MeshOnly   = 1,
     CrossField = 2,
@@ -79,6 +92,7 @@ enum class UMBERPhase {
     Frames     = 4,
     Polysquare = 5,
     Blocks     = 6,
+    Simplified = 7,
 };
 
 // OASIS is a one-shot solve driven by a parameter dialog rather than a
@@ -150,6 +164,21 @@ private:
     // need the announce-a-frame-ahead treatment the two solves get.
     void runBlocks();
 
+    // The blocks as a graph rather than a colouring of the triangles, which is
+    // what a chord can be walked on. Idempotent, and a no-op until runBlocks()
+    // has produced something to build from.
+    void buildBlockLayout();
+
+    // Modal dialog collecting the chord collapse settings, with a live count of
+    // how many chords they would let through -- the number that decides whether
+    // a threshold is the right one. Returns false if cancelled.
+    bool promptChordCollapseParameters();
+
+    // Collapse chords greedily at the current settings, always starting from
+    // the structure the tracing left rather than from the last result, so that
+    // trying a second threshold is a fresh attempt and not a further one.
+    void runChordCollapse();
+
     // The mesh with the optimized frame, its cuts and its boundary corners --
     // the left half of the split screen, and the whole of the Frames phase.
     void renderUMBERField();
@@ -207,6 +236,11 @@ private:
     std::optional<UMBER>        umber_;
     std::optional<Polysquare>   polysquare_;
     std::optional<MotorcycleGraph> blocks_;
+    // Both point into the one before them -- blockLayout_ into blocks_, and
+    // chordCollapse_ into a copy of blockLayout_'s layout -- so blocks_ is
+    // never rebuilt without clearing these first.
+    std::optional<BlockLayout>     blockLayout_;
+    std::optional<ChordCollapse>   chordCollapse_;
     // Cached results of the solve: recomputing them per frame would walk every
     // vertex star for nothing.
     std::vector<std::pair<int, int>>    umberCorners_;   // (vertex, quarter turns)
@@ -262,6 +296,10 @@ private:
     bool polysquareAnnounced_  = false;
     bool polysquareAttempted_  = false;
     bool blocksAttempted_      = false;
+
+    // Chord collapse settings, surviving a reset the way oasisLambda_ does so
+    // that the dialog opens on whatever was tried last.
+    ChordCollapse::Settings chordSettings_;
 
     // ── view / camera ────────────────────────────────────────────────────────
     viewer::ViewState view_;     // mesh-space view (left panel)
