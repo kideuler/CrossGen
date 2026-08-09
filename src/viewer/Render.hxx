@@ -96,6 +96,12 @@ void drawSingularitiesOnUV(const MIQSolver &miq, const CutMesh &cutMesh,
 // Draw the medial axis (Voronoi edges + vertices) on top of a mesh.
 void drawMedialAxis(const MedialAxis &ma, double vertexRadius);
 
+// Draw X/Y coordinate axes through the origin, with tick marks spaced at a
+// "nice" round interval, so the mesh's scale stays readable no matter what
+// mode or phase is on screen. `vs` is the ViewState whose ortho is currently
+// bound (the panel's world box sizes the axis extent and tick spacing).
+void drawAxis(const ViewState &vs);
+
 // Draw only the boundary edges of a mesh.
 void drawBoundaryEdges(const Mesh &m);
 

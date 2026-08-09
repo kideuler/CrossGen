@@ -705,6 +705,104 @@ void drawMedialAxis(const MedialAxis &ma, double vertexRadius) {
 
 namespace {
 
+// Fewer decimals for a coarse step (ticks land on whole numbers) and more
+// for a fine one, so a label never reads as more precise than the spacing
+// it names, e.g. step=0.05 -> "0.05" not "0.050000" or "0".
+std::string formatAxisTick(double v, double step) {
+    int decimals = 0;
+    if (step > 0.0 && step < 1.0) {
+        decimals = static_cast<int>(std::ceil(-std::log10(step)));
+        decimals = std::clamp(decimals, 0, 6);
+    }
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(decimals) << v;
+    return oss.str();
+}
+
+} // namespace
+
+void drawAxis(const ViewState &vs) {
+    double worldW = 1.0, worldH = 1.0;
+    computeWorldBox(vs, worldW, worldH);
+
+    const double left   = vs.cx - 0.5 * worldW;
+    const double right  = vs.cx + 0.5 * worldW;
+    const double bottom = vs.cy - 0.5 * worldH;
+    const double top    = vs.cy + 0.5 * worldH;
+
+    // Round the tick spacing to 1/2/5 * 10^n so it reads as a scale rather
+    // than an arbitrary fraction of the view, with roughly 8 ticks across
+    // the wider extent.
+    const double ext = std::max(worldW, worldH);
+    const double rawStep = ext / 8.0;
+    const double mag = std::pow(10.0, std::floor(std::log10(std::max(rawStep, 1e-12))));
+    const double norm = rawStep / mag;
+    const double niceNorm = (norm < 1.5) ? 1.0 : (norm < 3.0) ? 2.0 : (norm < 7.0) ? 5.0 : 10.0;
+    const double step = niceNorm * mag;
+    const double tick = 0.01 * ext;
+
+    glLineWidth(1.5f);
+
+    glColor3f(0.85f, 0.3f, 0.3f);
+    glBegin(GL_LINES);
+    glVertex2d(left, 0.0);
+    glVertex2d(right, 0.0);
+    for (double x = std::ceil(left / step) * step; x <= right; x += step) {
+        if (std::fabs(x) < 1e-9) continue; // the axes already cross at the origin
+        glVertex2d(x, -tick);
+        glVertex2d(x, tick);
+    }
+    glEnd();
+
+    glColor3f(0.3f, 0.8f, 0.35f);
+    glBegin(GL_LINES);
+    glVertex2d(0.0, bottom);
+    glVertex2d(0.0, top);
+    for (double y = std::ceil(bottom / step) * step; y <= top; y += step) {
+        if (std::fabs(y) < 1e-9) continue;
+        glVertex2d(-tick, y);
+        glVertex2d(tick, y);
+    }
+    glEnd();
+
+    glLineWidth(1.0f);
+
+    // Numeric labels in screen space. drawTextOverlay sets up its own
+    // screen-space projection (0..fbw, 0..fbh, top-left origin) rather than
+    // reusing the world ortho above, so each tick's world position is mapped
+    // through the same left/right/bottom/top box by hand; vs.fbw/fbh is the
+    // physical size of whatever viewport is currently bound (the full window,
+    // or a split-screen half via applyHalfOrtho), so this lines up in both.
+    const int fbw = std::max(1, vs.fbw);
+    const int fbh = std::max(1, vs.fbh);
+    auto worldToScreen = [&](double wx, double wy, float &sx, float &sy) {
+        sx = static_cast<float>((wx - left) / (right - left) * fbw);
+        sy = static_cast<float>((1.0 - (wy - bottom) / (top - bottom)) * fbh);
+    };
+
+    for (double x = std::ceil(left / step) * step; x <= right; x += step) {
+        if (std::fabs(x) < 1e-9) continue;
+        float sx, sy;
+        worldToScreen(x, 0.0, sx, sy);
+        drawTextOverlay(fbw, fbh, formatAxisTick(x, step).c_str(), sx + 4.0f, sy + 4.0f,
+                        0.95f, 0.55f, 0.55f);
+    }
+    for (double y = std::ceil(bottom / step) * step; y <= top; y += step) {
+        if (std::fabs(y) < 1e-9) continue;
+        float sx, sy;
+        worldToScreen(0.0, y, sx, sy);
+        drawTextOverlay(fbw, fbh, formatAxisTick(y, step).c_str(), sx + 4.0f, sy - 14.0f,
+                        0.55f, 0.9f, 0.6f);
+    }
+    {
+        float sx, sy;
+        worldToScreen(0.0, 0.0, sx, sy);
+        drawTextOverlay(fbw, fbh, "0", sx + 4.0f, sy + 4.0f, 0.75f, 0.75f, 0.75f);
+    }
+}
+
+namespace {
+
 // Diverging ramp: two hues with a neutral gray midpoint, stepped for a dark
 // surface. A quasi-eigenfunction is signed and oscillates about zero, so the
 // job is polarity, not magnitude — zero must land exactly on the neutral, and

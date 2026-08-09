@@ -1430,6 +1430,7 @@ void CrossGenWidget::runComputations() {
 // ── animation render paths ───────────────────────────────────────────────────
 
 void CrossGenWidget::renderMBOAnimation() {
+    viewer::drawAxis(view_);
     viewer::drawMesh(*mesh_);
     viewer::drawVertexCrossFieldUK(*mesh_, *crossField_, scale_);
 
@@ -1454,6 +1455,7 @@ void CrossGenWidget::renderMBOAnimation() {
 }
 
 void CrossGenWidget::renderSIPGAnimation() {
+    viewer::drawAxis(view_);
     viewer::drawMesh(*mesh_);
     viewer::drawTriangleCrossField(*mesh_, *sipgField_, scale_);
 
@@ -1471,6 +1473,7 @@ void CrossGenWidget::renderSIPGAnimation() {
 }
 
 void CrossGenWidget::renderTraceAnimation() {
+    viewer::drawAxis(view_);
     viewer::drawMesh(*mesh_);
 
     glLineWidth(3.0f);
@@ -1574,6 +1577,12 @@ void CrossGenWidget::renderNormal() {
 
         // ── Left panel: mesh with cut seams & singularities ───────────────────
         applyHalfOrtho(0, halfW, view_);
+        {
+            viewer::ViewState leftVs = view_;
+            leftVs.fbw = halfW;
+            leftVs.fbh = h;
+            viewer::drawAxis(leftVs);
+        }
         viewer::drawMesh(*mesh_);
         if (field_.has_value() && cutMesh_.has_value()) {
             viewer::drawUField(*mesh_, cutMesh_->getUField(), scale_);
@@ -1612,6 +1621,12 @@ void CrossGenWidget::renderNormal() {
 
             // Left panel: mesh with combed field + cut seams
             applyHalfOrtho(0, halfW, view_);
+            {
+                viewer::ViewState leftVs = view_;
+                leftVs.fbw = halfW;
+                leftVs.fbh = h;
+                viewer::drawAxis(leftVs);
+            }
             viewer::drawMesh(*mesh_);
             if (sipgCutMesh_.has_value()) {
                 viewer::drawUField(*mesh_, sipgCutMesh_->getUField(), scale_);
@@ -1644,6 +1659,7 @@ void CrossGenWidget::renderNormal() {
 
             drawSplitDivider(halfW);
         } else {
+        viewer::drawAxis(view_);
         viewer::drawMesh(*mesh_);
         if (sipgPhase_ >= SIPGPhase::CrossField && sipgField_.has_value()) {
             if (sipgPhase_ < SIPGPhase::CutSeams || !sipgCutMesh_.has_value()) {
@@ -1673,6 +1689,7 @@ void CrossGenWidget::renderNormal() {
         }
         } // end else (non-UVMesh SIPG phases)
     } else if (mode_ == Mode::MBO) {
+        viewer::drawAxis(view_);
         viewer::drawMesh(*mesh_);
         if (mboPhase_ >= MBOPhase::CrossField && crossField_.has_value()) {
             if (mboPhase_ >= MBOPhase::Stepping && mboStepCount_ > 0)
@@ -1729,6 +1746,7 @@ void CrossGenWidget::renderNormal() {
             glLineWidth(1.0f);
         }
     } else if (mode_ == Mode::OASIS) {
+        viewer::drawAxis(view_);
         if (oasisPhase_ == OASISPhase::Field && oasis_.has_value()) {
             // Field first, then the wireframe over it. The wireframe is kept
             // translucent and light: at these mesh densities an opaque one
@@ -1760,6 +1778,12 @@ void CrossGenWidget::renderNormal() {
         const bool showBlocks = (umberPhase_ >= UMBERPhase::Blocks && blocks_.has_value());
 
         applyHalfOrtho(0, halfW, view_);
+        {
+            viewer::ViewState leftVs = view_;
+            leftVs.fbw = halfW;
+            leftVs.fbh = fbh();
+            viewer::drawAxis(leftVs);
+        }
         if (showBlocks) {
             viewer::drawMesh(*mesh_);
             if (umberCut_.has_value()) {
@@ -1806,6 +1830,7 @@ void CrossGenWidget::renderNormal() {
 
         drawSplitDivider(halfW);
     } else if (mode_ == Mode::UMBER) {
+        viewer::drawAxis(view_);
         if (umberPhase_ < UMBERPhase::Frames || !umber_.has_value()) {
             viewer::drawMesh(*mesh_);
             // The SIPG stages, drawn as SIPG mode draws them: the input field
@@ -1832,6 +1857,7 @@ void CrossGenWidget::renderNormal() {
             renderUMBERField();
         }
     } else if (mode_ == Mode::MedialAxis) {
+        viewer::drawAxis(view_);
         if (maPhase_ != MedialAxisPhase::Classify) {
             if (delaunayMesh_)
                 viewer::drawMesh(*delaunayMesh_);
@@ -1907,6 +1933,7 @@ void CrossGenWidget::renderNormal() {
         }
     } else {
         // PolyVector phases 1-4 (not UV)
+        viewer::drawAxis(view_);
         if (phase_ >= Phase::MeshOnly)
             viewer::drawMesh(*mesh_);
 
