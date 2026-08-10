@@ -1535,6 +1535,18 @@ void CrossGenWidget::runComputations() {
             << rawE << " -> " << medialAxis_->medialEdges.size() << " edges: "
             << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
         console_.log(oss.str());
+
+        const auto &st = medialAxis_->stats;
+        if (st.degenerateCells || st.centersOutsideDomain || st.edgesCrossingBoundary ||
+            st.nonManifoldBoundaryVertices) {
+            std::ostringstream warn;
+            warn << "[MedialAxis] Sampling warnings: "
+                 << st.degenerateCells << " degenerate cells, "
+                 << st.centersOutsideDomain << " centers outside, "
+                 << st.edgesCrossingBoundary << " edges crossing the boundary, "
+                 << st.nonManifoldBoundaryVertices << " pinched boundary vertices";
+            console_.log(warn.str());
+        }
     }
 
     // ── Medial Axis: polylines / classify ─────────────────────────────────────
@@ -1542,10 +1554,12 @@ void CrossGenWidget::runComputations() {
         medialAxis_ && medialAxis_->polyLines.empty()) {
         auto t0 = Clock::now();
         medialAxis_->createPolylines();
-        medialAxis_->classifyMedialVertices();
         auto t1 = Clock::now();
+        int cycles = 0;
+        for (bool c : medialAxis_->polyLineIsCycle) cycles += c ? 1 : 0;
         std::ostringstream oss;
-        oss << "[MedialAxis] Created " << medialAxis_->polyLines.size() << " polylines: "
+        oss << "[MedialAxis] Created " << medialAxis_->polyLines.size() << " polylines ("
+            << cycles << " cyclic): "
             << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
         console_.log(oss.str());
     }
@@ -2105,35 +2119,29 @@ void CrossGenWidget::renderNormal() {
                 }
                 glLineWidth(1.0f);
 
+                // Blue for junctions, green for endpoints; endpoints whose
+                // dual cell is no longer a triangle are drawn brighter, since
+                // that is the case a merge produced.
                 double ballRadius_ma = avgEdge_ / 5.0;
                 for (size_t i = 0; i < medialAxis_->medialVertices.size(); ++i) {
                     const auto &mv = medialAxis_->medialVertices[i];
-                    if (!mv.active || mv.degree == 2) continue;
-                    if (mv.nodeType == TopMakerNodeType::Normal) {
+                    if (mv.degree == 2) continue;
+                    if (mv.degree >= 3) {
                         viewer::drawDisk3D(mv.coord, ballRadius_ma, 0.2f, 0.2f, 0.95f);
-                    } else if (mv.nodeType == TopMakerNodeType::Corner) {
-                        if (mv.cornerIndex >= 0 && mv.cornerIndex < static_cast<int>(medialAxis_->mesh->vertices.size())) {
-                            const Point &cornerP = medialAxis_->mesh->vertices[mv.cornerIndex];
-                            viewer::drawDisk3D(cornerP, ballRadius_ma, 0.95f, 0.2f, 0.2f);
-                            glLineWidth(2.0f);
-                            glColor3f(0.95f, 0.85f, 0.1f);
-                            glBegin(GL_LINES);
-                            glVertex2d(cornerP[0], cornerP[1]);
-                            glVertex2d(mv.coord[0], mv.coord[1]);
-                            glEnd();
-                            glLineWidth(1.0f);
-                        }
-                    } else {
+                    } else if (mv.dualIsTriangle) {
                         viewer::drawDisk3D(mv.coord, ballRadius_ma, 0.1f, 0.9f, 0.2f);
+                    } else {
+                        viewer::drawDisk3D(mv.coord, ballRadius_ma, 0.7f, 0.3f, 0.95f);
                     }
                 }
 
+                // Dual cell ring of every non-regular medial vertex: the
+                // boundary points its inscribed circle touches.
                 double touchRadius = avgEdge_ / 6.0;
                 for (size_t i = 0; i < medialAxis_->medialVertices.size(); ++i) {
                     const auto &mv = medialAxis_->medialVertices[i];
-                    if (!mv.active || mv.degree == 2) continue;
-                    if (mv.nodeType != TopMakerNodeType::Normal) continue;
-                    for (int tpIdx : mv.touchPoints) {
+                    if (mv.degree == 2 || mv.cell < 0) continue;
+                    for (int tpIdx : medialAxis_->cells[mv.cell].verts) {
                         if (tpIdx >= 0 && tpIdx < static_cast<int>(medialAxis_->mesh->vertices.size())) {
                             const Point &tp = medialAxis_->mesh->vertices[tpIdx];
                             viewer::drawDisk3D(tp, touchRadius, 0.0f, 0.9f, 0.9f);
@@ -2143,8 +2151,11 @@ void CrossGenWidget::renderNormal() {
             } else if (maPhase_ >= MedialAxisPhase::MedialAxis) {
                 double ballRadius_ma = avgEdge_ / 5.0;
                 viewer::drawMedialAxis(*medialAxis_, ballRadius_ma);
-                for (int i = 0; i < static_cast<int>(medialAxis_->sharpVertices.size()); ++i) {
-                    if (medialAxis_->sharpVertices[i]) {
+                for (int i = 0; i < static_cast<int>(medialAxis_->interiorAngle.size()); ++i) {
+                    if (medialAxis_->isConcaveCorner(i)) {
+                        const Point &p = medialAxis_->mesh->vertices[i];
+                        viewer::drawDisk3D(p, ballRadius_ma, 0.95f, 0.5f, 0.1f);
+                    } else if (medialAxis_->isSharpCorner(i)) {
                         const Point &p = medialAxis_->mesh->vertices[i];
                         viewer::drawDisk3D(p, ballRadius_ma, 0.95f, 0.2f, 0.2f);
                     }

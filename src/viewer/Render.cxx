@@ -697,9 +697,12 @@ void drawMedialAxis(const MedialAxis &ma, double vertexRadius) {
     glEnd();
     glLineWidth(1.0f);
 
-    // Draw medial axis vertices (circumcenters) as small cyan disks
+    // Draw medial axis vertices (circumcenters) as small cyan disks. Vertices
+    // whose circumcenter fell outside the domain are drawn red instead: they
+    // are not on the axis, and seeing them is the point.
     for (const auto &v : ma.medialVertices) {
-        drawDisk3D(v.coord, vertexRadius, 0.1f, 0.85f, 0.85f);
+        if (v.insideDomain) drawDisk3D(v.coord, vertexRadius, 0.1f, 0.85f, 0.85f);
+        else                drawDisk3D(v.coord, vertexRadius, 0.95f, 0.1f, 0.1f);
     }
 }
 

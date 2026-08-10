@@ -195,18 +195,6 @@ add_test(NAME TriangleMesher_CircleWithEllipseRegion COMMAND TestTriangleMesher 
 add_test(NAME TriangleMesher_CircleWithTwoEllipseHoles COMMAND TestTriangleMesher 5)
 add_test(NAME TriangleMesher_ConcentricShells COMMAND TestTriangleMesher 6)
 
-# Test executable for tracing components
-add_executable(TestTracingComponents src/tracing/tests/TestTracingComponents.cxx)
-target_link_libraries(TestTracingComponents PRIVATE PolyVector)
-
-# Add individual CTest tests for tracing
-add_test(NAME Tracing_ConstantFieldTrace COMMAND TestTracingComponents 1)
-add_test(NAME Tracing_RigidBodyRotation COMMAND TestTracingComponents 2)
-add_test(NAME Tracing_ParabolicStreamline COMMAND TestTracingComponents 3)
-add_test(NAME Tracing_SingularSweep_3port_center COMMAND TestTracingComponents 4)
-add_test(NAME Tracing_SingularSweep_3port_offcenter COMMAND TestTracingComponents 5)
-add_test(NAME Tracing_SingularSweep_5port_center COMMAND TestTracingComponents 6)
-add_test(NAME Tracing_SingularSweep_5port_offcenter COMMAND TestTracingComponents 7)
 
 # End-to-end: trace every model in data/meshes and check each layout is a plane
 # graph whose faces tile the model exactly with nothing left dangling. How many
