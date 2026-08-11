@@ -94,9 +94,10 @@ MedialAxisPhase nextMedialAxisPhase(MedialAxisPhase p) {
         case MedialAxisPhase::MeshOnly:     return MedialAxisPhase::DelaunayMesh;
         case MedialAxisPhase::DelaunayMesh: return MedialAxisPhase::MedialAxis;
         case MedialAxisPhase::MedialAxis:   return MedialAxisPhase::Map;
-        case MedialAxisPhase::Map:          return MedialAxisPhase::Map;
+        case MedialAxisPhase::Map:          return MedialAxisPhase::TMesh;
+        case MedialAxisPhase::TMesh:        return MedialAxisPhase::TMesh;
     }
-    return MedialAxisPhase::Map;
+    return MedialAxisPhase::TMesh;
 }
 
 const char *phaseName(Phase p) {
@@ -153,6 +154,7 @@ const char *medialAxisPhaseName(MedialAxisPhase p) {
         case MedialAxisPhase::DelaunayMesh: return "2) Delaunay re-triangulation";
         case MedialAxisPhase::MedialAxis:   return "3) Medial axis";
         case MedialAxisPhase::Map:          return "4) Boundary map";
+        case MedialAxisPhase::TMesh:        return "5) Coarse block decomposition";
     }
     return "?";
 }
@@ -451,6 +453,7 @@ void CrossGenWidget::doReset() {
     quadLayout_.reset();
     simplified_.reset();
     delaunayMesh_.reset();
+    medialAxisTMesh_.reset();
     medialAxisMap_.reset();
     medialAxis_.reset();
     oasis_.reset();
@@ -1575,6 +1578,36 @@ void CrossGenWidget::runComputations() {
                      "sections (axis endpoints)");
     }
 
+    // ── Medial Axis: the coarse block decomposition (Sec. 4) ──────────────────
+    if (mode_ == Mode::MedialAxis && maPhase_ >= MedialAxisPhase::TMesh &&
+        medialAxisMap_.has_value() && !medialAxisTMesh_.has_value()) {
+        auto t0 = Clock::now();
+        medialAxisTMesh_.emplace(*medialAxisMap_);
+        auto t1 = Clock::now();
+
+        const auto &st = medialAxisTMesh_->stats();
+        std::ostringstream oss;
+        oss << "[MedialAxis] T-mesh: " << st.blocks << " blocks from " << st.zones
+            << " zones (" << st.capZones << " caps) over " << st.coarseEdges
+            << " coarse edges, target size " << std::fixed << std::setprecision(3)
+            << medialAxisTMesh_->targetSize() << ": "
+            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+        {
+            std::ostringstream col;
+            col << "[MedialAxis] templates: " << st.colorCounts[0] << " green (2 blocks), "
+                << st.colorCounts[1] << " red (3), " << st.colorCounts[2]
+                << " blue (1), " << st.colorCounts[3] << " purple (5)";
+            console_.log(col.str());
+        }
+        if (st.skippedLoops || st.unpairedEdges) {
+            std::ostringstream warn;
+            warn << "[MedialAxis] Block warnings: " << st.skippedLoops
+                 << " loops skipped, " << st.unpairedEdges << " unpaired edges";
+            console_.log(warn.str());
+        }
+    }
+
     // ── PolyVector: solve crossfield ──────────────────────────────────────────
     if (mode_ == Mode::PolyVector && phase_ >= Phase::CrossField && !field_.has_value()) {
         auto t0 = Clock::now();
@@ -2103,9 +2136,9 @@ void CrossGenWidget::renderNormal() {
         }
     } else if (mode_ == Mode::MedialAxis) {
         viewer::drawAxis(view_);
-        // The map phase draws over the boundary alone: the triangulation
-        // underneath would bury the radii.
-        if (maPhase_ != MedialAxisPhase::Map) {
+        // The map and block phases draw over the boundary alone: the
+        // triangulation underneath would bury the radii / zone edges.
+        if (maPhase_ < MedialAxisPhase::Map) {
             if (delaunayMesh_)
                 viewer::drawMesh(*delaunayMesh_);
             else
@@ -2113,7 +2146,14 @@ void CrossGenWidget::renderNormal() {
         }
 
         if (medialAxis_) {
-            if (maPhase_ == MedialAxisPhase::Map && medialAxisMap_.has_value()) {
+            if (maPhase_ == MedialAxisPhase::TMesh && medialAxisTMesh_.has_value()) {
+                // The coarse block decomposition (Fig. 1-left / Fig. 3c):
+                // zones filled with a translucent tint of the class colour
+                // that picks their quad template, their walls over the fill,
+                // and the downsampled axis in full colour on top.
+                viewer::drawMedialTMesh(*medialAxisTMesh_, avgEdge_ / 4.0);
+                viewer::drawBoundaryEdges(*medialAxis_->mesh);
+            } else if (maPhase_ == MedialAxisPhase::Map && medialAxisMap_.has_value()) {
                 viewer::drawBoundaryEdges(*medialAxis_->mesh);
 
                 // The map phi drawn as its medial radii (Fig. 7/8 of the

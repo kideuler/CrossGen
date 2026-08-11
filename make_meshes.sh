@@ -3,7 +3,7 @@
 source clean.sh
 source build.sh --all
 
-export NP=80
+export NP=120
 
 # Create output directory
 OUT_DIR="$(pwd)/data/meshes"

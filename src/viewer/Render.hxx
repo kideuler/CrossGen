@@ -15,6 +15,7 @@
 #include "crossfield/CrossField.hxx"
 #include "sipg/SIPG.hxx"
 #include "medialaxis/MedialAxis.hxx"
+#include "medialaxis/MedialAxisTMesh.hxx"
 #include "tracing/QuadLayout.hxx"
 #include "UMBER/MotorcycleGraph.hxx"
 #include "UMBER/Polysquare.hxx"
@@ -95,6 +96,13 @@ void drawSingularitiesOnUV(const MIQSolver &miq, const CutMesh &cutMesh,
 
 // Draw the medial axis (Voronoi edges + vertices) on top of a mesh.
 void drawMedialAxis(const MedialAxis &ma, double vertexRadius);
+
+// The coarse block decomposition of the medial axis: every zone filled with a
+// translucent tint of its class colour so the blocking reads at a glance, the
+// zone walls (boundary run and the two spokes) over the fill, the downsampled
+// axis chains in full class colour on top, and the kept medial vertices as
+// block corners. `cornerRadius` sizes the corner disks.
+void drawMedialTMesh(const MedialAxisTMesh &tm, double cornerRadius);
 
 // Draw X/Y coordinate axes through the origin, with tick marks spaced at a
 // "nice" round interval, so the mesh's scale stays readable no matter what

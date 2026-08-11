@@ -708,6 +708,73 @@ void drawMedialAxis(const MedialAxis &ma, double vertexRadius) {
 
 namespace {
 
+void medialClassColor(MedialColor c, float alpha) {
+    switch (c) {
+        case MedialColor::Green:  glColor4f(0.15f, 0.85f, 0.25f, alpha); return;
+        case MedialColor::Red:    glColor4f(0.95f, 0.25f, 0.20f, alpha); return;
+        case MedialColor::Blue:   glColor4f(0.30f, 0.50f, 0.95f, alpha); return;
+        case MedialColor::Purple: glColor4f(0.80f, 0.30f, 0.95f, alpha); return;
+    }
+}
+
+} // namespace
+
+void drawMedialTMesh(const MedialAxisTMesh &tm, double cornerRadius) {
+    const MedialAxis &ma = *tm.axis;
+
+    // ── Block fills ──
+    //
+    // One fan per block, from its centroid. A template block is star-shaped
+    // about its centroid -- its four sides are two straight template edges
+    // and at most two boundary runs, none of which turns back on itself --
+    // so the fan is a valid triangulation and needs no ear clipping.
+    for (const TMeshBlock &block : tm.blocks) {
+        if (block.outline.size() < 3) continue;
+        Point c{0.0, 0.0};
+        for (const Point &p : block.outline) c = c + p;
+        c = c / static_cast<double>(block.outline.size());
+
+        medialClassColor(block.color, 0.28f);
+        glBegin(GL_TRIANGLE_FAN);
+        glVertex2d(c[0], c[1]);
+        for (const Point &p : block.outline) glVertex2d(p[0], p[1]);
+        glVertex2d(block.outline.front()[0], block.outline.front()[1]);
+        glEnd();
+    }
+
+    // ── The downsampled axis in class colour, under the block walls ──
+    glLineWidth(3.0f);
+    for (const MedialZone &zone : tm.zones) {
+        if (zone.chain.size() < 2) continue;
+        medialClassColor(zone.color, 1.0f);
+        glBegin(GL_LINE_STRIP);
+        for (int m : zone.chain) {
+            const Point &p = ma.medialVertices[m].coord;
+            glVertex2d(p[0], p[1]);
+        }
+        glEnd();
+    }
+
+    // ── The T-mesh blocking: every template block's closed outline ──
+    glLineWidth(2.2f);
+    glColor4f(0.94f, 0.94f, 0.94f, 0.95f);
+    for (const TMeshBlock &block : tm.blocks) {
+        glBegin(GL_LINE_LOOP);
+        for (const Point &p : block.outline) glVertex2d(p[0], p[1]);
+        glEnd();
+    }
+    glLineWidth(1.0f);
+
+    // ── Block corners ──
+    for (const TMeshBlock &block : tm.blocks) {
+        for (const Point &p : block.corners) {
+            drawDisk3D(p, cornerRadius, 0.95f, 0.9f, 0.85f);
+        }
+    }
+}
+
+namespace {
+
 // Fewer decimals for a coarse step (ticks land on whole numbers) and more
 // for a fine one, so a label never reads as more precise than the spacing
 // it names, e.g. step=0.05 -> "0.05" not "0.050000" or "0".

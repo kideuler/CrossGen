@@ -25,6 +25,7 @@
 #include "tracing/SeparatrixTrace.hxx"
 #include "medialaxis/MedialAxis.hxx"
 #include "medialaxis/MedialAxisMap.hxx"
+#include "medialaxis/MedialAxisTMesh.hxx"
 #include "OASIS/OASIS.hxx"
 #include "UMBER/BlockLayout.hxx"
 #include "UMBER/ChordCollapse.hxx"
@@ -108,6 +109,7 @@ enum class MedialAxisPhase {
     DelaunayMesh = 1,
     MedialAxis   = 2,
     Map          = 3,
+    TMesh        = 4,
 };
 
 // ── Widget ────────────────────────────────────────────────────────────────────
@@ -233,6 +235,8 @@ private:
     // The Sec. 3 map phi from the boundary to the axis above; holds a
     // shared_ptr to it, so the two are cleared together in reset().
     std::optional<MedialAxisMap> medialAxisMap_;
+    // The Sec. 4 coarse block decomposition cut out by the map above.
+    std::optional<MedialAxisTMesh> medialAxisTMesh_;
     std::optional<OASIS>       oasis_;
     // UMBER runs on the SIPG field held in sipgField_, so it needs no field of
     // its own; the cuts and the optimized frames are all that is added.
