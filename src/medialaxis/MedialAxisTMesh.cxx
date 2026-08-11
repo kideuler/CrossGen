@@ -415,220 +415,303 @@ void MedialAxisTMesh::classify() {
 }
 
 // ─── Templates (Fig. 17) ────────────────────────────────────────────────────
+//
+// Each class of coarse edge remeshes its subdomain with one quadrilateral
+// template. The machinery below keeps that table-driven: a template is a
+// function over a TemplateSubdomain -- the subdomain's geometry, oriented so
+// that the end the template treats specially comes first -- which emits its
+// blocks through a BlockBuilder.
+//
+// To add a template: write one such function and add a row to kTemplates
+// naming the class it serves, which end it wants first, and whether it
+// swallows the polar cap at that end. Nothing else here needs to change.
+
+namespace {
+
+// Which end of the coarse edge a template wants as `inner`.
+enum class Orient {
+    Any,       // symmetric template; take the edge as it comes
+    Narrow,    // the smaller medial radius, i.e. the subdomain's concave corner
+    Endpoint,  // the end that terminates the axis
+};
+
+// The subdomain of one coarse edge, oriented for its template.
+struct TemplateSubdomain {
+    Point inner{0.0, 0.0};   // the end the template treats specially
+    Point outer{0.0, 0.0};   // the other one
+
+    std::vector<Point> chain;         // every medial vertex, inner -> outer
+    std::vector<Point> sideA, sideB;  // the two boundary runs, inner -> outer
+
+    // The polar cap at `inner`, split at its midpoint W and joined to the
+    // flanks: arcUp runs outer's contact on side A to W, and arcLo runs W to
+    // outer's contact on side B, so together they are the entire boundary of
+    // a capped subdomain. Only filled for templates that asked for the cap.
+    std::vector<Point> arcUp, arcLo;
+
+    // The cap zone folded in above, for the caller to mark consumed.
+    int capZone = -1;
+
+    // Midpoints of the two radii at `outer` -- where a template that leaves a
+    // T-junction on those radii puts it.
+    Point midRadiusA() const { return (sideA.back() + outer) * 0.5; }
+    Point midRadiusB() const { return (sideB.back() + outer) * 0.5; }
+};
+
+// Assembles one block from its sides. `corner` adds a single vertex; `run`
+// appends a polyline and marks both its ends as corners. Points repeated
+// across consecutive calls are welded, so sharing an endpoint between two
+// sides costs nothing at the call site.
+class BlockBuilder {
+public:
+    BlockBuilder(std::vector<TMeshBlock> &out, MedialColor color, double weld)
+        : out_(out), color_(color), weld_(weld) {}
+
+    BlockBuilder &corner(const Point &p) {
+        push(p, true);
+        return *this;
+    }
+
+    BlockBuilder &run(const std::vector<Point> &pts) {
+        for (size_t i = 0; i < pts.size(); ++i) {
+            push(pts[i], i == 0 || i + 1 == pts.size());
+        }
+        return *this;
+    }
+
+    void emit() {
+        // The outline is a closed loop, so a last point on top of the first
+        // is a duplicate rather than a side.
+        if (block_.outline.size() > 1 &&
+            normP(block_.outline.front() - block_.outline.back()) < weld_) {
+            block_.outline.pop_back();
+        }
+        if (block_.corners.size() > 1 &&
+            normP(block_.corners.front() - block_.corners.back()) < weld_) {
+            block_.corners.pop_back();
+        }
+        if (block_.outline.size() >= 3) {
+            block_.color = color_;
+            out_.push_back(std::move(block_));
+        }
+        block_ = TMeshBlock{};
+    }
+
+private:
+    void push(const Point &p, bool isCorner) {
+        if (block_.outline.empty() || normP(p - block_.outline.back()) >= weld_) {
+            block_.outline.push_back(p);
+        }
+        if (isCorner && (block_.corners.empty() ||
+                         normP(p - block_.corners.back()) >= weld_)) {
+            block_.corners.push_back(p);
+        }
+    }
+
+    std::vector<TMeshBlock> &out_;
+    MedialColor color_;
+    double weld_;
+    TMeshBlock block_;
+};
+
+// ── The four templates ──
+
+// Green: the axis runs along quad edges, so the two zones already are the
+// template -- one quad per side, sharing the medial chain.
+void templateGreen(const TemplateSubdomain &s, BlockBuilder &b) {
+    b.run(s.sideA).run(reversed(s.chain)).emit();
+    b.run(s.sideB).run(reversed(s.chain)).emit();
+}
+
+// Red: three quads around the concave corner.
+//
+// At the narrow medial vertex both radii point back toward the apex, so the
+// subdomain is reflex there -- that is its one concave corner. Splitting it
+// means running an edge from that corner to each of the two opposite sides,
+// which here are the radii at `outer`. Each lands mid-radius and so leaves a
+// T-junction, the subdomain across that radius having no vertex there. The
+// medial edge ends up as the diagonal of the middle quad, which is what red
+// asks for: the axis follows quad diagonals.
+void templateRed(const TemplateSubdomain &s, BlockBuilder &b) {
+    const Point tA = s.midRadiusA();
+    const Point tB = s.midRadiusB();
+    b.corner(s.inner).run(s.sideA).corner(tA).emit();
+    b.corner(s.inner).corner(tA).corner(s.outer).corner(tB).emit();
+    b.corner(s.inner).corner(tB).run(reversed(s.sideB)).emit();
+}
+
+// Blue: one quad spanning the wedge at a sharp tip, the axis on its diagonal.
+void templateBlue(const TemplateSubdomain &s, BlockBuilder &b) {
+    b.corner(s.outer).run(s.arcUp).run(s.arcLo).emit();
+}
+
+// Purple: red's construction at a round cap. The T-junctions and the
+// half-radius running from each one out to the boundary are the same; what
+// differs is the far end, where an endpoint has no pair of inner radii to
+// serve as a concave corner, so its polar cap stands in for them -- split at
+// W, the single boundary point the endpoint maps to.
+void templatePurple(const TemplateSubdomain &s, BlockBuilder &b) {
+    const Point tA = s.midRadiusA();
+    const Point tB = s.midRadiusB();
+    b.run(s.arcUp).corner(s.inner).corner(tA).emit();
+    b.run(s.arcLo).corner(tB).corner(s.inner).emit();
+    b.corner(s.inner).corner(tA).corner(s.outer).corner(tB).emit();
+}
+
+struct TemplateEntry {
+    MedialColor color;
+    Orient orient;
+    bool wantsCap;
+    void (*apply)(const TemplateSubdomain &, BlockBuilder &);
+};
+
+const TemplateEntry kTemplates[] = {
+    {MedialColor::Green,  Orient::Any,      false, templateGreen},
+    {MedialColor::Red,    Orient::Narrow,   false, templateRed},
+    {MedialColor::Blue,   Orient::Endpoint, true,  templateBlue},
+    {MedialColor::Purple, Orient::Endpoint, true,  templatePurple},
+};
+
+const TemplateEntry &templateFor(MedialColor c) {
+    for (const TemplateEntry &t : kTemplates) {
+        if (t.color == c) return t;
+    }
+    return kTemplates[0];   // unreachable while every class has a row
+}
+
+// A zone kept whole, for what no template claimed.
+TMeshBlock zoneAsBlock(const MedialAxis &axis, const MedialZone &zone) {
+    TMeshBlock b;
+    b.outline = zone.boundarySide;
+    std::vector<Point> chainPts;
+    for (int m : zone.chain) chainPts.push_back(axis.medialVertices[m].coord);
+    if (zone.cap) {
+        // Open caps close through their vertex; a cap spanning a whole closed
+        // loop is already a cycle and needs no spoke at all.
+        if (normP(zone.boundarySide.front() - zone.boundarySide.back()) >
+            1e-9 * axis.boundingBoxDiagonal()) {
+            b.outline.push_back(chainPts.front());
+        }
+        b.corners = {zone.boundarySide.front(), zone.boundarySide.back(),
+                     chainPts.front()};
+    } else {
+        appendPts(b.outline, reversed(chainPts));
+        b.corners = {zone.boundarySide.front(), zone.boundarySide.back(),
+                     chainPts.back(), chainPts.front()};
+    }
+    b.color = zone.color;
+    return b;
+}
+
+// Orient the two flanking zones of `edge` into the frame `t` expects.
+TemplateSubdomain makeSubdomain(const MedialAxis &axis,
+                                const std::vector<MedialZone> &zones,
+                                const std::unordered_map<int, int> &capOf,
+                                const CoarseEdge &edge,
+                                const TemplateEntry &t) {
+    const MedialZone &A = zones[edge.zones[0]];
+    const MedialZone &B = zones[edge.zones[1]];
+
+    // The two zones walk the shared chain in opposite directions, so side B
+    // comes onto side A's orientation before anything else.
+    std::vector<int> chainIdx = A.chain;
+    std::vector<Point> sideA = A.boundarySide;
+    std::vector<Point> sideB =
+        (B.chain == A.chain) ? B.boundarySide : reversed(B.boundarySide);
+
+    bool innerAtFront = true;
+    if (t.orient == Orient::Narrow) {
+        innerAtFront = axis.medialVertices[chainIdx.front()].radius <=
+                       axis.medialVertices[chainIdx.back()].radius;
+    } else if (t.orient == Orient::Endpoint) {
+        const bool frontIsEnd = axis.medialVertices[chainIdx.front()].degree <= 1;
+        const bool backIsEnd  = axis.medialVertices[chainIdx.back()].degree <= 1;
+        // Both ends can terminate the axis (a lone branch), so prefer the one
+        // that actually carries a cap for the template to swallow.
+        if (frontIsEnd && backIsEnd) {
+            innerAtFront = capOf.count(chainIdx.front()) ||
+                           !capOf.count(chainIdx.back());
+        } else {
+            innerAtFront = frontIsEnd;
+        }
+    }
+    if (!innerAtFront) {
+        std::reverse(chainIdx.begin(), chainIdx.end());
+        std::reverse(sideA.begin(), sideA.end());
+        std::reverse(sideB.begin(), sideB.end());
+    }
+
+    TemplateSubdomain s;
+    s.chain.reserve(chainIdx.size());
+    for (int m : chainIdx) s.chain.push_back(axis.medialVertices[m].coord);
+    s.inner = s.chain.front();
+    s.outer = s.chain.back();
+    s.sideA = std::move(sideA);
+    s.sideB = std::move(sideB);
+    if (!t.wantsCap) return s;
+
+    // The polar cap at `inner`, oriented to leave side A and arrive at side B.
+    std::vector<Point> cap;
+    const auto capIt = capOf.find(chainIdx.front());
+    if (capIt != capOf.end()) {
+        s.capZone = capIt->second;
+        const std::vector<Point> &c = zones[s.capZone].boundarySide;
+        const bool forward = normP(c.front() - s.sideA.front()) <=
+                             normP(c.back() - s.sideA.front());
+        cap = forward ? c : reversed(c);
+    }
+
+    s.arcUp = reversed(s.sideA);                 // outer's contact -> inner's
+    if (cap.size() >= 2) {
+        std::vector<std::vector<Point>> pieces;
+        std::vector<Point> cuts;
+        splitPolyline(cap, {0.5}, pieces, cuts);
+        appendPts(s.arcUp, pieces[0]);           // ... -> W
+        s.arcLo = pieces[1];                     // W -> ...
+    } else {
+        // No cap: the two inner contacts coincide, and that point is W.
+        s.arcLo = {s.sideA.front()};
+    }
+    appendPts(s.arcLo, s.sideB);
+    return s;
+}
+
+} // namespace
 
 void MedialAxisTMesh::buildBlocks() {
     blocks.clear();
 
-    // Caps by endpoint, so the blue and purple templates can absorb the polar
-    // region at their endpoint into the subdomain they remesh.
+    // Caps by endpoint, so a template that wants one can find it.
     std::unordered_map<int, int> capOf;
     for (int z = 0; z < static_cast<int>(zones.size()); ++z) {
         if (zones[z].cap) capOf[zones[z].capVertex] = z;
     }
     std::vector<char> consumed(zones.size(), 0);
-
-    auto zoneAsBlock = [&](const MedialZone &zone) {
-        TMeshBlock b;
-        b.outline = zone.boundarySide;
-        std::vector<Point> chainPts;
-        for (int m : zone.chain) chainPts.push_back(axis->medialVertices[m].coord);
-        if (zone.cap) {
-            // Open caps close through their vertex; a cap spanning a whole
-            // closed loop is already a cycle and needs no spoke at all.
-            if (normP(zone.boundarySide.front() - zone.boundarySide.back()) >
-                1e-9 * axis->boundingBoxDiagonal()) {
-                b.outline.push_back(chainPts.front());
-            }
-            b.corners = {zone.boundarySide.front(), zone.boundarySide.back(),
-                         chainPts.front()};
-        } else {
-            appendPts(b.outline, reversed(chainPts));
-            b.corners = {zone.boundarySide.front(), zone.boundarySide.back(),
-                         chainPts.back(), chainPts.front()};
-        }
-        b.color = zone.color;
-        return b;
-    };
+    const double weld = 1e-12 * axis->boundingBoxDiagonal();
 
     for (const CoarseEdge &edge : edges) {
         // Without both flanks the subdomain is incomplete; keep what exists.
         if (edge.zones[1] < 0) {
             if (edge.zones[0] >= 0) {
-                blocks.push_back(zoneAsBlock(zones[edge.zones[0]]));
+                blocks.push_back(zoneAsBlock(*axis, zones[edge.zones[0]]));
                 consumed[edge.zones[0]] = 1;
             }
             continue;
         }
-        const MedialZone &A = zones[edge.zones[0]];
-        const MedialZone &B = zones[edge.zones[1]];
         consumed[edge.zones[0]] = 1;
         consumed[edge.zones[1]] = 1;
 
-        if (edge.color == MedialColor::Green) {
-            // Two quads, one per side: the zones already are the template.
-            blocks.push_back(zoneAsBlock(A));
-            blocks.push_back(zoneAsBlock(B));
-            continue;
-        }
+        const TemplateEntry &t = templateFor(edge.color);
+        const TemplateSubdomain s = makeSubdomain(*axis, zones, capOf, edge, t);
+        if (s.capZone >= 0) consumed[s.capZone] = 1;
 
-        // ── A common frame for the directional templates ──
-        //
-        // chain / sideA / sideB oriented so that the template's special end
-        // (the narrow end for red, the endpoint for blue and purple) is at
-        // the front. Side B is stored against its own walk direction, i.e.
-        // reversed relative to A, unless the pairing matched equal chains.
-        std::vector<int> chainIdx = A.chain;
-        std::vector<Point> sideA = A.boundarySide;
-        std::vector<Point> sideB =
-            (B.chain == A.chain) ? B.boundarySide : reversed(B.boundarySide);
-
-        bool specialAtFront;
-        if (edge.color == MedialColor::Red) {
-            specialAtFront = axis->medialVertices[chainIdx.front()].radius <=
-                             axis->medialVertices[chainIdx.back()].radius;
-        } else {
-            const bool frontIsEnd =
-                axis->medialVertices[chainIdx.front()].degree <= 1;
-            const bool backIsEnd =
-                axis->medialVertices[chainIdx.back()].degree <= 1;
-            // Both ends can be endpoints (a single-branch domain); prefer the
-            // one whose cap exists so the template absorbs it.
-            if (frontIsEnd && backIsEnd)
-                specialAtFront = capOf.count(chainIdx.front()) || !capOf.count(chainIdx.back());
-            else
-                specialAtFront = frontIsEnd;
-        }
-        if (!specialAtFront) {
-            std::reverse(chainIdx.begin(), chainIdx.end());
-            std::reverse(sideA.begin(), sideA.end());
-            std::reverse(sideB.begin(), sideB.end());
-        }
-        std::vector<Point> chainPts;
-        for (int m : chainIdx) chainPts.push_back(axis->medialVertices[m].coord);
-
-        const Point L = chainPts.front();
-        const Point R = chainPts.back();
-
-        if (edge.color == MedialColor::Red) {
-            // Three quads around the concave corner (Fig. 17, column 2).
-            //
-            // At the narrow medial vertex L both radii point back toward the
-            // apex, so the subdomain hexagon is reflex there -- L is its one
-            // concave corner. It is split by running an edge from L to each
-            // of the two opposite sides, which here are the radii at the wide
-            // vertex R. Those edges land mid-side, so each leaves a
-            // T-junction: the neighbouring subdomain across that radius has
-            // no vertex there. The medial edge L-R is left as the diagonal of
-            // the middle quad rather than an edge of it, which is exactly
-            // what red asks for -- the axis follows quad diagonals.
-            const Point A = (sideA.back() + R) * 0.5;   // T-junction on R's radius
-            const Point B = (sideB.back() + R) * 0.5;
-
-            TMeshBlock up;
-            up.outline = {L};
-            appendPts(up.outline, sideA);
-            appendPts(up.outline, {A});
-            up.corners = {L, sideA.front(), sideA.back(), A};
-            up.color = edge.color;
-            blocks.push_back(std::move(up));
-
-            TMeshBlock mid;
-            mid.outline = {L, A, R, B};
-            mid.corners = mid.outline;
-            mid.color = edge.color;
-            blocks.push_back(std::move(mid));
-
-            TMeshBlock lo;
-            lo.outline = {L, B};
-            appendPts(lo.outline, reversed(sideB));
-            lo.corners = {L, B, sideB.back(), sideB.front()};
-            lo.color = edge.color;
-            blocks.push_back(std::move(lo));
-            continue;
-        }
-
-        // Blue and purple own the polar cap at their endpoint, oriented to
-        // run from side A's inner corner around the tip to side B's.
-        std::vector<Point> cap;
-        const auto capIt = capOf.find(chainIdx.front());
-        if (capIt != capOf.end()) {
-            consumed[capIt->second] = 1;
-            const std::vector<Point> &c = zones[capIt->second].boundarySide;
-            const bool forward = normP(c.front() - sideA.front()) <=
-                                 normP(c.back() - sideA.front());
-            cap = forward ? c : reversed(c);
-        }
-
-        if (edge.color == MedialColor::Blue) {
-            // One quad spanning the whole wedge, the axis on its diagonal:
-            // the far vertex, its two contacts, and the tip between them.
-            std::vector<Point> arc = reversed(sideA);
-            appendPts(arc, cap);
-            appendPts(arc, sideB);
-
-            TMeshBlock quad;
-            quad.outline = {R};
-            appendPts(quad.outline, arc);
-            quad.corners = {R, sideA.back(),
-                            cap.empty() ? sideA.front() : cap[cap.size() / 2],
-                            sideB.back()};
-            quad.color = edge.color;
-            blocks.push_back(std::move(quad));
-            continue;
-        }
-
-        // Purple: three quads, the same construction as red (Fig. 17, col. 4).
-        //
-        // The T-junctions sit at the midpoints of the two radii at R, and the
-        // half-radius from each one out to the boundary is a template edge,
-        // exactly as in the red case. What differs is the far end: an
-        // endpoint has no pair of inner radii to act as the corners of a
-        // concave vertex, so its polar cap stands in for them, split at its
-        // midpoint W -- the single boundary point the endpoint maps to. The
-        // medial edge L-R is again the diagonal of the middle quad.
-        const Point Tu = (sideA.back() + R) * 0.5;   // T-junction on R's radius
-        const Point Tl = (sideB.back() + R) * 0.5;
-
-        // The subdomain's boundary, from R's contact on side A around the
-        // tip to its contact on side B, cut at W.
-        std::vector<Point> arcUp = reversed(sideA);   // uR -> gA
-        std::vector<Point> arcLo;                     // W  -> lR
-        if (cap.size() >= 2) {
-            std::vector<std::vector<Point>> capPieces;
-            std::vector<Point> capCuts;
-            splitPolyline(cap, {0.5}, capPieces, capCuts);
-            appendPts(arcUp, capPieces[0]);           // gA -> W
-            arcLo = capPieces[1];                     // W  -> gB
-        } else {
-            // No cap: the two inner contacts coincide and W is that point.
-            arcLo = {sideA.front()};
-        }
-        appendPts(arcLo, sideB);                      // gB -> lR
-
-        TMeshBlock up;
-        up.outline = arcUp;
-        appendPts(up.outline, {L, Tu});
-        up.corners = {sideA.back(), arcUp.back(), L, Tu};
-        up.color = edge.color;
-        blocks.push_back(std::move(up));
-
-        TMeshBlock lo;
-        lo.outline = arcLo;
-        appendPts(lo.outline, {Tl, L});
-        lo.corners = {arcLo.front(), sideB.back(), Tl, L};
-        lo.color = edge.color;
-        blocks.push_back(std::move(lo));
-
-        TMeshBlock diamond;
-        diamond.outline = {L, Tu, R, Tl};
-        diamond.corners = diamond.outline;
-        diamond.color = edge.color;
-        blocks.push_back(std::move(diamond));
+        BlockBuilder builder(blocks, edge.color, weld);
+        t.apply(s, builder);
     }
 
     // Whatever the templates did not absorb -- standalone caps, zones of
     // unpaired edges -- still tiles part of the domain, so it stays a block.
     for (int z = 0; z < static_cast<int>(zones.size()); ++z) {
-        if (!consumed[z]) blocks.push_back(zoneAsBlock(zones[z]));
+        if (!consumed[z]) blocks.push_back(zoneAsBlock(*axis, zones[z]));
     }
 }
