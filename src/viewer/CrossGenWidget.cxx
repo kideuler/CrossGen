@@ -93,7 +93,8 @@ MedialAxisPhase nextMedialAxisPhase(MedialAxisPhase p) {
     switch (p) {
         case MedialAxisPhase::MeshOnly:     return MedialAxisPhase::DelaunayMesh;
         case MedialAxisPhase::DelaunayMesh: return MedialAxisPhase::MedialAxis;
-        case MedialAxisPhase::MedialAxis:   return MedialAxisPhase::Classify;
+        case MedialAxisPhase::MedialAxis:   return MedialAxisPhase::Map;
+        case MedialAxisPhase::Map:          return MedialAxisPhase::Classify;
         case MedialAxisPhase::Classify:     return MedialAxisPhase::Classify;
     }
     return MedialAxisPhase::Classify;
@@ -152,7 +153,8 @@ const char *medialAxisPhaseName(MedialAxisPhase p) {
         case MedialAxisPhase::MeshOnly:     return "1) mesh";
         case MedialAxisPhase::DelaunayMesh: return "2) Delaunay re-triangulation";
         case MedialAxisPhase::MedialAxis:   return "3) Medial axis";
-        case MedialAxisPhase::Classify:     return "4) Classify / polylines";
+        case MedialAxisPhase::Map:          return "4) Boundary map";
+        case MedialAxisPhase::Classify:     return "5) Classify / polylines";
     }
     return "?";
 }
@@ -451,6 +453,7 @@ void CrossGenWidget::doReset() {
     quadLayout_.reset();
     simplified_.reset();
     delaunayMesh_.reset();
+    medialAxisMap_.reset();
     medialAxis_.reset();
     oasis_.reset();
     oasisGuide_.reset();
@@ -1549,6 +1552,31 @@ void CrossGenWidget::runComputations() {
         }
     }
 
+    // ── Medial Axis: the boundary -> axis map (Sec. 3) ────────────────────────
+    if (mode_ == Mode::MedialAxis && maPhase_ >= MedialAxisPhase::Map &&
+        medialAxis_ && !medialAxisMap_.has_value()) {
+        auto t0 = Clock::now();
+        medialAxisMap_.emplace(medialAxis_);
+        auto t1 = Clock::now();
+
+        const auto &st = medialAxisMap_->stats();
+        std::ostringstream oss;
+        oss << "[MedialAxis] Map phi: " << st.fans << " boundary fans ("
+            << st.collapsedFans << " collapsed), "
+            << medialAxisMap_->spokes().size() << " medial radii: "
+            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+        if (st.skippedVertices || st.fallbackProjections) {
+            std::ostringstream warn;
+            warn << "[MedialAxis] Map warnings: " << st.skippedVertices
+                 << " boundary vertices skipped, " << st.fallbackProjections
+                 << " polar rays missed (closest-point fallback)";
+            console_.log(warn.str());
+        }
+        console_.log("[MedialAxis] blue = bijective radii, magenta = polar "
+                     "sections (axis endpoints)");
+    }
+
     // ── Medial Axis: polylines / classify ─────────────────────────────────────
     if (mode_ == Mode::MedialAxis && maPhase_ >= MedialAxisPhase::Classify &&
         medialAxis_ && medialAxis_->polyLines.empty()) {
@@ -2092,7 +2120,9 @@ void CrossGenWidget::renderNormal() {
         }
     } else if (mode_ == Mode::MedialAxis) {
         viewer::drawAxis(view_);
-        if (maPhase_ != MedialAxisPhase::Classify) {
+        // The map and classification phases draw over the boundary alone: the
+        // triangulation underneath would bury the radii / polylines.
+        if (maPhase_ != MedialAxisPhase::Map && maPhase_ != MedialAxisPhase::Classify) {
             if (delaunayMesh_)
                 viewer::drawMesh(*delaunayMesh_);
             else
@@ -2148,6 +2178,28 @@ void CrossGenWidget::renderNormal() {
                         }
                     }
                 }
+            } else if (maPhase_ == MedialAxisPhase::Map && medialAxisMap_.has_value()) {
+                viewer::drawBoundaryEdges(*medialAxis_->mesh);
+
+                // The map phi drawn as its medial radii (Fig. 7/8 of the
+                // paper): each boundary point joined to its image on the
+                // axis. Radii first, the axis on top of them. Blue radii are
+                // the bijective sections; magenta ones belong to a polar
+                // section, where a run of boundary collapses onto a single
+                // medial vertex (a discrete axis endpoint).
+                glLineWidth(1.0f);
+                glBegin(GL_LINES);
+                for (const auto &s : medialAxisMap_->spokes()) {
+                    if (s.collapsed)
+                        glColor4f(0.9f, 0.25f, 0.9f, 0.85f);
+                    else
+                        glColor4f(0.35f, 0.55f, 0.95f, 0.55f);
+                    glVertex2d(s.boundary[0], s.boundary[1]);
+                    glVertex2d(s.medial[0], s.medial[1]);
+                }
+                glEnd();
+
+                viewer::drawMedialAxis(*medialAxis_, avgEdge_ / 6.0);
             } else if (maPhase_ >= MedialAxisPhase::MedialAxis) {
                 double ballRadius_ma = avgEdge_ / 5.0;
                 viewer::drawMedialAxis(*medialAxis_, ballRadius_ma);

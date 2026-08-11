@@ -78,6 +78,8 @@ add_library(PolyVector SHARED
     src/triangle/TriangleMesher.hpp
     src/medialaxis/MedialAxis.hxx
     src/medialaxis/MedialAxis.cxx
+    src/medialaxis/MedialAxisMap.hxx
+    src/medialaxis/MedialAxisMap.cxx
 )
 target_include_directories(PolyVector PUBLIC src)
 target_include_directories(PolyVector PUBLIC src/triangle)
