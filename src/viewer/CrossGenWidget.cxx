@@ -94,10 +94,9 @@ MedialAxisPhase nextMedialAxisPhase(MedialAxisPhase p) {
         case MedialAxisPhase::MeshOnly:     return MedialAxisPhase::DelaunayMesh;
         case MedialAxisPhase::DelaunayMesh: return MedialAxisPhase::MedialAxis;
         case MedialAxisPhase::MedialAxis:   return MedialAxisPhase::Map;
-        case MedialAxisPhase::Map:          return MedialAxisPhase::Classify;
-        case MedialAxisPhase::Classify:     return MedialAxisPhase::Classify;
+        case MedialAxisPhase::Map:          return MedialAxisPhase::Map;
     }
-    return MedialAxisPhase::Classify;
+    return MedialAxisPhase::Map;
 }
 
 const char *phaseName(Phase p) {
@@ -154,7 +153,6 @@ const char *medialAxisPhaseName(MedialAxisPhase p) {
         case MedialAxisPhase::DelaunayMesh: return "2) Delaunay re-triangulation";
         case MedialAxisPhase::MedialAxis:   return "3) Medial axis";
         case MedialAxisPhase::Map:          return "4) Boundary map";
-        case MedialAxisPhase::Classify:     return "5) Classify / polylines";
     }
     return "?";
 }
@@ -1577,21 +1575,6 @@ void CrossGenWidget::runComputations() {
                      "sections (axis endpoints)");
     }
 
-    // ── Medial Axis: polylines / classify ─────────────────────────────────────
-    if (mode_ == Mode::MedialAxis && maPhase_ >= MedialAxisPhase::Classify &&
-        medialAxis_ && medialAxis_->polyLines.empty()) {
-        auto t0 = Clock::now();
-        medialAxis_->createPolylines();
-        auto t1 = Clock::now();
-        int cycles = 0;
-        for (bool c : medialAxis_->polyLineIsCycle) cycles += c ? 1 : 0;
-        std::ostringstream oss;
-        oss << "[MedialAxis] Created " << medialAxis_->polyLines.size() << " polylines ("
-            << cycles << " cyclic): "
-            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
-        console_.log(oss.str());
-    }
-
     // ── PolyVector: solve crossfield ──────────────────────────────────────────
     if (mode_ == Mode::PolyVector && phase_ >= Phase::CrossField && !field_.has_value()) {
         auto t0 = Clock::now();
@@ -2120,9 +2103,9 @@ void CrossGenWidget::renderNormal() {
         }
     } else if (mode_ == Mode::MedialAxis) {
         viewer::drawAxis(view_);
-        // The map and classification phases draw over the boundary alone: the
-        // triangulation underneath would bury the radii / polylines.
-        if (maPhase_ != MedialAxisPhase::Map && maPhase_ != MedialAxisPhase::Classify) {
+        // The map phase draws over the boundary alone: the triangulation
+        // underneath would bury the radii.
+        if (maPhase_ != MedialAxisPhase::Map) {
             if (delaunayMesh_)
                 viewer::drawMesh(*delaunayMesh_);
             else
@@ -2130,55 +2113,7 @@ void CrossGenWidget::renderNormal() {
         }
 
         if (medialAxis_) {
-            if (maPhase_ == MedialAxisPhase::Classify) {
-                if (delaunayMesh_)
-                    viewer::drawBoundaryEdges(*delaunayMesh_);
-                else
-                    viewer::drawBoundaryEdges(*mesh_);
-
-                glLineWidth(2.5f);
-                glColor3f(0.95f, 0.85f, 0.1f);
-                for (const auto &pl : medialAxis_->polyLines) {
-                    if (pl.size() < 2) continue;
-                    glBegin(GL_LINE_STRIP);
-                    for (int vi : pl) {
-                        const Point &p = medialAxis_->medialVertices[vi].coord;
-                        glVertex2d(p[0], p[1]);
-                    }
-                    glEnd();
-                }
-                glLineWidth(1.0f);
-
-                // Blue for junctions, green for endpoints; endpoints whose
-                // dual cell is no longer a triangle are drawn brighter, since
-                // that is the case a merge produced.
-                double ballRadius_ma = avgEdge_ / 5.0;
-                for (size_t i = 0; i < medialAxis_->medialVertices.size(); ++i) {
-                    const auto &mv = medialAxis_->medialVertices[i];
-                    if (mv.degree == 2) continue;
-                    if (mv.degree >= 3) {
-                        viewer::drawDisk3D(mv.coord, ballRadius_ma, 0.2f, 0.2f, 0.95f);
-                    } else if (mv.dualIsTriangle) {
-                        viewer::drawDisk3D(mv.coord, ballRadius_ma, 0.1f, 0.9f, 0.2f);
-                    } else {
-                        viewer::drawDisk3D(mv.coord, ballRadius_ma, 0.7f, 0.3f, 0.95f);
-                    }
-                }
-
-                // Dual cell ring of every non-regular medial vertex: the
-                // boundary points its inscribed circle touches.
-                double touchRadius = avgEdge_ / 6.0;
-                for (size_t i = 0; i < medialAxis_->medialVertices.size(); ++i) {
-                    const auto &mv = medialAxis_->medialVertices[i];
-                    if (mv.degree == 2 || mv.cell < 0) continue;
-                    for (int tpIdx : medialAxis_->cells[mv.cell].verts) {
-                        if (tpIdx >= 0 && tpIdx < static_cast<int>(medialAxis_->mesh->vertices.size())) {
-                            const Point &tp = medialAxis_->mesh->vertices[tpIdx];
-                            viewer::drawDisk3D(tp, touchRadius, 0.0f, 0.9f, 0.9f);
-                        }
-                    }
-                }
-            } else if (maPhase_ == MedialAxisPhase::Map && medialAxisMap_.has_value()) {
+            if (maPhase_ == MedialAxisPhase::Map && medialAxisMap_.has_value()) {
                 viewer::drawBoundaryEdges(*medialAxis_->mesh);
 
                 // The map phi drawn as its medial radii (Fig. 7/8 of the

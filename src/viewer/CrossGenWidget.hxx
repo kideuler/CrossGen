@@ -108,7 +108,6 @@ enum class MedialAxisPhase {
     DelaunayMesh = 1,
     MedialAxis   = 2,
     Map          = 3,
-    Classify     = 4,
 };
 
 // ── Widget ────────────────────────────────────────────────────────────────────
