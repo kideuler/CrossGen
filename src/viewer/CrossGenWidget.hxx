@@ -27,6 +27,7 @@
 #include "medialaxis/MedialAxisMap.hxx"
 #include "medialaxis/MedialAxisTMesh.hxx"
 #include "quantization/QuantTMeshConvert.hxx"
+#include "quantization/TMeshContract.hxx"
 #include "quantization/TMeshQuantizer.hxx"
 #include "OASIS/OASIS.hxx"
 #include "UMBER/BlockLayout.hxx"

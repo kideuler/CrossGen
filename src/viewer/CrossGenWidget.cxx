@@ -1606,6 +1606,16 @@ void CrossGenWidget::runComputations() {
                 << " blue (1), " << st.colorCounts[3] << " purple (5)";
             console_.log(col.str());
         }
+        {
+            // A sharp corner left inside a block side is a kink no quad grid
+            // can reproduce, so every one of them is forced to be a block
+            // corner. Any that could not be is worth seeing.
+            std::ostringstream cor;
+            cor << "[MedialAxis] sharp corners: " << st.sharpCorners << " found, "
+                << st.cornerCuts << " forced into block corners";
+            if (st.cornersUnanchored > 0) cor << ", " << st.cornersUnanchored << " UNANCHORED";
+            console_.log(cor.str());
+        }
         if (st.skippedLoops || st.unpairedEdges) {
             std::ostringstream warn;
             warn << "[MedialAxis] Block warnings: " << st.skippedLoops
@@ -1673,9 +1683,29 @@ void CrossGenWidget::runComputations() {
                 std::ostringstream zss;
                 zss << "[MedialAxis] " << quantReport_.forcedZeroEdges
                     << " edges are forced to zero by the block decomposition "
-                       "itself (no strip runs through them); the blocks they "
-                       "collapse are outlined but carry no grid";
+                       "itself: no consistent assignment can lift them";
                 console_.log(zss.str());
+
+                // Clear them out the way QGP Sec. 7.1.1 advises, by
+                // deleting the cells they collapse and letting the
+                // neighbours meet in the middle.
+                const ContractReport cr = contractZeroEdges(*blockQuant_);
+                std::ostringstream css;
+                css << "[MedialAxis] Zero-cell cleanup: " << cr.mergedCells
+                    << " collapsed cells merged into their neighbours, "
+                    << cr.pointCells << " point cells dropped, " << cr.splitEdges
+                    << " edges split to line the sides up, " << cr.removedEdges
+                    << " edges removed";
+                console_.log(css.str());
+                if (!cr.ok) {
+                    console_.log("[MedialAxis] Cleanup rejected, keeping the "
+                                 "uncontracted T-mesh: " + cr.error);
+                } else if (cr.remainingZero > 0) {
+                    std::ostringstream rss;
+                    rss << "[MedialAxis] " << cr.remainingZero
+                        << " cells could not be merged and stay collapsed";
+                    console_.log(rss.str());
+                }
             }
             if (!quantReport_.consistent) {
                 console_.log("[MedialAxis] WARNING: quantization violates the "

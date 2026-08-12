@@ -17,5 +17,5 @@ TODO:
 - [X] Go back and try to fix tracing and simplification
 - [X] See if we can do a chord collapse operation for complex polysquares
 - [ ] Padding?
-- [ ] Try medial axis again.
+- [x] Try medial axis again.
 - [ ] Multi-material

@@ -88,6 +88,8 @@ add_library(PolyVector SHARED
     src/quantization/TMeshQuantizer.cxx
     src/quantization/QuantTMeshConvert.hxx
     src/quantization/QuantTMeshConvert.cxx
+    src/quantization/TMeshContract.hxx
+    src/quantization/TMeshContract.cxx
 )
 target_include_directories(PolyVector PUBLIC src)
 target_include_directories(PolyVector PUBLIC src/triangle)

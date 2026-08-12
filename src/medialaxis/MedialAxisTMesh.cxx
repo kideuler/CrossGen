@@ -2,9 +2,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <map>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace {
 
@@ -61,22 +63,6 @@ void splitPolyline(const std::vector<Point> &pts,
     pieces.push_back(std::move(cur));
 }
 
-// One step of the boundary walk: either a plain boundary vertex (medial < 0)
-// or the footpoint of a medial vertex passage.
-struct WalkEvent {
-    Point pos{0.0, 0.0};
-    int medial = -1;
-};
-
-// A maximal group of consecutive medial events sharing one medial vertex,
-// plain boundary events in between included. A run longer than one event is
-// a stretch of boundary collapsing onto that vertex -- a polar section.
-struct MedialRun {
-    int m = -1;
-    int first = -1;   // event index of the first passage footpoint
-    int last = -1;    // event index of the last one (== first for a point)
-};
-
 double distToSegment(const Point &p, const Point &a, const Point &b) {
     const Point e = b - a;
     const double len2 = dotP(e, e);
@@ -96,34 +82,6 @@ double subPolylineParam(const Point &p, const Point &midPrev, const Point &v,
     return lenPrev + normP(p - v);
 }
 
-// The fan's contribution to the walk, in boundary order. Each fan emits its
-// chain vertices 0..k-2 (the last belongs to the next fan, which starts with
-// it), plus the boundary vertex itself slotted in by arc length. A collapsed
-// fan emits its single vertex at the interval entry, so consecutive collapsed
-// fans build up the run that becomes a cap zone.
-void appendFanEvents(const MedialFan &fan, const Point &vpos,
-                     std::vector<WalkEvent> &events) {
-    const int k = static_cast<int>(fan.chain.size());
-    if (k == 1) {
-        events.push_back({fan.midPrev, fan.chain[0]});
-        events.push_back({vpos, -1});
-        return;
-    }
-
-    const double vparam = normP(vpos - fan.midPrev);
-    bool vEmitted = false;
-    for (int i = 0; i + 1 < k; ++i) {
-        const double p = subPolylineParam(fan.footpoints[i], fan.midPrev, vpos,
-                                          fan.midNext);
-        if (!vEmitted && p > vparam) {
-            events.push_back({vpos, -1});
-            vEmitted = true;
-        }
-        events.push_back({fan.footpoints[i], fan.chain[i]});
-    }
-    if (!vEmitted) events.push_back({vpos, -1});
-}
-
 } // namespace
 
 // ─── Construction ───────────────────────────────────────────────────────────
@@ -137,13 +95,12 @@ MedialAxisTMesh::MedialAxisTMesh(const MedialAxisMap &map, double targetSize)
     targetSize_ = targetSize > 0.0 ? targetSize : 0.1 * axis->boundingBoxDiagonal();
     passages_.assign(axis->medialVertices.size(), {});
 
+    // The walk comes first: runs depend only on the map, and both the corner
+    // anchoring and the sampling need to see them.
+    gatherLoops(map);
+    anchorCorners(map);
     selectKeptVertices();
-
-    std::vector<char> visited(axis->mesh->vertices.size(), 0);
-    for (int v = 0; v < static_cast<int>(axis->mesh->vertices.size()); ++v) {
-        if (visited[v] || axis->boundaryLinks[v].nextBoundaryVertex < 0) continue;
-        walkLoop(map, v, visited);
-    }
+    emitZones();
 
     buildEdges();
     classify();
@@ -154,10 +111,172 @@ MedialAxisTMesh::MedialAxisTMesh(const MedialAxisMap &map, double targetSize)
     stats_.blocks = static_cast<int>(blocks.size());
 }
 
+// ─── The walk ───────────────────────────────────────────────────────────────
+
+// The fan's contribution to the walk, in boundary order. Each fan emits its
+// chain vertices 0..k-2 (the last belongs to the next fan, which starts with
+// it), plus the boundary vertex itself slotted in by arc length. A collapsed
+// fan emits its single vertex at the interval entry, so consecutive collapsed
+// fans build up the run that becomes a cap zone.
+void MedialAxisTMesh::appendFanEvents(const MedialFan &fan, const Point &vpos,
+                                      int vIndex, std::vector<WalkEvent> &events) {
+    const int k = static_cast<int>(fan.chain.size());
+    if (k == 1) {
+        events.push_back({fan.midPrev, fan.chain[0], -1});
+        events.push_back({vpos, -1, vIndex});
+        return;
+    }
+
+    const double vparam = normP(vpos - fan.midPrev);
+    bool vEmitted = false;
+    for (int i = 0; i + 1 < k; ++i) {
+        const double p = subPolylineParam(fan.footpoints[i], fan.midPrev, vpos,
+                                          fan.midNext);
+        if (!vEmitted && p > vparam) {
+            events.push_back({vpos, -1, vIndex});
+            vEmitted = true;
+        }
+        events.push_back({fan.footpoints[i], fan.chain[i], -1});
+    }
+    if (!vEmitted) events.push_back({vpos, -1, vIndex});
+}
+
+void MedialAxisTMesh::gatherLoops(const MedialAxisMap &map) {
+    std::vector<char> visited(axis->mesh->vertices.size(), 0);
+
+    for (int start = 0; start < static_cast<int>(axis->mesh->vertices.size()); ++start) {
+        if (visited[start] || axis->boundaryLinks[start].nextBoundaryVertex < 0) continue;
+        ++stats_.loops;
+
+        LoopWalk loop;
+        int v = start;
+        int guard = static_cast<int>(axis->mesh->vertices.size()) + 1;
+        bool closed = false;
+        while (guard-- > 0) {
+            visited[v] = 1;
+            const MedialFan *fan = map.fanOf(v);
+            if (fan) {
+                appendFanEvents(*fan, axis->mesh->vertices[v], v, loop.events);
+            } else {
+                loop.events.push_back({axis->mesh->vertices[v], -1, v});
+            }
+            v = axis->boundaryLinks[v].nextBoundaryVertex;
+            if (v == start) { closed = true; break; }
+            // Broken or pinched links: the loop never closes, and zones cut
+            // from it would not either.
+            if (v < 0 || visited[v]) break;
+        }
+        if (!closed) { ++stats_.skippedLoops; continue; }
+
+        // Rotate the stream so it starts at a run boundary -- the first medial
+        // event whose vertex differs from the previous medial event's -- so
+        // runs never straddle the wrap-around.
+        const int n = static_cast<int>(loop.events.size());
+        int lastMedial = -1;
+        for (int i = n - 1; i >= 0; --i) {
+            if (loop.events[i].medial >= 0) { lastMedial = loop.events[i].medial; break; }
+        }
+        if (lastMedial < 0) {
+            // A loop no fan reached at all.
+            ++stats_.skippedLoops;
+            continue;
+        }
+        int rot = -1;
+        int prevMedial = lastMedial;
+        for (int i = 0; i < n; ++i) {
+            if (loop.events[i].medial < 0) continue;
+            if (loop.events[i].medial != prevMedial) { rot = i; break; }
+            prevMedial = loop.events[i].medial;
+        }
+
+        if (rot < 0) {
+            // Every passage hits the same medial vertex: the whole loop is one
+            // polar section (a domain reduced to a single inscribed circle).
+            loop.runs.push_back({lastMedial, 0, n - 1});
+        } else {
+            std::rotate(loop.events.begin(), loop.events.begin() + rot, loop.events.end());
+            for (int i = 0; i < n; ++i) {
+                if (loop.events[i].medial < 0) continue;
+                if (!loop.runs.empty() && loop.runs.back().m == loop.events[i].medial) {
+                    loop.runs.back().last = i;
+                } else {
+                    loop.runs.push_back({loop.events[i].medial, i, i});
+                }
+            }
+        }
+
+        // Record the passages: one footpoint per run, at the middle of the
+        // run's interval. These are the discrete medial radii the
+        // classification measures its angles between.
+        for (const MedialRun &r : loop.runs) {
+            passages_[r.m].push_back(
+                (loop.events[r.first].pos + loop.events[r.last].pos) * 0.5);
+        }
+
+        loops_.push_back(std::move(loop));
+    }
+}
+
+// ─── Sharp corners ──────────────────────────────────────────────────────────
+
+bool MedialAxisTMesh::isSharpBoundaryCorner(int v) const {
+    if (v < 0 || v >= static_cast<int>(axis->interiorAngle.size())) return false;
+    const double a = axis->interiorAngle[v];
+    return std::isfinite(a) && std::abs(a - M_PI) > MEDIAL_SHARP_CORNER_TOLERANCE;
+}
+
+void MedialAxisTMesh::anchorCorners(const MedialAxisMap &map) {
+    mandatory_.assign(axis->medialVertices.size(), 0);
+
+    for (LoopWalk &loop : loops_) {
+        const int n = static_cast<int>(loop.events.size());
+        const int nr = static_cast<int>(loop.runs.size());
+        if (nr == 0) continue;
+
+        // Cyclic distance from event e to a run's span, 0 when e is inside it.
+        auto forward = [n](int from, int to) { return ((to - from) % n + n) % n; };
+        auto distToRun = [&](int e, const MedialRun &r) {
+            const int span = forward(r.first, r.last);
+            if (forward(r.first, e) <= span) return 0;
+            return std::min(forward(e, r.first), forward(r.last, e));
+        };
+
+        for (int e = 0; e < n; ++e) {
+            const int bv = loop.events[e].boundaryVertex;
+            if (bv < 0 || !isSharpBoundaryCorner(bv)) continue;
+            ++stats_.sharpCorners;
+
+            // Only a medial vertex whose inscribed circle actually touches the
+            // corner can carry it: the spoke from the corner to that vertex
+            // has to be a real medial radius, or the zone it bounds would not
+            // be a subdomain of the map. Those are exactly the vertices of the
+            // corner's own fan.
+            const MedialFan *fan = map.fanOf(bv);
+            if (!fan || fan->chain.empty()) { ++stats_.cornersUnanchored; continue; }
+            const std::unordered_set<int> touching(fan->chain.begin(), fan->chain.end());
+
+            int bestRun = -1;
+            int bestDist = std::numeric_limits<int>::max();
+            for (int r = 0; r < nr; ++r) {
+                if (!touching.count(loop.runs[r].m)) continue;
+                const int d = distToRun(e, loop.runs[r]);
+                if (d < bestDist) { bestDist = d; bestRun = r; }
+            }
+            if (bestRun < 0) { ++stats_.cornersUnanchored; continue; }
+
+            loop.cornerCuts.push_back({bestRun, e});
+            mandatory_[loop.runs[bestRun].m] = 1;
+            ++stats_.cornerCuts;
+        }
+    }
+}
+
 // ─── Downsampling ───────────────────────────────────────────────────────────
 
 void MedialAxisTMesh::selectKeptVertices() {
-    kept_.assign(axis->medialVertices.size(), 0);
+    // Corner anchors are already in: they are as mandatory as a junction.
+    kept_ = mandatory_;
+    if (kept_.empty()) kept_.assign(axis->medialVertices.size(), 0);
 
     // Branches are the unit of downsampling, so make sure they exist.
     if (axis->polyLines.empty()) axis->createPolylines();
@@ -173,156 +292,152 @@ void MedialAxisTMesh::selectKeptVertices() {
             arc[i] = arc[i - 1] + normP(axis->medialVertices[pl[i]].coord -
                                         axis->medialVertices[pl[i - 1]].coord);
         }
-        const double length = arc.back();
 
-        int segments = std::max(1, static_cast<int>(std::lround(length / targetSize_)));
-        // A cycle's ends coincide, so fewer than three samples would leave a
-        // hole bounded by fewer than two zones per side.
-        if (axis->polyLineIsCycle[b]) segments = std::max(3, segments);
-
-        size_t cursor = 1;
-        for (int s = 1; s < segments; ++s) {
-            const double target = length * s / segments;
-            while (cursor + 1 < pl.size() - 1 && arc[cursor] < target) ++cursor;
-            // Nearest of the two candidates around the target, clamped to the
-            // branch interior (the ends are already kept).
-            size_t pick = cursor;
-            if (cursor > 1 &&
-                target - arc[cursor - 1] < arc[cursor] - target) pick = cursor - 1;
-            if (pick >= 1 && pick + 1 <= pl.size() - 1) kept_[pl[pick]] = 1;
+        // Sample between consecutive survivors rather than across the whole
+        // branch: a corner anchor is a fixed sample, and spacing the rest
+        // around it is what keeps a forced corner from leaving a sliver zone
+        // beside an arc-length sample that happened to land next to it.
+        std::vector<size_t> anchors{0};
+        for (size_t i = 1; i + 1 < pl.size(); ++i) {
+            if (kept_[pl[i]]) anchors.push_back(i);
         }
-    }
+        anchors.push_back(pl.size() - 1);
 
-    for (char k : kept_) stats_.keptVertices += k;
-}
+        for (size_t a = 0; a + 1 < anchors.size(); ++a) {
+            const size_t i0 = anchors[a];
+            const size_t i1 = anchors[a + 1];
+            const double length = arc[i1] - arc[i0];
+            int segments = std::max(1, static_cast<int>(std::lround(length / targetSize_)));
+            // A cycle's ends coincide, so with no interior anchor to break it
+            // fewer than three samples would leave a hole bounded by fewer
+            // than two zones per side.
+            if (axis->polyLineIsCycle[b] && anchors.size() == 2) {
+                segments = std::max(3, segments);
+            }
 
-// ─── The walk ───────────────────────────────────────────────────────────────
-
-void MedialAxisTMesh::walkLoop(const MedialAxisMap &map, int startVertex,
-                               std::vector<char> &visited) {
-    ++stats_.loops;
-
-    // Gather the loop's event stream.
-    std::vector<WalkEvent> events;
-    int v = startVertex;
-    int guard = static_cast<int>(axis->mesh->vertices.size()) + 1;
-    while (guard-- > 0) {
-        visited[v] = 1;
-        const MedialFan *fan = map.fanOf(v);
-        if (fan) {
-            appendFanEvents(*fan, axis->mesh->vertices[v], events);
-        } else {
-            events.push_back({axis->mesh->vertices[v], -1});
-        }
-        v = axis->boundaryLinks[v].nextBoundaryVertex;
-        if (v == startVertex) break;
-        if (v < 0 || visited[v]) {
-            // Broken or pinched links: the loop never closes, and zones cut
-            // from it would not either.
-            ++stats_.skippedLoops;
-            return;
-        }
-    }
-
-    // Rotate the stream so it starts at a run boundary -- the first medial
-    // event whose vertex differs from the previous medial event's -- so runs
-    // never straddle the wrap-around.
-    const int n = static_cast<int>(events.size());
-    int lastMedial = -1;
-    for (int i = n - 1; i >= 0; --i) {
-        if (events[i].medial >= 0) { lastMedial = events[i].medial; break; }
-    }
-    if (lastMedial < 0) {
-        // A loop no fan reached at all.
-        ++stats_.skippedLoops;
-        return;
-    }
-    int start = -1;
-    int prevMedial = lastMedial;
-    for (int i = 0; i < n; ++i) {
-        if (events[i].medial < 0) continue;
-        if (events[i].medial != prevMedial) { start = i; break; }
-        prevMedial = events[i].medial;
-    }
-
-    std::vector<MedialRun> runs;
-    if (start < 0) {
-        // Every passage hits the same medial vertex: the whole loop is one
-        // polar section (a domain reduced to a single inscribed circle).
-        runs.push_back({lastMedial, 0, n - 1});
-    } else {
-        std::rotate(events.begin(), events.begin() + start, events.end());
-        for (int i = 0; i < n; ++i) {
-            if (events[i].medial < 0) continue;
-            if (!runs.empty() && runs.back().m == events[i].medial) {
-                runs.back().last = i;
-            } else {
-                runs.push_back({events[i].medial, i, i});
+            size_t cursor = i0 + 1;
+            for (int s = 1; s < segments; ++s) {
+                const double target = arc[i0] + length * s / segments;
+                while (cursor + 1 < i1 && arc[cursor] < target) ++cursor;
+                // Nearest of the two candidates around the target, kept
+                // strictly inside the interval so an anchor is never doubled.
+                size_t pick = cursor;
+                if (cursor > i0 + 1 &&
+                    target - arc[cursor - 1] < arc[cursor] - target) pick = cursor - 1;
+                if (pick > i0 && pick < i1) kept_[pl[pick]] = 1;
             }
         }
     }
 
-    // Record the passages: one footpoint per run, at the middle of the run's
-    // interval. These are the discrete medial radii the classification needs.
-    for (const MedialRun &r : runs) {
-        passages_[r.m].push_back((events[r.first].pos + events[r.last].pos) * 0.5);
-    }
+    stats_.keptVertices = 0;
+    for (char k : kept_) stats_.keptVertices += k;
+}
 
-    std::vector<int> cuts;   // indices into runs
-    for (int i = 0; i < static_cast<int>(runs.size()); ++i) {
-        if (kept_[runs[i].m]) cuts.push_back(i);
-    }
-    if (cuts.empty()) {
-        // No kept vertex on this loop -- degenerate sampling. Nothing sound
-        // to cut, so report rather than fabricate a zone.
-        ++stats_.skippedLoops;
-        return;
-    }
+// ─── Zones ──────────────────────────────────────────────────────────────────
 
-    // Inclusive cyclic slice of event positions.
-    auto slice = [&](int from, int to) {
-        std::vector<Point> pts;
-        for (int i = from;; i = (i + 1) % n) {
-            pts.push_back(events[i].pos);
-            if (i == to) break;
-        }
-        return pts;
+void MedialAxisTMesh::emitZones() {
+    // Where one zone hands over to the next. A kept run hands over across its
+    // whole span, the stretch of boundary that collapses onto it, so the piece
+    // between `enter` and `exit` becomes a cap zone. A corner hands over at a
+    // single point, so it splits the boundary there and leaves no cap.
+    struct Cut {
+        int run = -1;
+        int enter = -1;   // where the zone before ends
+        int exit = -1;    // where the zone after starts
+        bool cap = false;
     };
 
-    // Cap zones: every kept run that covers more than a point.
-    for (int c : cuts) {
-        const MedialRun &r = runs[c];
-        if (r.first == r.last) continue;
-        MedialZone zone;
-        zone.boundarySide = slice(r.first, r.last);
-        // A run spanning the whole loop is a domain reduced to one inscribed
-        // circle; close the polyline so the cap covers the full perimeter.
-        if (runs.size() == 1) zone.boundarySide.push_back(events[r.first].pos);
-        zone.chain = {r.m};
-        zone.cap = true;
-        zone.capVertex = r.m;
-        zones.push_back(std::move(zone));
-        ++stats_.capZones;
-    }
+    for (const LoopWalk &loop : loops_) {
+        const std::vector<WalkEvent> &events = loop.events;
+        const std::vector<MedialRun> &runs = loop.runs;
+        const int n = static_cast<int>(events.size());
+        const int nr = static_cast<int>(runs.size());
+        if (nr == 0) continue;
 
-    // Quad zones: the interval between each pair of consecutive cuts, with
-    // the medial vertices passed in between as the chain. A single cut on the
-    // loop (a domain whose axis is one kept vertex) leaves no interval.
-    if (cuts.size() < 2 && runs.size() == 1) return;
-    const int nc = static_cast<int>(cuts.size());
-    for (int j = 0; j < nc; ++j) {
-        const MedialRun &a = runs[cuts[j]];
-        const MedialRun &b = runs[cuts[(j + 1) % nc]];
-        MedialZone zone;
-        zone.boundarySide = slice(a.last, b.first);
-        zone.chain.push_back(a.m);
-        for (int r = cuts[j] + 1;; ++r) {
-            const int ri = r % static_cast<int>(runs.size());
-            if (ri == cuts[(j + 1) % nc]) break;
-            zone.chain.push_back(runs[ri].m);
+        std::vector<std::vector<int>> cornerAt(nr);
+        for (const std::array<int, 2> &cc : loop.cornerCuts) {
+            cornerAt[cc[0]].push_back(cc[1]);
         }
-        zone.chain.push_back(b.m);
-        zones.push_back(std::move(zone));
+
+        // A run carrying corners is cut at them instead of across its span:
+        // the corner is the block corner, and the rest of the run's boundary
+        // simply belongs to the zones on either side.
+        std::vector<Cut> cuts;
+        for (int r = 0; r < nr; ++r) {
+            if (!cornerAt[r].empty()) {
+                std::sort(cornerAt[r].begin(), cornerAt[r].end());
+                for (int e : cornerAt[r]) cuts.push_back({r, e, e, false});
+            } else if (kept_[runs[r].m]) {
+                cuts.push_back({r, runs[r].first, runs[r].last,
+                                runs[r].first != runs[r].last});
+            }
+        }
+        if (cuts.empty()) {
+            // No kept vertex and no corner on this loop -- degenerate
+            // sampling. Nothing sound to cut, so report rather than fabricate.
+            ++stats_.skippedLoops;
+            continue;
+        }
+        std::stable_sort(cuts.begin(), cuts.end(),
+                         [](const Cut &a, const Cut &b) { return a.enter < b.enter; });
+
+        // Inclusive cyclic slice of event positions.
+        auto slice = [&](int from, int to) {
+            std::vector<Point> pts;
+            for (int i = from;; i = (i + 1) % n) {
+                pts.push_back(events[i].pos);
+                if (i == to) break;
+            }
+            return pts;
+        };
+
+        for (const Cut &c : cuts) {
+            if (!c.cap) continue;
+            MedialZone zone;
+            zone.boundarySide = slice(c.enter, c.exit);
+            // A run spanning the whole loop is a domain reduced to one
+            // inscribed circle; close the polyline so the cap covers the full
+            // perimeter.
+            if (nr == 1) zone.boundarySide.push_back(events[c.enter].pos);
+            zone.chain = {runs[c.run].m};
+            zone.cap = true;
+            zone.capVertex = runs[c.run].m;
+            zones.push_back(std::move(zone));
+            ++stats_.capZones;
+        }
+
+        // The interval between each pair of consecutive cuts, with the medial
+        // vertices passed in between as its chain. A single cut on a
+        // single-run loop leaves no interval.
+        const int nc = static_cast<int>(cuts.size());
+        if (nc < 2 && nr == 1) continue;
+        for (int j = 0; j < nc; ++j) {
+            const Cut &a = cuts[j];
+            const Cut &b = cuts[(j + 1) % nc];
+            MedialZone zone;
+            zone.boundarySide = slice(a.exit, b.enter);
+            zone.chain.push_back(runs[a.run].m);
+            // Two cuts inside one run have no runs between them; the wrap
+            // below is for the single-cut case, which does circle the loop.
+            if (!(nc > 1 && a.run == b.run)) {
+                int ri = a.run;
+                while (true) {
+                    ri = (ri + 1) % nr;
+                    if (ri == b.run) break;
+                    zone.chain.push_back(runs[ri].m);
+                }
+            }
+            zone.chain.push_back(runs[b.run].m);
+            // Both spokes landing on the same vertex makes this a polar
+            // wedge, not a quad -- two corners cut out of one run.
+            if (zone.chain.size() == 2 && zone.chain[0] == zone.chain[1]) {
+                zone.chain.resize(1);
+                zone.cap = true;
+                zone.capVertex = zone.chain[0];
+                ++stats_.capZones;
+            }
+            zones.push_back(std::move(zone));
+        }
     }
 }
 

@@ -10,7 +10,10 @@
 #include "medialaxis/MedialAxisTMesh.hxx"
 #include "quantization/QuantTMesh.hxx"
 #include "quantization/QuantTMeshConvert.hxx"
+#include "quantization/TMeshContract.hxx"
 #include "quantization/TMeshQuantizer.hxx"
+
+#include <cmath>
 
 #define GREEN "\033[32m"
 #define RED   "\033[31m"
@@ -168,11 +171,76 @@ static void testTrianglePromotion() {
     }
 }
 
+// A cell with a wholly zero side is not a cell. The cleanup deletes it and
+// lets the two neighbours meet on the line between them, so the strip ends
+// up with no zero edges and no gap where the cell was.
+static void testZeroCellContraction() {
+    std::cout << "Collapsed cell removed and its neighbours merged:\n";
+    auto quad = [](double x0, double x1) {
+        TMeshBlock b;
+        b.outline = {{x0, 0}, {x1, 0}, {x1, 1}, {x0, 1}};
+        b.corners = b.outline;
+        return b;
+    };
+    // Three cells in a row; the middle one is the one that will collapse.
+    BlockQuant bq = makeQuantTMesh({quad(0, 1), quad(1, 2), quad(2, 3)}, 1e-9);
+    check(bq.ok, "welded: " + bq.error);
+
+    // A quantization that is consistent yet gives the middle cell zero
+    // width -- exactly what a forced-zero edge produces on a real model.
+    for (auto &e : bq.tmesh.edges) e.x = 1;
+    int zeroed = 0;
+    for (size_t e = 0; e < bq.tmesh.edges.size(); ++e) {
+        const Point &a = bq.edgeGeometry[e].front();
+        const Point &b = bq.edgeGeometry[e].back();
+        const bool horizontal = std::abs(a[1] - b[1]) < 1e-9;
+        const double lo = std::min(a[0], b[0]), hi = std::max(a[0], b[0]);
+        if (horizontal && lo > 0.5 && hi < 2.5) {
+            bq.tmesh.edges[e].x = 0;
+            ++zeroed;
+        }
+    }
+    check(zeroed == 2, "middle cell's two horizontal edges zeroed, got " +
+                           std::to_string(zeroed));
+    check(bq.tmesh.consistent(), "the collapsed state is itself consistent");
+
+    const ContractReport cr = contractZeroEdges(bq);
+    check(cr.ok, "contraction finalizes: " + cr.error);
+    check(cr.mergedCells == 1,
+          "one cell merged away, got " + std::to_string(cr.mergedCells));
+    check(cr.remainingZero == 0, "nothing left stuck");
+    check(bq.tmesh.faces.size() == 2,
+          "two cells remain, got " + std::to_string(bq.tmesh.faces.size()));
+    check(bq.tmesh.edges.size() == 7,
+          "seven edges remain, got " + std::to_string(bq.tmesh.edges.size()));
+    bool positive = true;
+    for (const auto &e : bq.tmesh.edges) positive = positive && e.x >= 1;
+    check(positive, "no zero-length edge survives");
+    check(bq.tmesh.consistent(), "contracted mesh still satisfies Ax = 0");
+
+    // The surviving neighbours should meet on the mid-line of the cell
+    // that was removed, so between them they still cover 0..3.
+    int onMidline = 0;
+    for (const auto &g : bq.edgeGeometry) {
+        if (std::abs(g.front()[0] - 1.5) < 1e-9 && std::abs(g.back()[0] - 1.5) < 1e-9) {
+            ++onMidline;
+        }
+    }
+    check(onMidline == 1, "the shared edge sits at x = 1.5, got " +
+                              std::to_string(onMidline));
+    for (size_t f = 0; f < bq.tmesh.faces.size(); ++f) {
+        check(sideCurve(bq, f, 0).cells() == sideCurve(bq, f, 2).cells() &&
+                  sideCurve(bq, f, 1).cells() == sideCurve(bq, f, 3).cells(),
+              "face " + std::to_string(f) + " grids weld");
+    }
+}
+
 int main() {
     testTJunction();
     testStageIIGrows();
     testBlockWelder();
     testTrianglePromotion();
+    testZeroCellContraction();
     std::cout << (failures == 0 ? GREEN "\nAll checks passed\n" RESET
                                 : RED "\nFAILURES\n" RESET);
     return failures == 0 ? 0 : 1;

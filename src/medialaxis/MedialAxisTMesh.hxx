@@ -33,6 +33,15 @@ enum class MedialColor { Green = 0, Red = 1, Blue = 2, Purple = 3 };
 
 const double MEDIAL_COLOR_ANGLE_THRESHOLD = 3.0 * M_PI / 4.0;
 
+// A boundary vertex counts as a sharp corner when its interior angle differs
+// from a straight boundary by more than this -- convex below 135 degrees, or
+// reflex above 225. Such a corner is forced to be a corner of the blocking:
+// left in the interior of a block side, it is a kink no quad grid laid over
+// that block can reproduce, which is the geometric unrealizability of Sec. 6.
+// The threshold sits well clear of the mild reflex angles a discretized arc
+// produces, so a circle is not mistaken for a ring of corners.
+const double MEDIAL_SHARP_CORNER_TOLERANCE = M_PI / 4.0;
+
 // One four-sided zone. Its sides are: the boundary interval, the spoke from
 // each end of that interval to the matching end of the medial chain, and the
 // chain itself. A cap zone degenerates the chain to a single vertex, so both
@@ -89,6 +98,9 @@ struct TMeshStats {
     int coarseEdges = 0;
     int unpairedEdges = 0;     // edges that did not find two flanking zones
     int blocks = 0;
+    int sharpCorners = 0;      // sharp boundary corners found
+    int cornerCuts = 0;        // of those, the ones forced into block corners
+    int cornersUnanchored = 0; // corners no incident medial vertex could carry
     std::array<int, 4> colorCounts{0, 0, 0, 0};  // indexed by MedialColor
 };
 
@@ -120,16 +132,61 @@ public:
     }
 
 private:
-    // Junctions and endpoints always survive; branches keep interior samples
-    // every ~targetSize of arc length, and cycles keep at least three so a
-    // hole never degenerates to fewer than two zones.
+    // One step of the boundary walk: either a plain boundary vertex or the
+    // footpoint of one medial vertex's passage.
+    struct WalkEvent {
+        Point pos{0.0, 0.0};
+        int medial = -1;          // the vertex passed here, -1 for a plain step
+        int boundaryVertex = -1;  // set on plain steps, for corner lookup
+    };
+
+    // A maximal group of consecutive events sharing one medial vertex. A run
+    // longer than a point is a stretch of boundary collapsing onto that
+    // vertex -- a polar section.
+    struct MedialRun {
+        int m = -1;
+        int first = -1;
+        int last = -1;
+    };
+
+    // One boundary loop, walked and grouped into runs. Where the cuts fall is
+    // decided afterwards, so this is independent of the downsampling.
+    struct LoopWalk {
+        std::vector<WalkEvent> events;
+        std::vector<MedialRun> runs;
+        // {run, event} pairs where a sharp corner forces a cut.
+        std::vector<std::array<int, 2>> cornerCuts;
+    };
+
+    // Walk every boundary loop into its event stream and runs. Runs depend
+    // only on the map, not on which vertices survive downsampling, so this
+    // comes first and both of the next two steps read it.
+    void gatherLoops(const MedialAxisMap &map);
+
+    // Pin every sharp boundary corner to a medial vertex that touches it, so
+    // that the corner becomes a cut -- and hence a block corner -- rather
+    // than a kink inside a block side. The vertex chosen is the nearest one
+    // whose inscribed circle actually contacts the corner, which makes the
+    // spoke from corner to vertex a genuine medial radius.
+    void anchorCorners(const MedialAxisMap &map);
+
+    // Junctions, endpoints and corner anchors always survive; the arc length
+    // *between* consecutive survivors is then filled with samples every
+    // ~targetSize, so a forced corner never leaves a sliver beside it. Cycles
+    // keep at least three samples so a hole never degenerates to fewer than
+    // two zones.
     void selectKeptVertices();
 
-    // Walk one boundary loop, cut it at the kept footpoints, and emit zones.
-    // `startVertex` is any vertex of the loop; `visited` is shared across
-    // loops so each is walked once.
-    void walkLoop(const MedialAxisMap &map, int startVertex,
-                  std::vector<char> &visited);
+    // Cut each loop at its corner and kept-vertex cuts, and emit the zones
+    // between them.
+    void emitZones();
+
+    // True when v's interior angle departs from straight by more than
+    // MEDIAL_SHARP_CORNER_TOLERANCE.
+    bool isSharpBoundaryCorner(int v) const;
+
+    static void appendFanEvents(const MedialFan &fan, const Point &vpos,
+                                int vIndex, std::vector<WalkEvent> &events);
 
     // Pair the zones across each chain into coarse edges, then color them.
     void buildEdges();
@@ -138,6 +195,10 @@ private:
     // Apply the Fig. 17 template of each edge's class to its subdomain.
     void buildBlocks();
 
+    std::vector<LoopWalk> loops_;
+    // Medial vertices the downsampling is not allowed to drop: the corner
+    // anchors. Junction and endpoint survival is handled per branch.
+    std::vector<char> mandatory_;
     std::vector<char> kept_;
     // Footpoints of each passage of every medial vertex, filled by the walk.
     // A regular vertex is passed once per side; the two entries are its two
