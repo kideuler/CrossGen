@@ -775,6 +775,95 @@ void drawMedialTMesh(const MedialAxisTMesh &tm, double cornerRadius) {
 
 namespace {
 
+// Line segments per cell along a grid curve. A curve crossing a cell is
+// only as bent as the sides it interpolates, so a handful of segments is
+// already past the point where more would show.
+constexpr int QUANT_CURVE_SUBDIV = 8;
+
+// Transfinite (Coons) interpolation between the four sides of a block.
+// Along each side the formula collapses to that side's own geometry, so a
+// block wall is drawn exactly as it curves and two blocks sharing it agree
+// on it to the last point.
+Point coons(const SideCurve &bottom, const SideCurve &top,
+            const SideCurve &left, const SideCurve &right,
+            double u, double v) {
+    const Point p = bottom.at(u) * (1.0 - v) + top.at(u) * v +
+                    left.at(v) * (1.0 - u) + right.at(v) * u;
+    return p - (bottom.at(0.0) * ((1.0 - u) * (1.0 - v)) +
+                bottom.at(1.0) * (u * (1.0 - v)) +
+                top.at(0.0)    * ((1.0 - u) * v) +
+                top.at(1.0)    * (u * v));
+}
+
+}  // namespace
+
+void drawQuantizedBlocks(const BlockQuant &bq) {
+    const QuantTMesh &q = bq.tmesh;
+
+    glLineWidth(1.5f);
+    glColor4f(0.35f, 0.62f, 0.98f, 0.95f);
+
+    for (size_t f = 0; f < q.faces.size(); ++f) {
+        const int nu = static_cast<int>(q.sideSum(static_cast<int>(f), 0));
+        const int nv = static_cast<int>(q.sideSum(static_cast<int>(f), 1));
+
+        // A block the quantization collapsed has no cells to draw, but it
+        // is still part of the decomposition: outline it, so the region
+        // reads as a block with no subdivision rather than as a hole.
+        if (nu <= 0 || nv <= 0) {
+            for (int s = 0; s < 4; ++s) {
+                for (int e : q.faces[f].sides[s]) {
+                    glBegin(GL_LINE_STRIP);
+                    for (const Point &p : bq.edgeGeometry[e]) glVertex2d(p[0], p[1]);
+                    glEnd();
+                }
+            }
+            continue;
+        }
+
+        // The four sides on a common (u, v) frame: bottom and left run away
+        // from corner 0, top and right toward corner 2, so opposite sides
+        // are parametrized alike.
+        const SideCurve bottom = sideCurve(bq, static_cast<int>(f), 0);
+        const SideCurve right  = sideCurve(bq, static_cast<int>(f), 1);
+        const SideCurve top    = sideCurve(bq, static_cast<int>(f), 2).reversed();
+        const SideCurve left   = sideCurve(bq, static_cast<int>(f), 3).reversed();
+
+        // An inconsistent quantization would leave opposite sides with
+        // different cell counts; there is no grid to draw then.
+        if (bottom.cells() != nu || top.cells()  != nu ||
+            right.cells()  != nv || left.cells() != nv) {
+            continue;
+        }
+
+        for (int i = 0; i <= nu; ++i) {
+            const double u = static_cast<double>(i) / nu;
+            glBegin(GL_LINE_STRIP);
+            for (int k = 0; k <= nv * QUANT_CURVE_SUBDIV; ++k) {
+                const Point p = coons(bottom, top, left, right, u,
+                                      static_cast<double>(k) /
+                                          (nv * QUANT_CURVE_SUBDIV));
+                glVertex2d(p[0], p[1]);
+            }
+            glEnd();
+        }
+        for (int j = 0; j <= nv; ++j) {
+            const double v = static_cast<double>(j) / nv;
+            glBegin(GL_LINE_STRIP);
+            for (int k = 0; k <= nu * QUANT_CURVE_SUBDIV; ++k) {
+                const Point p = coons(bottom, top, left, right,
+                                      static_cast<double>(k) /
+                                          (nu * QUANT_CURVE_SUBDIV), v);
+                glVertex2d(p[0], p[1]);
+            }
+            glEnd();
+        }
+    }
+    glLineWidth(1.0f);
+}
+
+namespace {
+
 // Fewer decimals for a coarse step (ticks land on whole numbers) and more
 // for a fine one, so a label never reads as more precise than the spacing
 // it names, e.g. step=0.05 -> "0.05" not "0.050000" or "0".

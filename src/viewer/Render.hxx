@@ -16,6 +16,7 @@
 #include "sipg/SIPG.hxx"
 #include "medialaxis/MedialAxis.hxx"
 #include "medialaxis/MedialAxisTMesh.hxx"
+#include "quantization/QuantTMeshConvert.hxx"
 #include "tracing/QuadLayout.hxx"
 #include "UMBER/MotorcycleGraph.hxx"
 #include "UMBER/Polysquare.hxx"
@@ -103,6 +104,19 @@ void drawMedialAxis(const MedialAxis &ma, double vertexRadius);
 // axis chains in full class colour on top, and the kept medial vertices as
 // block corners. `cornerRadius` sizes the corner disks.
 void drawMedialTMesh(const MedialAxisTMesh &tm, double cornerRadius);
+
+// The quantized block decomposition: the integer edge lengths the QGP
+// quantizer settled on, drawn as the quad grid they prescribe -- edges
+// only, no fill.
+//
+// Every grid line is a transfinite (Coons) curve through the four sides of
+// its block, evaluated against their real geometry rather than chords
+// between the corners, so the cells follow the block's curvature and the
+// outermost lines reproduce the curved sides exactly. Cell corners sit on
+// the quantization ticks, so the grids of two faces meet flush along the
+// edge they share exactly when the quantization is consistent -- a
+// violated constraint shows up as a visible mismatch.
+void drawQuantizedBlocks(const BlockQuant &bq);
 
 // Draw X/Y coordinate axes through the origin, with tick marks spaced at a
 // "nice" round interval, so the mesh's scale stays readable no matter what

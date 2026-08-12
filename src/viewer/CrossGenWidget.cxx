@@ -95,9 +95,11 @@ MedialAxisPhase nextMedialAxisPhase(MedialAxisPhase p) {
         case MedialAxisPhase::DelaunayMesh: return MedialAxisPhase::MedialAxis;
         case MedialAxisPhase::MedialAxis:   return MedialAxisPhase::Map;
         case MedialAxisPhase::Map:          return MedialAxisPhase::TMesh;
-        case MedialAxisPhase::TMesh:        return MedialAxisPhase::TMesh;
+        case MedialAxisPhase::TMesh:        return MedialAxisPhase::Quantize;
+        case MedialAxisPhase::Quantize:     return MedialAxisPhase::Quantized;
+        case MedialAxisPhase::Quantized:    return MedialAxisPhase::Quantized;
     }
-    return MedialAxisPhase::TMesh;
+    return MedialAxisPhase::Quantized;
 }
 
 const char *phaseName(Phase p) {
@@ -155,6 +157,8 @@ const char *medialAxisPhaseName(MedialAxisPhase p) {
         case MedialAxisPhase::MedialAxis:   return "3) Medial axis";
         case MedialAxisPhase::Map:          return "4) Boundary map";
         case MedialAxisPhase::TMesh:        return "5) Coarse block decomposition";
+        case MedialAxisPhase::Quantize:     return "6) Quantization";
+        case MedialAxisPhase::Quantized:    return "7) Quantized block decomposition";
     }
     return "?";
 }
@@ -453,6 +457,8 @@ void CrossGenWidget::doReset() {
     quadLayout_.reset();
     simplified_.reset();
     delaunayMesh_.reset();
+    blockQuant_.reset();
+    quantReport_ = TMeshQuantizer::Report{};
     medialAxisTMesh_.reset();
     medialAxisMap_.reset();
     medialAxis_.reset();
@@ -1608,6 +1614,76 @@ void CrossGenWidget::runComputations() {
         }
     }
 
+    // ── Medial Axis: quantization of the block decomposition (QGP Sec. 6) ────
+    //
+    // The blocks carry no shared-edge identifiers, so the converter welds
+    // them geometrically first: corners become nodes, block sides are split
+    // where another block's corner lands on them, and the T-junctions the
+    // red and purple templates leave on the mid-radii are recovered that
+    // way. xIdeal is 1 on every edge -- the block-decomposition setting of
+    // QGP Sec. 10.1, where Stage II drives each edge to its minimum and so
+    // acts as an automatic block-merging operator.
+    if (mode_ == Mode::MedialAxis && maPhase_ >= MedialAxisPhase::Quantize &&
+        medialAxisTMesh_.has_value() && !blockQuant_.has_value()) {
+        auto t0 = Clock::now();
+        blockQuant_.emplace(makeQuantTMesh(*medialAxisTMesh_));
+        auto t1 = Clock::now();
+
+        const BlockQuant &bq = *blockQuant_;
+        std::ostringstream oss;
+        oss << "[MedialAxis] T-mesh welded: " << bq.nodes.size() << " nodes, "
+            << bq.tmesh.edges.size() << " edges, " << bq.tmesh.faces.size()
+            << " faces, " << bq.tmesh.rows.size() << " constraints, from "
+            << medialAxisTMesh_->blocks.size() << " blocks: "
+            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+        if (bq.skippedBlocks > 0) {
+            std::ostringstream skip;
+            skip << "[MedialAxis] " << bq.skippedBlocks
+                 << " blocks dropped as unusable cells: " << bq.skippedNonQuad
+                 << " not four-sided, " << bq.skippedUnlocatable
+                 << " with a corner off their outline, " << bq.skippedDegenerate
+                 << " with two sides on one curve, " << bq.skippedOverlapping
+                 << " overlapping a pair already in place";
+            console_.log(skip.str());
+        }
+
+        if (!bq.ok) {
+            console_.log("[MedialAxis] Quantization aborted: " + bq.error);
+        } else {
+            auto q0 = Clock::now();
+            quantReport_ = TMeshQuantizer(blockQuant_->tmesh).run();
+            auto q1 = Clock::now();
+
+            int total = 0, maxLen = 0;
+            for (const auto &e : blockQuant_->tmesh.edges) {
+                total += e.x;
+                maxLen = std::max(maxLen, e.x);
+            }
+            std::ostringstream qss;
+            qss << "[MedialAxis] Quantized: " << quantReport_.stage1Vectors
+                << " stage-I strips, " << quantReport_.stage2Moves << "/"
+                << quantReport_.stage2Tried << " stage-II moves, objective "
+                << std::fixed << std::setprecision(3) << quantReport_.objective
+                << ", " << total << " quads across the boundary (longest edge "
+                << maxLen << "): "
+                << formatMs(std::chrono::duration<double, std::milli>(q1 - q0).count());
+            console_.log(qss.str());
+            if (quantReport_.forcedZeroEdges > 0) {
+                std::ostringstream zss;
+                zss << "[MedialAxis] " << quantReport_.forcedZeroEdges
+                    << " edges are forced to zero by the block decomposition "
+                       "itself (no strip runs through them); the blocks they "
+                       "collapse are outlined but carry no grid";
+                console_.log(zss.str());
+            }
+            if (!quantReport_.consistent) {
+                console_.log("[MedialAxis] WARNING: quantization violates the "
+                             "consistency system Ax = 0");
+            }
+        }
+    }
+
     // ── PolyVector: solve crossfield ──────────────────────────────────────────
     if (mode_ == Mode::PolyVector && phase_ >= Phase::CrossField && !field_.has_value()) {
         auto t0 = Clock::now();
@@ -2146,7 +2222,15 @@ void CrossGenWidget::renderNormal() {
         }
 
         if (medialAxis_) {
-            if (maPhase_ == MedialAxisPhase::TMesh && medialAxisTMesh_.has_value()) {
+            if (maPhase_ >= MedialAxisPhase::Quantized && blockQuant_.has_value() &&
+                blockQuant_->ok) {
+                // The integer edge lengths as the quad grid they prescribe:
+                // transfinite curves through each block's four curved
+                // sides, edges only. Grids meeting flush across a block
+                // wall are the quantization's consistency made visible.
+                viewer::drawQuantizedBlocks(*blockQuant_);
+            } else if (maPhase_ >= MedialAxisPhase::TMesh &&
+                       medialAxisTMesh_.has_value()) {
                 // The coarse block decomposition (Fig. 1-left / Fig. 3c):
                 // zones filled with a translucent tint of the class colour
                 // that picks their quad template, their walls over the fill,

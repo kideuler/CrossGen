@@ -26,6 +26,8 @@
 #include "medialaxis/MedialAxis.hxx"
 #include "medialaxis/MedialAxisMap.hxx"
 #include "medialaxis/MedialAxisTMesh.hxx"
+#include "quantization/QuantTMeshConvert.hxx"
+#include "quantization/TMeshQuantizer.hxx"
 #include "OASIS/OASIS.hxx"
 #include "UMBER/BlockLayout.hxx"
 #include "UMBER/ChordCollapse.hxx"
@@ -104,12 +106,19 @@ enum class OASISPhase {
     Field    = 2,
 };
 
+// The last two stages are the quantization of Campen et al. 2015: Quantize
+// turns the block decomposition into the T-mesh consistency system and
+// solves it for integer edge lengths, and Quantized draws the quad grid
+// those lengths prescribe. They are split so the console reports the solve
+// before the picture that depends on it.
 enum class MedialAxisPhase {
     MeshOnly     = 0,
     DelaunayMesh = 1,
     MedialAxis   = 2,
     Map          = 3,
     TMesh        = 4,
+    Quantize     = 5,
+    Quantized    = 6,
 };
 
 // ── Widget ────────────────────────────────────────────────────────────────────
@@ -237,6 +246,11 @@ private:
     std::optional<MedialAxisMap> medialAxisMap_;
     // The Sec. 4 coarse block decomposition cut out by the map above.
     std::optional<MedialAxisTMesh> medialAxisTMesh_;
+    // The block decomposition welded into a QuantTMesh and quantized. Built
+    // from medialAxisTMesh_ and cleared with it. xIdeal is 1 everywhere: the
+    // target is the coarsest valid blocking, not a mesh of a given size.
+    std::optional<BlockQuant> blockQuant_;
+    TMeshQuantizer::Report quantReport_;
     std::optional<OASIS>       oasis_;
     // UMBER runs on the SIPG field held in sipgField_, so it needs no field of
     // its own; the cuts and the optimized frames are all that is added.

@@ -82,6 +82,12 @@ add_library(PolyVector SHARED
     src/medialaxis/MedialAxisMap.cxx
     src/medialaxis/MedialAxisTMesh.hxx
     src/medialaxis/MedialAxisTMesh.cxx
+    src/quantization/QuantTMesh.hxx
+    src/quantization/QuantTMesh.cxx
+    src/quantization/TMeshQuantizer.hxx
+    src/quantization/TMeshQuantizer.cxx
+    src/quantization/QuantTMeshConvert.hxx
+    src/quantization/QuantTMeshConvert.cxx
 )
 target_include_directories(PolyVector PUBLIC src)
 target_include_directories(PolyVector PUBLIC src/triangle)
@@ -108,6 +114,10 @@ target_link_libraries(TestMIQ PRIVATE PolyVector)
 # Test medial axis construction and phi-inverse mapping
 add_executable(TestMedialAxis src/utils/TestMedialAxis.cxx)
 target_link_libraries(TestMedialAxis PRIVATE PolyVector)
+
+# Test the QGP T-mesh quantizer and its converters
+add_executable(TestQuantization src/utils/TestQuantization.cxx)
+target_link_libraries(TestQuantization PRIVATE PolyVector)
 
 # Generate circle/ellipse topologies
 add_executable(GenerateCircleTopologies src/utils/GenerateCircleTopologies.cxx)
