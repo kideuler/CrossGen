@@ -55,6 +55,12 @@ enum class Phase {
     UVMesh       = 5,
 };
 
+// The last two stages quantize the block decomposition tracing left (Sec. 4
+// of Viertel et al. is a block decomposition already -- a QuadLayout's faces
+// are its blocks -- so this runs the same Campen et al. 2015 quantizer the
+// MedialAxisPhase stages below do, on the T-mesh a QuadLayout converts to
+// directly). Split the same way, so the console reports the solve before the
+// picture that depends on it.
 enum class MBOPhase {
     MeshOnly    = 1,
     CrossField  = 2,
@@ -63,6 +69,8 @@ enum class MBOPhase {
     Trace       = 5,
     Layout      = 6,
     Simplified  = 7,
+    Quantize    = 8,
+    Quantized   = 9,
 };
 
 enum class SIPGPhase {
@@ -208,6 +216,17 @@ private:
     bool sipgStageWantsField() const;
     bool sipgStageIsStepping() const;
 
+    // Nodes of the simplified layout that are T-junctions the quantization
+    // failed to resolve. A T-junction is found structurally -- three
+    // interior darts at a non-singularity; the stored kind can be stale
+    // after chord collapses merge nodes -- and one that welds is not
+    // returned: with every incident edge quantized >= 1 the grids on both
+    // sides place a tick on the junction and it becomes a regular vertex
+    // of the result. What is left hanging is a junction with an incident
+    // edge forced to zero, or bordering a component the conversion had to
+    // skip. Empty until traceQuant_ exists.
+    std::vector<int> hangingTJunctions() const;
+
     // rendering sub-routines called from paintGL
     void renderMBOAnimation();
     void renderSIPGAnimation();
@@ -240,6 +259,12 @@ private:
     // the layout before simplification survives alongside it and the two can be
     // drawn together.
     std::optional<PartitionSimplify> simplified_;
+    // simplified_'s layout converted to a QuantTMesh and quantized -- the
+    // same Sec. 6 solve blockQuant_ below runs, on the block decomposition
+    // tracing left rather than the medial axis one. xIdeal is 1 everywhere,
+    // for the same reason. Built from simplified_ and cleared with it.
+    std::optional<QuadLayoutQuant> traceQuant_;
+    TMeshQuantizer::Report traceQuantReport_;
     std::shared_ptr<Mesh>      delaunayMesh_;
     std::shared_ptr<MedialAxis> medialAxis_;
     // The Sec. 3 map phi from the boundary to the axis above; holds a

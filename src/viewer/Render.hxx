@@ -118,6 +118,15 @@ void drawMedialTMesh(const MedialAxisTMesh &tm, double cornerRadius);
 // violated constraint shows up as a visible mismatch.
 void drawQuantizedBlocks(const BlockQuant &bq);
 
+// The same, for the T-mesh a QuadLayout converts to directly (see
+// QuantTMeshConvert.hxx): the block decomposition tracing leaves after
+// separatrix tracing and chord collapse, rather than the medial axis one.
+//
+// `vertexRadius` > 0 marks every grid vertex with a disk of that radius --
+// block corners and interior cell corners alike, since after quantization
+// every crossing of two grid lines is a vertex of the final decomposition.
+void drawQuantizedLayout(const QuadLayoutQuant &lq, double vertexRadius = 0.0);
+
 // Draw X/Y coordinate axes through the origin, with tick marks spaced at a
 // "nice" round interval, so the mesh's scale stays readable no matter what
 // mode or phase is on screen. `vs` is the ViewState whose ortho is currently

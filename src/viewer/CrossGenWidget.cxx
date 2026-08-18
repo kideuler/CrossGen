@@ -60,9 +60,11 @@ MBOPhase nextMBOPhase(MBOPhase p) {
         case MBOPhase::Separatrices: return MBOPhase::Trace;
         case MBOPhase::Trace:        return MBOPhase::Layout;
         case MBOPhase::Layout:       return MBOPhase::Simplified;
-        case MBOPhase::Simplified:   return MBOPhase::Simplified;
+        case MBOPhase::Simplified:   return MBOPhase::Quantize;
+        case MBOPhase::Quantize:     return MBOPhase::Quantized;
+        case MBOPhase::Quantized:    return MBOPhase::Quantized;
     }
-    return MBOPhase::Simplified;
+    return MBOPhase::Quantized;
 }
 
 SIPGPhase nextSIPGPhase(SIPGPhase p) {
@@ -122,6 +124,8 @@ const char *mboPhaseName(MBOPhase p) {
         case MBOPhase::Trace:        return "5) trace";
         case MBOPhase::Layout:       return "6) quad layout";
         case MBOPhase::Simplified:   return "7) simplified partition";
+        case MBOPhase::Quantize:     return "8) Quantization";
+        case MBOPhase::Quantized:    return "9) Quantized block decomposition";
     }
     return "?";
 }
@@ -456,6 +460,8 @@ void CrossGenWidget::doReset() {
     separatrixTrace_.reset();
     quadLayout_.reset();
     simplified_.reset();
+    traceQuant_.reset();
+    traceQuantReport_ = TMeshQuantizer::Report{};
     delaunayMesh_.reset();
     blockQuant_.reset();
     quantReport_ = TMeshQuantizer::Report{};
@@ -1203,6 +1209,44 @@ bool CrossGenWidget::sipgStageIsStepping() const {
            (mode_ == Mode::UMBER && umberPhase_ == UMBERPhase::Stepping);
 }
 
+std::vector<int> CrossGenWidget::hangingTJunctions() const {
+    std::vector<int> out;
+    if (!traceQuant_.has_value() || !simplified_.has_value()) return out;
+    const QuadLayout &sl = simplified_->getLayout();
+    const auto &nodes = sl.getNodes();
+    const auto &arcs = sl.getArcs();
+    for (size_t n = 0; n < nodes.size(); ++n) {
+        // Structural T-junction: three arcs meeting in the interior at
+        // something that is not a singularity, the same test the layout's
+        // own report uses (QuadLayout::finish).
+        const auto &node = nodes[n];
+        if (node.darts.size() != 3 ||
+            node.kind == QuadLayout::NodeKind::Singularity) {
+            continue;
+        }
+        bool boundary = false;
+        for (const int d : node.darts) {
+            if (arcs[QuadLayout::arcOfDart(d)].onBoundary) boundary = true;
+        }
+        if (boundary) continue;
+
+        // Resolved by the quantization unless an incident edge was forced
+        // to zero (no tick lands on the junction, so no grid line leaves
+        // it) or an incident arc never became a T-mesh edge at all (it
+        // borders a skipped component, where no grid exists to weld with).
+        bool hanging = false;
+        for (const int d : node.darts) {
+            const int e = traceQuant_->edgeOfArc[QuadLayout::arcOfDart(d)];
+            if (e < 0 || traceQuant_->tmesh.edges[e].x <= 0) {
+                hanging = true;
+                break;
+            }
+        }
+        if (hanging) out.push_back(static_cast<int>(n));
+    }
+    return out;
+}
+
 // ── lazy computations ────────────────────────────────────────────────────────
 
 void CrossGenWidget::runComputations() {
@@ -1331,6 +1375,85 @@ void CrossGenWidget::runComputations() {
             << r.blockedByEnergy << " by the energy, " << r.rolledBack
             << " collapse(s) undone for breaking Proposition 2";
         console_.log(why.str());
+    }
+
+    // ── MBO: quantize the block decomposition the layout already is (QGP) ────
+    //
+    // A simplified QuadLayout's faces are already the blocks -- Sec. 4 of
+    // Viertel et al. is a block decomposition in the same sense Sec. 4 of
+    // Campen et al. is -- and its arcs are already shared edges, so the
+    // conversion is a relabeling rather than the geometric welding the
+    // medial axis blocks need. xIdeal is 1 on every edge, same as there:
+    // Stage II drives each edge to its minimum and acts as an automatic
+    // block-merging operator on top of what chord collapse already did.
+    if (mode_ == Mode::MBO && mboPhase_ >= MBOPhase::Quantize &&
+        simplified_.has_value() && !traceQuant_.has_value()) {
+        auto t0 = Clock::now();
+        traceQuant_.emplace(makeQuantTMesh(simplified_->getLayout()));
+        auto t1 = Clock::now();
+
+        const QuadLayoutQuant &lq = *traceQuant_;
+        std::ostringstream oss;
+        oss << "[Trace] T-mesh: " << lq.tmesh.edges.size() << " edges, "
+            << lq.tmesh.faces.size() << " faces, " << lq.tmesh.rows.size()
+            << " constraints, from " << simplified_->getLayout().getFaces().size()
+            << " components: "
+            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+        if (lq.skippedFaces > 0) {
+            console_.log("[Trace] " + std::to_string(lq.skippedFaces) +
+                         " component(s) not four-sided, drawn unquantized "
+                         "rather than left as a gap");
+        }
+        // The report's count is structural (QuadLayout::finish), so it can
+        // be trusted after the collapses; the node kinds cannot.
+        const int tJunctions = simplified_->getLayout().getReport().tJunctions;
+        if (tJunctions > 0) {
+            console_.log("[Trace] " + std::to_string(tJunctions) +
+                         " T-junction(s) in the block structure; the "
+                         "quantized grids weld across a T-junction, so "
+                         "each becomes a regular vertex of the result");
+        }
+
+        if (!lq.ok) {
+            console_.log("[Trace] Quantization aborted: " + lq.error);
+        } else {
+            auto q0 = Clock::now();
+            traceQuantReport_ = TMeshQuantizer(traceQuant_->tmesh).run();
+            auto q1 = Clock::now();
+
+            int total = 0, maxLen = 0;
+            for (const auto &e : traceQuant_->tmesh.edges) {
+                total += e.x;
+                maxLen = std::max(maxLen, e.x);
+            }
+            std::ostringstream qss;
+            qss << "[Trace] Quantized: " << traceQuantReport_.stage1Vectors
+                << " stage-I strips, " << traceQuantReport_.stage2Moves << "/"
+                << traceQuantReport_.stage2Tried << " stage-II moves, objective "
+                << std::fixed << std::setprecision(3) << traceQuantReport_.objective
+                << ", " << total << " quads across the boundary (longest edge "
+                << maxLen << "): "
+                << formatMs(std::chrono::duration<double, std::milli>(q1 - q0).count());
+            console_.log(qss.str());
+            if (traceQuantReport_.forcedZeroEdges > 0) {
+                std::ostringstream zss;
+                zss << "[Trace] " << traceQuantReport_.forcedZeroEdges
+                    << " edges are forced to zero by the decomposition itself: "
+                       "no consistent assignment can lift them";
+                console_.log(zss.str());
+            }
+            const size_t hanging = hangingTJunctions().size();
+            if (hanging > 0) {
+                console_.log("[Trace] WARNING: " + std::to_string(hanging) +
+                             " T-junction(s) left hanging by zero edges or "
+                             "skipped components -- shown in red");
+            }
+            if (!traceQuantReport_.consistent) {
+                console_.log("[Trace] WARNING: quantization violates the "
+                             "consistency system Ax = 0");
+            }
+        }
     }
 
     // ── SIPG: Initialize ──────────────────────────────────────────────────────
@@ -2052,8 +2175,16 @@ void CrossGenWidget::renderNormal() {
         } // end else (non-UVMesh SIPG phases)
     } else if (mode_ == Mode::MBO) {
         viewer::drawAxis(view_);
-        viewer::drawMesh(*mesh_);
-        if (mboPhase_ >= MBOPhase::CrossField && crossField_.has_value()) {
+        // The quantized grid is the payoff of this whole mode, and the
+        // triangulation underneath only buries it -- the medial axis mode's
+        // Quantized phase drops the mesh the same way.
+        if (mboPhase_ < MBOPhase::Quantized) viewer::drawMesh(*mesh_);
+        // The crossfield answers "why did the separatrices go where they
+        // went"; once the quantized grid is up that question is moot and
+        // the crosses only clutter the block decomposition it took the
+        // rest of the pipeline to produce.
+        if (mboPhase_ >= MBOPhase::CrossField && mboPhase_ < MBOPhase::Quantized &&
+            crossField_.has_value()) {
             if (mboPhase_ >= MBOPhase::Stepping && mboStepCount_ > 0)
                 viewer::drawVertexCrossFieldUK(*mesh_, *crossField_, scale_);
             else
@@ -2083,7 +2214,36 @@ void CrossGenWidget::renderNormal() {
         // the same curves cut at the nodes, plus the pieces of the boundary
         // that close the components, so drawing both would only double the
         // interior lines and still leave the outline out.
-        if (mboPhase_ >= MBOPhase::Simplified && simplified_.has_value()) {
+        if (mboPhase_ >= MBOPhase::Quantized && traceQuant_.has_value() && traceQuant_->ok) {
+            // The integer edge lengths as the quad grid they prescribe, same
+            // as the medial axis mode's Quantized phase: transfinite curves
+            // through each component's four sides -- plus a yellow disk on
+            // every grid vertex, interior cell corners included, since after
+            // quantization every crossing of two grid lines is a vertex of
+            // the finished decomposition. That covers the block-structure
+            // T-junctions too: with every edge quantized >= 1 the grids
+            // meeting at one weld flush and it is a regular vertex of the
+            // result, not a defect to flag.
+            //
+            // Sized by the model, not by the mesh: vertices are as far
+            // apart as cells are, and cells scale with the model, so a
+            // radius in mesh edges vanishes on any finely meshed model.
+            // view_.zoom is 1.0 at fit and shrinks as the view zooms in, so
+            // scaling by it keeps the markers the same size on screen.
+            const double sceneDiag = std::hypot(bounds_.maxx - bounds_.minx,
+                                                bounds_.maxy - bounds_.miny);
+            const double nodeRadius = 0.010 * sceneDiag * view_.zoom;
+            viewer::drawQuantizedLayout(*traceQuant_, nodeRadius);
+
+            // Red only for the junctions quantization could NOT resolve:
+            // an incident edge forced to zero, or a component the
+            // conversion skipped. Found structurally, since the stored
+            // node kinds go stale once chord collapses merge nodes.
+            for (const int n : hangingTJunctions()) {
+                viewer::drawDisk3D(simplified_->getLayout().getNodes()[n].pos,
+                                   1.3 * nodeRadius, 0.95f, 0.1f, 0.1f);
+            }
+        } else if (mboPhase_ >= MBOPhase::Simplified && simplified_.has_value()) {
             viewer::drawQuadLayoutArcs(simplified_->getLayout(), 3.0f, 0.95f, 0.2f, 0.2f);
             // view_.zoom is 1.0 at fit and shrinks as the view zooms in, so
             // scaling the radius by it makes the markers shrink along with it

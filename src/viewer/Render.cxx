@@ -775,10 +775,20 @@ void drawMedialTMesh(const MedialAxisTMesh &tm, double cornerRadius) {
 
 namespace {
 
-// Line segments per cell along a grid curve. A curve crossing a cell is
-// only as bent as the sides it interpolates, so a handful of segments is
-// already past the point where more would show.
+// Line segments per cell along a grid curve, as a floor rather than the
+// measure: see gridSamples() below for why the cell count alone is not
+// enough to decide how finely a grid line has to be walked.
 constexpr int QUANT_CURVE_SUBDIV = 8;
+
+// Ceiling on the samples one grid line may take, so a block sitting on a
+// pathologically dense stretch of boundary cannot cost unbounded time.
+constexpr int QUANT_CURVE_MAX_SAMPLES = 2000;
+
+// Width of every line of the quantized picture -- grid lines, the outlines
+// of blocks with no grid, and the outlines of components that never made it
+// into the T-mesh. Kept in one place so those three cannot drift apart:
+// they are all meant to read as the same decomposition.
+constexpr float QUANT_LINE_WIDTH = 3.0f;
 
 // Transfinite (Coons) interpolation between the four sides of a block.
 // Along each side the formula collapses to that side's own geometry, so a
@@ -795,13 +805,112 @@ Point coons(const SideCurve &bottom, const SideCurve &top,
                 top.at(1.0)    * (u * v));
 }
 
+// Total turning of a side's polyline, unsigned: how far its direction
+// rotates from one end to the other. Near zero for a straight or gently
+// curved side; approaching 2*pi for a side that wraps a hole.
+double sideWinding(const std::vector<Point> &pts) {
+    double total = 0.0;
+    Point prev{0.0, 0.0};
+    bool havePrev = false;
+    for (size_t i = 1; i < pts.size(); ++i) {
+        const Point d = pts[i] - pts[i - 1];
+        if (normP(d) <= 0.0) continue;
+        if (havePrev) {
+            total += std::atan2(prev[0] * d[1] - prev[1] * d[0],
+                                prev[0] * d[0] + prev[1] * d[1]);
+        }
+        prev = d;
+        havePrev = true;
+    }
+    return std::fabs(total);
+}
+
+// Above this winding, a pair of sides no longer looks anything like the
+// straight rails of a quad and the Coons shape terms taken from the other
+// pair stop being a correction and start being a lie (see below).
+constexpr double QUANT_WINDING_LIMIT = 2.0 * M_PI / 3.0;
+
+// The arc length behind SideCurve::at(t): the tick-interpolated position,
+// as a fraction of the side's full length.
+double arcFractionAt(const SideCurve &sc, double t) {
+    const int n = sc.cells();
+    if (n <= 0 || sc.length <= 0.0) return 0.0;
+    const double s = std::min(std::max(t, 0.0), 1.0) * n;
+    int i = static_cast<int>(s);
+    if (i >= n) i = n - 1;
+    const double f = s - i;
+    return (sc.tickAt[i] + (sc.tickAt[i + 1] - sc.tickAt[i]) * f) / sc.length;
+}
+
+// One point of a ruled interior line between sides A and B of a winding
+// pair: at parameter w in [0, 1] the line has slid from A's endpoint tick
+// (arc fraction fa of A) to B's (fb of B), and sits at the blend of the two
+// sides sampled at the *interpolated* fraction. A plain chord from tick to
+// tick is not enough: on a block that wraps a hole the two ticks can sit at
+// different angles around it, and the chord then cuts straight across.
+// Sliding the fraction keeps the line inside the band the two sides bound,
+// and it still lands exactly on both ticks.
+Point ruledPoint(const SideCurve &a, const SideCurve &b, double fa, double fb,
+                 double w) {
+    const double f = fa * (1.0 - w) + fb * w;
+    return a.atArc(f * a.length) * (1.0 - w) + b.atArc(f * b.length) * w;
+}
+
+// How finely to walk a grid line that spans `cells` cells and runs
+// alongside the two sides `a` and `b`.
+//
+// The cell count on its own is the wrong measure. With xIdeal = 1 Stage II
+// drives every edge toward its minimum, so `cells` is routinely 1, while a
+// single block side can be a long run of the model boundary carrying
+// hundreds of polyline points. Scaling by cells alone would then draw that
+// side as QUANT_CURVE_SUBDIV straight segments -- and since the Coons
+// formula collapses to the side's own geometry at u = 0 and u = 1, the
+// outermost grid line *is* that side, so the block visibly stops following
+// the boundary it was cut from and reads as a coarse polygon.
+//
+// The sides know their own true geometry, so ask them: enough samples to
+// resolve every point they carry, and never fewer than the per-cell floor.
+int gridSamples(int cells, const SideCurve &a, const SideCurve &b) {
+    const int byCells = std::max(1, cells) * QUANT_CURVE_SUBDIV;
+    const int byGeometry = static_cast<int>(a.pts.size() + b.pts.size());
+    return std::clamp(std::max(byCells, byGeometry), 1, QUANT_CURVE_MAX_SAMPLES);
+}
+
 }  // namespace
 
-void drawQuantizedBlocks(const BlockQuant &bq) {
+namespace {
+
+// Shared by drawQuantizedBlocks() and drawQuantizedLayout(): both quant
+// structs (BlockQuant, QuadLayoutQuant) carry a QuantTMesh plus per-edge
+// geometry and per-side reversal flags, and sideCurve() is overloaded on
+// both, so the grid-drawing walk below only needs the type as a parameter.
+//
+// `vertexRadius` > 0 additionally marks every grid vertex -- every point
+// where two grid lines cross, block corners and interior cell corners
+// alike -- with a disk of that radius. They are all vertices of the final
+// quad decomposition: a block-structure T-junction included, since with
+// every edge quantized >= 1 the grids of the faces meeting there weld
+// flush and the point is a regular vertex of the result.
+template <typename Quant>
+void drawQuantizedTMesh(const Quant &bq, double vertexRadius = 0.0) {
     const QuantTMesh &q = bq.tmesh;
 
-    glLineWidth(1.5f);
+    glLineWidth(QUANT_LINE_WIDTH);
     glColor4f(0.35f, 0.62f, 0.98f, 0.95f);
+
+    // Every edge of a face at its own full geometry: what to fall back on
+    // whenever the face has no grid to draw. Drawing it beats leaving a
+    // hole, and since it is the edge polylines themselves it follows the
+    // boundary exactly.
+    const auto outlineFace = [&](size_t f) {
+        for (int s = 0; s < 4; ++s) {
+            for (int e : q.faces[f].sides[s]) {
+                glBegin(GL_LINE_STRIP);
+                for (const Point &p : bq.edgeGeometry[e]) glVertex2d(p[0], p[1]);
+                glEnd();
+            }
+        }
+    };
 
     for (size_t f = 0; f < q.faces.size(); ++f) {
         const int nu = static_cast<int>(q.sideSum(static_cast<int>(f), 0));
@@ -811,13 +920,7 @@ void drawQuantizedBlocks(const BlockQuant &bq) {
         // is still part of the decomposition: outline it, so the region
         // reads as a block with no subdivision rather than as a hole.
         if (nu <= 0 || nv <= 0) {
-            for (int s = 0; s < 4; ++s) {
-                for (int e : q.faces[f].sides[s]) {
-                    glBegin(GL_LINE_STRIP);
-                    for (const Point &p : bq.edgeGeometry[e]) glVertex2d(p[0], p[1]);
-                    glEnd();
-                }
-            }
+            outlineFace(f);
             continue;
         }
 
@@ -830,34 +933,140 @@ void drawQuantizedBlocks(const BlockQuant &bq) {
         const SideCurve left   = sideCurve(bq, static_cast<int>(f), 3).reversed();
 
         // An inconsistent quantization would leave opposite sides with
-        // different cell counts; there is no grid to draw then.
+        // different cell counts, and then there is no grid to lay down --
+        // but the block is still there, so outline it rather than dropping
+        // it out of the picture without a word.
         if (bottom.cells() != nu || top.cells()  != nu ||
             right.cells()  != nv || left.cells() != nv) {
+            outlineFace(f);
             continue;
         }
 
-        for (int i = 0; i <= nu; ++i) {
-            const double u = static_cast<double>(i) / nu;
+        const int sampleU = gridSamples(nu, bottom, top);
+        const int sampleV = gridSamples(nv, left, right);
+
+        // Which interpolant each family of interior lines gets.
+        //
+        // An iso-u line hangs its endpoints on bottom and top and takes its
+        // shape through the interior from left and right (and vice versa
+        // for iso-v). On a block that wraps a hole -- left and right two
+        // near-full circles, bottom and top the short cut between them --
+        // that borrowing inverts: an iso-v line's endpoints travel around
+        // the ring with left and right, while its shape terms stay pinned
+        // to the cut's position, and the line is dragged clear across the
+        // hole and out of the block. So when a family's *endpoint* pair
+        // winds far more than its *shape* pair, drop the shape terms and
+        // rule straight between the endpoints: for the ring that is a
+        // radial chord, which is exactly right. The other family keeps
+        // Coons -- its lines run along the winding and the winding sides
+        // are then its shape terms, which is what carries them around.
+        const double windB = sideWinding(bottom.pts), windT = sideWinding(top.pts);
+        const double windL = sideWinding(left.pts), windR = sideWinding(right.pts);
+        const bool ruledU = std::max(windB, windT) > QUANT_WINDING_LIMIT &&
+                            std::max(windB, windT) > std::max(windL, windR);
+        const bool ruledV = std::max(windL, windR) > QUANT_WINDING_LIMIT &&
+                            std::max(windL, windR) > std::max(windB, windT);
+
+        // The outermost grid lines are the block's own sides: the Coons
+        // formula collapses to left/right at u = 0/1 and to bottom/top at
+        // v = 0/1. So draw those four from their polylines verbatim rather
+        // than resampling them.
+        //
+        // This is not just cheaper, it is the only way to get them right.
+        // Sampling walks a side at even steps of arc length, and even
+        // steps need not land on the side's own vertices -- so wherever a
+        // side turns a genuine corner between two of them, the drawn line
+        // cuts it off, and no amount of extra sampling fixes it because
+        // the corner is a real kink and not a resolution artifact. Traced
+        // layouts have such corners: a block side that runs along the
+        // model boundary inherits every corner of it. Drawn from the
+        // polyline the side is exact, kinks included, so a block that sits
+        // on the boundary conforms to it exactly.
+        const auto strip = [](const std::vector<Point> &pts) {
             glBegin(GL_LINE_STRIP);
-            for (int k = 0; k <= nv * QUANT_CURVE_SUBDIV; ++k) {
-                const Point p = coons(bottom, top, left, right, u,
-                                      static_cast<double>(k) /
-                                          (nv * QUANT_CURVE_SUBDIV));
+            for (const Point &p : pts) glVertex2d(p[0], p[1]);
+            glEnd();
+        };
+
+        for (int i = 0; i <= nu; ++i) {
+            if (i == 0)  { strip(left.pts);  continue; }
+            if (i == nu) { strip(right.pts); continue; }
+            const double u = static_cast<double>(i) / nu;
+            const double fb = arcFractionAt(bottom, u), ft = arcFractionAt(top, u);
+            glBegin(GL_LINE_STRIP);
+            for (int k = 0; k <= sampleV; ++k) {
+                const double v = static_cast<double>(k) / sampleV;
+                const Point p = ruledU ? ruledPoint(bottom, top, fb, ft, v)
+                                       : coons(bottom, top, left, right, u, v);
                 glVertex2d(p[0], p[1]);
             }
             glEnd();
         }
         for (int j = 0; j <= nv; ++j) {
+            if (j == 0)  { strip(bottom.pts); continue; }
+            if (j == nv) { strip(top.pts);    continue; }
             const double v = static_cast<double>(j) / nv;
+            const double fl = arcFractionAt(left, v), fr = arcFractionAt(right, v);
             glBegin(GL_LINE_STRIP);
-            for (int k = 0; k <= nu * QUANT_CURVE_SUBDIV; ++k) {
-                const Point p = coons(bottom, top, left, right,
-                                      static_cast<double>(k) /
-                                          (nu * QUANT_CURVE_SUBDIV), v);
+            for (int k = 0; k <= sampleU; ++k) {
+                const double u = static_cast<double>(k) / sampleU;
+                const Point p = ruledV ? ruledPoint(left, right, fl, fr, u)
+                                       : coons(bottom, top, left, right, u, v);
                 glVertex2d(p[0], p[1]);
             }
             glEnd();
         }
+
+        // The grid vertices, on the same interpolants as the lines so the
+        // disks land exactly on the crossings. Where a family is ruled its
+        // line is the trustworthy one, so its point wins; ticks on the
+        // sides come from the sides themselves either way. Shared ticks are
+        // drawn once per incident face, which is harmless overdraw.
+        if (vertexRadius > 0.0) {
+            for (int i = 0; i <= nu; ++i) {
+                const double u = static_cast<double>(i) / nu;
+                const double fb = arcFractionAt(bottom, u);
+                const double ft = arcFractionAt(top, u);
+                for (int j = 0; j <= nv; ++j) {
+                    const double v = static_cast<double>(j) / nv;
+                    Point p{0.0, 0.0};
+                    if (i == 0)       p = left.at(v);
+                    else if (i == nu) p = right.at(v);
+                    else if (j == 0)  p = bottom.at(u);
+                    else if (j == nv) p = top.at(u);
+                    else if (ruledU)  p = ruledPoint(bottom, top, fb, ft, v);
+                    else if (ruledV)  p = ruledPoint(left, right,
+                                                     arcFractionAt(left, v),
+                                                     arcFractionAt(right, v), u);
+                    else              p = coons(bottom, top, left, right, u, v);
+                    drawDisk3D(p, vertexRadius, 0.98f, 0.85f, 0.1f);
+                }
+            }
+            // The disks painted over the line color; restore it for the
+            // next face's grid.
+            glColor4f(0.35f, 0.62f, 0.98f, 0.95f);
+        }
+    }
+    glLineWidth(1.0f);
+}
+
+}  // namespace
+
+void drawQuantizedBlocks(const BlockQuant &bq) { drawQuantizedTMesh(bq); }
+
+void drawQuantizedLayout(const QuadLayoutQuant &lq, double vertexRadius) {
+    drawQuantizedTMesh(lq, vertexRadius);
+
+    // Components that were not four-sided took no part in the quantization,
+    // but they are still ground the partition covers -- outline them in the
+    // same blue, unsubdivided, so the picture has no hole where one sits and
+    // the domain boundary stays unbroken across its share of it.
+    glLineWidth(QUANT_LINE_WIDTH);
+    glColor4f(0.35f, 0.62f, 0.98f, 0.95f);
+    for (const auto &outline : lq.skippedOutlines) {
+        glBegin(GL_LINE_STRIP);
+        for (const Point &p : outline) glVertex2d(p[0], p[1]);
+        glEnd();
     }
     glLineWidth(1.0f);
 }

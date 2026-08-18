@@ -32,6 +32,26 @@ struct QuadLayoutQuant {
     QuantTMesh tmesh;
     std::vector<int> edgeOfArc;      // layout arc -> tmesh edge, -1 if unused
     std::vector<int> faceOfLayout;   // layout face -> tmesh face, -1 skipped
+
+    // Geometry for rendering, in the same shape BlockQuant carries it: a
+    // layout arc already is the finest shared unit between its two faces, so
+    // unlike the block welder above this needs no splitting -- one arc is
+    // one tmesh edge and its polyline is that edge's geometry directly, in
+    // the arc's own a -> b direction.
+    std::vector<std::vector<Point>> edgeGeometry;  // tmesh edge -> polyline
+    // Whether a side's edge runs against that a -> b direction, per face,
+    // per side, per edge of that side: dart parity (see QuadLayout::Arc).
+    std::vector<std::array<std::vector<char>, 4>> sideReversed;
+
+    // A face that is not four-sided is not a T-mesh cell and cannot be
+    // quantized, but it still occupies real ground in the model -- dropping
+    // it silently would leave a hole in the picture, and if it sits on the
+    // domain boundary that hole opens straight through the outline. Its true
+    // outline (every arc of it, walked in face order and true geometry) is
+    // kept here instead, so the renderer can draw it unsubdivided the same
+    // way it already draws a block the quantizer collapsed to zero cells.
+    std::vector<std::vector<Point>> skippedOutlines;
+
     int skippedFaces = 0;
     bool ok = false;
     std::string error;
@@ -114,5 +134,6 @@ struct SideCurve {
 
 // Requires a quantized tmesh.
 SideCurve sideCurve(const BlockQuant &bq, int face, int side);
+SideCurve sideCurve(const QuadLayoutQuant &lq, int face, int side);
 
 #endif  // _QUANT_TMESH_CONVERT_HXX_

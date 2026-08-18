@@ -275,17 +275,40 @@ QuadLayoutQuant makeQuantTMesh(const QuadLayout &layout, double h) {
         const QuadLayout::Face &f = faces[fi];
         if (f.sides.size() != 4) {
             ++out.skippedFaces;
+            // Not a T-mesh cell, but still real ground: walk every dart of
+            // it in face order, true geometry, so the outline is exactly
+            // the boundary this component actually has -- including its
+            // share of the domain boundary, if any.
+            std::vector<Point> outline;
+            for (int dart : f.darts) {
+                const int arc = QuadLayout::arcOfDart(dart);
+                std::vector<Point> pts = arcs[arc].pts;
+                if (dart & 1) std::reverse(pts.begin(), pts.end());
+                const size_t start = outline.empty() ? 0 : 1;
+                outline.insert(outline.end(), pts.begin() + start, pts.end());
+            }
+            out.skippedOutlines.push_back(std::move(outline));
             continue;
         }
         std::array<std::vector<int>, 4> sides;
+        std::array<std::vector<char>, 4> reversed;
         for (int s = 0; s < 4; ++s) {
             for (int dart : f.sides[s]) {
-                sides[s].push_back(
-                    edgeFor(out, arcs, QuadLayout::arcOfDart(dart), h));
+                const int arc = QuadLayout::arcOfDart(dart);
+                const int e = edgeFor(out, arcs, arc, h);
+                if (e >= static_cast<int>(out.edgeGeometry.size())) {
+                    out.edgeGeometry.resize(e + 1);
+                    out.edgeGeometry[e] = arcs[arc].pts;
+                }
+                sides[s].push_back(e);
+                // Dart parity: 2*arc+0 runs a -> b, the direction pts is
+                // stored in; 2*arc+1 is the reverse.
+                reversed[s].push_back((dart & 1) ? 1 : 0);
             }
         }
         out.faceOfLayout[fi] = out.tmesh.addFace(sides[0], sides[1],
                                                  sides[2], sides[3]);
+        out.sideReversed.push_back(std::move(reversed));
     }
 
     out.ok = out.tmesh.finalize(&out.error);
@@ -486,13 +509,21 @@ SideCurve SideCurve::reversed() const {
     return r;
 }
 
-SideCurve sideCurve(const BlockQuant &bq, int face, int side) {
+namespace {
+
+// Shared by both sideCurve() overloads below: the two quant structs carry
+// their per-edge geometry and per-side reversal flags in the same shape,
+// just under different names, so only this needs to know the layout.
+SideCurve sideCurveImpl(const QuantTMesh &tmesh,
+                        const std::vector<std::vector<Point>> &edgeGeometry,
+                        const std::vector<std::array<std::vector<char>, 4>> &sideReversed,
+                        int face, int side) {
     SideCurve out;
-    const std::vector<int> &edges = bq.tmesh.faces[face].sides[side];
-    const std::vector<char> &rev = bq.sideReversed[face][side];
+    const std::vector<int> &edges = tmesh.faces[face].sides[side];
+    const std::vector<char> &rev = sideReversed[face][side];
     for (size_t i = 0; i < edges.size(); ++i) {
         const int e = edges[i];
-        std::vector<Point> geometry = bq.edgeGeometry[e];
+        std::vector<Point> geometry = edgeGeometry[e];
         if (i < rev.size() && rev[i]) {
             std::reverse(geometry.begin(), geometry.end());
         }
@@ -511,8 +542,27 @@ SideCurve sideCurve(const BlockQuant &bq, int face, int side) {
         }
         // A zero edge contributes no tick: the grid has no cell across it.
         const double len = out.length - base;
-        const int n = std::max(0, bq.tmesh.edges[e].x);
+        const int n = std::max(0, tmesh.edges[e].x);
         for (int k = 1; k <= n; ++k) out.tickAt.push_back(base + len * k / n);
     }
+    // A side that *ends* in zero edges has geometry past its last tick, and
+    // at(1.0) would stop there rather than at the corner -- the Coons
+    // corner terms then subtract the wrong point and every interior grid
+    // line of the face inherits the offset. Snap the last tick to the full
+    // length: the zero edge is parametrically zero wide, so its geometry
+    // belongs to the final cell -- the mirror image of what already happens
+    // at the start of a side, where tick 0 sits at the true corner and a
+    // leading zero edge falls into the first cell.
+    if (out.tickAt.size() > 1) out.tickAt.back() = out.length;
     return out;
+}
+
+}  // namespace
+
+SideCurve sideCurve(const BlockQuant &bq, int face, int side) {
+    return sideCurveImpl(bq.tmesh, bq.edgeGeometry, bq.sideReversed, face, side);
+}
+
+SideCurve sideCurve(const QuadLayoutQuant &lq, int face, int side) {
+    return sideCurveImpl(lq.tmesh, lq.edgeGeometry, lq.sideReversed, face, side);
 }
