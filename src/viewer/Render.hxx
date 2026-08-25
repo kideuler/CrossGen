@@ -11,7 +11,9 @@
 
 #include "MERIDIAN/ConeCut.hxx"
 #include "MERIDIAN/ConeSingularities.hxx"
+#include "MERIDIAN/Immersion.hxx"
 #include "MERIDIAN/RicciFlow.hxx"
+#include "MERIDIAN/SubdomainLabels.hxx"
 #include "Parameterization/CutMesh.hxx"
 #include "Parameterization/MIQ.hxx"
 #include "Parameterization/UVGParam.hxx"
@@ -321,5 +323,38 @@ void computeConeFanBounds(const std::vector<ConeFan> &fans,
 
 void drawConeFans(const std::vector<ConeFan> &fans);
 
-} // namespace viewer
+// ── MERIDIAN: the layout Psi on Omega ────────────────────────────────────────
+//
+// Stages 4 to 6 are the first ones that produce a *map*, so unlike everything
+// above they have a second geometry of their own to draw: Omega laid out in the
+// plane, at psi_R out of Stage 4 and at Psi out of Stage 6. Both are drawn by
+// the same routine, since the difference between them is what the picture is
+// for -- the same triangulation, the same seams and the same cones, moved.
+//
+// What each colour is answering, in the order Definition 2.1 asks it:
+//
+//   red fill      a triangle with det J < 0. Q1 has failed there, and E1's
+//                 barrier cannot repair it, so one is a defect and not a
+//                 blemish.
+//   blue / green  the boundary edges of Gamma_u and Gamma_v out of Stage 5.
+//                 Q3 says each is on a constant-coordinate line, so once the
+//                 continuation has converged every blue run is vertical and
+//                 every green one horizontal, and a run that is neither is
+//                 exactly where the Q3 residual lives.
+//   amber/magenta the two banks of each arc of G. Q4 says they are the same
+//                 curve up to R_k, so they are drawn apart: an arc whose two
+//                 banks are not congruent has not met E4.
+//   cone disks    the same index colours drawCones() uses on the model, at
+//                 every child of the cone in Omega. An interior cone that the
+//                 cut opened appears once per child.
 
+// View bounds for the layout panel (call once, when the map lands).
+void computeLayoutBounds(const std::vector<Point> &uv,
+                         double &cx, double &cy, double &baseW, double &baseH);
+
+// `labels` may be null, which drops the Gamma_u / Gamma_v colouring and leaves
+// the boundary in grey -- what psi_R looks like before Stage 5 has run.
+void drawLayoutUV(const Immersion &imm, const SubdomainLabels *labels,
+                  const std::vector<Point> &uv, double coneRadius);
+
+} // namespace viewer

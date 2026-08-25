@@ -2068,5 +2068,130 @@ void drawConeFans(const std::vector<ConeFan> &fans) {
     }
 }
 
-} // namespace viewer
+// ============================================================================
+// MERIDIAN -- the layout Psi on Omega
+// ============================================================================
 
+void computeLayoutBounds(const std::vector<Point> &uv,
+                         double &cx, double &cy, double &baseW, double &baseH) {
+    cx = cy = 0.0;
+    baseW = baseH = 1.0;
+    if (uv.empty()) return;
+
+    double minx = 1e300, maxx = -1e300, miny = 1e300, maxy = -1e300;
+    for (const Point &p : uv) {
+        minx = std::min(minx, p[0]);  maxx = std::max(maxx, p[0]);
+        miny = std::min(miny, p[1]);  maxy = std::max(maxy, p[1]);
+    }
+    const double du = maxx - minx, dv = maxy - miny;
+    double ext = std::max(du, dv);
+    if (!(ext > 0.0)) ext = 1.0;
+    const double pad = 0.08 * ext;
+
+    cx = 0.5 * (minx + maxx);
+    cy = 0.5 * (miny + maxy);
+    baseW = std::max(1e-9, du + 2.0 * pad);
+    baseH = std::max(1e-9, dv + 2.0 * pad);
+}
+
+void drawLayoutUV(const Immersion &imm, const SubdomainLabels *labels,
+                  const std::vector<Point> &uv, double coneRadius) {
+    const Mesh &cm = imm.getCutMesh();
+    const int nV = static_cast<int>(uv.size());
+    if (nV == 0) return;
+
+    auto ok = [&](int v) { return v >= 0 && v < nV; };
+
+    // Q1 first, underneath everything: a triangle the map turned over. It is
+    // filled rather than outlined because a fold is usually a handful of
+    // triangles in a crease and an outline of one is lost among the wireframe.
+    glColor4f(0.9f, 0.1f, 0.1f, 0.45f);
+    glBegin(GL_TRIANGLES);
+    for (const auto &tri : cm.triangles) {
+        const int i = tri[0], j = tri[1], k = tri[2];
+        if (!ok(i) || !ok(j) || !ok(k)) continue;
+        const double area2 = (uv[j][0] - uv[i][0]) * (uv[k][1] - uv[i][1]) -
+                             (uv[k][0] - uv[i][0]) * (uv[j][1] - uv[i][1]);
+        if (area2 < 0.0) {
+            glVertex2d(uv[i][0], uv[i][1]);
+            glVertex2d(uv[j][0], uv[j][1]);
+            glVertex2d(uv[k][0], uv[k][1]);
+        }
+    }
+    glEnd();
+
+    // The triangulation, in the same cyan the other parameter domains use.
+    glColor3f(0.3f, 0.8f, 0.9f);
+    glLineWidth(1.0f);
+    glBegin(GL_LINES);
+    for (const auto &tri : cm.triangles) {
+        for (int e = 0; e < 3; ++e) {
+            const int a = tri[e], b = tri[(e + 1) % 3];
+            if (!ok(a) || !ok(b)) continue;
+            glVertex2d(uv[a][0], uv[a][1]);
+            glVertex2d(uv[b][0], uv[b][1]);
+        }
+    }
+    glEnd();
+
+    // The two banks of each arc of G. Drawn apart because Q4 is a statement
+    // about the pair: they are the same curve up to R_k, and an arc whose banks
+    // are not congruent is where E4 still has work.
+    glLineWidth(2.5f);
+    for (const Immersion::Arc &arc : imm.getArcs()) {
+        for (int side = 0; side < 2; ++side) {
+            const std::vector<int> &chain = side == 0 ? arc.plusChain : arc.minusChain;
+            if (chain.size() < 2) continue;
+            if (side == 0) glColor4f(0.98f, 0.70f, 0.15f, 0.95f);
+            else           glColor4f(0.90f, 0.25f, 0.90f, 0.95f);
+            glBegin(GL_LINE_STRIP);
+            for (const int v : chain) {
+                if (!ok(v)) continue;
+                glVertex2d(uv[v][0], uv[v][1]);
+            }
+            glEnd();
+        }
+    }
+
+    // dS, coloured by the label Stage 5 gave it. Q3 is read straight off this:
+    // every blue run should be vertical and every green one horizontal.
+    glLineWidth(3.0f);
+    glBegin(GL_LINES);
+    if (labels) {
+        for (const auto &be : labels->boundaryEdges()) {
+            if (!ok(be.a) || !ok(be.b)) continue;
+            if (be.label == SubdomainLabels::Align::U)      glColor3f(0.35f, 0.55f, 0.95f);
+            else if (be.label == SubdomainLabels::Align::V) glColor3f(0.20f, 0.85f, 0.40f);
+            else                                            glColor3f(0.70f, 0.70f, 0.72f);
+            glVertex2d(uv[be.a][0], uv[be.a][1]);
+            glVertex2d(uv[be.b][0], uv[be.b][1]);
+        }
+    } else {
+        glColor3f(0.70f, 0.70f, 0.72f);
+        for (const int be : cm.boundaryEdges) {
+            const int a = cm.edges[be][0], b = cm.edges[be][1];
+            if (!ok(a) || !ok(b)) continue;
+            glVertex2d(uv[a][0], uv[a][1]);
+            glVertex2d(uv[b][0], uv[b][1]);
+        }
+    }
+    glEnd();
+    glLineWidth(1.0f);
+
+    // The cones, at every child the cut left them with, in the index colours
+    // the model panel uses -- so a cone can be found in both halves at once.
+    if (coneRadius > 0.0) {
+        const std::vector<std::vector<int>> &children = imm.getConeChildren();
+        const std::vector<int> &idx = imm.getConeIndices();
+        for (size_t c = 0; c < children.size(); ++c) {
+            float r, g, b;
+            coneColor(c < idx.size() ? idx[c] : 0, r, g, b);
+            for (const int v : children[c]) {
+                if (!ok(v)) continue;
+                drawDisk3D(Point{uv[v][0], uv[v][1]}, coneRadius, r, g, b);
+            }
+        }
+    }
+}
+
+} // namespace viewer

@@ -15,7 +15,10 @@
 #include "mesh/Mesh.hxx"
 #include "MERIDIAN/ConeCut.hxx"
 #include "MERIDIAN/ConeSingularities.hxx"
+#include "MERIDIAN/Immersion.hxx"
+#include "MERIDIAN/LayoutEnergy.hxx"
 #include "MERIDIAN/RicciFlow.hxx"
+#include "MERIDIAN/SubdomainLabels.hxx"
 #include "Parameterization/CutMesh.hxx"
 #include "Parameterization/HarmonicCut.hxx"
 #include "Parameterization/MIQ.hxx"
@@ -144,6 +147,18 @@ enum class UMBERPhase {
 //              the right each cone's one-ring unfolded *in that metric*, which
 //              is the only place the cone angles themselves can be seen. See
 //              viewer::ConeFan.
+//
+//   Layout     Stages 4, 5 and 6 together -- the metric immersion psi_R, the
+//              subdomain labelling, and the penalty continuation that turns the
+//              first into Psi. They are one phase rather than three because
+//              only the first and the last have a picture, and the first is the
+//              last's starting point: psi_R and Psi are the same triangulation
+//              in the same plane, and what Stage 6 did is the difference
+//              between them, which is only visible if the continuation is run
+//              before anything is drawn. Split screen, like SIPG mode's UVMesh
+//              phase -- the model on the left and the parameter domain on the
+//              right -- because this is the first stage that produces a map,
+//              and a map is a thing with two ends.
 enum class MERIDIANPhase {
     MeshOnly   = 1,
     CrossField = 2,
@@ -152,6 +167,7 @@ enum class MERIDIANPhase {
     Cut        = 5,
     RicciFlow  = 6,
     Metric     = 7,
+    Layout     = 8,
 };
 
 // OASIS is a one-shot solve driven by a parameter dialog rather than a
@@ -268,6 +284,12 @@ private:
     // and what the Cut and RicciFlow phases draw their cones and graph over.
     void renderMERIDIANModel();
 
+    // Stages 4 to 6 in one go: unfold the flat metric into the plane, label the
+    // subdomains, and run the penalty continuation of Eq. (13). Blocking and
+    // announced a frame ahead, like the Ricci solve, and by some way the
+    // longest of the MERIDIAN stages.
+    void runMERIDIANLayout();
+
     // Whether a parameter domain occupies the right half of the window.
     bool inUVSplitScreen() const;
 
@@ -374,6 +396,18 @@ private:
     // not the pinned vertex's value.
     Eigen::VectorXd                  ricciU_;
     double                           ricciUAbsMax_ = 1.0;
+    // Stages 4 to 6. Each holds a reference to the one before it -- Immersion
+    // to the cut, the flow and the cones, SubdomainLabels to the immersion,
+    // LayoutEnergy to both -- so they are destroyed in the reverse order and
+    // never rebuilt without clearing the ones above them.
+    std::optional<Immersion>         immersion_;
+    std::optional<SubdomainLabels>   meridianLabels_;
+    std::optional<LayoutEnergy>      meridianLayout_;
+    // psi_R kept alongside Psi: LayoutEnergy moves its copy in place, so the
+    // map Stage 6 started from is otherwise gone by the time there is anything
+    // to compare it with. 'p' toggles which of the two the right panel shows.
+    std::vector<Point>               psiR_;
+    bool                             showPsiR_ = false;
 
     // Guiding field for the OASIS orientation term. Held by shared_ptr because
     // OASIS keeps a reference to it for as long as it lives; separate from
@@ -437,6 +471,8 @@ private:
     bool cutAttempted_         = false;
     bool ricciAnnounced_       = false;
     bool ricciAttempted_       = false;
+    bool layoutAnnounced_      = false;
+    bool layoutAttempted_      = false;
 
     // Chord collapse settings, surviving a reset the way oasisLambda_ does so
     // that the dialog opens on whatever was tried last.

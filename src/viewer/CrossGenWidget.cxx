@@ -99,9 +99,10 @@ MERIDIANPhase nextMERIDIANPhase(MERIDIANPhase p) {
         case MERIDIANPhase::Cones:      return MERIDIANPhase::Cut;
         case MERIDIANPhase::Cut:        return MERIDIANPhase::RicciFlow;
         case MERIDIANPhase::RicciFlow:  return MERIDIANPhase::Metric;
-        case MERIDIANPhase::Metric:     return MERIDIANPhase::Metric;
+        case MERIDIANPhase::Metric:     return MERIDIANPhase::Layout;
+        case MERIDIANPhase::Layout:     return MERIDIANPhase::Layout;
     }
-    return MERIDIANPhase::Metric;
+    return MERIDIANPhase::Layout;
 }
 
 MedialAxisPhase nextMedialAxisPhase(MedialAxisPhase p) {
@@ -176,6 +177,7 @@ const char *meridianPhaseName(MERIDIANPhase p) {
         case MERIDIANPhase::Cut:        return "5) cutting graph (Sec. 3.2.2)";
         case MERIDIANPhase::RicciFlow:  return "6) discrete Ricci flow (Sec. 3.2.1)";
         case MERIDIANPhase::Metric:     return "7) flat cone metric";
+        case MERIDIANPhase::Layout:     return "8) layout Psi (Secs. 3.2.2, 3.3)";
     }
     return "?";
 }
@@ -355,6 +357,24 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
         }
         break;
 
+    case Qt::Key_P:
+        // The right half of the MERIDIAN layout phase carries two maps of the
+        // same domain -- Stage 4's psi_R and Stage 6's Psi -- and the whole of
+        // what Sec. 3.3 does is the difference between them, which is only
+        // visible by swapping one for the other in place.
+        if (mode_ == Mode::MERIDIAN && meridianPhase_ == MERIDIANPhase::Layout &&
+            meridianLayout_.has_value() && !psiR_.empty()) {
+            showPsiR_ = !showPsiR_;
+            const std::vector<Point> &uv = showPsiR_ ? psiR_ : meridianLayout_->getUV();
+            viewer::computeLayoutBounds(uv, uvView_.cx, uvView_.cy,
+                                        uvView_.baseW, uvView_.baseH);
+            uvView_.zoom = 1.0;
+            console_.log(showPsiR_ ? "[Layout] right panel: psi_R, the Stage 4 immersion"
+                                   : "[Layout] right panel: Psi, the Stage 6 layout");
+            update();
+        }
+        break;
+
     case Qt::Key_1:
         if (mode_ == Mode::Unselected && phase_ == Phase::MeshOnly) {
             mode_ = Mode::PolyVector;
@@ -414,7 +434,7 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
         if (mode_ == Mode::Unselected && phase_ == Phase::MeshOnly) {
             mode_ = Mode::MERIDIAN;
             std::cerr << "[Viewer] Selected mode: " << modeName(mode_) << " (press 'c' to advance)\n";
-            console_.log("Selected mode: MERIDIAN (Shepherd, Gu and Hughes 2022, Stages 1-3)");
+            console_.log("Selected mode: MERIDIAN (Shepherd, Gu and Hughes 2022, Stages 1-6)");
         }
         break;
 
@@ -518,7 +538,14 @@ void CrossGenWidget::doReset() {
     blocks_.reset();
     umberCorners_.clear();
     umberInternal_.clear();
-    // Ricci and the cut both hold on to the cone set, so they go first.
+    // Each MERIDIAN stage holds on to the ones before it, so they go in
+    // reverse: the layout on the labels and the immersion, the immersion on the
+    // cut, the flow and the cones, and both the flow and the cut on the cones.
+    meridianLayout_.reset();
+    meridianLabels_.reset();
+    immersion_.reset();
+    psiR_.clear();
+    showPsiR_ = false;
     ricci_.reset();
     coneCut_.reset();
     cones_.reset();
@@ -556,6 +583,8 @@ void CrossGenWidget::doReset() {
     cutAttempted_         = false;
     ricciAnnounced_       = false;
     ricciAttempted_       = false;
+    layoutAnnounced_      = false;
+    layoutAttempted_      = false;
 
     view_.cx    = 0.5 * (bounds_.minx + bounds_.maxx);
     view_.cy    = 0.5 * (bounds_.miny + bounds_.maxy);
@@ -1426,6 +1455,182 @@ void CrossGenWidget::runRicciFlow() {
     }
 }
 
+// Stages 4, 5 and 6 in one go, Secs. 3.2.2 and 3.3. They are one viewer phase
+// because only the ends of the sequence have a picture and the two are the same
+// picture moved: psi_R is where Stage 6 starts and Psi is where it stops, drawn
+// on the same triangulation in the same plane, so 'p' swaps between them rather
+// than 'c' advancing from one to the other.
+//
+// Blocking, and the longest wait in the mode -- the continuation is sixteen
+// outer steps of up to sixty inner Newton-like solves each -- so it is
+// announced a frame ahead like the Ricci solve.
+//
+// The three stages fail differently and are handled differently. A fold out of
+// Stage 4 is terminal: E1's barrier keeps local injectivity and cannot restore
+// it, so the continuation is not started at all and psi_R is left on screen as
+// the thing to look at. A continuation that runs but does not converge is not
+// terminal -- what it produced is still a map, still worth drawing, and its
+// residuals are what say which property it failed.
+void CrossGenWidget::runMERIDIANLayout() {
+    layoutAttempted_ = true;
+    if (!coneCut_.has_value() || !ricci_.has_value() || !cones_.has_value()) return;
+
+    // Fit the right panel to whichever map is about to be shown there.
+    auto fitPanel = [this](const std::vector<Point> &uv) {
+        if (uv.empty()) return;
+        viewer::computeLayoutBounds(uv, uvView_.cx, uvView_.cy,
+                                    uvView_.baseW, uvView_.baseH);
+        uvView_.zoom = 1.0;
+        uvView_.fbw  = view_.fbw;
+        uvView_.fbh  = view_.fbh;
+    };
+
+    // ── Stage 4: the metric immersion psi_R ──────────────────────────────────
+    auto t0 = Clock::now();
+    try {
+        immersion_.emplace(*coneCut_, *ricci_, *cones_);
+    } catch (const std::exception &e) {
+        immersion_.reset();
+        console_.log(std::string("[Immersion] FAILED: ") + e.what());
+        std::cerr << "[Viewer] Immersion failed: " << e.what() << "\n";
+        return;
+    }
+    auto t1 = Clock::now();
+
+    const Immersion::Report &ir = immersion_->getReport();
+    psiR_ = immersion_->getUV();
+    showPsiR_ = false;
+    fitPanel(psiR_);
+
+    {
+        std::ostringstream oss;
+        oss << "[Immersion] " << ir.placedVertices << "/" << ir.cutVertices
+            << " vertices placed, image " << std::fixed << std::setprecision(3)
+            << (ir.uvMax[0] - ir.uvMin[0]) << " x " << (ir.uvMax[1] - ir.uvMin[1])
+            << (ir.mirrored ? " (reflected)" : "") << ", "
+            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Immersion] metric realised to " << std::scientific << std::setprecision(2)
+            << ir.maxMetricResidual << " relative, closure gap " << ir.maxClosureGap
+            << "; Q1 " << (ir.flippedFaces == 0 ? "[PASS]" : "[FAIL]") << " ("
+            << ir.flippedFaces << " flipped face(s))";
+        console_.log(oss.str());
+        std::cerr << "[Viewer] " << oss.str() << "\n";
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Immersion] " << ir.arcs << " arc(s), " << ir.seamEdgePairs
+            << " seam pair(s); Gamma_Hol_0..3 = " << ir.holonomyCount[0] << ", "
+            << ir.holonomyCount[1] << ", " << ir.holonomyCount[2] << ", "
+            << ir.holonomyCount[3] << "; Q4 snap " << std::scientific
+            << std::setprecision(2) << ir.maxSnapError << " rad";
+        console_.log(oss.str());
+    }
+    if (ir.clusteredConePairs > 0) {
+        std::ostringstream oss;
+        oss << "[Immersion] " << ir.clusteredConePairs << " clustered cone pair(s), closest "
+            << std::scientific << std::setprecision(2) << ir.minConeSeparation
+            << " of the model apart -- Q2 usually ends up limited by this";
+        console_.log(oss.str());
+    }
+    for (const std::string &m : ir.messages) console_.log("[Immersion] " + m);
+
+    if (ir.flippedFaces > 0 || ir.unplacedVertices > 0) {
+        console_.log("[Immersion] psi_R does not satisfy Q1; the continuation of Sec. 3.3 "
+                     "can only preserve it, never repair it, so it was not run");
+        return;
+    }
+
+    // ── Stage 5: subdomain labelling ─────────────────────────────────────────
+    t0 = Clock::now();
+    try {
+        meridianLabels_.emplace(*immersion_);
+    } catch (const std::exception &e) {
+        meridianLabels_.reset();
+        console_.log(std::string("[Labels] FAILED: ") + e.what());
+        std::cerr << "[Viewer] SubdomainLabels failed: " << e.what() << "\n";
+        return;
+    }
+    t1 = Clock::now();
+
+    const SubdomainLabels::Report &sr = meridianLabels_->getReport();
+    {
+        std::ostringstream oss;
+        oss << "[Labels] dS: " << sr.boundaryEdges << " edge(s) -> Gamma_u "
+            << sr.boundaryEdgesU << ", Gamma_v " << sr.boundaryEdgesV << " in "
+            << sr.boundaryChains << " chain(s)";
+        if (sr.ambiguousBoundaryEdges > 0) oss << " (" << sr.ambiguousBoundaryEdges << " near-tied)";
+        oss << ", " << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Labels] features: " << sr.featureEdges << " edge(s) in " << sr.featureChains
+            << " chain(s); Gamma_topo: " << sr.topoPaths << " path(s) from "
+            << sr.separatrices << " separatrix/-ces (" << sr.separatricesToCone
+            << " to a cone, " << sr.separatricesCapped << " unresolved)";
+        console_.log(oss.str());
+    }
+    for (const std::string &m : sr.messages) console_.log("[Labels] " + m);
+
+    // ── Stage 6: the layout-inducing energies ────────────────────────────────
+    t0 = Clock::now();
+    bool ok = false;
+    try {
+        meridianLayout_.emplace(*immersion_, *meridianLabels_);
+        ok = meridianLayout_->run();
+    } catch (const std::exception &e) {
+        meridianLayout_.reset();
+        console_.log(std::string("[Layout] FAILED: ") + e.what());
+        std::cerr << "[Viewer] LayoutEnergy failed: " << e.what() << "\n";
+        return;
+    }
+    t1 = Clock::now();
+
+    const LayoutEnergy::Report &er = meridianLayout_->getReport();
+    fitPanel(meridianLayout_->getUV());
+
+    {
+        std::ostringstream oss;
+        oss << "[Layout] " << er.outerSteps << " outer step(s), " << er.innerIterations
+            << " inner iteration(s), " << er.referenceSwitches << " reference switch(es), "
+            << er.relabels << " relabel(s), "
+            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Layout] Q3 boundary " << std::scientific << std::setprecision(2)
+            << er.initialBoundaryResidual << " -> " << er.maxBoundaryResidual
+            << ", Q4 seam " << er.initialSeamResidual << " -> " << er.maxSeamResidual
+            << ", Q5 topo " << er.initialTopoResidual << " -> " << er.maxTopoResidual;
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Layout] Q1 det J >= " << std::fixed << std::setprecision(4) << er.minDetJ
+            << " (" << er.invertedTriangles << " inverted) " << (er.injective ? "[PASS]" : "[FAIL]")
+            << "; Q2 cone angles off by " << std::scientific << std::setprecision(2)
+            << er.maxConeAngleResidual << " rad " << (er.anglesHeld ? "[PASS]" : "[FAIL]");
+        if (er.coneValenceChanges > 0) oss << ", " << er.coneValenceChanges << " changed valence";
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Layout] Psi " << (ok ? "satisfies Q1-Q5: a quadrilateral layout in the sense "
+                                        "of Definition 2.1 [PASS]"
+                                      : "is not yet a layout; see the residuals above [FAIL]");
+        console_.log(oss.str());
+        std::cerr << "[Viewer] " << oss.str() << "\n";
+    }
+    for (const std::string &m : er.messages) console_.log("[Layout] " + m);
+    console_.log("[Layout] right panel = Psi; press 'p' for psi_R, the map it started from. "
+                 "Blue = Gamma_u, green = Gamma_v, amber/magenta = the two banks of each seam");
+}
+
 // ── phase advancement ────────────────────────────────────────────────────────
 
 void CrossGenWidget::advancePhase() {
@@ -1828,6 +2033,18 @@ void CrossGenWidget::runComputations() {
             ricciAnnounced_ = true;
         } else {
             runRicciFlow();
+        }
+    }
+
+    // ── MERIDIAN: Stages 4 to 6, psi_R through Psi ───────────────────────────
+    if (mode_ == Mode::MERIDIAN && meridianPhase_ >= MERIDIANPhase::Layout &&
+        ricci_.has_value() && !flatMetric_.edges.empty() && !layoutAttempted_) {
+        if (!layoutAnnounced_) {
+            console_.log("[Layout] unfolding psi_R and running the Eq. (13) continuation, "
+                         "this blocks...");
+            layoutAnnounced_ = true;
+        } else {
+            runMERIDIANLayout();
         }
     }
 
@@ -2296,7 +2513,11 @@ bool CrossGenWidget::inUVSplitScreen() const {
            // it is a second world with its own scale in the right half of the
            // window, which is all this predicate is really asking.
            (mode_ == Mode::MERIDIAN && meridianPhase_ == MERIDIANPhase::Metric &&
-            !coneFans_.empty());
+            !coneFans_.empty()) ||
+           // Stages 4 to 6 do have a parameter domain in the ordinary sense:
+           // psi_R and Psi are maps of Omega into the plane.
+           (mode_ == Mode::MERIDIAN && meridianPhase_ == MERIDIANPhase::Layout &&
+            immersion_.has_value());
 }
 
 void CrossGenWidget::applyHalfOrtho(int x, int vpW, const viewer::ViewState &vs) const {
@@ -2750,6 +2971,42 @@ void CrossGenWidget::renderNormal() {
             // failed to leave the interior.
             renderUMBERField();
         }
+    } else if (mode_ == Mode::MERIDIAN && meridianPhase_ == MERIDIANPhase::Layout &&
+               immersion_.has_value()) {
+        // ── Split-screen: left = the model, right = Omega in the plane ───────
+        //
+        // The same arrangement SIPG mode's UVMesh phase uses, and for the same
+        // reason: this is the first MERIDIAN stage that produces a map, and a
+        // map is only readable against the thing it is a map of. The right half
+        // is Psi once the continuation has run and psi_R before it -- or after
+        // it, on 'p', which is the only way to see what Stage 6 actually did.
+        const std::vector<Point> &uv =
+            (meridianLayout_.has_value() && !showPsiR_) ? meridianLayout_->getUV() : psiR_;
+
+        const int w = fbw();
+        const int halfW = w / 2;
+
+        applyHalfOrtho(0, halfW, view_);
+        {
+            viewer::ViewState leftVs = view_;
+            leftVs.fbw = halfW;
+            leftVs.fbh = fbh();
+            viewer::drawAxis(leftVs);
+        }
+        renderMERIDIANModel();
+
+        applyHalfOrtho(halfW, w - halfW, uvView_);
+        {
+            // Sized by the image rather than by the mesh, so the cones stay
+            // visible on a finely triangulated model, and scaled by the zoom so
+            // they keep their size on screen.
+            const double diag = std::hypot(uvView_.baseW, uvView_.baseH);
+            viewer::drawLayoutUV(*immersion_,
+                                 meridianLabels_.has_value() ? &*meridianLabels_ : nullptr,
+                                 uv, 0.010 * diag * uvView_.zoom);
+        }
+
+        drawSplitDivider(halfW);
     } else if (mode_ == Mode::MERIDIAN && meridianPhase_ == MERIDIANPhase::Metric &&
                !coneFans_.empty()) {
         // ── Split-screen: left = the flat metric on the model, right = the
@@ -2925,6 +3182,9 @@ void CrossGenWidget::renderNormal() {
     } else if (mode_ == Mode::OASIS) {
         renderOverlay("press 'c' to change lambda / orientation\n"
                       "press 'r' to restart\npress 'q' to quit");
+    } else if (mode_ == Mode::MERIDIAN && meridianPhase_ == MERIDIANPhase::Layout &&
+               meridianLayout_.has_value()) {
+        renderOverlay("press 'p' to swap psi_R / Psi\npress 'r' to restart\npress 'q' to quit");
     } else if (mode_ == Mode::UMBER && umberPhase_ == UMBERPhase::Simplified) {
         renderOverlay("press 'c' to change the collapse settings\n"
                       "press 'r' to restart\npress 'q' to quit");
