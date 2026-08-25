@@ -160,6 +160,26 @@ public:
     // them. With no flips this is the whole metric in the caller's indexing.
     std::vector<double> originalEdgeLengths() const;
 
+    // The same, with the flipped-away edges filled in rather than left at -1.
+    //
+    // Stage 4 lays out the *geometric* triangulation -- Omega is built on the
+    // input faces, and the feature and boundary bookkeeping of Stages 5 to 8 is
+    // keyed on them -- so it needs a length for every input edge, including the
+    // ones the flow no longer carries. The practical note of Sec. 3.2.1 is to
+    // keep the two triangulations apart and "map back at the end"; this is that
+    // mapping.
+    //
+    // The fill is not an approximation. cos(phi_ij) is measured once from the
+    // input metric and is a property of the *edge*, not of the triangulation it
+    // sits in: the flow only ever moves gamma. So an input edge that was
+    // flipped away still has the length Eq. (11) gives it from its own
+    // cos(phi_ij) and the converged u, which is exactly the length the flow
+    // would have produced for it had the flip never happened. What a flip does
+    // change is the metric's *realisability* on those faces -- the flip
+    // happened because a face stopped closing -- so `recovered` comes back with
+    // the count and Immersion reports any face that still fails to close.
+    std::vector<double> originalEdgeLengthsCompleted(int *recovered = nullptr) const;
+
     // Largest relative disagreement between the assembled Hessian and a central
     // finite difference of K with respect to u, over `samples` vertices. The
     // Hessian is the one thing here that cannot be checked by looking at the
@@ -242,6 +262,10 @@ private:
     std::vector<std::array<int, 3>> faceEdges;
     std::unordered_map<EdgeKey, int, EdgeKeyHash> edgeIndex;
     std::unordered_map<EdgeKey, double, EdgeKeyHash> cosPhi; // persistent across flips
+    // cos(phi_ij) as first measured, keyed on the *input* edges. `cosPhi` loses
+    // an entry every time a flip retires an edge; this one never changes, which
+    // is what originalEdgeLengthsCompleted() reads.
+    std::unordered_map<EdgeKey, double, EdgeKeyHash> initialCosPhi;
 
     double tolerance = 1e-8;
     int maxIterations = 100;

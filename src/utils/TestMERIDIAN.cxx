@@ -1,14 +1,16 @@
-// Utility to run Stages 1-3 of Shepherd, Gu and Hughes (2022) on a mesh:
-// cone singularities from the SIPG cross field, the cutting graph and the cut
-// disk, the discrete Gauss-Bonnet check, and discrete surface Ricci flow.
+// Utility to run Stages 1-6 of Shepherd, Gu and Hughes (2022) on a mesh: cone
+// singularities from the SIPG cross field, the cutting graph and the cut disk,
+// the discrete Gauss-Bonnet check, discrete surface Ricci flow, the metric
+// immersion psi_R, the subdomain labelling, and the penalty continuation
+// against the layout-inducing energies.
 //
 //   TestMERIDIAN <mesh.obj> [options]
 //   TestMERIDIAN --selftest
 //
-// Reports each stage and exits non-zero if the pipeline did not reach a flat
-// cone metric on a disk. --selftest drives Stage 3 alone on prescribed cone
-// sets that the models in data/meshes never produce; see selfTest() for why
-// that is worth having.
+// Reports each stage and exits non-zero if the pipeline did not reach a valid
+// layout. --selftest drives Stage 3 alone on prescribed cone sets that the
+// models in data/meshes never produce; see selfTest() for why that is worth
+// having.
 
 #include <algorithm>
 #include <cmath>
@@ -204,7 +206,16 @@ void usage(const char *argv0) {
               << "  --no-flips         disable weighted-Delaunay flipping\n"
               << "  --no-rebalance     do not repair Eq. (4) automatically\n"
               << "  --cut <file.obj>   write the cut disk Omega\n"
-              << "  --cones <n>        list at most n cones          (default 20)\n";
+              << "  --cones <n>        list at most n cones          (default 20)\n"
+              << "  --outer <n>        penalty continuation steps    (default 10)\n"
+              << "  --inner <n>        inner iterations per step     (default 40)\n"
+              << "  --lambda <l>       initial lambda_2..lambda_5    (default 1e-2)\n"
+              << "  --growth <g>       lambda growth per outer step  (default 10)\n"
+              << "  --near-miss <f>    Gamma_topo seeding tolerance      (default 0.15)\n"
+              << "  --no-topo          skip the Gamma_topo seeding (E5 off)\n"
+              << "  --no-layout        stop after Stage 4\n"
+              << "  --psi <file.obj>   write psi_R, the Stage 4 immersion\n"
+              << "  --layout <file.obj> write Psi, the Stage 6 result\n";
 }
 
 } // namespace
@@ -215,7 +226,7 @@ int main(int argc, char **argv) {
 
     const std::string path = argv[1];
     MERIDIAN::Options opts;
-    std::string cutOut;
+    std::string cutOut, psiOut, layoutOut;
     int coneListLimit = 20;
 
     for (int i = 2; i < argc; ++i) {
@@ -228,6 +239,15 @@ int main(int argc, char **argv) {
         else if (a == "--no-rebalance")            opts.autoRebalance = false;
         else if (a == "--cut" && i + 1 < argc)     cutOut = argv[++i];
         else if (a == "--cones" && i + 1 < argc)   coneListLimit = std::stoi(argv[++i]);
+        else if (a == "--outer" && i + 1 < argc)   opts.outerSteps = std::stoi(argv[++i]);
+        else if (a == "--inner" && i + 1 < argc)   opts.innerIterations = std::stoi(argv[++i]);
+        else if (a == "--lambda" && i + 1 < argc)  opts.lambdaInit = std::stod(argv[++i]);
+        else if (a == "--growth" && i + 1 < argc)  opts.lambdaGrowth = std::stod(argv[++i]);
+        else if (a == "--no-topo")                 opts.seedTopoConstraints = false;
+        else if (a == "--near-miss" && i + 1 < argc) opts.topoNearMiss = std::stod(argv[++i]);
+        else if (a == "--no-layout")               opts.runLayout = false;
+        else if (a == "--psi" && i + 1 < argc)     psiOut = argv[++i];
+        else if (a == "--layout" && i + 1 < argc)  layoutOut = argv[++i];
         else { std::cerr << "Unknown option: " << a << "\n"; usage(argv[0]); return 1; }
     }
 
@@ -239,7 +259,7 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    std::cout << "MERIDIAN -- Shepherd, Gu and Hughes (2022), Stages 1-3\n";
+    std::cout << "MERIDIAN -- Shepherd, Gu and Hughes (2022), Stages 1-6\n";
     std::cout << "Mesh: " << path << "\n";
     std::cout << "  " << mesh->vertices.size() << " vertices, "
               << mesh->edges.size() << " edges, "
@@ -429,15 +449,186 @@ int main(int argc, char **argv) {
 
     for (const std::string &m : rr.messages) std::cout << "  " << kWarn << " " << m << "\n";
 
+    if (!st.readyForImmersion) {
+        heading("Result");
+        std::cout << "  " << kFail
+                  << " Pipeline did not reach a usable flat cone metric; see above.\n";
+        return 5;
+    }
+
+    // ---------------------------------------------------------------------
+    // Stage 4 -- the metric immersion psi_R
+    // ---------------------------------------------------------------------
+    heading("Stage 4  Metric immersion psi_R (Sec. 3.2.2)");
+    const Immersion &psi = pipeline.getImmersion();
+    const Immersion::Report &pr = psi.getReport();
+
+    std::cout << "  Omega laid out: " << pr.placedVertices << " of " << pr.cutVertices
+              << " vertices, image " << std::fixed << std::setprecision(3)
+              << (pr.uvMax[0] - pr.uvMin[0]) << " x " << (pr.uvMax[1] - pr.uvMin[1])
+              << std::defaultfloat << (pr.mirrored ? "  (reflected to positive orientation)" : "")
+              << "\n";
+    std::cout << "  Metric realised to " << std::scientific << std::setprecision(3)
+              << pr.maxMetricResidual << " relative; path-independence gap "
+              << pr.maxClosureGap << std::defaultfloat << "\n";
+    std::cout << "  Angle sums off target by " << std::scientific << std::setprecision(3)
+              << pr.maxConeAngleResidual << " rad at the cones, "
+              << pr.maxRegularAngleResidual << " elsewhere" << std::defaultfloat << "\n";
+    std::cout << "  Cutting graph: " << pr.arcs << " arc(s), " << pr.seamEdgePairs
+              << " seam edge pair(s); Gamma_Hol_0..3 = " << pr.holonomyCount[0] << ", "
+              << pr.holonomyCount[1] << ", " << pr.holonomyCount[2] << ", "
+              << pr.holonomyCount[3] << "\n";
+    std::cout << "  Transition fit: rotation snapped by at most " << std::scientific
+              << std::setprecision(3) << pr.maxSnapError << " rad, residual "
+              << pr.maxFitResidual << std::defaultfloat << "\n";
+    if (pr.alignedBoundaryEdge >= 0) {
+        std::cout << "  Rotated by " << std::fixed << std::setprecision(4) << pr.globalRotation
+                  << " rad to put boundary edge " << pr.alignedBoundaryEdge
+                  << " on an axis" << std::defaultfloat << "\n";
+    }
+
+    verdict(pr.unplacedVertices == 0, "Every vertex of Omega was placed");
+    verdict(pr.maxMetricResidual < 1e-6, "The unfolding realises the flat metric");
+    verdict(pr.maxClosureGap < 1e-6,
+            "The unfolding is path-independent (no cone enclosed by a loop)");
+    verdict(pr.flippedFaces == 0, "Q1: no face of psi_R is inverted");
+    verdict(pr.maxConeAngleResidual < 1e-6, "Q2: cone angle sums are multiples of pi/2");
+    verdict(pr.degenerateArcs == 0 && pr.maxSnapError < 1e-6,
+            "Q4: every arc's transition is exactly a quarter-turn rotation");
+    if (pr.clusteredConePairs > 0) {
+        std::cout << "  " << kWarn << " " << pr.clusteredConePairs
+                  << " clustered cone pair(s); closest " << std::scientific
+                  << std::setprecision(3) << pr.minConeSeparation
+                  << " of the model apart" << std::defaultfloat << "\n";
+    }
+    for (const std::string &m : pr.messages) std::cout << "  " << kWarn << " " << m << "\n";
+
+    if (!psiOut.empty()) {
+        if (psi.writeOBJ(psiOut)) std::cout << "  Wrote psi_R to " << psiOut << "\n";
+        else std::cout << "  " << kWarn << " Failed to write " << psiOut << "\n";
+    }
+
+    if (!pipeline.hasLabels()) {
+        heading("Result");
+        const bool immOk = pr.valid;
+        std::cout << "  " << (immOk ? kPass : kFail) << " "
+                  << (immOk ? "psi_R is a valid metric immersion (Stages 5 and 6 not run)."
+                            : "psi_R is not usable; the later stages were not run.")
+                  << "\n";
+        return immOk ? 0 : 5;
+    }
+
+    // ---------------------------------------------------------------------
+    // Stage 5 -- subdomain labelling
+    // ---------------------------------------------------------------------
+    heading("Stage 5  Subdomain labelling (Sec. 3.3)");
+    const SubdomainLabels &lab = pipeline.getLabels();
+    const SubdomainLabels::Report &sr = lab.getReport();
+
+    std::cout << "  dS: " << sr.boundaryEdges << " edge(s) -> Gamma_u " << sr.boundaryEdgesU
+              << ", Gamma_v " << sr.boundaryEdgesV << ", in " << sr.boundaryChains
+              << " chain(s)";
+    if (sr.ambiguousBoundaryEdges > 0) {
+        std::cout << "  (" << sr.ambiguousBoundaryEdges << " near-tied)";
+    }
+    std::cout << "\n";
+    std::cout << "  Features: " << sr.featureEdges << " edge(s) in " << sr.featureChains
+              << " chain(s) -> Gamma_u^feat " << sr.featureChainsU
+              << ", Gamma_v^feat " << sr.featureChainsV << "\n";
+    std::cout << "  Separatrices traced: " << sr.separatrices << " -> "
+              << sr.separatricesToCone << " to a cone, " << sr.separatricesToBoundary
+              << " out through dS, " << sr.separatricesCapped << " unresolved\n";
+    std::cout << "  Gamma_topo: " << sr.topoPaths << " path(s)";
+    if (sr.topoPaths > 0) {
+        std::cout << ", worst advance " << std::scientific << std::setprecision(3)
+                  << sr.maxTopoResidual << std::defaultfloat;
+    }
+    std::cout << "   (mean cone spacing " << std::fixed << std::setprecision(4)
+              << sr.meanConeSpacing << std::defaultfloat << ")\n";
+
+    verdict(sr.boundaryEdges > 0, "Every curve of dS carries a label");
+    for (const std::string &m : sr.messages) std::cout << "  " << kWarn << " " << m << "\n";
+
+    if (!pipeline.hasLayout()) {
+        heading("Result");
+        std::cout << "  " << kWarn << " Stage 6 was not run.\n";
+        return 0;
+    }
+
+    // ---------------------------------------------------------------------
+    // Stage 6 -- the layout-inducing energies
+    // ---------------------------------------------------------------------
+    heading("Stage 6  Layout-inducing energies (Sec. 3.3)");
+    const LayoutEnergy &lay = pipeline.getLayout();
+    const LayoutEnergy::Report &er = lay.getReport();
+
+    std::cout << "  Outer steps: " << er.outerSteps << " of " << opts.outerSteps
+              << ", inner iterations " << er.innerIterations
+              << ", line-search stops " << er.lineSearchFailures << "\n";
+    std::cout << "  lambda_2..5 reached " << std::scientific << std::setprecision(2)
+              << er.lambdaFinal[0] << ", " << er.lambdaFinal[1] << ", "
+              << er.lambdaFinal[2] << ", " << er.lambdaFinal[3] << std::defaultfloat;
+    if (er.referenceSwitches || er.relabels) {
+        std::cout << "   (" << er.referenceSwitches << " reference switch(es), "
+                  << er.relabels << " relabel(s))";
+    }
+    std::cout << "\n";
+    // The two totals are each measured at their own lambda, so the pair is not
+    // a decrease and is not meant to read as one: a rise means the penalties
+    // outgrew the distortion, which is what a working continuation looks like.
+    std::cout << "  Energy at lambda_init " << std::scientific << std::setprecision(4)
+              << er.energyStart << ", at the end " << er.energyEnd
+              << "   E1 " << er.e1 << ", E2 " << er.e2
+              << ", E3 " << er.e3 << ", E4 " << er.e4 << ", E5 " << er.e5
+              << std::defaultfloat << "\n";
+    std::cout << "  Residuals (relative to the image extent)\n";
+    std::cout << "     Q3 boundary  " << std::scientific << std::setprecision(3)
+              << er.initialBoundaryResidual << "  ->  " << er.maxBoundaryResidual << "\n";
+    std::cout << "     features     " << "        " << "  ->  " << er.maxFeatureResidual << "\n";
+    std::cout << "     Q4 seam      " << er.initialSeamResidual << "  ->  "
+              << er.maxSeamResidual << "\n";
+    std::cout << "     Q5 topo      " << er.initialTopoResidual << "  ->  "
+              << er.maxTopoResidual << std::defaultfloat << "\n";
+    std::cout << "  det J in [" << std::fixed << std::setprecision(4) << er.minDetJ
+              << ", ...], " << er.invertedTriangles << " inverted triangle(s)"
+              << std::defaultfloat << "\n";
+    std::cout << "  Q2 angle sums off the prescribed value by " << std::scientific
+              << std::setprecision(3) << er.maxConeAngleResidual << " rad at the cones, "
+              << er.maxRegularAngleResidual << " elsewhere" << std::defaultfloat;
+    if (er.coneValenceChanges > 0) {
+        std::cout << "; " << er.coneValenceChanges << " cone(s) changed valence";
+    }
+    std::cout << "\n";
+
+    const double gradErr = lay.checkGradient(32);
+    std::cout << "  Gradient vs. central difference: " << std::scientific
+              << std::setprecision(3) << gradErr << std::defaultfloat << " relative\n";
+
+    verdict(gradErr < 1e-4, "The assembled gradient matches a finite difference");
+    verdict(er.injective, "Q1: det J > 0 on every triangle");
+    verdict(er.maxSeamResidual < 1e-6, "Q4: seam transitions are exactly R_k");
+    verdict(er.maxBoundaryResidual < 1e-6, "Q3: every curve of dS is on a coordinate line");
+    verdict(er.maxFeatureResidual < 1e-6, "Feature chains are layout edges");
+    verdict(sr.topoPaths == 0 || er.maxTopoResidual < 1e-6,
+            "Q5: the connectivity constraints are met");
+    verdict(er.anglesHeld, "Q2: every cone kept the angle Stage 1 prescribed for it");
+    for (const std::string &m : er.messages) std::cout << "  " << kWarn << " " << m << "\n";
+
+    if (!layoutOut.empty()) {
+        if (lay.writeOBJ(layoutOut)) std::cout << "  Wrote Psi to " << layoutOut << "\n";
+        else std::cout << "  " << kWarn << " Failed to write " << layoutOut << "\n";
+    }
+
     // ---------------------------------------------------------------------
     heading("Result");
     if (ok) {
         std::cout << "  " << kPass
-                  << " Flat cone metric on a topological disk. Ready for Stage 4 "
-                  << "(metric immersion).\n";
+                  << " Psi satisfies Q1-Q5: a quadrilateral layout in the sense of "
+                  << "Definition 2.1. Ready for Stage 7 (separatrix tracing).\n";
     } else {
         std::cout << "  " << kFail
-                  << " Pipeline did not reach a usable flat cone metric; see above.\n";
+                  << " The continuation did not reach a valid layout; see the residuals "
+                  << "above.\n";
     }
     return ok ? 0 : 5;
 }

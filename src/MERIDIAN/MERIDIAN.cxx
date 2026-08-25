@@ -103,5 +103,59 @@ bool MERIDIAN::run() {
     status.readyForImmersion = status.conesAdmissible && status.cutIsDisk &&
                                status.allConesOnBoundary && status.ricciConverged &&
                                ricci->getReport().nonRealisableFaces == 0;
-    return status.readyForImmersion;
+    if (!status.readyForImmersion) {
+        status.messages.push_back(
+            "Stopping before the immersion: the flat cone metric on a disk that Stage 4 "
+            "unfolds is not there yet.");
+        return false;
+    }
+
+    // --- Stage 4: metric immersion, Sec. 3.2.2 ----------------------------
+    immersion = std::make_unique<Immersion>(*cutter, *ricci, *cones);
+    const Immersion::Report &ir = immersion->getReport();
+    status.immersionValid = ir.valid;
+    status.immersionFlippedFaces = ir.flippedFaces;
+    status.seamArcs = ir.arcs;
+    for (const std::string &m : ir.messages) status.messages.push_back("Stage 4: " + m);
+
+    // A fold here is terminal for the rest of the pipeline, not merely
+    // untidy: E1's barrier keeps local injectivity, it does not restore it.
+    if (ir.flippedFaces > 0 || ir.unplacedVertices > 0) {
+        status.messages.push_back(
+            "Stopping before the layout energies: psi_R does not satisfy Q1, and Sec. 3.3's "
+            "barrier can only preserve Q1, never repair it.");
+        return false;
+    }
+    if (!options.runLayout) return true;
+
+    // --- Stage 5: subdomain labelling, Sec. 3.3 ---------------------------
+    SubdomainLabels::Options lopts;
+    lopts.seedTopoConstraints = options.seedTopoConstraints;
+    lopts.nearMissTolerance = options.topoNearMiss;
+    labels = std::make_unique<SubdomainLabels>(*immersion, lopts);
+    const SubdomainLabels::Report &lr = labels->getReport();
+    status.boundaryEdgesU = lr.boundaryEdgesU;
+    status.boundaryEdgesV = lr.boundaryEdgesV;
+    status.featureChains = lr.featureChains;
+    status.topoPaths = lr.topoPaths;
+    for (const std::string &m : lr.messages) status.messages.push_back("Stage 5: " + m);
+
+    // --- Stage 6: the layout-inducing energies, Sec. 3.3 ------------------
+    LayoutEnergy::Options eopts;
+    eopts.lambdaInit = options.lambdaInit;
+    eopts.lambdaGrowth = options.lambdaGrowth;
+    eopts.outerSteps = options.outerSteps;
+    eopts.innerIterations = options.innerIterations;
+    eopts.alternateReference = options.alternateReference;
+    eopts.relabel = options.relabelBetweenSteps;
+    layout = std::make_unique<LayoutEnergy>(*immersion, *labels, eopts);
+    status.layoutRan = layout->run();
+    const LayoutEnergy::Report &er = layout->getReport();
+    status.layoutInjective = er.injective;
+    status.layoutConstrained = er.constraintsMet;
+    status.outerStepsTaken = er.outerSteps;
+    status.layoutValid = er.valid;
+    for (const std::string &m : er.messages) status.messages.push_back("Stage 6: " + m);
+
+    return status.layoutValid;
 }

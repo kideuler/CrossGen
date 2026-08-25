@@ -122,6 +122,8 @@ void RicciFlow::initialiseMetric() {
         }
     }
 
+    initialCosPhi = cosPhi;
+
     curvature.assign(nV, 0.0);
     angleSum.assign(nV, 0.0);
 
@@ -758,6 +760,26 @@ std::vector<double> RicciFlow::originalEdgeLengths() const {
         auto it = edgeIndex.find(EdgeKey(mesh->edges[e][0], mesh->edges[e][1]));
         if (it != edgeIndex.end()) out[e] = edges[it->second].length;
     }
+    return out;
+}
+
+std::vector<double> RicciFlow::originalEdgeLengthsCompleted(int *recovered) const {
+    std::vector<double> out = originalEdgeLengths();
+    int filled = 0;
+    for (size_t e = 0; e < out.size(); ++e) {
+        if (out[e] >= 0.0) continue;
+        const EdgeKey key(mesh->edges[e][0], mesh->edges[e][1]);
+        auto it = initialCosPhi.find(key);
+        if (it == initialCosPhi.end()) continue;   // not an edge of this mesh at all
+        // Eq. (11) on the edge's own inversive distance and the converged u.
+        const double gi = std::exp(u[key.a]);
+        const double gj = std::exp(u[key.b]);
+        const double sq = gi * gi + gj * gj + 2.0 * gi * gj * it->second;
+        if (!(sq > 0.0)) continue;
+        out[e] = std::sqrt(sq);
+        ++filled;
+    }
+    if (recovered) *recovered = filled;
     return out;
 }
 
