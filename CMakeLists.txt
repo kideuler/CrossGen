@@ -65,6 +65,12 @@ add_library(PolyVector SHARED
     src/MERIDIAN/ConeCut.cxx
     src/MERIDIAN/RicciFlow.hxx
     src/MERIDIAN/RicciFlow.cxx
+    src/MERIDIAN/Immersion.hxx
+    src/MERIDIAN/Immersion.cxx
+    src/MERIDIAN/SubdomainLabels.hxx
+    src/MERIDIAN/SubdomainLabels.cxx
+    src/MERIDIAN/LayoutEnergy.hxx
+    src/MERIDIAN/LayoutEnergy.cxx
     src/UMBER/Polysquare.hxx
     src/UMBER/Polysquare.cxx
     src/UMBER/MotorcycleGraph.hxx
@@ -145,7 +151,7 @@ target_link_libraries(TestSIPG PRIVATE PolyVector)
 add_executable(TestUMBER src/utils/TestUMBER.cxx)
 target_link_libraries(TestUMBER PRIVATE PolyVector)
 
-# Test MERIDIAN Stages 1-3 (Shepherd, Gu and Hughes 2022, Secs. 3.1-3.2):
+# Test MERIDIAN Stages 1-6 (Shepherd, Gu and Hughes 2022, Secs. 3.1-3.3):
 # cone singularities, cutting graph, Gauss-Bonnet, discrete Ricci flow
 add_executable(TestMERIDIAN src/utils/TestMERIDIAN.cxx)
 target_link_libraries(TestMERIDIAN PRIVATE PolyVector)
@@ -256,6 +262,19 @@ add_test(NAME Tracing_LayoutsOnAllMeshes
 # is what puts the weighted-Delaunay flipping under load. Checks the cone angle
 # sums directly and the Hessian against a finite difference.
 add_test(NAME MERIDIAN_RicciFlowSelfTest COMMAND TestMERIDIAN --selftest)
+
+# End-to-end: Stages 1 to 6 on a handful of models that between them exercise
+# every part of the later stages -- a plain disk with one interior cone
+# (geom001), a model whose cutting graph carries several different holonomies
+# (geom003), one with voids and a dozen connectivity constraints (geom012), and
+# a two-material model, where the interface between the physical surfaces is a
+# feature chain and E3 has something to hold (multimat geom001). Each asserts
+# Q1 to Q5 on the map that comes out; the whole corpus is `make meridian`.
+foreach(MERIDIAN_CASE singlemat/geom001 singlemat/geom003 singlemat/geom012 multimat/geom001)
+    string(REPLACE "/" "_" MERIDIAN_CASE_NAME ${MERIDIAN_CASE})
+    add_test(NAME MERIDIAN_Layout_${MERIDIAN_CASE_NAME}
+             COMMAND TestMERIDIAN ${CMAKE_CURRENT_SOURCE_DIR}/data/meshes/${MERIDIAN_CASE}.obj)
+endforeach()
 # Optional Qt6 OpenGL viewer (replaces the old GLFW-based viewer)
 option(BUILD_OPENGL_VIEWER "Build the Qt6 OpenGL mesh/field viewer" OFF)
 if (BUILD_OPENGL_VIEWER)
