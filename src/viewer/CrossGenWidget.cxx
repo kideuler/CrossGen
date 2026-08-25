@@ -91,6 +91,19 @@ UMBERPhase nextUMBERPhase(UMBERPhase p) {
     return UMBERPhase::Simplified;
 }
 
+MERIDIANPhase nextMERIDIANPhase(MERIDIANPhase p) {
+    switch (p) {
+        case MERIDIANPhase::MeshOnly:   return MERIDIANPhase::CrossField;
+        case MERIDIANPhase::CrossField: return MERIDIANPhase::Stepping;
+        case MERIDIANPhase::Stepping:   return MERIDIANPhase::Cones;
+        case MERIDIANPhase::Cones:      return MERIDIANPhase::Cut;
+        case MERIDIANPhase::Cut:        return MERIDIANPhase::RicciFlow;
+        case MERIDIANPhase::RicciFlow:  return MERIDIANPhase::Metric;
+        case MERIDIANPhase::Metric:     return MERIDIANPhase::Metric;
+    }
+    return MERIDIANPhase::Metric;
+}
+
 MedialAxisPhase nextMedialAxisPhase(MedialAxisPhase p) {
     switch (p) {
         case MedialAxisPhase::MeshOnly:     return MedialAxisPhase::DelaunayMesh;
@@ -154,6 +167,19 @@ const char *umberPhaseName(UMBERPhase p) {
     return "?";
 }
 
+const char *meridianPhaseName(MERIDIANPhase p) {
+    switch (p) {
+        case MERIDIANPhase::MeshOnly:   return "1) mesh";
+        case MERIDIANPhase::CrossField: return "2) SIPG crossfield";
+        case MERIDIANPhase::Stepping:   return "3) SIPG stepping";
+        case MERIDIANPhase::Cones:      return "4) cone singularities (Sec. 3.1)";
+        case MERIDIANPhase::Cut:        return "5) cutting graph (Sec. 3.2.2)";
+        case MERIDIANPhase::RicciFlow:  return "6) discrete Ricci flow (Sec. 3.2.1)";
+        case MERIDIANPhase::Metric:     return "7) flat cone metric";
+    }
+    return "?";
+}
+
 const char *medialAxisPhaseName(MedialAxisPhase p) {
     switch (p) {
         case MedialAxisPhase::MeshOnly:     return "1) mesh";
@@ -184,9 +210,16 @@ const char *modeName(Mode m) {
         case Mode::SIPG:       return "SIPG";
         case Mode::OASIS:      return "OASIS";
         case Mode::UMBER:      return "UMBER";
+        case Mode::MERIDIAN:   return "MERIDIAN";
     }
     return "?";
 }
+
+// The line every mode-selection prompt prints, kept in one place so adding a
+// mode does not mean chasing three copies of it.
+const char *kModeMenu =
+    "press '1' for PolyVector, '2' for MBO, '3' for Medial Axis, '4' for SIPG, "
+    "'5' for OASIS, '6' for UMBER, '7' for MERIDIAN";
 
 } // anonymous namespace
 
@@ -232,8 +265,7 @@ CrossGenWidget::CrossGenWidget(const std::string &meshPath, QWidget *parent)
 
     setFocusPolicy(Qt::StrongFocus);
 
-    std::cerr << "[Viewer] Phase " << phaseName(phase_)
-              << " (press '1' for PolyVector, '2' for MBO, '3' for Medial Axis, '4' for SIPG, '5' for OASIS, '6' for UMBER)\n";
+    std::cerr << "[Viewer] Phase " << phaseName(phase_) << " (" << kModeMenu << ")\n";
 }
 
 // ── QOpenGLWidget overrides ───────────────────────────────────────────────────
@@ -378,6 +410,14 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
         }
         break;
 
+    case Qt::Key_7:
+        if (mode_ == Mode::Unselected && phase_ == Phase::MeshOnly) {
+            mode_ = Mode::MERIDIAN;
+            std::cerr << "[Viewer] Selected mode: " << modeName(mode_) << " (press 'c' to advance)\n";
+            console_.log("Selected mode: MERIDIAN (Shepherd, Gu and Hughes 2022, Stages 1-3)");
+        }
+        break;
+
     default:
         QOpenGLWidget::keyPressEvent(event);
         break;
@@ -478,6 +518,14 @@ void CrossGenWidget::doReset() {
     blocks_.reset();
     umberCorners_.clear();
     umberInternal_.clear();
+    // Ricci and the cut both hold on to the cone set, so they go first.
+    ricci_.reset();
+    coneCut_.reset();
+    cones_.reset();
+    flatMetric_ = viewer::FlatMetric{};
+    coneFans_.clear();
+    ricciU_.resize(0);
+    ricciUAbsMax_ = 1.0;
 
     mode_     = Mode::Unselected;
     phase_    = Phase::MeshOnly;
@@ -486,6 +534,7 @@ void CrossGenWidget::doReset() {
     maPhase_  = MedialAxisPhase::MeshOnly;
     oasisPhase_ = OASISPhase::MeshOnly;
     umberPhase_ = UMBERPhase::MeshOnly;
+    meridianPhase_ = MERIDIANPhase::MeshOnly;
     // oasisLambda_ deliberately survives a reset so it can be reused as the
     // dialog's default on the next run.
 
@@ -503,6 +552,10 @@ void CrossGenWidget::doReset() {
     polysquareAnnounced_  = false;
     polysquareAttempted_  = false;
     blocksAttempted_      = false;
+    conesAttempted_       = false;
+    cutAttempted_         = false;
+    ricciAnnounced_       = false;
+    ricciAttempted_       = false;
 
     view_.cx    = 0.5 * (bounds_.minx + bounds_.maxx);
     view_.cy    = 0.5 * (bounds_.miny + bounds_.maxy);
@@ -522,8 +575,7 @@ void CrossGenWidget::doReset() {
         console_.log(oss.str());
     }
     console_.log("[Reset] Restarted viewer.");
-    std::cerr << "[Viewer] Reset. Phase " << phaseName(phase_)
-              << " (press '1' for PolyVector, '2' for MBO, '3' for Medial Axis, '4' for SIPG, '5' for OASIS, '6' for UMBER)\n";
+    std::cerr << "[Viewer] Reset. Phase " << phaseName(phase_) << " (" << kModeMenu << ")\n";
 }
 
 // ── OASIS parameter dialog ───────────────────────────────────────────────────
@@ -1153,6 +1205,227 @@ void CrossGenWidget::runChordCollapse() {
                  "press 'c' to try other settings");
 }
 
+// ── MERIDIAN: Shepherd, Gu and Hughes (2022), Stages 1-3 ─────────────────────
+
+// Stage 1, Sec. 3.1. Interior indices are the SIPG field's winding numbers,
+// boundary ones come from the field's rotation across each boundary star
+// against the interior angle there; then Eq. (4) is checked, and repaired from
+// the boundary cones if the rounding on them cost it.
+//
+// This is the gate for everything after. sum(Kbar) = 2 pi chi is the
+// solvability condition of the Newton system in Stage 3 -- the Laplacian's
+// kernel is the constants, so the residual has to be orthogonal to them -- and
+// an inadmissible set does not converge slowly, it has no solution at all.
+void CrossGenWidget::runMERIDIANCones() {
+    conesAttempted_ = true;
+    if (!sipgField_.has_value()) return;
+
+    // Cone indices are read off a *converged* field: an interior winding number
+    // is an exact integer only once the field has stopped moving, and a
+    // boundary one is measured against a field that is supposed to be aligned
+    // with the boundary. Advancing past the stepping phase early therefore
+    // finishes the solve here rather than reading a field still in motion.
+    if (!sipgConverged_) {
+        auto t0 = Clock::now();
+        sipgField_->runMBO();
+        sipgConverged_ = true;
+        auto t1 = Clock::now();
+        std::ostringstream oss;
+        oss << "[MERIDIAN] finished the SIPG solve first, error " << std::scientific
+            << std::setprecision(3) << sipgField_->error << ", "
+            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+    }
+
+    auto t0 = Clock::now();
+    try {
+        cones_.emplace(*sipgField_);
+    } catch (const std::exception &e) {
+        cones_.reset();
+        console_.log(std::string("[Cones] FAILED: ") + e.what());
+        std::cerr << "[Viewer] ConeSingularities failed: " << e.what() << "\n";
+        return;
+    }
+    auto gb = cones_->gaussBonnet();
+    if (!gb.admissible) {
+        const int moved = cones_->rebalance();
+        gb = cones_->gaussBonnet();
+        if (moved > 0) {
+            std::ostringstream oss;
+            oss << "[Cones] rebalanced " << moved << " index unit(s) onto boundary cones at a "
+                << "cost of " << std::fixed << std::setprecision(2) << gb.rebalanceCost
+                << " quarter turns";
+            console_.log(oss.str());
+        } else if (moved < 0) {
+            console_.log("[Cones] could not restore Eq. (4): no boundary cone left within "
+                         "the allowed index range");
+        }
+    }
+    auto t1 = Clock::now();
+
+    {
+        std::ostringstream oss;
+        oss << "[Cones] " << cones_->interiorCones().size() << " interior, "
+            << cones_->boundaryCones().size() << " boundary; V-E+F = "
+            << gb.eulerCharacteristic;
+        if (gb.isolatedVertices > 0) oss << " (" << gb.isolatedVertices << " isolated v. excluded)";
+        oss << ", " << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Cones] Eq. (4): sum I(v) = " << gb.indexSum << ", 4 chi = " << gb.indexTarget
+            << " -- " << (gb.admissible ? "admissible [PASS]" : "NOT admissible [FAIL]");
+        console_.log(oss.str());
+        std::cerr << "[Viewer] " << oss.str() << "\n";
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Cones] Eq. (7): sum K_v - 2 pi chi = " << std::scientific << std::setprecision(2)
+            << (gb.curvatureSum - gb.curvatureTarget)
+            << (gb.metricConsistent ? " [PASS]" : " [FAIL]");
+        console_.log(oss.str());
+    }
+    if (!gb.admissible) {
+        console_.log("[Cones] the flat cone metric asked for does not exist; Ricci flow "
+                     "will refuse to start");
+    }
+}
+
+// Stage 2, Sec. 3.2.2. HarmonicCut opens the voids and the cone arcs drag every
+// interior cone out to the boundary, leaving S - G a disk with P in G union dS.
+void CrossGenWidget::runMERIDIANCut() {
+    cutAttempted_ = true;
+    if (!cones_.has_value()) return;
+
+    auto t0 = Clock::now();
+    try {
+        coneCut_.emplace(mesh_, *cones_);
+    } catch (const std::exception &e) {
+        coneCut_.reset();
+        console_.log(std::string("[Cut] FAILED: ") + e.what());
+        std::cerr << "[Viewer] ConeCut failed: " << e.what() << "\n";
+        return;
+    }
+    auto t1 = Clock::now();
+
+    const ConeCut::Report &r = coneCut_->getReport();
+    {
+        std::ostringstream oss;
+        oss << "[Cut] " << r.harmonicCuts << "/" << r.voids << " void arc(s), "
+            << r.conesRouted << "/" << r.interiorCones << " cone arc(s), "
+            << coneCut_->getCutEdges().size() << " edges, "
+            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Cut] Omega: chi = " << r.eulerCharacteristic << ", "
+            << r.boundaryComponents << " boundary component(s) -- "
+            << (r.isDisk ? "disk [PASS]" : "not a disk [FAIL]") << "; P in G u dS "
+            << (r.allConesOnBoundary ? "[PASS]" : "[FAIL]");
+        console_.log(oss.str());
+        std::cerr << "[Viewer] " << oss.str() << "\n";
+    }
+    if (r.conesSplitByCut > 0) {
+        std::ostringstream oss;
+        oss << "[Cut] " << r.conesSplitByCut
+            << " cone(s) the graph runs across rather than stopping at -- legal, but "
+               "Sec. 3.2.2 prefers otherwise";
+        console_.log(oss.str());
+    }
+    console_.log("[Cut] magenta = void arcs (one per hole), amber = cone arcs "
+                 "(one per interior cone)");
+}
+
+// Stage 3, Sec. 3.2.1. Blocking: a few Newton steps and a flip pass or two,
+// milliseconds on these models but a solve all the same, so it is announced a
+// frame ahead like the UMBER ones. Everything the last two phases draw is
+// derived here rather than per frame -- both are a walk over every edge or
+// every cone star.
+void CrossGenWidget::runRicciFlow() {
+    ricciAttempted_ = true;
+    if (!cones_.has_value()) return;
+
+    auto t0 = Clock::now();
+    bool ok = false;
+    try {
+        ricci_.emplace(mesh_, *cones_);
+        ok = ricci_->solve();
+    } catch (const std::exception &e) {
+        ricci_.reset();
+        console_.log(std::string("[Ricci] FAILED: ") + e.what());
+        std::cerr << "[Viewer] RicciFlow failed: " << e.what() << "\n";
+        return;
+    }
+    auto t1 = Clock::now();
+
+    const RicciFlow::Report &r = ricci_->getReport();
+    {
+        std::ostringstream oss;
+        oss << "[Ricci] ||K - Kbar||_inf " << std::scientific << std::setprecision(2)
+            << r.initialError << " -> " << r.finalError << " in " << r.newtonIterations
+            << " Newton step(s), " << r.flips << " flip(s), "
+            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+        std::cerr << "[Viewer] " << oss.str() << "\n";
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Ricci] flat cone metric " << (ok ? "reached [PASS]" : "NOT reached [FAIL]")
+            << "; cos(phi) in [" << std::fixed << std::setprecision(2)
+            << r.minInversiveDistance << ", " << r.maxInversiveDistance << "]";
+        if (r.minInversiveDistance >= 1.0) oss << " (all >= 1: the generalised flow of [87])";
+        console_.log(oss.str());
+    }
+    for (const std::string &m : r.messages) console_.log("[Ricci] " + m);
+    if (!ok) return;
+
+    // u for the ramp, with its mean removed: only differences in u mean
+    // anything, since u -> u + c is a global rescaling of the metric.
+    const std::vector<double> &u = ricci_->getU();
+    const std::vector<char> &active = cones_->getActiveVertices();
+    double sum = 0.0;
+    int n = 0;
+    for (size_t v = 0; v < u.size(); ++v) if (active[v]) { sum += u[v]; ++n; }
+    const double mean = (n > 0) ? sum / n : 0.0;
+
+    ricciU_.resize(static_cast<Eigen::Index>(u.size()));
+    ricciUAbsMax_ = 1e-12;
+    for (size_t v = 0; v < u.size(); ++v) {
+        ricciU_[static_cast<Eigen::Index>(v)] = active[v] ? u[v] - mean : 0.0;
+        ricciUAbsMax_ = std::max(ricciUAbsMax_, std::fabs(ricciU_[static_cast<Eigen::Index>(v)]));
+    }
+
+    flatMetric_ = viewer::buildFlatMetric(*ricci_);
+    coneFans_ = viewer::buildConeFans(*ricci_, *cones_);
+
+    // Fit the right panel to the gallery now, while it is being built, the way
+    // the other split-screen modes fit theirs as their parameterization lands.
+    if (!coneFans_.empty()) {
+        viewer::computeConeFanBounds(coneFans_, uvView_.cx, uvView_.cy,
+                                     uvView_.baseW, uvView_.baseH);
+        uvView_.zoom = 1.0;
+        uvView_.fbw  = view_.fbw;
+        uvView_.fbh  = view_.fbh;
+    }
+
+    {
+        std::ostringstream oss;
+        oss << "[Ricci] conformal factor gamma = e^u spans " << std::fixed
+            << std::setprecision(2) << std::exp(2.0 * ricciUAbsMax_)
+            << "x; edge lengths " << flatMetric_.minRatio << "x to "
+            << flatMetric_.maxRatio << "x about the mean";
+        console_.log(oss.str());
+    }
+    if (!flatMetric_.replaced.empty()) {
+        std::ostringstream oss;
+        oss << "[Ricci] " << flatMetric_.replaced.size()
+            << " input edge(s) replaced by flipping (grey underneath, green on top)";
+        console_.log(oss.str());
+    }
+}
+
 // ── phase advancement ────────────────────────────────────────────────────────
 
 void CrossGenWidget::advancePhase() {
@@ -1194,19 +1467,26 @@ void CrossGenWidget::advancePhase() {
             if (blockLayout_.has_value() && promptChordCollapseParameters())
                 runChordCollapse();
         }
+    } else if (mode_ == Mode::MERIDIAN) {
+        MERIDIANPhase old = meridianPhase_;
+        meridianPhase_ = nextMERIDIANPhase(meridianPhase_);
+        if (meridianPhase_ != old)
+            std::cerr << "[Viewer] MERIDIAN Phase " << meridianPhaseName(meridianPhase_) << "\n";
     }
 }
 
 // ── stages shared with SIPG mode ─────────────────────────────────────────────
 
 bool CrossGenWidget::sipgStageWantsField() const {
-    return (mode_ == Mode::SIPG  && sipgPhase_  >= SIPGPhase::CrossField) ||
-           (mode_ == Mode::UMBER && umberPhase_ >= UMBERPhase::CrossField);
+    return (mode_ == Mode::SIPG     && sipgPhase_     >= SIPGPhase::CrossField) ||
+           (mode_ == Mode::UMBER    && umberPhase_    >= UMBERPhase::CrossField) ||
+           (mode_ == Mode::MERIDIAN && meridianPhase_ >= MERIDIANPhase::CrossField);
 }
 
 bool CrossGenWidget::sipgStageIsStepping() const {
-    return (mode_ == Mode::SIPG  && sipgPhase_  == SIPGPhase::Stepping) ||
-           (mode_ == Mode::UMBER && umberPhase_ == UMBERPhase::Stepping);
+    return (mode_ == Mode::SIPG     && sipgPhase_     == SIPGPhase::Stepping) ||
+           (mode_ == Mode::UMBER    && umberPhase_    == UMBERPhase::Stepping) ||
+           (mode_ == Mode::MERIDIAN && meridianPhase_ == MERIDIANPhase::Stepping);
 }
 
 std::vector<int> CrossGenWidget::hangingTJunctions() const {
@@ -1525,6 +1805,32 @@ void CrossGenWidget::runComputations() {
         polysquare_.has_value() && !blocksAttempted_) {
         runBlocks();
     }
+
+    // ── MERIDIAN: Stage 1, the cones and Eq. (4) ─────────────────────────────
+    if (mode_ == Mode::MERIDIAN && meridianPhase_ >= MERIDIANPhase::Cones &&
+        sipgField_.has_value() && !conesAttempted_) {
+        runMERIDIANCones();
+    }
+
+    // ── MERIDIAN: Stage 2, the cutting graph ─────────────────────────────────
+    if (mode_ == Mode::MERIDIAN && meridianPhase_ >= MERIDIANPhase::Cut &&
+        cones_.has_value() && !cutAttempted_) {
+        runMERIDIANCut();
+    }
+
+    // ── MERIDIAN: Stage 3, discrete Ricci flow ───────────────────────────────
+    if (mode_ == Mode::MERIDIAN && meridianPhase_ >= MERIDIANPhase::RicciFlow &&
+        cones_.has_value() && !ricciAttempted_) {
+        if (!ricciAnnounced_) {
+            // runComputations() runs at the top of paintGL, so returning here
+            // lets this frame draw the notice; the solve starts on the next.
+            console_.log("[Ricci] solving Eq. (10) for the flat cone metric, this blocks...");
+            ricciAnnounced_ = true;
+        } else {
+            runRicciFlow();
+        }
+    }
+
 
     // ── SIPG: Cut seams from converged SIPG field ─────────────────────────────
     if (mode_ == Mode::SIPG && sipgPhase_ >= SIPGPhase::CutSeams &&
@@ -1985,7 +2291,12 @@ bool CrossGenWidget::inUVSplitScreen() const {
            // to show is the structure before against the structure after, and
            // both of those live in the model.
            (mode_ == Mode::UMBER && umberPhase_ >= UMBERPhase::Polysquare &&
-            umberPhase_ <= UMBERPhase::Blocks && polysquare_.has_value());
+            umberPhase_ <= UMBERPhase::Blocks && polysquare_.has_value()) ||
+           // The gallery of unfolded cone fans is not a parameter domain, but
+           // it is a second world with its own scale in the right half of the
+           // window, which is all this predicate is really asking.
+           (mode_ == Mode::MERIDIAN && meridianPhase_ == MERIDIANPhase::Metric &&
+            !coneFans_.empty());
 }
 
 void CrossGenWidget::applyHalfOrtho(int x, int vpW, const viewer::ViewState &vs) const {
@@ -2050,6 +2361,45 @@ void CrossGenWidget::renderUMBERField() {
         if (vertIdx < 0 || vertIdx >= static_cast<int>(mesh_->vertices.size())) continue;
         viewer::drawDisk3D(mesh_->vertices[vertIdx], ballRadius, 0.1f, 0.9f, 0.2f);
     }
+}
+
+// The model at whichever MERIDIAN stage is current: the mesh (or the flat
+// metric drawn over it), the cutting graph once it exists, and the cones on
+// top. Shared by the last four phases and by the left half of the split screen,
+// so that the cones stay in the same place and the same colours throughout.
+void CrossGenWidget::renderMERIDIANModel() {
+    const bool showMetric = (meridianPhase_ >= MERIDIANPhase::Metric &&
+                             !flatMetric_.edges.empty());
+    const bool showU = (meridianPhase_ == MERIDIANPhase::RicciFlow && ricciU_.size() > 0);
+
+    if (showMetric) {
+        // The metric replaces the wireframe rather than covering it: every edge
+        // is drawn, just coloured by what the flow did to it.
+        viewer::drawFlatMetric(*mesh_, flatMetric_, 1.6f);
+    } else if (showU) {
+        // The conformal factor as a filled field, with the wireframe kept
+        // translucent over it so the triangulation stays readable against the
+        // saturated ends of the ramp -- the same treatment OASIS mode gives its
+        // quasi-eigenfunction.
+        viewer::drawScalarField(*mesh_, ricciU_, ricciUAbsMax_);
+        viewer::drawMeshOverlay(*mesh_, 0.85f, 0.85f, 0.85f, 0.22f, 1.0f);
+    } else {
+        viewer::drawMesh(*mesh_);
+    }
+
+    // The cross field stays under the cone phase: the indices were read off its
+    // holonomy, and a cone sitting where the field turns is the whole argument
+    // for putting one there. It goes once the cutting graph arrives, which
+    // would otherwise be lost among the arrows.
+    if (meridianPhase_ == MERIDIANPhase::Cones && sipgField_.has_value())
+        viewer::drawTriangleCrossField(*mesh_, *sipgField_, scale_);
+
+    if (meridianPhase_ >= MERIDIANPhase::Cut && coneCut_.has_value())
+        viewer::drawCuttingGraph(*coneCut_, showMetric ? 2.0f : 3.5f);
+    viewer::drawBoundaryEdges(*mesh_);
+
+    if (cones_.has_value())
+        viewer::drawCones(*mesh_, *cones_, 0.5 * avgEdge_);
 }
 
 // ── normal render ─────────────────────────────────────────────────────────────
@@ -2400,6 +2750,54 @@ void CrossGenWidget::renderNormal() {
             // failed to leave the interior.
             renderUMBERField();
         }
+    } else if (mode_ == Mode::MERIDIAN && meridianPhase_ == MERIDIANPhase::Metric &&
+               !coneFans_.empty()) {
+        // ── Split-screen: left = the flat metric on the model, right = the
+        //    cone angles it was driven to ─────────────────────────────────────
+        //
+        // Neither half says what the metric is on its own. The left shows where
+        // it differs from the one the model came with, which is the whole of
+        // what the flow changed; the right shows the thing the flow was for,
+        // which is invisible on the model because the triangles on screen still
+        // carry the angles they were built with.
+        const int w = fbw();
+        const int halfW = w / 2;
+
+        applyHalfOrtho(0, halfW, view_);
+        {
+            viewer::ViewState leftVs = view_;
+            leftVs.fbw = halfW;
+            leftVs.fbh = fbh();
+            viewer::drawAxis(leftVs);
+        }
+        renderMERIDIANModel();
+
+        applyHalfOrtho(halfW, w - halfW, uvView_);
+        viewer::drawConeFans(coneFans_);
+
+        drawSplitDivider(halfW);
+    } else if (mode_ == Mode::MERIDIAN) {
+        viewer::drawAxis(view_);
+        if (meridianPhase_ < MERIDIANPhase::Cones || !cones_.has_value()) {
+            // The SIPG stages, drawn as SIPG mode draws them: the field whose
+            // holonomy Sec. 3.1 is about to turn into cone indices, and the
+            // interior singularities it already found.
+            viewer::drawMesh(*mesh_);
+            if (meridianPhase_ >= MERIDIANPhase::CrossField && sipgField_.has_value()) {
+                viewer::drawTriangleCrossField(*mesh_, *sipgField_, scale_);
+                const double ballRadius = 0.5 * avgEdge_;
+                for (const auto &[vertIdx, crossIndex] : sipgField_->singularVertices) {
+                    if (vertIdx < 0 || vertIdx >= static_cast<int>(mesh_->vertices.size())) continue;
+                    const Point &c = mesh_->vertices[vertIdx];
+                    if (crossIndex > 0)
+                        viewer::drawDisk3D(c, ballRadius, 0.2f, 0.2f, 0.95f);
+                    else
+                        viewer::drawDisk3D(c, ballRadius, 0.95f, 0.2f, 0.2f);
+                }
+            }
+        } else {
+            renderMERIDIANModel();
+        }
     } else if (mode_ == Mode::MedialAxis) {
         viewer::drawAxis(view_);
         // The map and block phases draw over the boundary alone: the
@@ -2503,11 +2901,25 @@ void CrossGenWidget::renderNormal() {
                                       "quasi-eigenfunction");
     }
 
+    // MERIDIAN: the cone colours everywhere they are drawn, and whichever ramp
+    // the current phase is using under them.
+    if (mode_ == Mode::MERIDIAN && cones_.has_value()) {
+        viewer::drawConeLegend(fbw(), fbh());
+        if (meridianPhase_ == MERIDIANPhase::RicciFlow && ricciU_.size() > 0) {
+            viewer::drawScalarFieldLegend(fbw(), fbh(), -ricciUAbsMax_, ricciUAbsMax_,
+                                          "conformal factor u, mean removed");
+        } else if (meridianPhase_ >= MERIDIANPhase::Metric && !flatMetric_.edges.empty()) {
+            viewer::drawScalarFieldLegend(fbw(), fbh(), -flatMetric_.absMax, flatMetric_.absMax,
+                                          "log(l_flat / l_input), mean removed");
+        }
+    }
+
     // Overlay text
     if (mode_ == Mode::Unselected) {
         renderOverlay("press '1' for PolyVector mode\npress '2' for MBO mode\n"
                       "press '3' for Medial Axis mode\npress '4' for SIPG mode\n"
                       "press '5' for OASIS mode\npress '6' for UMBER mode\n"
+                      "press '7' for MERIDIAN mode\n"
                       "right-drag to pan, scroll to zoom\n"
                       "press 'r' to restart\npress 'q' to quit");
     } else if (mode_ == Mode::OASIS) {

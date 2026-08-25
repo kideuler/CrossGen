@@ -9,6 +9,8 @@
 #include <functional>
 #include <iomanip>
 #include <sstream>
+#include <unordered_map>
+#include <unordered_set>
 
 #include <Eigen/Dense>
 
@@ -1653,6 +1655,416 @@ void drawQuadLayoutNodes(const QuadLayout &layout, double radius) {
                 drawDisk3D(n.pos, radius, 0.9f, 0.1f, 0.1f);
                 break;
         }
+    }
+}
+
+// ============================================================================
+// MERIDIAN -- cones, the cutting graph, and the flat cone metric
+// ============================================================================
+
+namespace {
+
+// Blue at +1, red at -1, cyan at -2, yellow beyond. The first two follow the
+// convention the rest of the viewer already uses for a cross field's index; the
+// cyan is Fig. 11's colour for the valence-six cones it merges pairs of
+// valence-five ones into.
+void coneColor(int index, float &r, float &g, float &b) {
+    if (index == 1)       { r = 0.25f; g = 0.45f; b = 0.95f; }
+    else if (index == -1) { r = 0.95f; g = 0.30f; b = 0.25f; }
+    else if (index == -2) { r = 0.20f; g = 0.85f; b = 0.90f; }
+    else                  { r = 0.95f; g = 0.85f; b = 0.15f; }
+}
+
+void drawPolylineOnMesh(const Mesh &m, const std::vector<int> &path) {
+    if (path.size() < 2) return;
+    glBegin(GL_LINE_STRIP);
+    for (const int v : path) {
+        if (v < 0 || v >= static_cast<int>(m.vertices.size())) continue;
+        glVertex2d(m.vertices[v][0], m.vertices[v][1]);
+    }
+    glEnd();
+}
+
+} // namespace
+
+void drawCones(const Mesh &m, const ConeSingularities &cones, double radius) {
+    if (!(radius > 0.0)) return;
+    for (const auto &c : cones.getCones()) {
+        if (c.vertex < 0 || c.vertex >= static_cast<int>(m.vertices.size())) continue;
+        const Point &p = m.vertices[c.vertex];
+        // An interior cone is the kind that still needs an arc of the cutting
+        // graph run out to the boundary, so it is haloed and a boundary cone,
+        // which is already there, is not.
+        if (!c.onBoundary) drawDisk3D(p, 1.45 * radius, 0.85f, 0.85f, 0.88f);
+        float r, g, b;
+        coneColor(c.index, r, g, b);
+        drawDisk3D(p, radius, r, g, b);
+    }
+}
+
+void drawConeLegend(int fbw, int fbh) {
+    struct Row { int index; const char *label; };
+    static const Row kRows[] = {
+        {  1, "I=+1  valence 3" },
+        { -1, "I=-1  valence 5" },
+        { -2, "I=-2  valence 6" },
+        { -3, "|I|>2 higher"    },
+    };
+
+    const float x0 = 20.0f;
+    const float sw = 16.0f;                       // swatch side
+    const float lineH = 22.0f;
+    float y0 = static_cast<float>(fbh) - 190.0f;  // above the scalar-field legend
+
+    glMatrixMode(GL_PROJECTION);
+    glPushMatrix();
+    glLoadIdentity();
+    glOrtho(0, fbw, fbh, 0, -1, 1); // top-left origin
+    glMatrixMode(GL_MODELVIEW);
+    glPushMatrix();
+    glLoadIdentity();
+
+    glBegin(GL_QUADS);
+    for (int i = 0; i < 4; ++i) {
+        float r, g, b;
+        coneColor(kRows[i].index, r, g, b);
+        glColor3f(r, g, b);
+        const float y = y0 + i * lineH;
+        glVertex2f(x0, y);
+        glVertex2f(x0 + sw, y);
+        glVertex2f(x0 + sw, y + sw);
+        glVertex2f(x0, y + sw);
+    }
+    glEnd();
+
+    glMatrixMode(GL_PROJECTION);
+    glPopMatrix();
+    glMatrixMode(GL_MODELVIEW);
+    glPopMatrix();
+
+    for (int i = 0; i < 4; ++i) {
+        drawTextOverlay(fbw, fbh, kRows[i].label, x0 + sw + 8.0f, y0 + i * lineH + 2.0f,
+                        0.8f, 0.8f, 0.8f);
+    }
+}
+
+void drawCuttingGraph(const ConeCut &cut, float lineWidth) {
+    const Mesh &m = cut.getOriginalMesh();
+
+    glLineWidth(lineWidth);
+
+    // Void arcs: one per hole, both ends on the boundary (Wang et al. Sec. 4.1).
+    glColor3f(1.0f, 0.2f, 0.9f);
+    for (const auto &c : cut.getVoidCuts()) drawPolylineOnMesh(m, c.path);
+
+    // Cone arcs: one per interior cone, one end *at* the cone (Sec. 3.2.2).
+    glColor3f(1.0f, 0.65f, 0.1f);
+    for (const auto &c : cut.getConePaths()) drawPolylineOnMesh(m, c.path);
+
+    glLineWidth(1.0f);
+}
+
+// ── the flat cone metric ─────────────────────────────────────────────────────
+
+FlatMetric buildFlatMetric(const RicciFlow &flow) {
+    FlatMetric fm;
+    const Mesh &m = flow.getMesh();
+    const auto flat = flow.flowEdgeLengths();
+    if (flat.empty()) return fm;
+
+    auto inputLength = [&](int a, int b) {
+        const Point &pa = m.vertices[a];
+        const Point &pb = m.vertices[b];
+        return std::hypot(pa[0] - pb[0], pa[1] - pb[1]);
+    };
+
+    std::unordered_set<MeshEdgeKey, MeshEdgeKeyHash> inputEdges;
+    inputEdges.reserve(m.edges.size() * 2);
+    for (const auto &e : m.edges) inputEdges.emplace(e[0], e[1]);
+
+    fm.edges.reserve(flat.size());
+    double sum = 0.0;
+    for (const auto &[key, len] : flat) {
+        const double l0 = inputLength(key.a, key.b);
+        if (!(len > 0.0) || !(l0 > 0.0)) continue;
+        FlatMetric::Edge e;
+        e.a = key.a;
+        e.b = key.b;
+        e.t = std::log(len / l0);
+        e.newDiagonal = (inputEdges.find(key) == inputEdges.end());
+        sum += e.t;
+        fm.edges.push_back(e);
+    }
+    if (fm.edges.empty()) return fm;
+
+    // Remove the mean: u -> u + c rescales the whole metric and is not part of
+    // the answer, so what is drawn is the stretch relative to the average one.
+    const double mean = sum / static_cast<double>(fm.edges.size());
+    double lo = 0.0, hi = 0.0;
+    for (auto &e : fm.edges) {
+        e.t -= mean;
+        lo = std::min(lo, e.t);
+        hi = std::max(hi, e.t);
+        fm.absMax = std::max(fm.absMax, std::fabs(e.t));
+    }
+    fm.absMax = std::max(fm.absMax, 1e-12);
+    fm.minRatio = std::exp(lo);
+    fm.maxRatio = std::exp(hi);
+
+    // The input edges the flipping took out. Their flat length is undefined
+    // without unfolding, but where they *were* is worth seeing next to the
+    // diagonals that replaced them.
+    for (const auto &e : m.edges) {
+        if (flat.find(MeshEdgeKey(e[0], e[1])) == flat.end()) {
+            fm.replaced.push_back({e[0], e[1]});
+        }
+    }
+    return fm;
+}
+
+void drawFlatMetric(const Mesh &m, const FlatMetric &fm, float lineWidth) {
+    if (fm.edges.empty()) return;
+    const int nV = static_cast<int>(m.vertices.size());
+    auto valid = [&](int a, int b) { return a >= 0 && b >= 0 && a < nV && b < nV; };
+
+    // The removed input edges go down first, dim, so the diagonals that took
+    // their place read as an overlay rather than as more of the metric.
+    if (!fm.replaced.empty()) {
+        glLineWidth(std::max(1.0f, lineWidth * 0.6f));
+        glColor4f(0.40f, 0.45f, 0.55f, 0.75f);
+        glBegin(GL_LINES);
+        for (const auto &e : fm.replaced) {
+            if (!valid(e[0], e[1])) continue;
+            glVertex2d(m.vertices[e[0]][0], m.vertices[e[0]][1]);
+            glVertex2d(m.vertices[e[1]][0], m.vertices[e[1]][1]);
+        }
+        glEnd();
+    }
+
+    glLineWidth(lineWidth);
+    glBegin(GL_LINES);
+    for (const auto &e : fm.edges) {
+        if (e.newDiagonal || !valid(e.a, e.b)) continue;
+        float r, g, b;
+        divergingColor(e.t / fm.absMax, r, g, b);
+        glColor3f(r, g, b);
+        glVertex2d(m.vertices[e.a][0], m.vertices[e.a][1]);
+        glVertex2d(m.vertices[e.b][0], m.vertices[e.b][1]);
+    }
+    glEnd();
+
+    // The diagonals the weighted-Delaunay flipping introduced, on top and in a
+    // colour the ramp never produces.
+    glLineWidth(lineWidth + 1.5f);
+    glColor3f(0.15f, 0.95f, 0.35f);
+    glBegin(GL_LINES);
+    for (const auto &e : fm.edges) {
+        if (!e.newDiagonal || !valid(e.a, e.b)) continue;
+        glVertex2d(m.vertices[e.a][0], m.vertices[e.a][1]);
+        glVertex2d(m.vertices[e.b][0], m.vertices[e.b][1]);
+    }
+    glEnd();
+    glLineWidth(1.0f);
+}
+
+// ── the cone angles, unfolded ────────────────────────────────────────────────
+
+std::vector<ConeFan> buildConeFans(const RicciFlow &flow, const ConeSingularities &cones) {
+    std::vector<ConeFan> fans;
+    const Mesh &m = flow.getMesh();
+    const auto &faces = flow.getFlowFaces();
+    const auto flat = flow.flowEdgeLengths();
+    if (faces.empty() || flat.empty() || cones.getCones().empty()) return fans;
+
+    auto lengthOf = [&](int a, int b) -> double {
+        auto it = flat.find(MeshEdgeKey(a, b));
+        return (it == flat.end()) ? -1.0 : it->second;
+    };
+
+    std::vector<std::vector<int>> incident(m.vertices.size());
+    for (int f = 0; f < static_cast<int>(faces.size()); ++f) {
+        for (int k = 0; k < 3; ++k) {
+            const int v = faces[f][k];
+            if (v >= 0 && v < static_cast<int>(incident.size())) incident[v].push_back(f);
+        }
+    }
+
+    for (const auto &cone : cones.getCones()) {
+        const int v = cone.vertex;
+        if (v < 0 || v >= static_cast<int>(incident.size())) continue;
+        if (incident[v].empty()) continue;
+
+        // In a face (a, b, c) written counter-clockwise, the counter-clockwise
+        // sweep at a runs from the edge a->b towards a->c. Chaining those pairs
+        // walks the star in order without needing any adjacency structure.
+        std::unordered_map<int, std::pair<int, double>> nextOf; // nbr -> (next nbr, angle)
+        std::unordered_set<int> isSuccessor;
+        bool ok = true;
+
+        for (const int f : incident[v]) {
+            int i0 = -1;
+            for (int k = 0; k < 3; ++k) if (faces[f][k] == v) i0 = k;
+            if (i0 < 0) { ok = false; break; }
+            const int a = faces[f][(i0 + 1) % 3];
+            const int b = faces[f][(i0 + 2) % 3];
+
+            const double la = lengthOf(v, a), lb = lengthOf(v, b), lab = lengthOf(a, b);
+            if (!(la > 0.0) || !(lb > 0.0) || !(lab > 0.0)) { ok = false; break; }
+            double cosA = (la * la + lb * lb - lab * lab) / (2.0 * la * lb);
+            cosA = std::max(-1.0, std::min(1.0, cosA));
+
+            if (!nextOf.emplace(a, std::make_pair(b, std::acos(cosA))).second) { ok = false; break; }
+            isSuccessor.insert(b);
+        }
+        if (!ok || nextOf.empty()) continue;
+
+        // A boundary fan starts at the neighbour nothing leads to; an interior
+        // one is a cycle, so any start will do.
+        int start = -1;
+        for (const auto &[from, to] : nextOf) {
+            if (!isSuccessor.count(from)) { start = from; break; }
+        }
+        const bool closed = (start < 0);
+        if (closed) start = nextOf.begin()->first;
+
+        ConeFan fan;
+        fan.vertex = v;
+        fan.index = cone.index;
+        fan.onBoundary = cone.onBoundary;
+        fan.closed = closed;
+
+        double theta = 0.0;
+        double maxR = 0.0;
+        std::vector<std::array<double, 2>> polar; // (radius, angle)
+
+        int cur = start;
+        for (size_t step = 0; step <= nextOf.size(); ++step) {
+            const double r = lengthOf(v, cur);
+            if (!(r > 0.0)) { ok = false; break; }
+            polar.push_back({{r, theta}});
+            maxR = std::max(maxR, r);
+
+            auto it = nextOf.find(cur);
+            if (it == nextOf.end()) break;          // open fan, walked to the far edge
+            theta += it->second.second;
+            cur = it->second.first;
+            if (cur == start) {
+                // Closed fan: record the first neighbour a second time, at the
+                // angle the walk arrived back at it. The gap between the two is
+                // the cone angle's departure from 2pi, which is the picture.
+                const double r2 = lengthOf(v, cur);
+                if (r2 > 0.0) polar.push_back({{r2, theta}});
+                break;
+            }
+        }
+        // Two points is a legitimate fan, not a degenerate one: a convex
+        // boundary corner sharp enough to be filled by a single triangle has
+        // exactly two neighbours, and its one wedge is the whole cone angle.
+        if (!ok || polar.size() < 2 || !(maxR > 0.0)) continue;
+
+        fan.angleSum = theta;
+        fan.ring.reserve(polar.size());
+        for (const auto &p : polar) {
+            const double r = p[0] / maxR;
+            fan.ring.push_back({{r * std::cos(p[1]), r * std::sin(p[1])}});
+        }
+        fans.push_back(std::move(fan));
+    }
+
+    // Lay the gallery out in a grid, interior cones first (they are the ones a
+    // cone angle other than 2pi was asked for in the first place).
+    std::stable_sort(fans.begin(), fans.end(), [](const ConeFan &a, const ConeFan &b) {
+        if (a.onBoundary != b.onBoundary) return !a.onBoundary;
+        return a.vertex < b.vertex;
+    });
+
+    const int n = static_cast<int>(fans.size());
+    const int cols = std::max(1, static_cast<int>(std::ceil(std::sqrt(static_cast<double>(n)))));
+    const double pitch = 2.8;
+    for (int i = 0; i < n; ++i) {
+        fans[i].center = {{(i % cols) * pitch, -(i / cols) * pitch}};
+    }
+    return fans;
+}
+
+void computeConeFanBounds(const std::vector<ConeFan> &fans,
+                          double &cx, double &cy, double &baseW, double &baseH) {
+    cx = cy = 0.0;
+    baseW = baseH = 1.0;
+    if (fans.empty()) return;
+
+    double minx = 1e300, maxx = -1e300, miny = 1e300, maxy = -1e300;
+    for (const auto &f : fans) {
+        minx = std::min(minx, f.center[0] - 1.4);
+        maxx = std::max(maxx, f.center[0] + 1.4);
+        miny = std::min(miny, f.center[1] - 1.4);
+        maxy = std::max(maxy, f.center[1] + 1.4);
+    }
+    cx = 0.5 * (minx + maxx);
+    cy = 0.5 * (miny + maxy);
+    baseW = std::max(1e-6, (maxx - minx) * 1.05);
+    baseH = std::max(1e-6, (maxy - miny) * 1.05);
+}
+
+void drawConeFans(const std::vector<ConeFan> &fans) {
+    for (const auto &f : fans) {
+        if (f.ring.size() < 2) continue;
+        const double cx = f.center[0], cy = f.center[1];
+        float r, g, b;
+        coneColor(f.index, r, g, b);
+
+        // The unit circle the fan is measured against: a full turn of the
+        // one-ring, so the gap or the overlap against it is the cone angle.
+        glLineWidth(1.0f);
+        glColor4f(0.45f, 0.45f, 0.50f, 0.8f);
+        glBegin(GL_LINE_LOOP);
+        for (int i = 0; i < 64; ++i) {
+            const double a = 2.0 * M_PI * i / 64.0;
+            glVertex2d(cx + std::cos(a), cy + std::sin(a));
+        }
+        glEnd();
+
+        // The triangles, translucent, so that where a fan of more than 2pi laps
+        // itself the overlap shows up as a brighter wedge.
+        glColor4f(r, g, b, 0.28f);
+        glBegin(GL_TRIANGLES);
+        for (size_t k = 0; k + 1 < f.ring.size(); ++k) {
+            glVertex2d(cx, cy);
+            glVertex2d(cx + f.ring[k][0], cy + f.ring[k][1]);
+            glVertex2d(cx + f.ring[k + 1][0], cy + f.ring[k + 1][1]);
+        }
+        glEnd();
+
+        // Their edges: the spokes to each neighbour, and the chords between.
+        glLineWidth(1.0f);
+        glColor4f(r, g, b, 0.75f);
+        glBegin(GL_LINES);
+        for (size_t k = 0; k < f.ring.size(); ++k) {
+            glVertex2d(cx, cy);
+            glVertex2d(cx + f.ring[k][0], cy + f.ring[k][1]);
+        }
+        glEnd();
+        glBegin(GL_LINE_STRIP);
+        for (const auto &p : f.ring) glVertex2d(cx + p[0], cy + p[1]);
+        glEnd();
+
+        // The two spokes that carry the answer. On an interior fan they are the
+        // same mesh edge reached from either side of the star, so the angle
+        // between them is exactly the cone angle less 2pi; on a boundary fan
+        // they are the two boundary edges, and the angle between them is the
+        // cone angle itself.
+        glLineWidth(3.0f);
+        glBegin(GL_LINES);
+        glColor3f(0.95f, 0.95f, 0.95f);
+        glVertex2d(cx, cy);
+        glVertex2d(cx + f.ring.front()[0], cy + f.ring.front()[1]);
+        glColor3f(0.98f, 0.85f, 0.15f);
+        glVertex2d(cx, cy);
+        glVertex2d(cx + f.ring.back()[0], cy + f.ring.back()[1]);
+        glEnd();
+        glLineWidth(1.0f);
+
+        drawDisk3D(Point{cx, cy}, 0.11, r, g, b);
     }
 }
 

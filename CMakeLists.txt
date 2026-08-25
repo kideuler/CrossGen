@@ -57,6 +57,14 @@ add_library(PolyVector SHARED
     src/OASIS/OASIS.cxx
     src/UMBER/UMBER.hxx
     src/UMBER/UMBER.cxx
+    src/MERIDIAN/MERIDIAN.hxx
+    src/MERIDIAN/MERIDIAN.cxx
+    src/MERIDIAN/ConeSingularities.hxx
+    src/MERIDIAN/ConeSingularities.cxx
+    src/MERIDIAN/ConeCut.hxx
+    src/MERIDIAN/ConeCut.cxx
+    src/MERIDIAN/RicciFlow.hxx
+    src/MERIDIAN/RicciFlow.cxx
     src/UMBER/Polysquare.hxx
     src/UMBER/Polysquare.cxx
     src/UMBER/MotorcycleGraph.hxx
@@ -137,6 +145,11 @@ target_link_libraries(TestSIPG PRIVATE PolyVector)
 add_executable(TestUMBER src/utils/TestUMBER.cxx)
 target_link_libraries(TestUMBER PRIVATE PolyVector)
 
+# Test MERIDIAN Stages 1-3 (Shepherd, Gu and Hughes 2022, Secs. 3.1-3.2):
+# cone singularities, cutting graph, Gauss-Bonnet, discrete Ricci flow
+add_executable(TestMERIDIAN src/utils/TestMERIDIAN.cxx)
+target_link_libraries(TestMERIDIAN PRIVATE PolyVector)
+
 # copy all meshes to build directory for easy access, keeping the material
 # subdirectory layout (singlemat/, multimat/, ...) intact
 file(GLOB_RECURSE MESH_FILES RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}/data/meshes"
@@ -198,6 +211,23 @@ add_custom_target(sipg
     VERBATIM
 )
 
+# Custom target to run TestMERIDIAN on all meshes
+set(MERIDIAN_COMMANDS "")
+foreach(MESH_FILE ${MESH_OBJ_FILES})
+    get_filename_component(MESH_NAME ${MESH_FILE} NAME)
+    list(APPEND MERIDIAN_COMMANDS
+        COMMAND ${CMAKE_COMMAND} -E echo "Processing ${MESH_NAME}..."
+        COMMAND $<TARGET_FILE:TestMERIDIAN> ${MESH_FILE} || ${CMAKE_COMMAND} -E true
+    )
+endforeach()
+
+add_custom_target(meridian
+    ${MERIDIAN_COMMANDS}
+    DEPENDS TestMERIDIAN
+    COMMENT "Running TestMERIDIAN on all meshes in data/meshes"
+    VERBATIM
+)
+
 # Enable testing
 enable_testing()
 
@@ -220,6 +250,12 @@ add_test(NAME TriangleMesher_ConcentricShells COMMAND TestTriangleMesher 6)
 # the part Sec. 4 of the paper is for.
 add_test(NAME Tracing_LayoutsOnAllMeshes
          COMMAND TraceMesh --no-vtu ${MESH_OBJ_FILES})
+
+# Discrete Ricci flow (Shepherd et al. Sec. 3.2.1) against prescribed cone sets
+# with far more curvature to move than anything in data/meshes asks for, which
+# is what puts the weighted-Delaunay flipping under load. Checks the cone angle
+# sums directly and the Hessian against a finite difference.
+add_test(NAME MERIDIAN_RicciFlowSelfTest COMMAND TestMERIDIAN --selftest)
 # Optional Qt6 OpenGL viewer (replaces the old GLFW-based viewer)
 option(BUILD_OPENGL_VIEWER "Build the Qt6 OpenGL mesh/field viewer" OFF)
 if (BUILD_OPENGL_VIEWER)

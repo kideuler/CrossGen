@@ -3,11 +3,15 @@
 #include "viewer/ViewerTypes.hxx"
 #include "viewer/GL.hxx"
 
+#include <array>
 #include <string>
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
 
+#include "MERIDIAN/ConeCut.hxx"
+#include "MERIDIAN/ConeSingularities.hxx"
+#include "MERIDIAN/RicciFlow.hxx"
 #include "Parameterization/CutMesh.hxx"
 #include "Parameterization/MIQ.hxx"
 #include "Parameterization/UVGParam.hxx"
@@ -218,6 +222,104 @@ void drawQuadLayoutArcs(const QuadLayout &layout, float lineWidth, float r, floa
 // squarely, cyan where two separatrices cross, magenta where two were joined
 // head-on, and blue for a T-junction.
 void drawQuadLayoutNodes(const QuadLayout &layout, double radius);
+
+// ── MERIDIAN: cones, the cutting graph, and the flat cone metric ─────────────
+//
+// Shepherd, Gu and Hughes (2022), Secs. 3.1 and 3.2. Everything here is drawn
+// over the model at its own coordinates -- the metric Ricci flow produces is a
+// set of edge lengths, not a set of positions, so there is no second geometry
+// to draw until the immersion of Stage 4 exists. What can be shown is where the
+// metric differs from the one the model came with, and what the cone angles it
+// was driven to actually came out as; drawConeFans() is the second of those.
+
+// The prescribed cones, one disk each, coloured by index: blue at +1 (a
+// valence-three corner), red at -1 (valence five), cyan at -2 (valence six, the
+// colour Fig. 11 of the paper uses for them), yellow for anything larger. An
+// interior cone carries a pale halo, because it is the kind that needs an arc
+// of the cutting graph run out to the boundary; a boundary cone is already
+// there and gets none.
+void drawCones(const Mesh &m, const ConeSingularities &cones, double radius);
+
+// Screen-space key for those colours, bottom-left, above the scalar legend.
+void drawConeLegend(int fbw, int fbh);
+
+// The cutting graph G, with its two kinds of arc kept apart: magenta for the
+// void arcs (HarmonicCut's, one per hole) and amber for the cone arcs (Sec.
+// 3.2.2's, one per interior cone). The distinction is not cosmetic -- a void
+// arc has both ends on the boundary and a cone arc has one end at a
+// singularity, which is what makes it a leaf of G.
+void drawCuttingGraph(const ConeCut &cut, float lineWidth);
+
+// ── the flat cone metric ─────────────────────────────────────────────────────
+
+// The metric prepared for drawing: one entry per edge of the *flow*
+// triangulation (which is the thing that carries the metric, and which the
+// weighted-Delaunay flipping may have changed), carrying how far the flow
+// stretched that edge.
+//
+// The stretch is measured as log(l_flat / l_input) with its mean removed. Both
+// halves of that matter. The log makes a halving and a doubling symmetric
+// about the neutral midpoint of the ramp, and removing the mean throws away the
+// global scale -- which is arbitrary, since the Ricci energy is invariant under
+// u -> u + c and only one vertex being pinned fixes it at all. What is left is
+// the part of the metric change that is real: where the surface had to be
+// stretched relative to everywhere else to flatten it.
+struct FlatMetric {
+    struct Edge {
+        int a = -1, b = -1;
+        double t = 0.0;             // log(l_flat / l_input), mean removed
+        bool newDiagonal = false;   // an edge the flipping introduced
+    };
+    std::vector<Edge> edges;
+    std::vector<std::array<int, 2>> replaced; // input edges the flipping removed
+    double absMax = 1.0;                      // max |t|, the symmetric ramp range
+    double minRatio = 1.0, maxRatio = 1.0;    // exp of the extremes, for the console
+};
+
+FlatMetric buildFlatMetric(const RicciFlow &flow);
+
+// The flow triangulation coloured by that stretch, with the flips called out:
+// the input edges the flipping removed in dim slate underneath, the diagonals
+// it put in their place in green on top. Everything else is the diverging ramp
+// drawScalarField uses, so blue reads "shrunk" and red "stretched".
+void drawFlatMetric(const Mesh &m, const FlatMetric &fm, float lineWidth);
+
+// ── the cone angles, unfolded ────────────────────────────────────────────────
+//
+// The single thing Stage 3 is for is that the angle sum at a cone comes out at
+// exactly 2pi - (pi/2) I(v), and nowhere else is it anything but 2pi. That is a
+// statement about a metric, so no drawing of the model can show it -- the
+// triangles on screen still carry the angles they came with. Laying one cone's
+// one-ring out in the plane *under the new metric* can: walk the fan, opening
+// each triangle by the angle the flat metric gives it, and the total is the
+// cone angle.
+//
+// A cone of index +1 then closes 90 degrees early and leaves a visible wedge of
+// gap; one of index -1 overshoots by 90 and laps itself; one of index -4 wraps
+// twice round. The first spoke is drawn white and the last yellow, so the
+// discrepancy between them is the cone angle's excess over 2pi, read straight
+// off the picture. For an interior cone those two spokes are the *same* mesh
+// edge, arrived at from both sides of the fan.
+struct ConeFan {
+    int vertex = -1;
+    int index = 0;
+    bool onBoundary = false;
+    bool closed = false;                     // interior: the last spoke returns to the first
+    double angleSum = 0.0;                   // Theta, the cone angle in the flat metric
+    std::array<double, 2> center{{0.0, 0.0}}; // where it sits in the gallery
+    std::vector<std::array<double, 2>> ring;  // unfolded one-ring, largest radius 1
+};
+
+// One fan per cone, laid out in a grid. Empty if the flow has no cones, or for
+// any cone whose star could not be walked (a pinch, or a vertex the flipping
+// left with a broken link).
+std::vector<ConeFan> buildConeFans(const RicciFlow &flow, const ConeSingularities &cones);
+
+// View bounds for the gallery (call once, before drawing it).
+void computeConeFanBounds(const std::vector<ConeFan> &fans,
+                          double &cx, double &cy, double &baseW, double &baseH);
+
+void drawConeFans(const std::vector<ConeFan> &fans);
 
 } // namespace viewer
 

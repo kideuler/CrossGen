@@ -13,6 +13,9 @@
 #include "viewer/Geometry.hxx"
 
 #include "mesh/Mesh.hxx"
+#include "MERIDIAN/ConeCut.hxx"
+#include "MERIDIAN/ConeSingularities.hxx"
+#include "MERIDIAN/RicciFlow.hxx"
 #include "Parameterization/CutMesh.hxx"
 #include "Parameterization/HarmonicCut.hxx"
 #include "Parameterization/MIQ.hxx"
@@ -45,6 +48,7 @@ enum class Mode {
     SIPG        = 4,
     OASIS       = 5,
     UMBER       = 6,
+    MERIDIAN    = 7,
 };
 
 enum class Phase {
@@ -106,6 +110,48 @@ enum class UMBERPhase {
     Polysquare = 5,
     Blocks     = 6,
     Simplified = 7,
+};
+
+// MERIDIAN is Stages 1-3 of Shepherd, Gu and Hughes (2022), and it borrows the
+// same first three stages as SIPG and UMBER modes because its input is the same
+// converged cross field -- Sec. 3.1 reads the cone indices off a field's
+// holonomy, and here that field is the SIPG one.
+//
+// The four stages after it are the pipeline proper, and each is chosen to show
+// the thing that stage is judged on rather than just what it computed:
+//
+//   Cones      the cone set and the discrete Gauss-Bonnet condition of Eq. (4).
+//              This is the gate: sum I(v) = 4 chi(S) is the solvability
+//              condition of the Newton system four stages later, so if it does
+//              not hold the flat metric being asked for does not exist and
+//              nothing downstream means anything.
+//
+//   Cut        the cutting graph G and the disk it leaves. The two kinds of arc
+//              are drawn apart because they come from different places -- the
+//              void arcs from HarmonicCut, the cone arcs from Sec. 3.2.2 -- and
+//              behave differently at their ends.
+//
+//   RicciFlow  the conformal factor u of Eq. (8), the actual unknown of the
+//              flow, drawn as a scalar field. On a planar model the interior
+//              starts flat and all the curvature sits on the boundary, so what
+//              u shows is the transport: the factor swells around the cones
+//              that had to absorb it.
+//
+//   Metric     what the flow produced. Split screen, because the flat cone
+//              metric is a set of edge lengths rather than a set of positions
+//              and neither half alone says what it is: on the left the model
+//              with every edge coloured by how far the flow stretched it, on
+//              the right each cone's one-ring unfolded *in that metric*, which
+//              is the only place the cone angles themselves can be seen. See
+//              viewer::ConeFan.
+enum class MERIDIANPhase {
+    MeshOnly   = 1,
+    CrossField = 2,
+    Stepping   = 3,
+    Cones      = 4,
+    Cut        = 5,
+    RicciFlow  = 6,
+    Metric     = 7,
 };
 
 // OASIS is a one-shot solve driven by a parameter dialog rather than a
@@ -204,6 +250,24 @@ private:
     // the left half of the split screen, and the whole of the Frames phase.
     void renderUMBERField();
 
+    // Stage 1 of Shepherd et al.: read the cone indices off the SIPG field,
+    // check Eq. (4), and rebalance the boundary cones if it does not hold.
+    // Cheap; unlike the two below it needs no announcement.
+    void runMERIDIANCones();
+
+    // Stage 2: HarmonicCut's void arcs plus the Sec. 3.2.2 cone arcs, and the
+    // disk they cut S into.
+    void runMERIDIANCut();
+
+    // Stage 3: the Newton solve on Eq. (10), then the two things drawn from it
+    // -- the conformal factor as a scalar field and the unfolded cone fans.
+    // Blocking, like runUMBER, and announced a frame ahead for the same reason.
+    void runRicciFlow();
+
+    // The model under the flat cone metric: the left half of the Metric phase,
+    // and what the Cut and RicciFlow phases draw their cones and graph over.
+    void renderMERIDIANModel();
+
     // Whether a parameter domain occupies the right half of the window.
     bool inUVSplitScreen() const;
 
@@ -293,6 +357,24 @@ private:
     // vertex star for nothing.
     std::vector<std::pair<int, int>>    umberCorners_;   // (vertex, quarter turns)
     std::vector<std::pair<int, double>> umberInternal_;  // what failed to reach the boundary
+    // MERIDIAN runs on the SIPG field in sipgField_, like UMBER. Each stage
+    // holds a reference to the one before -- ConeCut and RicciFlow both read
+    // cones_, and ConeCut checks it was measured on this very mesh -- so cones_
+    // is never rebuilt without clearing the two below it first.
+    std::optional<ConeSingularities> cones_;
+    std::optional<ConeCut>           coneCut_;
+    std::optional<RicciFlow>         ricci_;
+    // Derived from ricci_ once, because both are a walk over every edge or
+    // every cone star and neither belongs in a paint call.
+    viewer::FlatMetric               flatMetric_;
+    std::vector<viewer::ConeFan>     coneFans_;
+    // The conformal factor with its mean removed, ready for the diverging ramp.
+    // u is only defined up to an additive constant -- pinning one vertex is
+    // what fixes it at all -- so the mean is the honest zero to draw about,
+    // not the pinned vertex's value.
+    Eigen::VectorXd                  ricciU_;
+    double                           ricciUAbsMax_ = 1.0;
+
     // Guiding field for the OASIS orientation term. Held by shared_ptr because
     // OASIS keeps a reference to it for as long as it lives; separate from
     // crossField_, which belongs to MBO mode and follows its own state machine.
@@ -306,6 +388,7 @@ private:
     MedialAxisPhase maPhase_ = MedialAxisPhase::MeshOnly;
     OASISPhase     oasisPhase_ = OASISPhase::MeshOnly;
     UMBERPhase     umberPhase_ = UMBERPhase::MeshOnly;
+    MERIDIANPhase  meridianPhase_ = MERIDIANPhase::MeshOnly;
 
     // OASIS parameters and derived display range.
     double oasisLambda_  = 0.0;   // set by the dialog on first use
@@ -344,6 +427,16 @@ private:
     bool polysquareAnnounced_  = false;
     bool polysquareAttempted_  = false;
     bool blocksAttempted_      = false;
+    // One-shot discipline for the three MERIDIAN stages. Each is attempted once
+    // per run and not retried: a failure leaves its optional empty, and keying
+    // off the optional alone would run the whole stage again on every frame --
+    // which for the cones means re-running the SIPG solve sixty times a second.
+    // The Ricci solve is additionally announced a frame early, so the notice is
+    // on screen while the GUI thread is inside the Newton loop.
+    bool conesAttempted_       = false;
+    bool cutAttempted_         = false;
+    bool ricciAnnounced_       = false;
+    bool ricciAttempted_       = false;
 
     // Chord collapse settings, surviving a reset the way oasisLambda_ does so
     // that the dialog opens on whatever was tried last.
