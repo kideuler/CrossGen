@@ -923,7 +923,7 @@ double Polysquare::meanImageBoundaryEdge() const {
 // the same iso-line therefore come out at two numbers, and a motorcycle sent
 // down one of them misses whatever sits on the other.
 //
-// data/meshes/geom031 is what that costs. It is a comb: thirty reflex corners
+// data/meshes/singlemat/geom031 is what that costs. It is a comb: thirty reflex corners
 // whose teeth all sit at one u in the shape they are meant to be. They come out
 // spread over nine different u, 2.6e-3 apart end to end -- a tenth of a boundary
 // edge -- so every iso-line launched from a tooth misses every other tooth, and
@@ -1009,7 +1009,7 @@ void Polysquare::alignRuns(std::vector<Run> &runs) {
 // other come out a little apart, and "a little" is enough: the ray leaves one
 // of them, passes the other on the wrong side, and carries on into the model.
 //
-// data/meshes/geom021 is the case that shows what it costs. Its two reflex
+// data/meshes/singlemat/geom021 is the case that shows what it costs. Its two reflex
 // corners sit at u = 0.125905 and u = 0.126426 -- 5.2e-4 apart, 1.4% of a mesh
 // edge -- because the segment they are on is the one the cut lands on, so
 // snapBoundary() leaves one half of it alone (see the note on the far bank

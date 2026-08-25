@@ -116,7 +116,7 @@ public:
     //
     // The low end of that range does not survive here, because E_align is
     // linear in ||v|| and so pays a boundary triangle to shrink: at w_r = 0.5
-    // on data/meshes/geom003.obj the boundary vectors collapse and E_align
+    // on data/meshes/singlemat/geom003.obj the boundary vectors collapse and E_align
     // reads 2e-4 instead of the ~1.0 a unit aligned field gives, which is a
     // degenerate field that merely scores well. 5, 50 and 500 all hold
     // E_align at 0.89, 0.99, 1.00 with no change in the singularity count, so

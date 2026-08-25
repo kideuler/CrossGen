@@ -721,7 +721,7 @@ std::vector<std::pair<int, double>> UMBER::internalSingularities() const {
 // point defect of the continuum but a discrete field spreads it over the two
 // or three vertices it takes the frame to swing across, and each of those
 // carries a fraction of the quarter turn: on the circle-like model of
-// data/meshes/geom016 all four corners come out as triples summing to 1.00 --
+// data/meshes/singlemat/geom016 all four corners come out as triples summing to 1.00 --
 // 0.35, 0.45, 0.20 at one of them -- so rounding each vertex on its own
 // reports every one of them as nothing and the field appears to have lost the
 // four defects it in fact still has.

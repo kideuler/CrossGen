@@ -122,7 +122,10 @@ class Mesh {
     std::vector<std::array<int,3>> cornerTriangles; // List of corner triangle indices and their corresponding boundary edges
     std::vector<int> boundaryVertices; // List of vertex indices that lie on the boundary
     std::vector<bool> isBoundaryVertex; // Boolean flag per vertex indicating if it's a boundary vertex
-    std::vector<int8_t> triangleMatId; // Material ID per triangle (optional, can be used for visualization or other purposes)
+    // Material ID per triangle, one entry per triangle. Single-material meshes
+    // carry all 1s. An .obj sets these from its `usemtl mat<id>` lines, which
+    // Mesh2Dgmsh writes from the Physical Surface tags of the .geo.
+    std::vector<int> triangleMatId;
 
     // Edge data structures
     std::vector<std::array<int, 2>> edges; // Unique edges: edge index -> [v0, v1] vertex ids
@@ -139,6 +142,11 @@ class Mesh {
     Mesh(const std::string &filename); // Load mesh from an .obj file
 
     Mesh(const std::vector<Point> &vertices, const std::vector<Triangle> &triangles); // Construct mesh from given vertices and triangles
+
+    // As above, with an explicit material id per triangle. An empty matIds is
+    // taken as a single-material mesh and fills triangleMatId with 1s.
+    Mesh(const std::vector<Point> &vertices, const std::vector<Triangle> &triangles,
+         const std::vector<int> &matIds);
 
     int findTriangleContainingPoint(const Point &p) const; // Find the triangle index that contains point p, or -1 if not found
 };

@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <iomanip>
 #include <sstream>
 
@@ -88,20 +89,67 @@ void Console::draw(int fbw, int fbh, float startY) const {
 // Mesh drawing
 // ============================================================================
 
+// Color for material id 0..9 from a fixed qualitative palette; anything
+// beyond that gets a color hashed from the id, so it is stable across
+// frames (no flicker) without needing a palette entry for every material.
+static void materialColor(int matId, float &r, float &g, float &b) {
+    static const float palette[10][3] = {
+        {0.10f, 0.80f, 0.80f}, // 0 cyan
+        {0.85f, 0.15f, 0.15f}, // 1 red
+        {0.15f, 0.75f, 0.15f}, // 2 green
+        {0.55f, 0.20f, 0.80f}, // 3 purple
+        {0.95f, 0.55f, 0.10f}, // 4 orange
+        {0.90f, 0.85f, 0.10f}, // 5 yellow
+        {0.10f, 0.15f, 0.60f}, // 6 dark blue
+        {0.55f, 0.05f, 0.05f}, // 7 dark red
+        {0.05f, 0.40f, 0.05f}, // 8 dark green
+        {0.30f, 0.05f, 0.45f}, // 9 dark purple
+    };
+    if (matId >= 0 && matId < 10) {
+        r = palette[matId][0];
+        g = palette[matId][1];
+        b = palette[matId][2];
+        return;
+    }
+    std::size_t h = std::hash<int>{}(matId);
+    float hue = static_cast<float>(h % 360u) / 360.0f;
+    float s = 0.65f, v = 0.9f;
+    float i = std::floor(hue * 6.0f);
+    float f = hue * 6.0f - i;
+    float p = v * (1.0f - s);
+    float q = v * (1.0f - f * s);
+    float t = v * (1.0f - (1.0f - f) * s);
+    switch (static_cast<int>(i) % 6) {
+        case 0: r = v; g = t; b = p; break;
+        case 1: r = q; g = v; b = p; break;
+        case 2: r = p; g = v; b = t; break;
+        case 3: r = p; g = q; b = v; break;
+        case 4: r = t; g = p; b = v; break;
+        default: r = v; g = p; b = q; break;
+    }
+}
+
 void drawMesh(const Mesh &m) {
-    glColor3f(0.85f, 0.85f, 0.85f);
     glLineWidth(1.25f);
     glBegin(GL_LINES);
-    for (const auto &tri : m.triangles) {
-        const Point &a = m.vertices[tri[0]];
-        const Point &b = m.vertices[tri[1]];
-        const Point &c = m.vertices[tri[2]];
+    for (std::size_t e = 0; e < m.edges.size(); ++e) {
+        int t0 = m.edgeTriangles[e][0];
+        int t1 = m.edgeTriangles[e][1];
+        float r, g, b;
+        if (t1 < 0) {
+            // Boundary edge: colored by its one incident triangle's material.
+            materialColor(m.triangleMatId[t0], r, g, b);
+        } else if (m.triangleMatId[t0] != m.triangleMatId[t1]) {
+            // Interface edge, touching more than one material: highlight white.
+            r = g = b = 1.0f;
+        } else {
+            materialColor(m.triangleMatId[t0], r, g, b);
+        }
+        glColor3f(r, g, b);
+        const Point &a = m.vertices[m.edges[e][0]];
+        const Point &b_ = m.vertices[m.edges[e][1]];
         glVertex2d(a[0], a[1]);
-        glVertex2d(b[0], b[1]);
-        glVertex2d(b[0], b[1]);
-        glVertex2d(c[0], c[1]);
-        glVertex2d(c[0], c[1]);
-        glVertex2d(a[0], a[1]);
+        glVertex2d(b_[0], b_[1]);
     }
     glEnd();
 }

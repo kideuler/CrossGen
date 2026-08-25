@@ -340,7 +340,7 @@ private:
     //
     // The normal case is a guiding field that already agrees with the boundary,
     // e.g. one solved by MBO on the same mesh, and there the term does what it
-    // says. On data/meshes/geom001.obj, guided by its own MBO cross field:
+    // says. On data/meshes/singlemat/geom001.obj, guided by its own MBO cross field:
     //
     //   gamma      0      0.1    1      10     100
     //   deg       12.6    5.7    1.4    0.35   0.04

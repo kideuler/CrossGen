@@ -51,7 +51,7 @@
 // the mesh is coarse there -- they are 90 degrees apart but the wedge spans
 // enough for both -- and they can only leave it through its one free edge, so
 // whichever went second would die one step out. That is what cost
-// data/meshes/geom005 a trace and a block.
+// data/meshes/singlemat/geom005 a trace and a block.
 class MotorcycleGraph {
 public:
     using EdgeKey = MeshEdgeKey;

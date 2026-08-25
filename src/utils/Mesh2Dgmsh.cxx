@@ -8,6 +8,8 @@
 #include <utility>
 #include <filesystem>
 #include <unordered_map>
+#include <map>
+#include <array>
 #include <fstream>
 #include <iomanip>
 
@@ -28,6 +30,60 @@ static void setUniformMeshSize(double h) {
 	}
 	// Apply size directly to point entity tags (vectorpair expected)
 	if (!points.empty()) gmsh::model::mesh::setSize(points, h);
+}
+
+// Physical Surface groups, captured as (physical tag -> member surface tags).
+// gmsh::model::occ::synchronize() has a quirk in this Gmsh version: after an
+// occ::translate/occ::dilate call (even an identity one), the following
+// synchronize() silently drops every dim-2 physical group even though the
+// surface tags themselves are unaffected. normalizeToUnitSquare() takes this
+// snapshot before transforming so the caller can restore it afterward.
+static std::vector<std::pair<int, std::vector<int>>> capturePhysicalSurfaceGroups() {
+	std::vector<std::pair<int, std::vector<int>>> groups;
+	std::vector<std::pair<int, int>> physDimTags;
+	gmsh::model::getPhysicalGroups(physDimTags, 2);
+	for (const auto &dimTag : physDimTags) {
+		std::vector<int> entityTags;
+		gmsh::model::getEntitiesForPhysicalGroup(dimTag.first, dimTag.second, entityTags);
+		groups.emplace_back(dimTag.second, entityTags);
+	}
+	return groups;
+}
+
+// Reinstates the snapshot unconditionally rather than only when
+// getPhysicalGroups() reports empty: Gmsh can leave a physical group's tag
+// reserved internally (so re-adding it collides) even once it has stopped
+// showing up in that query, so checking "is it gone" first is not reliable.
+// Clearing whatever dim-2 groups are currently registered before re-adding
+// the snapshot is the safe order either way.
+static void restorePhysicalSurfaceGroups(const std::vector<std::pair<int, std::vector<int>>> &saved) {
+	if (saved.empty()) return;
+	std::vector<std::pair<int, int>> current;
+	gmsh::model::getPhysicalGroups(current, 2);
+	// The geo-kernel path (single-material and geo-kernel multimat files)
+	// keeps its groups through normalizeToUnitSquare, so leave it alone: a
+	// touch-and-restore cycle on physical groups the frontal-Delaunay 2D
+	// mesher hasn't run yet perturbs its advancing-front order and produces
+	// a different (still valid, but needlessly different) mesh. Only the
+	// occ::synchronize() quirk this guards against drops the count.
+	if (current.size() == saved.size()) return;
+
+	// Once occ::synchronize() has dropped a group, getPhysicalGroups() no
+	// longer lists its tag, but the tag stays reserved internally: adding a
+	// physical group with that same tag still fails as "already exists". Ask
+	// for the removal of exactly the (dim, tag) pairs the snapshot names,
+	// regardless of what the (unreliable, post-drop) query reports.
+	std::vector<std::pair<int, int>> toRemove;
+	toRemove.reserve(saved.size());
+	for (const auto &group : saved) toRemove.emplace_back(2, group.first);
+	try {
+		gmsh::model::removePhysicalGroups(toRemove);
+	} catch (...) {
+		// Nothing registered under these tags; fine, addPhysicalGroup below will succeed.
+	}
+	for (const auto &group : saved) {
+		gmsh::model::addPhysicalGroup(2, group.second, group.first);
+	}
 }
 
 static void normalizeToUnitSquare() {
@@ -64,6 +120,21 @@ static void normalizeToUnitSquare() {
 		}
 }
 
+// Material id of a surface entity: the tag of the first physical group it
+// belongs to, or 1 when the geometry declares no physical groups at all (the
+// single-material case). Multimaterial .geo files select ids by writing
+// `Physical Surface(<id>) = {...};` for each region.
+static int materialIdOfSurface(int surfaceTag) {
+	std::vector<int> physicalTags;
+	try {
+		gmsh::model::getPhysicalGroupsForEntity(2, surfaceTag, physicalTags);
+	} catch (...) {
+		return 1;
+	}
+	if (physicalTags.empty()) return 1;
+	return physicalTags.front();
+}
+
 static void writeOBJ(const std::string &path) {
 	// Fetch all nodes
 	std::vector<std::size_t> nodeTags;
@@ -95,43 +166,57 @@ static void writeOBJ(const std::string &path) {
 		out << "v " << x << ' ' << y << ' ' << z << '\n';
 	}
 
-	// Fetch 2D elements (surfaces)
-	std::vector<int> types;
-	std::vector<std::vector<std::size_t>> elementTags, elementNodeTags;
-	gmsh::model::mesh::getElements(types, elementTags, elementNodeTags, 2, -1);
+	// Gather the triangles of every surface entity, keyed by material id, so
+	// that each material comes out as one contiguous `usemtl mat<id>` block.
+	std::map<int, std::vector<std::array<int, 3>>> facesByMaterial;
 
-	// Write faces: handle triangles (3-node and 6-node) and degrade quads to triangles
-	for (std::size_t k = 0; k < types.size(); ++k) {
-		int et = types[k];
-		const auto &nodes = elementNodeTags[k];
-		if (et == 2) {
-			// 3-node triangles
-			for (std::size_t j = 0; j + 2 < nodes.size(); j += 3) {
-				int a = idx[nodes[j + 0]];
-				int b = idx[nodes[j + 1]];
-				int c = idx[nodes[j + 2]];
-				out << "f " << a << ' ' << b << ' ' << c << '\n';
+	std::vector<std::pair<int, int>> surfaces;
+	gmsh::model::getEntities(surfaces, 2);
+	for (const auto &surface : surfaces) {
+		const int surfaceTag = surface.second;
+		const int matId = materialIdOfSurface(surfaceTag);
+		std::vector<std::array<int, 3>> &faces = facesByMaterial[matId];
+
+		std::vector<int> types;
+		std::vector<std::vector<std::size_t>> elementTags, elementNodeTags;
+		gmsh::model::mesh::getElements(types, elementTags, elementNodeTags, 2, surfaceTag);
+
+		// Handle triangles (3-node and 6-node) and degrade quads to triangles
+		for (std::size_t k = 0; k < types.size(); ++k) {
+			int et = types[k];
+			const auto &nodes = elementNodeTags[k];
+			if (et == 2) {
+				// 3-node triangles
+				for (std::size_t j = 0; j + 2 < nodes.size(); j += 3) {
+					faces.push_back({idx[nodes[j + 0]], idx[nodes[j + 1]], idx[nodes[j + 2]]});
+				}
+			} else if (et == 9) {
+				// 6-node triangles: use corner nodes (1,2,3)
+				for (std::size_t j = 0; j + 5 < nodes.size(); j += 6) {
+					faces.push_back({idx[nodes[j + 0]], idx[nodes[j + 1]], idx[nodes[j + 2]]});
+				}
+			} else if (et == 3) {
+				// 4-node quads: split into two triangles (1,2,3) and (1,3,4)
+				for (std::size_t j = 0; j + 3 < nodes.size(); j += 4) {
+					int n1 = idx[nodes[j + 0]];
+					int n2 = idx[nodes[j + 1]];
+					int n3 = idx[nodes[j + 2]];
+					int n4 = idx[nodes[j + 3]];
+					faces.push_back({n1, n2, n3});
+					faces.push_back({n1, n3, n4});
+				}
+			} else {
+				// Other element types are ignored for OBJ output
 			}
-		} else if (et == 9) {
-			// 6-node triangles: use corner nodes (1,2,3)
-			for (std::size_t j = 0; j + 5 < nodes.size(); j += 6) {
-				int a = idx[nodes[j + 0]];
-				int b = idx[nodes[j + 1]];
-				int c = idx[nodes[j + 2]];
-				out << "f " << a << ' ' << b << ' ' << c << '\n';
-			}
-		} else if (et == 3) {
-			// 4-node quads: split into two triangles (1,2,3) and (1,3,4)
-			for (std::size_t j = 0; j + 3 < nodes.size(); j += 4) {
-				int n1 = idx[nodes[j + 0]];
-				int n2 = idx[nodes[j + 1]];
-				int n3 = idx[nodes[j + 2]];
-				int n4 = idx[nodes[j + 3]];
-				out << "f " << n1 << ' ' << n2 << ' ' << n3 << '\n';
-				out << "f " << n1 << ' ' << n3 << ' ' << n4 << '\n';
-			}
-		} else {
-			// Other element types are ignored for OBJ output
+		}
+	}
+
+	// Write faces, one `usemtl` block per material id
+	for (const auto &entry : facesByMaterial) {
+		if (entry.second.empty()) continue;
+		out << "usemtl mat" << entry.first << '\n';
+		for (const auto &f : entry.second) {
+			out << "f " << f[0] << ' ' << f[1] << ' ' << f[2] << '\n';
 		}
 	}
 
@@ -163,8 +248,12 @@ int main(int argc, char **argv) {
 		gmsh::model::geo::synchronize();
 
 		// Merge geometry (if the .geo creates multiple components, open already loads them).
-		// Apply normalization: translate and scale to fit within [-1,1]^2
+		// Apply normalization: translate and scale to fit within [-1,1]^2. This can
+		// drop OCC-kernel Physical Surface groups (see normalizeToUnitSquare's
+		// comment above capturePhysicalSurfaceGroups), so save and restore them.
+		auto savedPhysicalGroups = capturePhysicalSurfaceGroups();
 		normalizeToUnitSquare();
+		restorePhysicalSurfaceGroups(savedPhysicalGroups);
 
 		// Set characteristic length h = 2/np
 		const double h = 2.0 / static_cast<double>(np);

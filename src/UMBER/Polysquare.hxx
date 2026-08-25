@@ -138,7 +138,7 @@ public:
     // (Sec. 7.1, Fig. 14).
     //
     // The stage past 1.0 is the one that matters, and stopping at 1.0 does not
-    // give a polysquare: on data/meshes/geom010 the boundary is still 1.9
+    // give a polysquare: on data/meshes/singlemat/geom010 the boundary is still 1.9
     // degrees off axis on average and 19 at worst, with a visible diagonal run
     // where a staircase of axis-aligned segments belongs. The 2.0 stage brings
     // that to 0.32 and 1.5. Pushing further keeps buying alignment and pays
@@ -192,7 +192,7 @@ public:
     // How close two corners have to be, in mean image boundary edges, for them
     // to be treated as sharing an iso-line -- see snapCorners(). 0 disables it.
     //
-    // The discrepancy this is for is small: on data/meshes/geom021 the two
+    // The discrepancy this is for is small: on data/meshes/singlemat/geom021 the two
     // corners that should share an iso-line come out 1.4% of a boundary edge
     // apart, and that is the one that costs a whole partition. So the default
     // is a twentieth of an edge -- three times what is needed there and still

@@ -137,21 +137,23 @@ target_link_libraries(TestSIPG PRIVATE PolyVector)
 add_executable(TestUMBER src/utils/TestUMBER.cxx)
 target_link_libraries(TestUMBER PRIVATE PolyVector)
 
-# copy all meshes to build directory for easy access
-file(GLOB MESH_FILES "${CMAKE_CURRENT_SOURCE_DIR}/data/meshes/*")
-foreach(MESH_FILE ${MESH_FILES})
-    get_filename_component(MESH_NAME ${MESH_FILE} NAME)
-    configure_file(${MESH_FILE} ${CMAKE_CURRENT_BINARY_DIR}/data/meshes/${MESH_NAME} COPYONLY)
+# copy all meshes to build directory for easy access, keeping the material
+# subdirectory layout (singlemat/, multimat/, ...) intact
+file(GLOB_RECURSE MESH_FILES RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}/data/meshes"
+     "${CMAKE_CURRENT_SOURCE_DIR}/data/meshes/*")
+foreach(MESH_REL ${MESH_FILES})
+    configure_file(${CMAKE_CURRENT_SOURCE_DIR}/data/meshes/${MESH_REL}
+                   ${CMAKE_CURRENT_BINARY_DIR}/data/meshes/${MESH_REL} COPYONLY)
 endforeach()
 
 # Custom target to run TestCutMesh on all meshes
-file(GLOB MESH_OBJ_FILES "${CMAKE_CURRENT_BINARY_DIR}/data/meshes/*.obj")
+file(GLOB_RECURSE MESH_OBJ_FILES "${CMAKE_CURRENT_BINARY_DIR}/data/meshes/*.obj")
 set(CUT_COMMANDS "")
 foreach(MESH_FILE ${MESH_OBJ_FILES})
     get_filename_component(MESH_NAME ${MESH_FILE} NAME)
     list(APPEND CUT_COMMANDS 
         COMMAND ${CMAKE_COMMAND} -E echo "Processing ${MESH_NAME}..."
-        COMMAND $<TARGET_FILE:TestCutMesh> ${CMAKE_CURRENT_BINARY_DIR}/data/meshes/${MESH_NAME}
+        COMMAND $<TARGET_FILE:TestCutMesh> ${MESH_FILE}
     )
 endforeach()
 
@@ -168,7 +170,7 @@ foreach(MESH_FILE ${MESH_OBJ_FILES})
     get_filename_component(MESH_NAME ${MESH_FILE} NAME)
     list(APPEND MIQ_COMMANDS 
         COMMAND ${CMAKE_COMMAND} -E echo "Processing ${MESH_NAME}..."
-        COMMAND $<TARGET_FILE:TestMIQ> ${CMAKE_CURRENT_BINARY_DIR}/data/meshes/${MESH_NAME} || ${CMAKE_COMMAND} -E true
+        COMMAND $<TARGET_FILE:TestMIQ> ${MESH_FILE} || ${CMAKE_COMMAND} -E true
     )
 endforeach()
 
@@ -185,7 +187,7 @@ foreach(MESH_FILE ${MESH_OBJ_FILES})
     get_filename_component(MESH_NAME ${MESH_FILE} NAME)
     list(APPEND SIPG_COMMANDS 
         COMMAND ${CMAKE_COMMAND} -E echo "Processing ${MESH_NAME}..."
-        COMMAND $<TARGET_FILE:TestSIPG> ${CMAKE_CURRENT_BINARY_DIR}/data/meshes/${MESH_NAME} || ${CMAKE_COMMAND} -E true
+        COMMAND $<TARGET_FILE:TestSIPG> ${MESH_FILE} || ${CMAKE_COMMAND} -E true
     )
 endforeach()
 

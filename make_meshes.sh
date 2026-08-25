@@ -3,14 +3,12 @@
 source clean.sh
 source build.sh --all
 
-export NP=120
+export NP=50
 
-# Create output directory
-OUT_DIR="$(pwd)/data/meshes"
-mkdir -p "$OUT_DIR"
-
-# Loop over geometry files and generate meshes
-GEOM_DIR="$(pwd)/data/geometry"
+# Geometry lives in per-material-kind subdirectories (singlemat/, multimat/,
+# ...); each one is meshed into the matching subdirectory of data/meshes.
+GEOM_ROOT="$(pwd)/data/geometry"
+OUT_ROOT="$(pwd)/data/meshes"
 EXEC="$(pwd)/build/Mesh2Dgmsh"
 
 if [ ! -x "$EXEC" ]; then
@@ -19,14 +17,17 @@ if [ ! -x "$EXEC" ]; then
 fi
 
 shopt -s nullglob
-for geo in "$GEOM_DIR"/*.geo; do
-	echo "Meshing $(basename "$geo") with NP=$NP"
-	"$EXEC" "$geo" "$OUT_DIR" "$NP" || {
+for geo in "$GEOM_ROOT"/*/*.geo; do
+	kind="$(basename "$(dirname "$geo")")"
+	out_dir="$OUT_ROOT/$kind"
+	mkdir -p "$out_dir"
+	echo "Meshing $kind/$(basename "$geo") with NP=$NP"
+	"$EXEC" "$geo" "$out_dir" "$NP" || {
 		echo "Failed to mesh $geo" >&2
 	}
 done
 shopt -u nullglob
 
-echo "All done. Meshes are in $OUT_DIR"
+echo "All done. Meshes are in $OUT_ROOT"
 cd build
 cmake ..

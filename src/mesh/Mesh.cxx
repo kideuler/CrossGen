@@ -32,8 +32,30 @@ static bool parse_obj_index(const std::string &tok, int &vertexIndexOut) {
 	}
 }
 
-Mesh::Mesh(const std::vector<Point> &verts, const std::vector<Triangle> &tris) 
+// Parse the material id out of an OBJ material name such as "mat3": the
+// trailing run of digits. Names without one keep the id already in effect.
+static bool parse_material_id(const std::string &name, int &matIdOut) {
+	std::size_t end = name.size();
+	while (end > 0 && std::isdigit(static_cast<unsigned char>(name[end - 1]))) --end;
+	if (end == name.size()) return false;
+	try {
+		matIdOut = std::stoi(name.substr(end));
+		return true;
+	} catch (...) {
+		return false;
+	}
+}
+
+Mesh::Mesh(const std::vector<Point> &verts, const std::vector<Triangle> &tris)
+	: Mesh(verts, tris, std::vector<int>{}) {}
+
+Mesh::Mesh(const std::vector<Point> &verts, const std::vector<Triangle> &tris,
+           const std::vector<int> &matIds)
 	: vertices(verts), triangles(tris) {
+
+	// A mesh with no material information given is a single-material mesh.
+	if (matIds.size() == triangles.size()) triangleMatId = matIds;
+	else triangleMatId.assign(triangles.size(), 1);
 	
 	// Prepare adjacency; initialize with -1 for boundaries
 	triangleAdjacency.resize(triangles.size(), std::array<int,3>{-1, -1, -1});
@@ -140,6 +162,8 @@ Mesh::Mesh(const std::string &filename) {
 	std::string line;
 	std::vector<Point> tempVertices;
 	std::vector<Triangle> tempTriangles;
+	std::vector<int> tempMatIds;
+	int currentMatId = 1; // faces before any usemtl belong to material 1
 
 	while (std::getline(in, line)) {
 		// Trim leading spaces
@@ -156,6 +180,10 @@ Mesh::Mesh(const std::string &filename) {
 			iss >> x >> y; // 2D mesh expects x,y; ignore optional z if present
 			Point p{ x, y };
 			tempVertices.push_back(p);
+		} else if (tag == "usemtl") {
+			std::string matName;
+			iss >> matName;
+			parse_material_id(matName, currentMatId);
 		} else if (tag == "f") {
 			// face: expect triangles. If more than 3 vertices, triangulate fan-wise
 			std::vector<int> faceIndices;
@@ -189,6 +217,7 @@ Mesh::Mesh(const std::string &filename) {
 				double A2 = (pb[0]-pa[0])*(pc[1]-pa[1]) - (pb[1]-pa[1])*(pc[0]-pa[0]);
 				if (A2 < 0.0) std::swap(b, c);
 				tempTriangles.push_back(Triangle{a,b,c});
+				tempMatIds.push_back(currentMatId);
 			}
 		}
 		// ignore other tags (vt, vn, etc.)
@@ -197,7 +226,7 @@ Mesh::Mesh(const std::string &filename) {
 	// Delegate to the main constructor via placement new
 	// This is a common pattern to reuse constructor logic
 	this->~Mesh();
-	new (this) Mesh(tempVertices, tempTriangles);
+	new (this) Mesh(tempVertices, tempTriangles, tempMatIds);
 }
 
 int Mesh::findTriangleContainingPoint(const Point &p) const {
