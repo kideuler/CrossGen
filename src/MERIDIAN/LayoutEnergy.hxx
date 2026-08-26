@@ -297,6 +297,25 @@ private:
     bool innerSolve(int outer);
     void measure(bool initial);
 
+    // The diagonal of the image *as it currently stands*, which is the length
+    // every residual below is divided by and the scale every step length is
+    // taken relative to.
+    //
+    // This has to be re-read rather than taken once from psi_R. E1 measures
+    // distortion against a reference triangle, and switching the reference from
+    // the Ricci metric to the surface's own Euclidean geometry -- which Sec.
+    // 3.3's continuation does, and which run() does here -- rescales the whole
+    // map by the ratio of the two metrics' scales. On the meshes in this corpus
+    // that ratio is around 40. A residual divided by psi_R's extent after such
+    // a switch is understated by exactly that factor, and since constraintsUnder()
+    // is what stops the continuation, the penalty loop declares Q3/Q4/Q5 met
+    // roughly 40x before they are. The visible symptom is Stage 7: separatrices
+    // that pass a few times 1e-6 of the image from a cone instead of landing on
+    // it, so nothing snaps and curves that should join two singularities run on
+    // to the step cap instead.
+    double imageExtent() const;
+    void updateExtent() { extent = imageExtent(); }
+
     static int dofU(int v) { return 2 * v; }
     static int dofV(int v) { return 2 * v + 1; }
 
@@ -319,7 +338,10 @@ private:
     Reference currentReference = Reference::Ricci;
 
     double lambda[6] = {1.0, 1.0, 0.0, 0.0, 0.0, 0.0};   // lambda[1..5]
-    double extent = 1.0;   // diagonal of the image, the scale residuals are read against
+    // Diagonal of the image, the scale residuals are read against. Kept current
+    // by updateExtent() -- see the note there for why a stale one is not a
+    // cosmetic error in the reporting but an early stop of the continuation.
+    double extent = 1.0;
 
     Report report;
 };

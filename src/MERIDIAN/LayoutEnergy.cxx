@@ -120,9 +120,7 @@ LayoutEnergy::LayoutEnergy(const Immersion &immersion, SubdomainLabels &lab,
     x.assign(2 * nV, 0.0);
     for (int v = 0; v < nV; ++v) { x[dofU(v)] = uv[v][0]; x[dofV(v)] = uv[v][1]; }
 
-    const Point &lo = imm->getReport().uvMin;
-    const Point &hi = imm->getReport().uvMax;
-    extent = std::max(1e-30, std::hypot(hi[0] - lo[0], hi[1] - lo[1]));
+    updateExtent();
 
     if (options.pinnedVertex < 0 || options.pinnedVertex >= nV) options.pinnedVertex = 0;
 
@@ -469,6 +467,10 @@ double LayoutEnergy::maxStep(const std::vector<double> &xx,
 // ---------------------------------------------------------------------------
 bool LayoutEnergy::innerSolve(int outer) {
     (void)outer;
+    // options.innerTolerance is a step length relative to the image, so the
+    // stopping test below needs the extent of the image this solve starts from,
+    // not psi_R's.
+    updateExtent();
     std::vector<double> grad, dir(2 * nV, 0.0), trial(2 * nV, 0.0);
     std::vector<Eigen::Triplet<double>> trips;
 
@@ -578,12 +580,29 @@ bool LayoutEnergy::innerSolve(int outer) {
 }
 
 // ---------------------------------------------------------------------------
+double LayoutEnergy::imageExtent() const {
+    Point lo{kInf, kInf}, hi{-kInf, -kInf};
+    for (const Point &p : uv) {
+        lo[0] = std::min(lo[0], p[0]);
+        lo[1] = std::min(lo[1], p[1]);
+        hi[0] = std::max(hi[0], p[0]);
+        hi[1] = std::max(hi[1], p[1]);
+    }
+    if (!(hi[0] >= lo[0])) return 1.0;   // no vertices
+    return std::max(1e-30, std::hypot(hi[0] - lo[0], hi[1] - lo[1]));
+}
+
+// ---------------------------------------------------------------------------
 // measure()
 //
 // One residual per property, read off the map rather than off the energies --
 // a small E2 with a large lambda_2 says nothing about how far Q3 still is.
 // ---------------------------------------------------------------------------
 void LayoutEnergy::measure(bool initial) {
+    // The residuals below are all lengths divided by the extent, and the extent
+    // moves with the map. Re-read it before using it.
+    updateExtent();
+
     report.maxBoundaryResidual = 0.0;
     report.maxFeatureResidual = 0.0;
     report.maxSeamResidual = 0.0;
@@ -866,7 +885,7 @@ double LayoutEnergy::checkGradient(int samples, double h) const {
     if (wmax <= 0.0) return 0.0;
 
     const double cap = maxStep(x, w);
-    double alpha = 0.02 * extent / wmax;
+    double alpha = 0.02 * imageExtent() / wmax;
     if (std::isfinite(cap)) alpha = std::min(alpha, 0.25 * cap);
 
     std::vector<double> xt(2 * nV);
