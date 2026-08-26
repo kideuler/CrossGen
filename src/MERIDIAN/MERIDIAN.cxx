@@ -157,5 +157,31 @@ bool MERIDIAN::run() {
     status.layoutValid = er.valid;
     for (const std::string &m : er.messages) status.messages.push_back("Stage 6: " + m);
 
+    if (!options.runSeparatrices) return status.layoutValid;
+
+    // --- Stage 7: separatrix tracing, Sec. 4 ------------------------------
+    // Run even when the continuation fell short. The curves are the only place
+    // Q5 is visible as the property it actually is -- every integral curve out
+    // of a cone is finite -- and a capped one names the pair of cones whose
+    // connectivity constraint is missing, which is the diagnosis Sec. 3.3 asks
+    // for when the layout is not yet a layout.
+    Separatrices::Options sopts;
+    sopts.coneSnapTolerance = options.separatrixSnap;
+    sopts.maxSteps = options.separatrixMaxSteps;
+    try {
+        separatrices = std::make_unique<Separatrices>(*immersion, layout->getUV(), sopts);
+    } catch (const std::exception &e) {
+        status.messages.push_back(std::string("Stage 7: could not be run: ") + e.what());
+        return status.layoutValid;
+    }
+    const Separatrices::Report &sr2 = separatrices->getReport();
+    status.separatricesRan = true;
+    status.separatrices = sr2.emitted;
+    status.separatricesToCone = sr2.endedAtCone;
+    status.separatricesToBoundary = sr2.endedAtBoundary;
+    status.separatricesUnresolved = sr2.capped + sr2.stuck + sr2.degenerate;
+    status.q5Verified = sr2.valid;
+    for (const std::string &m : sr2.messages) status.messages.push_back("Stage 7: " + m);
+
     return status.layoutValid;
 }

@@ -10,6 +10,7 @@
 #include "MERIDIAN/Immersion.hxx"
 #include "MERIDIAN/LayoutEnergy.hxx"
 #include "MERIDIAN/RicciFlow.hxx"
+#include "MERIDIAN/Separatrices.hxx"
 #include "MERIDIAN/SubdomainLabels.hxx"
 #include "mesh/Mesh.hxx"
 
@@ -63,6 +64,15 @@ class SIPG;
 //                        where the layout is actually produced.
 //                        -> LayoutEnergy
 //
+//   Stage 7  Sec. 4      The separatrices of Psi: the integral curves that
+//                        leave each cone along its grid directions, marched
+//                        triangle by triangle and continued across the cutting
+//                        graph by the transitions of Q4, until each terminates
+//                        at a cone or leaves through dS. This is Q5 read back
+//                        off the map as curves rather than as a residual, and
+//                        it is what Stages 8 to 10 partition and fit.
+//                        -> Separatrices
+//
 // The Gauss-Bonnet check between Stages 1 and 3 is not a formality. Newton's
 // system in the flow is Delta du = Kbar - K with Delta a Laplacian, whose
 // kernel is the constants; the residual has to be orthogonal to that kernel for
@@ -80,9 +90,10 @@ class SIPG;
 // than only its own convergence.
 //
 // What comes out at the end is Psi, one planar point per vertex of the cut
-// disk, satisfying Q1 to Q5 to whatever tolerance the continuation reached.
-// Stages 7 to 10 -- separatrix tracing, the arrangement, the spline fit and the
-// analysis handoff -- read it and are not implemented here.
+// disk, satisfying Q1 to Q5 to whatever tolerance the continuation reached, and
+// the separatrices traced on it. Stages 8 to 10 -- the arrangement of those
+// curves into a layout, the spline fit and the analysis handoff -- read them
+// and are not implemented here.
 class MERIDIAN {
 public:
     struct Options {
@@ -119,6 +130,13 @@ public:
         // automatically from near-misses of the separatrices on psi_R.
         bool seedTopoConstraints = true;
         double topoNearMiss = 0.15;  // as a fraction of the mean cone spacing
+
+        // Stage 7. The snap tolerance is Sec. 3.4's, as a fraction of the image
+        // extent; the step cap is what turns a curve that never terminates into
+        // a reported failure of Q5 rather than a hang.
+        bool runSeparatrices = true;
+        double separatrixSnap = 1e-6;
+        int separatrixMaxSteps = 50000;
     };
 
     struct Status {
@@ -158,6 +176,18 @@ public:
         // sense of Definition 2.1.
         bool layoutValid = false;
 
+        // Stage 7
+        bool separatricesRan = false;
+        int separatrices = 0;
+        int separatricesToCone = 0;
+        int separatricesToBoundary = 0;
+        int separatricesUnresolved = 0;   // capped, stuck or degenerate
+        // Every separatrix ended the way Q5 allows and every cone emitted the
+        // number its index prescribes. Stage 6 asserts Q5 through the residual
+        // of E5, which is a statement about the Gamma_topo paths it was given;
+        // this is the same property read off every curve there is.
+        bool q5Verified = false;
+
         std::vector<std::string> messages;
     };
 
@@ -179,6 +209,7 @@ public:
     const Immersion& getImmersion() const { return *immersion; }
     const SubdomainLabels& getLabels() const { return *labels; }
     const LayoutEnergy& getLayout() const { return *layout; }
+    const Separatrices& getSeparatrices() const { return *separatrices; }
 
     // Null until the stage that builds them has run.
     bool hasCones() const { return cones != nullptr; }
@@ -187,6 +218,7 @@ public:
     bool hasImmersion() const { return immersion != nullptr; }
     bool hasLabels() const { return labels != nullptr; }
     bool hasLayout() const { return layout != nullptr; }
+    bool hasSeparatrices() const { return separatrices != nullptr; }
 
     const Status& getStatus() const { return status; }
 
@@ -207,6 +239,7 @@ private:
     std::unique_ptr<Immersion> immersion;
     std::unique_ptr<SubdomainLabels> labels;
     std::unique_ptr<LayoutEnergy> layout;
+    std::unique_ptr<Separatrices> separatrices;
 };
 
 #endif // __MERIDIAN_HXX__

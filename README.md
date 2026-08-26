@@ -1,6 +1,6 @@
 A purely 2D implementation of Cross-fields along with block decomposition
 
-TODO:
+# TODO:
 - [X] Implement polyvectors to obtain crossfields.
 - [X] Robustly detect and classify singularities.
 - [X] Cut Mesh for MIQ.
@@ -16,6 +16,6 @@ TODO:
 - [X] Implement basic polysquare stuff from 2023 paper
 - [X] Go back and try to fix tracing and simplification
 - [X] See if we can do a chord collapse operation for complex polysquares
-- [ ] Padding?
 - [x] Try medial axis again.
-- [ ] Multi-material
+- [ ] Change mesh cutting a little so singularities do not lie on the same cut. Should conditions better.
+- [ ] Tracing.

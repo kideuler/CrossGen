@@ -71,6 +71,8 @@ add_library(PolyVector SHARED
     src/MERIDIAN/SubdomainLabels.cxx
     src/MERIDIAN/LayoutEnergy.hxx
     src/MERIDIAN/LayoutEnergy.cxx
+    src/MERIDIAN/Separatrices.hxx
+    src/MERIDIAN/Separatrices.cxx
     src/UMBER/Polysquare.hxx
     src/UMBER/Polysquare.cxx
     src/UMBER/MotorcycleGraph.hxx
@@ -151,8 +153,9 @@ target_link_libraries(TestSIPG PRIVATE PolyVector)
 add_executable(TestUMBER src/utils/TestUMBER.cxx)
 target_link_libraries(TestUMBER PRIVATE PolyVector)
 
-# Test MERIDIAN Stages 1-6 (Shepherd, Gu and Hughes 2022, Secs. 3.1-3.3):
-# cone singularities, cutting graph, Gauss-Bonnet, discrete Ricci flow
+# Test MERIDIAN Stages 1-7 (Shepherd, Gu and Hughes 2022, Secs. 3.1-3.3 and 4):
+# cone singularities, cutting graph, Gauss-Bonnet, discrete Ricci flow, the
+# metric immersion, the layout energies, and the separatrices of the result
 add_executable(TestMERIDIAN src/utils/TestMERIDIAN.cxx)
 target_link_libraries(TestMERIDIAN PRIVATE PolyVector)
 
@@ -263,13 +266,20 @@ add_test(NAME Tracing_LayoutsOnAllMeshes
 # sums directly and the Hessian against a finite difference.
 add_test(NAME MERIDIAN_RicciFlowSelfTest COMMAND TestMERIDIAN --selftest)
 
-# End-to-end: Stages 1 to 6 on a handful of models that between them exercise
+# End-to-end: Stages 1 to 7 on a handful of models that between them exercise
 # every part of the later stages -- a plain disk with one interior cone
 # (geom001), a model whose cutting graph carries several different holonomies
 # (geom003), one with voids and a dozen connectivity constraints (geom012), and
 # a two-material model, where the interface between the physical surfaces is a
 # feature chain and E3 has something to hold (multimat geom001). Each asserts
-# Q1 to Q5 on the map that comes out; the whole corpus is `make meridian`.
+# Q1 to Q5 on the map that comes out and traces its separatrices; the whole
+# corpus is `make meridian`.
+#
+# The exit code follows the layout, not the tracing. A separatrix that runs on
+# past the step cap is Q5 failing on a curve E5 was never given a constraint
+# for -- Remark 3.1's case, and one whose remedy is a Gamma_topo constraint
+# rather than a fix to Stage 7 -- so it is reported as a warning. geom012 has
+# four of them and passes.
 foreach(MERIDIAN_CASE singlemat/geom001 singlemat/geom003 singlemat/geom012 multimat/geom001)
     string(REPLACE "/" "_" MERIDIAN_CASE_NAME ${MERIDIAN_CASE})
     add_test(NAME MERIDIAN_Layout_${MERIDIAN_CASE_NAME}

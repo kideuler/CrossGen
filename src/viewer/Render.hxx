@@ -13,6 +13,7 @@
 #include "MERIDIAN/ConeSingularities.hxx"
 #include "MERIDIAN/Immersion.hxx"
 #include "MERIDIAN/RicciFlow.hxx"
+#include "MERIDIAN/Separatrices.hxx"
 #include "MERIDIAN/SubdomainLabels.hxx"
 #include "Parameterization/CutMesh.hxx"
 #include "Parameterization/MIQ.hxx"
@@ -356,5 +357,42 @@ void computeLayoutBounds(const std::vector<Point> &uv,
 // the boundary in grey -- what psi_R looks like before Stage 5 has run.
 void drawLayoutUV(const Immersion &imm, const SubdomainLabels *labels,
                   const std::vector<Point> &uv, double coneRadius);
+
+// ── MERIDIAN: the separatrices of Psi ────────────────────────────────────────
+//
+// Sec. 4. Stage 7 stores each curve as a list of (triangle, barycentric entry,
+// barycentric exit), and barycentric coordinates are the same numbers in the
+// image and on S, so the *same* curve can be drawn in either world without
+// re-projecting it: Separatrices::polyline() evaluates the same steps against
+// Psi or against the model. That is why both halves of this phase are drawn by
+// one routine with a Space argument -- they are not two computations, they are
+// one curve seen from its two ends, which is the whole point of the picture.
+//
+// The colour is the end the curve came to, because that is what Q5 asks:
+//
+//   green    terminated at a cone. The case Q5 wants, and the one that closes
+//            a patch of the layout.
+//   blue     left transversely through dS. Also allowed, and what happens to
+//            the rays of a boundary cone that point out of the model.
+//   red      still running when the step cap was reached. Not a failure of the
+//            tracer: away from the cones these are geodesics of a flat cone
+//            metric, so a direction no Gamma_topo constraint quantised does
+//            not close. A red curve names the pair of cones whose connectivity
+//            constraint Sec. 3.3 is missing.
+//   orange   stuck or degenerate -- a ray that could not be marched at all.
+//
+// A curve is drawn broken in the image and unbroken on the model, and that
+// asymmetry is Q4 rather than a defect: crossing an arc of G jumps the image to
+// the other bank of the cut while the pullback walks straight on. `breaks` out
+// of polyline() is what puts the gaps in.
+//
+// The terminus of anything that did not reach a cone gets a disk, since a green
+// curve already ends on a cone disk and the other three are the ones worth
+// finding.
+void drawSeparatrices(const Separatrices &sep, Separatrices::Space space,
+                      double endRadius, float lineWidth);
+
+// Screen-space key for those four colours, under the cone legend.
+void drawSeparatrixLegend(int fbw, int fbh);
 
 } // namespace viewer

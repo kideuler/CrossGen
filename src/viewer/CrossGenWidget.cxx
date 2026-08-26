@@ -100,9 +100,10 @@ MERIDIANPhase nextMERIDIANPhase(MERIDIANPhase p) {
         case MERIDIANPhase::Cut:        return MERIDIANPhase::RicciFlow;
         case MERIDIANPhase::RicciFlow:  return MERIDIANPhase::Metric;
         case MERIDIANPhase::Metric:     return MERIDIANPhase::Layout;
-        case MERIDIANPhase::Layout:     return MERIDIANPhase::Layout;
+        case MERIDIANPhase::Layout:     return MERIDIANPhase::Separatrices;
+        case MERIDIANPhase::Separatrices: return MERIDIANPhase::Separatrices;
     }
-    return MERIDIANPhase::Layout;
+    return MERIDIANPhase::Separatrices;
 }
 
 MedialAxisPhase nextMedialAxisPhase(MedialAxisPhase p) {
@@ -178,6 +179,7 @@ const char *meridianPhaseName(MERIDIANPhase p) {
         case MERIDIANPhase::RicciFlow:  return "6) discrete Ricci flow (Sec. 3.2.1)";
         case MERIDIANPhase::Metric:     return "7) flat cone metric";
         case MERIDIANPhase::Layout:     return "8) layout Psi (Secs. 3.2.2, 3.3)";
+        case MERIDIANPhase::Separatrices: return "9) separatrices (Sec. 4, Q5)";
     }
     return "?";
 }
@@ -541,6 +543,7 @@ void CrossGenWidget::doReset() {
     // Each MERIDIAN stage holds on to the ones before it, so they go in
     // reverse: the layout on the labels and the immersion, the immersion on the
     // cut, the flow and the cones, and both the flow and the cut on the cones.
+    separatrices_.reset();
     meridianLayout_.reset();
     meridianLabels_.reset();
     immersion_.reset();
@@ -585,6 +588,8 @@ void CrossGenWidget::doReset() {
     ricciAttempted_       = false;
     layoutAnnounced_      = false;
     layoutAttempted_      = false;
+    separatricesAnnounced_ = false;
+    separatricesAttempted_ = false;
 
     view_.cx    = 0.5 * (bounds_.minx + bounds_.maxx);
     view_.cy    = 0.5 * (bounds_.miny + bounds_.maxy);
@@ -1631,6 +1636,92 @@ void CrossGenWidget::runMERIDIANLayout() {
                  "Blue = Gamma_u, green = Gamma_v, amber/magenta = the two banks of each seam");
 }
 
+// Stage 7, Sec. 4. The separatrices are what Q5 is actually about -- every
+// integral curve of Psi out of a cone is finite -- and Stage 6 can only assert
+// that through the residual of E5, which is a statement about the Gamma_topo
+// paths Stage 5 happened to seed. This traces every curve there is and reads
+// the property off all of them.
+//
+// It runs on Psi rather than on psi_R even when the continuation fell short,
+// and it is worth running then: a curve that reaches the step cap names the
+// pair of cones whose connectivity constraint is missing, which is the
+// diagnosis Sec. 3.3 asks for when the layout is not yet a layout.
+void CrossGenWidget::runMERIDIANSeparatrices() {
+    separatricesAttempted_ = true;
+    if (!immersion_.has_value() || !meridianLayout_.has_value()) return;
+
+    auto t0 = Clock::now();
+    try {
+        separatrices_.emplace(*immersion_, meridianLayout_->getUV());
+    } catch (const std::exception &e) {
+        separatrices_.reset();
+        console_.log(std::string("[Separatrices] FAILED: ") + e.what());
+        std::cerr << "[Viewer] Separatrices failed: " << e.what() << "\n";
+        return;
+    }
+    auto t1 = Clock::now();
+
+    // If the Layout phase was left showing psi_R the right panel is fitted to
+    // it, and this phase always shows Psi; refit before the first frame.
+    if (showPsiR_) {
+        showPsiR_ = false;
+        viewer::computeLayoutBounds(meridianLayout_->getUV(), uvView_.cx, uvView_.cy,
+                                    uvView_.baseW, uvView_.baseH);
+        uvView_.zoom = 1.0;
+    }
+
+    const Separatrices::Report &r = separatrices_->getReport();
+    {
+        std::ostringstream oss;
+        oss << "[Separatrices] " << r.emitted << " curve(s) from " << r.cones
+            << " cone(s), the indices prescribe " << r.prescribed
+            << " (4 - I interior, 1 - I on dS), "
+            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Separatrices] ends: " << r.endedAtCone << " at a cone, " << r.endedAtBoundary
+            << " out through dS, " << r.capped << " capped";
+        if (r.stuck > 0 || r.degenerate > 0)
+            oss << ", " << r.stuck << " stuck, " << r.degenerate << " degenerate";
+        oss << "; " << r.triangleSteps << " triangle crossing(s), " << r.seamCrossings
+            << " seam crossing(s)";
+        console_.log(oss.str());
+    }
+    {
+        // The two numbers that say the tracing itself is sound, independently of
+        // whether the layout is: how far a snap had to reach compared with the
+        // tolerance it was allowed, and whether the pullback of each curve is
+        // continuous where it crosses the cut, which is the only place a wrong
+        // transition would show.
+        std::ostringstream oss;
+        oss << "[Separatrices] snap tolerance " << std::scientific << std::setprecision(2)
+            << r.snapTolerance << " of the image, worst snap taken " << r.maxSnapGap
+            << "; pullback continuity " << r.maxPullbackGap << " of the model";
+        console_.log(oss.str());
+    }
+    if (r.capped > 0) {
+        std::ostringstream oss;
+        oss << "[Separatrices] " << r.capped
+            << " curve(s) still running at the cap; nearest miss " << std::scientific
+            << std::setprecision(2) << r.worstMissGap
+            << " of the image -- away from the cones these are geodesics of a flat cone "
+               "metric, so a direction no Gamma_topo constraint quantised does not close";
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Separatrices] Q5 " << (r.valid ? "holds on every curve traced [PASS]"
+                                                : "not yet verified; see the ends above [FAIL]");
+        console_.log(oss.str());
+        std::cerr << "[Viewer] " << oss.str() << "\n";
+    }
+    for (const std::string &m : r.messages) console_.log("[Separatrices] " + m);
+    console_.log("[Separatrices] left = the curves on the model (Fig. 9), right = the same "
+                 "curves on Psi. Green ends at a cone, blue leaves through dS, red hit the cap");
+}
+
 // ── phase advancement ────────────────────────────────────────────────────────
 
 void CrossGenWidget::advancePhase() {
@@ -2045,6 +2136,18 @@ void CrossGenWidget::runComputations() {
             layoutAnnounced_ = true;
         } else {
             runMERIDIANLayout();
+        }
+    }
+
+    // ── MERIDIAN: Stage 7, the separatrices of Psi ───────────────────────────
+    if (mode_ == Mode::MERIDIAN && meridianPhase_ >= MERIDIANPhase::Separatrices &&
+        meridianLayout_.has_value() && !separatricesAttempted_) {
+        if (!separatricesAnnounced_) {
+            console_.log("[Separatrices] tracing the integral curves out of every cone, "
+                         "this blocks...");
+            separatricesAnnounced_ = true;
+        } else {
+            runMERIDIANSeparatrices();
         }
     }
 
@@ -2517,6 +2620,9 @@ bool CrossGenWidget::inUVSplitScreen() const {
            // Stages 4 to 6 do have a parameter domain in the ordinary sense:
            // psi_R and Psi are maps of Omega into the plane.
            (mode_ == Mode::MERIDIAN && meridianPhase_ == MERIDIANPhase::Layout &&
+            immersion_.has_value()) ||
+           // Stage 7 draws the same domain again, with the curves on it.
+           (mode_ == Mode::MERIDIAN && meridianPhase_ == MERIDIANPhase::Separatrices &&
             immersion_.has_value());
 }
 
@@ -2589,7 +2695,11 @@ void CrossGenWidget::renderUMBERField() {
 // top. Shared by the last four phases and by the left half of the split screen,
 // so that the cones stay in the same place and the same colours throughout.
 void CrossGenWidget::renderMERIDIANModel() {
+    // The stretch ramp is dropped again at the separatrix phase: what that one
+    // is about is the curves, and a wireframe in the diverging ramp underneath
+    // competes with them for exactly the colours they are drawn in.
     const bool showMetric = (meridianPhase_ >= MERIDIANPhase::Metric &&
+                             meridianPhase_ != MERIDIANPhase::Separatrices &&
                              !flatMetric_.edges.empty());
     const bool showU = (meridianPhase_ == MERIDIANPhase::RicciFlow && ricciU_.size() > 0);
 
@@ -2971,7 +3081,9 @@ void CrossGenWidget::renderNormal() {
             // failed to leave the interior.
             renderUMBERField();
         }
-    } else if (mode_ == Mode::MERIDIAN && meridianPhase_ == MERIDIANPhase::Layout &&
+    } else if (mode_ == Mode::MERIDIAN &&
+               (meridianPhase_ == MERIDIANPhase::Layout ||
+                meridianPhase_ == MERIDIANPhase::Separatrices) &&
                immersion_.has_value()) {
         // ── Split-screen: left = the model, right = Omega in the plane ───────
         //
@@ -2980,8 +3092,12 @@ void CrossGenWidget::renderNormal() {
         // map is only readable against the thing it is a map of. The right half
         // is Psi once the continuation has run and psi_R before it -- or after
         // it, on 'p', which is the only way to see what Stage 6 actually did.
+        // At the separatrix phase the map is not a choice: the curves were
+        // marched over Psi, and drawing them over psi_R would be drawing them
+        // over a map they are not the integral curves of.
+        const bool wantPsiR = showPsiR_ && meridianPhase_ == MERIDIANPhase::Layout;
         const std::vector<Point> &uv =
-            (meridianLayout_.has_value() && !showPsiR_) ? meridianLayout_->getUV() : psiR_;
+            (meridianLayout_.has_value() && !wantPsiR) ? meridianLayout_->getUV() : psiR_;
 
         const int w = fbw();
         const int halfW = w / 2;
@@ -2994,6 +3110,13 @@ void CrossGenWidget::renderNormal() {
             viewer::drawAxis(leftVs);
         }
         renderMERIDIANModel();
+        // The pullback of the curves, over the model they are a layout of --
+        // the left half of Fig. 9. Barycentric coordinates are the same numbers
+        // in both worlds, so this is the same curve as the right half and not a
+        // second trace of it.
+        if (separatrices_.has_value())
+            viewer::drawSeparatrices(*separatrices_, Separatrices::Space::Model,
+                                     0.35 * avgEdge_, 2.5f);
 
         applyHalfOrtho(halfW, w - halfW, uvView_);
         {
@@ -3004,6 +3127,13 @@ void CrossGenWidget::renderNormal() {
             viewer::drawLayoutUV(*immersion_,
                                  meridianLabels_.has_value() ? &*meridianLabels_ : nullptr,
                                  uv, 0.010 * diag * uvView_.zoom);
+            // On Psi every segment of these is axis-parallel -- that is what
+            // being an integral curve of the map means -- and every gap in one
+            // is a seam crossing, where Q4 moves the image to the far bank of
+            // the cut while the pullback on the left walks straight on.
+            if (separatrices_.has_value())
+                viewer::drawSeparatrices(*separatrices_, Separatrices::Space::Image,
+                                         0.007 * diag * uvView_.zoom, 2.5f);
         }
 
         drawSplitDivider(halfW);
@@ -3162,10 +3292,14 @@ void CrossGenWidget::renderNormal() {
     // the current phase is using under them.
     if (mode_ == Mode::MERIDIAN && cones_.has_value()) {
         viewer::drawConeLegend(fbw(), fbh());
-        if (meridianPhase_ == MERIDIANPhase::RicciFlow && ricciU_.size() > 0) {
+        if (meridianPhase_ == MERIDIANPhase::Separatrices && separatrices_.has_value()) {
+            viewer::drawSeparatrixLegend(fbw(), fbh());
+        } else if (meridianPhase_ == MERIDIANPhase::RicciFlow && ricciU_.size() > 0) {
             viewer::drawScalarFieldLegend(fbw(), fbh(), -ricciUAbsMax_, ricciUAbsMax_,
                                           "conformal factor u, mean removed");
-        } else if (meridianPhase_ >= MERIDIANPhase::Metric && !flatMetric_.edges.empty()) {
+        } else if (meridianPhase_ >= MERIDIANPhase::Metric &&
+                   meridianPhase_ != MERIDIANPhase::Separatrices &&
+                   !flatMetric_.edges.empty()) {
             viewer::drawScalarFieldLegend(fbw(), fbh(), -flatMetric_.absMax, flatMetric_.absMax,
                                           "log(l_flat / l_input), mean removed");
         }

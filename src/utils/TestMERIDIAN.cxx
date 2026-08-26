@@ -1,8 +1,9 @@
-// Utility to run Stages 1-6 of Shepherd, Gu and Hughes (2022) on a mesh: cone
+// Utility to run Stages 1-7 of Shepherd, Gu and Hughes (2022) on a mesh: cone
 // singularities from the SIPG cross field, the cutting graph and the cut disk,
 // the discrete Gauss-Bonnet check, discrete surface Ricci flow, the metric
-// immersion psi_R, the subdomain labelling, and the penalty continuation
-// against the layout-inducing energies.
+// immersion psi_R, the subdomain labelling, the penalty continuation against
+// the layout-inducing energies, and the separatrices of the layout that comes
+// out.
 //
 //   TestMERIDIAN <mesh.obj> [options]
 //   TestMERIDIAN --selftest
@@ -214,8 +215,14 @@ void usage(const char *argv0) {
               << "  --near-miss <f>    Gamma_topo seeding tolerance      (default 0.15)\n"
               << "  --no-topo          skip the Gamma_topo seeding (E5 off)\n"
               << "  --no-layout        stop after Stage 4\n"
+              << "  --no-trace         skip Stage 7 (separatrix tracing)\n"
+              << "  --snap <t>         cone snap tolerance, of the extent (default 1e-6)\n"
+              << "  --max-steps <n>    separatrix step cap             (default 50000)\n"
+              << "  --curves <n>       list at most n separatrices     (default 10)\n"
               << "  --psi <file.obj>   write psi_R, the Stage 4 immersion\n"
-              << "  --layout <file.obj> write Psi, the Stage 6 result\n";
+              << "  --layout <file.obj> write Psi, the Stage 6 result\n"
+              << "  --sep <file.obj>   write the separatrices on the model\n"
+              << "  --sep-uv <file.obj> write the separatrices in the layout image\n";
 }
 
 } // namespace
@@ -226,8 +233,9 @@ int main(int argc, char **argv) {
 
     const std::string path = argv[1];
     MERIDIAN::Options opts;
-    std::string cutOut, psiOut, layoutOut;
+    std::string cutOut, psiOut, layoutOut, sepOut, sepUVOut;
     int coneListLimit = 20;
+    int curveListLimit = 10;
 
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
@@ -246,8 +254,14 @@ int main(int argc, char **argv) {
         else if (a == "--no-topo")                 opts.seedTopoConstraints = false;
         else if (a == "--near-miss" && i + 1 < argc) opts.topoNearMiss = std::stod(argv[++i]);
         else if (a == "--no-layout")               opts.runLayout = false;
+        else if (a == "--no-trace")                opts.runSeparatrices = false;
+        else if (a == "--snap" && i + 1 < argc)    opts.separatrixSnap = std::stod(argv[++i]);
+        else if (a == "--max-steps" && i + 1 < argc) opts.separatrixMaxSteps = std::stoi(argv[++i]);
+        else if (a == "--curves" && i + 1 < argc)  curveListLimit = std::stoi(argv[++i]);
         else if (a == "--psi" && i + 1 < argc)     psiOut = argv[++i];
         else if (a == "--layout" && i + 1 < argc)  layoutOut = argv[++i];
+        else if (a == "--sep" && i + 1 < argc)     sepOut = argv[++i];
+        else if (a == "--sep-uv" && i + 1 < argc)  sepUVOut = argv[++i];
         else { std::cerr << "Unknown option: " << a << "\n"; usage(argv[0]); return 1; }
     }
 
@@ -259,7 +273,7 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    std::cout << "MERIDIAN -- Shepherd, Gu and Hughes (2022), Stages 1-6\n";
+    std::cout << "MERIDIAN -- Shepherd, Gu and Hughes (2022), Stages 1-7\n";
     std::cout << "Mesh: " << path << "\n";
     std::cout << "  " << mesh->vertices.size() << " vertices, "
               << mesh->edges.size() << " edges, "
@@ -342,10 +356,14 @@ int main(int argc, char **argv) {
     verdict(gb.admissible, "Cone set is admissible, Eq. (4): sum I(v) = 4 chi(S)");
 
     // The pipeline collects every stage's notes into one list, tagged by stage;
-    // the later stages print their own below, so only the untagged ones (the
-    // field, the rebalance) and Stage 1's belong here.
+    // every stage from the second on prints its own below, so only the untagged
+    // ones (the field, the rebalance) and Stage 1's belong here.
     for (const std::string &m : st.messages) {
-        if (m.rfind("Stage 2: ", 0) == 0 || m.rfind("Stage 3: ", 0) == 0) continue;
+        bool later = false;
+        for (int s = 2; s <= 7; ++s) {
+            if (m.rfind("Stage " + std::to_string(s) + ": ", 0) == 0) later = true;
+        }
+        if (later) continue;
         std::cout << "  " << kWarn << " " << m << "\n";
     }
 
@@ -619,12 +637,156 @@ int main(int argc, char **argv) {
         else std::cout << "  " << kWarn << " Failed to write " << layoutOut << "\n";
     }
 
+    if (!pipeline.hasSeparatrices()) {
+        heading("Result");
+        std::cout << "  " << (ok ? kPass : kFail) << " "
+                  << (ok ? "Psi satisfies Q1-Q5 (Stage 7 not run)."
+                         : "The continuation did not reach a valid layout; see above.")
+                  << "\n";
+        return ok ? 0 : 5;
+    }
+
+    // ---------------------------------------------------------------------
+    // Stage 7 -- the separatrices of Psi
+    // ---------------------------------------------------------------------
+    heading("Stage 7  Separatrix tracing (Sec. 4, Q5 of Definition 2.1)");
+    const Separatrices &sep = pipeline.getSeparatrices();
+    const Separatrices::Report &tr = sep.getReport();
+
+    std::cout << "  Emitted " << tr.emitted << " separatrix/ces from " << tr.cones
+              << " cone(s); the indices prescribe " << tr.prescribed
+              << " (4 - I interior, 1 - I on dS)\n";
+    if (tr.designatedCone >= 0) {
+        std::cout << "  Footnote 3: no cones, so vertex " << tr.designatedCone
+                  << " was called the surface's only singularity\n";
+    }
+    std::cout << "  Ends: " << tr.endedAtCone << " at a cone, " << tr.endedAtBoundary
+              << " out through dS, " << tr.capped << " capped";
+    if (tr.stuck > 0 || tr.degenerate > 0) {
+        std::cout << ", " << tr.stuck << " stuck, " << tr.degenerate << " degenerate";
+    }
+    std::cout << "\n";
+    std::cout << "  " << tr.triangleSteps << " triangle crossing(s), longest curve "
+              << tr.maxTriangleSteps << "; " << tr.seamCrossings
+              << " seam crossing(s), most on one curve " << tr.maxSeamCrossings << "\n";
+    // Both gaps are lengths in the image, so they are reported against its
+    // extent -- the same scale Stage 6 measured its constraint residuals in.
+    std::cout << "  Snap tolerance " << std::scientific << std::setprecision(2)
+              << opts.separatrixSnap << " of the image; worst snap actually taken "
+              << (tr.extent > 0.0 ? tr.maxSnapGap / tr.extent : 0.0) << std::defaultfloat << "\n";
+    if (tr.worstMissCurve >= 0) {
+        std::cout << "  Worst unresolved curve passed " << std::scientific
+                  << std::setprecision(2)
+                  << (tr.extent > 0.0 ? tr.worstMissGap / tr.extent : 0.0)
+                  << " of the image from the nearest cone it crossed"
+                  << std::defaultfloat << "\n";
+    }
+    std::cout << "  Pullback continuity across the cuts: " << std::scientific
+              << std::setprecision(3) << tr.maxPullbackGap << " of the model"
+              << std::defaultfloat << "\n";
+    std::cout << "  Fan sweep: cone angles off the prescribed value by " << std::scientific
+              << std::setprecision(3) << tr.maxConeAngleResidual << " rad"
+              << std::defaultfloat;
+    if (tr.worstConeAngleSlot >= 0 &&
+        tr.worstConeAngleSlot < static_cast<int>(sep.coneVertices().size())) {
+        std::cout << " (worst at vertex " << sep.coneVertices()[tr.worstConeAngleSlot] << ")";
+    }
+    std::cout << "\n";
+
+    if (curveListLimit > 0 && !sep.curves().empty()) {
+        std::cout << "      from     I  dir   tris  seams  ends            gap\n";
+        int shown = 0;
+        for (const Separatrices::Curve &c : sep.curves()) {
+            if (shown++ >= curveListLimit) {
+                std::cout << "     ... " << (sep.curves().size() - curveListLimit) << " more\n";
+                break;
+            }
+            static const char *kDir[4] = {"+u", "+v", "-u", "-v"};
+            std::cout << "  " << std::setw(9) << sep.coneVertices()[c.cone]
+                      << std::setw(6) << std::showpos << c.index << std::noshowpos
+                      << std::setw(5) << kDir[c.dir]
+                      << std::setw(7) << c.steps.size()
+                      << std::setw(7) << c.seamCrossings << "  ";
+            switch (c.end) {
+                case Separatrices::End::Cone:
+                    std::cout << "cone " << std::setw(9) << std::left
+                              << sep.coneVertices()[c.toCone] << std::right;
+                    break;
+                case Separatrices::End::Boundary:
+                    std::cout << std::setw(14) << std::left << "dS" << std::right;
+                    break;
+                case Separatrices::End::Capped:
+                    std::cout << std::setw(14) << std::left << "step cap" << std::right;
+                    break;
+                case Separatrices::End::Stuck:
+                    std::cout << std::setw(14) << std::left << "stuck" << std::right;
+                    break;
+                default:
+                    std::cout << std::setw(14) << std::left << "degenerate" << std::right;
+                    break;
+            }
+            const double g = (c.end == Separatrices::End::Cone) ? c.gap : c.nearestConeGap;
+            if (std::isfinite(g) && tr.extent > 0.0) {
+                std::cout << std::scientific << std::setprecision(1) << g / tr.extent
+                          << std::defaultfloat;
+            } else {
+                std::cout << "      -";
+            }
+            std::cout << "\n";
+        }
+    }
+
+    verdict(tr.fanFailures == 0, "Every cone's one-ring fan in Omega was swept");
+    verdict(tr.emitted == tr.prescribed,
+            "Every cone emitted the number of separatrices its index prescribes");
+    verdict(tr.stuck == 0 && tr.degenerate == 0, "Every ray was traceable");
+    verdict(tr.maxPullbackGap < 1e-9,
+            "Every curve is continuous on S across the cutting graph");
+    // Not a verdict. A separatrix that runs on past the cap is Q5 failing to
+    // hold on a curve E5 was never given a constraint for, and the remedy is
+    // upstream of this stage: away from the cones the flat metric makes the
+    // integral curves geodesics of a translation surface, and a geodesic in a
+    // direction nothing has quantised does not close -- it fills the model and
+    // leaves through dS eventually or not at all. Remark 3.1 is this same fact
+    // stated as patch counts.
+    if (tr.capped == 0) {
+        std::cout << "  " << kPass
+                  << " Q5: every separatrix terminates at a cone or leaves through dS\n";
+    } else {
+        std::cout << "  " << kWarn << " " << tr.capped << " of " << tr.emitted
+                  << " separatrices ran past the step cap: Q5 holds on the Gamma_topo paths "
+                  << "E5 was given, not on every integral curve\n";
+    }
+    for (const std::string &m : tr.messages) std::cout << "  " << kWarn << " " << m << "\n";
+
+    if (!sepOut.empty()) {
+        if (sep.writeOBJ(sepOut, Separatrices::Space::Model)) {
+            std::cout << "  Wrote the separatrices on the model to " << sepOut << "\n";
+        } else {
+            std::cout << "  " << kWarn << " Failed to write " << sepOut << "\n";
+        }
+    }
+    if (!sepUVOut.empty()) {
+        if (sep.writeOBJ(sepUVOut, Separatrices::Space::Image)) {
+            std::cout << "  Wrote the separatrices in the image to " << sepUVOut << "\n";
+        } else {
+            std::cout << "  " << kWarn << " Failed to write " << sepUVOut << "\n";
+        }
+    }
+
     // ---------------------------------------------------------------------
     heading("Result");
-    if (ok) {
+    if (ok && tr.valid) {
         std::cout << "  " << kPass
                   << " Psi satisfies Q1-Q5: a quadrilateral layout in the sense of "
-                  << "Definition 2.1. Ready for Stage 7 (separatrix tracing).\n";
+                  << "Definition 2.1, and its " << tr.emitted
+                  << " separatrices are all finite. Ready for Stage 8 (arrangement).\n";
+    } else if (ok) {
+        std::cout << "  " << kWarn
+                  << " Psi satisfies Q1-Q5 as the energies measure them, but "
+                  << (tr.capped + tr.stuck + tr.degenerate)
+                  << " separatrix/ces did not terminate: Q5 holds on the Gamma_topo paths "
+                  << "E5 was given and not on every integral curve.\n";
     } else {
         std::cout << "  " << kFail
                   << " The continuation did not reach a valid layout; see the residuals "

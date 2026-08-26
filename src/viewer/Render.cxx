@@ -2194,4 +2194,112 @@ void drawLayoutUV(const Immersion &imm, const SubdomainLabels *labels,
     }
 }
 
+// ============================================================================
+// MERIDIAN -- the separatrices of Psi
+// ============================================================================
+
+namespace {
+
+void separatrixColor(Separatrices::End e, float &r, float &g, float &b) {
+    switch (e) {
+        case Separatrices::End::Cone:       r = 0.25f; g = 0.90f; b = 0.45f; break;
+        case Separatrices::End::Boundary:   r = 0.35f; g = 0.60f; b = 0.98f; break;
+        case Separatrices::End::Capped:     r = 0.95f; g = 0.20f; b = 0.20f; break;
+        default:                            r = 0.98f; g = 0.65f; b = 0.10f; break;
+    }
+}
+
+} // namespace
+
+void drawSeparatrices(const Separatrices &sep, Separatrices::Space space,
+                      double endRadius, float lineWidth) {
+    const std::vector<Separatrices::Curve> &curves = sep.curves();
+    if (curves.empty()) return;
+
+    std::vector<Point> pts;
+    std::vector<int> breaks;
+
+    // The curves first, then the termini, so a disk is never buried under the
+    // line of a curve that happens to pass over it.
+    glLineWidth(lineWidth);
+    for (const Separatrices::Curve &c : curves) {
+        float r, g, b;
+        separatrixColor(c.end, r, g, b);
+        glColor3f(r, g, b);
+
+        pts = sep.polyline(c, space, &breaks);
+        if (pts.size() < 2) continue;
+
+        // breaks[k] is the index the run after the k-th break starts at, so the
+        // runs are [0, b0), [b0, b1), ..., [blast, end). In the image a break is
+        // a seam crossing and the two runs sit on opposite banks of the cut; on
+        // the model there are none and the whole curve is one strip.
+        size_t start = 0;
+        for (size_t k = 0; k <= breaks.size(); ++k) {
+            const size_t stop = (k < breaks.size()) ? static_cast<size_t>(breaks[k]) : pts.size();
+            if (stop > start + 1) {
+                glBegin(GL_LINE_STRIP);
+                for (size_t i = start; i < stop; ++i) glVertex2d(pts[i][0], pts[i][1]);
+                glEnd();
+            }
+            start = stop;
+        }
+    }
+    glLineWidth(1.0f);
+
+    if (endRadius <= 0.0) return;
+    for (const Separatrices::Curve &c : curves) {
+        if (c.end == Separatrices::End::Cone || c.steps.empty()) continue;
+        float r, g, b;
+        separatrixColor(c.end, r, g, b);
+        drawDisk3D(sep.point(c.steps.back(), true, space), endRadius, r, g, b);
+    }
+}
+
+void drawSeparatrixLegend(int fbw, int fbh) {
+    struct Row { Separatrices::End end; const char *label; };
+    static const Row kRows[] = {
+        { Separatrices::End::Cone,       "ends at a cone"   },
+        { Separatrices::End::Boundary,   "ends through dS"  },
+        { Separatrices::End::Capped,     "hit the step cap" },
+        { Separatrices::End::Degenerate, "not traceable"    },
+    };
+
+    const float x0 = 20.0f;
+    const float sw = 16.0f;
+    const float lineH = 22.0f;
+    float y0 = static_cast<float>(fbh) - 290.0f;  // above the cone legend
+
+    glMatrixMode(GL_PROJECTION);
+    glPushMatrix();
+    glLoadIdentity();
+    glOrtho(0, fbw, fbh, 0, -1, 1); // top-left origin
+    glMatrixMode(GL_MODELVIEW);
+    glPushMatrix();
+    glLoadIdentity();
+
+    glBegin(GL_QUADS);
+    for (int i = 0; i < 4; ++i) {
+        float r, g, b;
+        separatrixColor(kRows[i].end, r, g, b);
+        glColor3f(r, g, b);
+        const float y = y0 + i * lineH;
+        glVertex2f(x0, y);
+        glVertex2f(x0 + sw, y);
+        glVertex2f(x0 + sw, y + sw);
+        glVertex2f(x0, y + sw);
+    }
+    glEnd();
+
+    glMatrixMode(GL_PROJECTION);
+    glPopMatrix();
+    glMatrixMode(GL_MODELVIEW);
+    glPopMatrix();
+
+    for (int i = 0; i < 4; ++i) {
+        drawTextOverlay(fbw, fbh, kRows[i].label, x0 + sw + 8.0f, y0 + i * lineH + 2.0f,
+                        0.8f, 0.8f, 0.8f);
+    }
+}
+
 } // namespace viewer

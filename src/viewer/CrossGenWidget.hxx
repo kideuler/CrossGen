@@ -18,6 +18,7 @@
 #include "MERIDIAN/Immersion.hxx"
 #include "MERIDIAN/LayoutEnergy.hxx"
 #include "MERIDIAN/RicciFlow.hxx"
+#include "MERIDIAN/Separatrices.hxx"
 #include "MERIDIAN/SubdomainLabels.hxx"
 #include "Parameterization/CutMesh.hxx"
 #include "Parameterization/HarmonicCut.hxx"
@@ -115,12 +116,12 @@ enum class UMBERPhase {
     Simplified = 7,
 };
 
-// MERIDIAN is Stages 1-3 of Shepherd, Gu and Hughes (2022), and it borrows the
+// MERIDIAN is Stages 1-7 of Shepherd, Gu and Hughes (2022), and it borrows the
 // same first three stages as SIPG and UMBER modes because its input is the same
 // converged cross field -- Sec. 3.1 reads the cone indices off a field's
 // holonomy, and here that field is the SIPG one.
 //
-// The four stages after it are the pipeline proper, and each is chosen to show
+// The stages after it are the pipeline proper, and each is chosen to show
 // the thing that stage is judged on rather than just what it computed:
 //
 //   Cones      the cone set and the discrete Gauss-Bonnet condition of Eq. (4).
@@ -159,15 +160,31 @@ enum class UMBERPhase {
 //              phase -- the model on the left and the parameter domain on the
 //              right -- because this is the first stage that produces a map,
 //              and a map is a thing with two ends.
+//
+//   Separatrices  Stage 7, Sec. 4. The integral curves out of the cones,
+//              marched over Psi and continued across the cutting graph. Split
+//              screen again, and this is the phase the split is really for:
+//              Stage 7 stores each curve as barycentric coordinates in a list
+//              of triangles, and those are the same numbers in the image and on
+//              S, so the left half is the very same curve as the right half and
+//              not a second computation of it. What each half answers is
+//              different, though. The right is where the curve is straight --
+//              every segment axis-parallel, which is what being an integral
+//              curve of Psi means -- and where the seam jumps are, since Q4
+//              moves the image to the other bank of the cut while the model
+//              walks on. The left is where the layout it induces actually is:
+//              this is the left half of the paper's Fig. 9 and what Stages 8
+//              to 10 partition and fit.
 enum class MERIDIANPhase {
-    MeshOnly   = 1,
-    CrossField = 2,
-    Stepping   = 3,
-    Cones      = 4,
-    Cut        = 5,
-    RicciFlow  = 6,
-    Metric     = 7,
-    Layout     = 8,
+    MeshOnly     = 1,
+    CrossField   = 2,
+    Stepping     = 3,
+    Cones        = 4,
+    Cut          = 5,
+    RicciFlow    = 6,
+    Metric       = 7,
+    Layout       = 8,
+    Separatrices = 9,
 };
 
 // OASIS is a one-shot solve driven by a parameter dialog rather than a
@@ -290,6 +307,14 @@ private:
     // longest of the MERIDIAN stages.
     void runMERIDIANLayout();
 
+    // Stage 7, Sec. 4: march the integral curves out of every cone over Psi,
+    // continuing them across the cutting graph, until each one terminates the
+    // way Q5 allows. Much quicker than the continuation above it -- a fraction
+    // of a second on every model in data/meshes -- but a curve that never
+    // terminates runs to the step cap, so it is announced a frame ahead like
+    // the two blocking stages before it.
+    void runMERIDIANSeparatrices();
+
     // Whether a parameter domain occupies the right half of the window.
     bool inUVSplitScreen() const;
 
@@ -408,6 +433,9 @@ private:
     // to compare it with. 'p' toggles which of the two the right panel shows.
     std::vector<Point>               psiR_;
     bool                             showPsiR_ = false;
+    // Stage 7, traced on Psi. Holds a reference to the immersion like the three
+    // above it, so it is cleared first and never outlives immersion_.
+    std::optional<Separatrices>      separatrices_;
 
     // Guiding field for the OASIS orientation term. Held by shared_ptr because
     // OASIS keeps a reference to it for as long as it lives; separate from
@@ -473,6 +501,8 @@ private:
     bool ricciAttempted_       = false;
     bool layoutAnnounced_      = false;
     bool layoutAttempted_      = false;
+    bool separatricesAnnounced_ = false;
+    bool separatricesAttempted_ = false;
 
     // Chord collapse settings, surviving a reset the way oasisLambda_ does so
     // that the dialog opens on whatever was tried last.
