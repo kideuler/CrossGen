@@ -9,11 +9,13 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "MERIDIAN/Arrangement.hxx"
 #include "MERIDIAN/ConeCut.hxx"
 #include "MERIDIAN/ConeSingularities.hxx"
 #include "MERIDIAN/Immersion.hxx"
 #include "MERIDIAN/RicciFlow.hxx"
 #include "MERIDIAN/Separatrices.hxx"
+#include "MERIDIAN/SplineFit.hxx"
 #include "MERIDIAN/SubdomainLabels.hxx"
 #include "Parameterization/CutMesh.hxx"
 #include "Parameterization/MIQ.hxx"
@@ -394,5 +396,27 @@ void drawSeparatrices(const Separatrices &sep, Separatrices::Space space,
 
 // Screen-space key for those four colours, under the cone legend.
 void drawSeparatrixLegend(int fbw, int fbh);
+
+// ── MERIDIAN: the blocks of Stages 8 and 9 ───────────────────────────────────
+//
+// The layout drawn on the model, which is the left half of the paper's Fig. 12:
+// every side of every patch in light blue, every node of the arrangement as a
+// green disk.
+//
+// Both live on S and only on S. Stage 8 is built there on purpose -- Psi
+// overlaps itself, so an arrangement computed in the image would invent
+// crossings -- and Stage 9's control points are fitted to the arcs' polylines
+// on S, so nothing here needs projecting.
+//
+// `fit` may be null, and where it is non-null a side is drawn as the fitted
+// spline sampled rather than as the polyline it was fitted to. The two differ
+// by the fit's deviation, which is smaller than the line is wide; what makes
+// the distinction worth keeping is that a side with no fit behind it is a side
+// of a face Stage 9 skipped, and drawing the raw arc there is honest about it.
+//
+// Only faces flagged `patch` are outlined. The unbounded face and the holes are
+// faces of the subdivision too, and they are not blocks.
+void drawLayoutPatches(const Arrangement &arr, const SplineFit *fit,
+                       double nodeRadius, float lineWidth, int samples = 16);
 
 } // namespace viewer

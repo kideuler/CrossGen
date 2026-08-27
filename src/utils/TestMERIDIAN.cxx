@@ -1,9 +1,9 @@
-// Utility to run Stages 1-7 of Shepherd, Gu and Hughes (2022) on a mesh: cone
+// Utility to run Stages 1-9 of Shepherd, Gu and Hughes (2022) on a mesh: cone
 // singularities from the SIPG cross field, the cutting graph and the cut disk,
 // the discrete Gauss-Bonnet check, discrete surface Ricci flow, the metric
 // immersion psi_R, the subdomain labelling, the penalty continuation against
-// the layout-inducing energies, and the separatrices of the layout that comes
-// out.
+// the layout-inducing energies, the separatrices of the layout that comes out,
+// the arrangement they cut S into, and the bicubic patches fitted to it.
 //
 //   TestMERIDIAN <mesh.obj> [options]
 //   TestMERIDIAN --selftest
@@ -206,6 +206,7 @@ void usage(const char *argv0) {
               << "  --newton <n>       max Newton iterations         (default 100)\n"
               << "  --no-flips         disable weighted-Delaunay flipping\n"
               << "  --no-rebalance     do not repair Eq. (4) automatically\n"
+              << "  --cut-to-graph     cone cuts may stop on an earlier cut, not only dS\n"
               << "  --cut <file.obj>   write the cut disk Omega\n"
               << "  --cones <n>        list at most n cones          (default 20)\n"
               << "  --outer <n>        penalty continuation steps    (default 10)\n"
@@ -229,7 +230,19 @@ void usage(const char *argv0) {
               << "  --psi <file.obj>   write psi_R, the Stage 4 immersion\n"
               << "  --layout <file.obj> write Psi, the Stage 6 result\n"
               << "  --sep <file.obj>   write the separatrices on the model\n"
-              << "  --sep-uv <file.obj> write the separatrices in the layout image\n";
+              << "  --sep-uv <file.obj> write the separatrices in the layout image\n"
+              << "  --no-arrange       skip Stage 8 (arrangement)\n"
+              << "  --merge <t>        node merge tolerance, of the model  (default 1e-7)\n"
+              << "  --corner <r>       corner tolerance, radians           (default 0.35)\n"
+              << "  --collapse <t>     sliver-arc tolerance, of the model  (default 1e-4)\n"
+              << "  --arcs <file.obj>  write the layout arcs on the model\n"
+              << "  --faces <file.obj> write the layout faces as polylines\n"
+              << "  --no-splines       skip Stage 9 (spline reconstruction)\n"
+              << "  --segments <n>     cubic segments per arc              (default 3)\n"
+              << "  --samples <n>      patch sampling grid                 (default 8)\n"
+              << "  --fit <file.obj>   write the fitted arc curves\n"
+              << "  --net <file.obj>   write the patch control nets\n"
+              << "  --surf <file.obj>  write the reconstructed patches\n";
 }
 
 } // namespace
@@ -241,6 +254,7 @@ int main(int argc, char **argv) {
     const std::string path = argv[1];
     MERIDIAN::Options opts;
     std::string cutOut, psiOut, layoutOut, sepOut, sepUVOut;
+    std::string arcsOut, facesOut, fitOut, netOut, surfOut;
     int coneListLimit = 20;
     int curveListLimit = 10;
 
@@ -252,6 +266,7 @@ int main(int argc, char **argv) {
         else if (a == "--newton" && i + 1 < argc)  opts.ricciMaxIterations = std::stoi(argv[++i]);
         else if (a == "--no-flips")                opts.delaunayFlips = false;
         else if (a == "--no-rebalance")            opts.autoRebalance = false;
+        else if (a == "--cut-to-graph")            opts.coneCutsToBoundary = false;
         else if (a == "--cut" && i + 1 < argc)     cutOut = argv[++i];
         else if (a == "--cones" && i + 1 < argc)   coneListLimit = std::stoi(argv[++i]);
         else if (a == "--outer" && i + 1 < argc)   opts.outerSteps = std::stoi(argv[++i]);
@@ -276,6 +291,18 @@ int main(int argc, char **argv) {
         else if (a == "--layout" && i + 1 < argc)  layoutOut = argv[++i];
         else if (a == "--sep" && i + 1 < argc)     sepOut = argv[++i];
         else if (a == "--sep-uv" && i + 1 < argc)  sepUVOut = argv[++i];
+        else if (a == "--no-arrange")              opts.runArrangement = false;
+        else if (a == "--merge" && i + 1 < argc)   opts.arrangementMerge = std::stod(argv[++i]);
+        else if (a == "--corner" && i + 1 < argc)  opts.arrangementCorner = std::stod(argv[++i]);
+        else if (a == "--collapse" && i + 1 < argc) opts.arrangementCollapse = std::stod(argv[++i]);
+        else if (a == "--arcs" && i + 1 < argc)    arcsOut = argv[++i];
+        else if (a == "--faces" && i + 1 < argc)   facesOut = argv[++i];
+        else if (a == "--no-splines")              opts.runSplines = false;
+        else if (a == "--segments" && i + 1 < argc) opts.splineSegments = std::stoi(argv[++i]);
+        else if (a == "--samples" && i + 1 < argc) opts.splineSamples = std::stoi(argv[++i]);
+        else if (a == "--fit" && i + 1 < argc)     fitOut = argv[++i];
+        else if (a == "--net" && i + 1 < argc)     netOut = argv[++i];
+        else if (a == "--surf" && i + 1 < argc)    surfOut = argv[++i];
         else { std::cerr << "Unknown option: " << a << "\n"; usage(argv[0]); return 1; }
     }
 
@@ -287,7 +314,7 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    std::cout << "MERIDIAN -- Shepherd, Gu and Hughes (2022), Stages 1-7\n";
+    std::cout << "MERIDIAN -- Shepherd, Gu and Hughes (2022), Stages 1-9\n";
     std::cout << "Mesh: " << path << "\n";
     std::cout << "  " << mesh->vertices.size() << " vertices, "
               << mesh->edges.size() << " edges, "
@@ -374,7 +401,7 @@ int main(int argc, char **argv) {
     // ones (the field, the rebalance) and Stage 1's belong here.
     for (const std::string &m : st.messages) {
         bool later = false;
-        for (int s = 2; s <= 7; ++s) {
+        for (int s = 2; s <= 9; ++s) {
             if (m.rfind("Stage " + std::to_string(s) + ": ", 0) == 0) later = true;
         }
         if (later) continue;
@@ -394,7 +421,10 @@ int main(int argc, char **argv) {
     const ConeCut &cut = pipeline.getCut();
     const ConeCut::Report &cr = cut.getReport();
     std::cout << "  Voids: " << cr.voids << ", HarmonicCut arcs: " << cr.harmonicCuts
-              << ", cone arcs: " << cr.conesRouted << " of " << cr.interiorCones << "\n";
+              << ", cone arcs: " << cr.conesRouted << " of " << cr.interiorCones
+              << " (" << cr.conesToBoundary << " reached dS";
+    if (cr.conesFellBack > 0) std::cout << ", " << cr.conesFellBack << " fell back";
+    std::cout << ")\n";
     std::cout << "  Omega: " << cut.getCutMesh().vertices.size() << " vertices, "
               << "chi = " << cr.eulerCharacteristic << ", "
               << cr.boundaryComponents << " boundary component"
@@ -408,6 +438,10 @@ int main(int argc, char **argv) {
     std::cout << "  Cutting graph: " << cut.getCutEdges().size() << " edges, total length "
               << std::fixed << std::setprecision(4) << totalCutLength
               << std::defaultfloat << "\n";
+
+    std::cout << "  Junctions of G away from dS: " << cr.interiorJunctions
+              << (opts.coneCutsToBoundary ? "  (expected 0: every arc runs to dS)" : "")
+              << "\n";
 
     verdict(cr.isDisk, "Omega = S - G is a topological disk");
     verdict(cr.allConesOnBoundary, "P is contained in G union dS (all cones on the boundary)");
@@ -807,8 +841,199 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (!pipeline.hasArrangement()) {
+        heading("Result");
+        std::cout << "  " << (ok ? kPass : kFail) << " "
+                  << (ok ? "Psi satisfies Q1-Q5 (Stage 8 not run)."
+                         : "The continuation did not reach a valid layout; see above.")
+                  << "\n";
+        return ok ? 0 : 5;
+    }
+
+    // ---------------------------------------------------------------------
+    // Stage 8 -- the arrangement, and the layout read off it
+    // ---------------------------------------------------------------------
+    heading("Stage 8  Arrangement and layout extraction (Sec. 4)");
+    const Arrangement &arrangement = pipeline.getArrangement();
+    const Arrangement::Report &arep = arrangement.getReport();
+
+    std::cout << "  Nodes: " << arep.nodes << " -- " << arep.coneNodes << " cone, "
+              << arep.crossingNodes << " separatrix crossing, " << arep.boundaryHitNodes
+              << " on dS, " << arep.boundaryCornerNodes << " boundary corner";
+    if (arep.danglingNodes > 0) std::cout << ", " << arep.danglingNodes << " dangling";
+    if (arep.mergedNodes > 0) std::cout << "  (" << arep.mergedNodes << " coincided)";
+    std::cout << "\n";
+    // Not a defect, and worth saying plainly: a cone-to-cone arc is a
+    // separatrix of both its cones, so Stage 7 traced every one of them twice.
+    std::cout << "  Curves traced from both ends: " << arep.duplicateCurves
+              << " second copy/ies dropped\n";
+    std::cout << "  Arcs: " << arep.arcs << " -- " << arep.separatrixArcs << " separatrix, "
+              << arep.boundaryArcs << " on dS";
+    if (arep.degenerateArcs > 0) std::cout << ", " << arep.degenerateArcs << " degenerate";
+    if (arep.danglingArcs > 0) std::cout << ", " << arep.danglingArcs << " dangling";
+    std::cout << "\n";
+    std::cout << "  Faces: " << arep.faces << " -- " << arep.patches << " inside S, of which "
+              << arep.quads << " have four corners and " << arep.simpleQuads
+              << " one arc on each side\n";
+    std::cout << "  Patch area from " << std::scientific << std::setprecision(3)
+              << arep.minPatchArea << " to " << arep.maxPatchArea << "; they cover "
+              << std::fixed << std::setprecision(6) << arep.areaCoverage << " of S"
+              << std::defaultfloat << "\n";
+    std::cout << "  Sectors off a whole quarter turn by at most " << std::scientific
+              << std::setprecision(3) << arep.maxSectorResidual << " rad";
+    if (arep.worstSectorNode >= 0) std::cout << " (at node " << arep.worstSectorNode << ")";
+    if (arep.ambiguousSectors > 0) {
+        std::cout << "; " << arep.ambiguousSectors << " farther out than "
+                  << opts.arrangementCorner << " rad";
+    }
+    std::cout << std::defaultfloat << "\n";
+    if (arep.selfCrossings > 0 || arep.parallelOverlaps > 0 || arep.collapsedArcs > 0 ||
+        arep.sliversKept > 0 || arep.clusteredCones > 0) {
+        std::cout << "  " << arep.collapsedArcs << " sliver arc(s) collapsed, "
+                  << arep.sliversKept << " left as they were, "
+                  << arep.selfCrossings << " self-crossing(s), " << arep.parallelOverlaps
+                  << " segment pair(s) too nearly collinear to cut";
+        if (arep.clusteredCones > 0) {
+            std::cout << ", " << arep.clusteredCones << " clustered cone pair(s) left alone";
+        }
+        std::cout << "\n";
+    }
+    if (arep.featureChains > 0) {
+        std::cout << "  Feature chains: " << arep.featureChainsCovered << " of "
+                  << arep.featureChains << " are a union of arcs; worst gap "
+                  << std::scientific << std::setprecision(3) << arep.maxFeatureGap
+                  << " of the model" << std::defaultfloat << "\n";
+    }
+    if (arep.maxConeSnapGap > 0.0) {
+        std::cout << "  Curve ends moved onto their cone by at most " << std::scientific
+                  << std::setprecision(3) << arep.maxConeSnapGap << " of the model"
+                  << std::defaultfloat << "\n";
+    }
+    if (arep.interpolatedAngles > 0) {
+        std::cout << "  " << kWarn << " " << arep.interpolatedAngles
+                  << " arc end(s) reach their cone from outside its one-ring, so the fan "
+                  << "placed them by interpolation rather than exactly\n";
+    }
+
+    verdict(arep.danglingNodes == 0, "Every curve of the layout ends at a node");
+    verdict(arep.wrongCornerFaces == 0, "Every patch has exactly four corners");
+    verdict(arep.tJunctions == 0, "No T-junction: every node a patch passes turns a quarter");
+    verdict(arep.simpleQuads == arep.patches, "Every patch has one arc on each side");
+    verdict(arep.unsharedArcs == 0, "Every arc separates two patches, or a patch from dS");
+    verdict(arep.coneValenceErrors == 0 && arep.isolatedCones == 0,
+            "Every cone has the arcs its index prescribes");
+    verdict(arep.areaCoverage > 0.999 && arep.areaCoverage < 1.001, "The patches tile S");
+    if (arep.featureChains > 0) {
+        verdict(arep.featureChainsCovered == arep.featureChains,
+                "Every feature chain is a union of arcs");
+    }
+    for (const std::string &m : arep.messages) std::cout << "  " << kWarn << " " << m << "\n";
+
+    if (!arcsOut.empty()) {
+        if (arrangement.writeOBJ(arcsOut)) {
+            std::cout << "  Wrote the layout arcs to " << arcsOut << "\n";
+        } else {
+            std::cout << "  " << kWarn << " Failed to write " << arcsOut << "\n";
+        }
+    }
+    if (!facesOut.empty()) {
+        if (arrangement.writePatchOBJ(facesOut)) {
+            std::cout << "  Wrote the patch outlines to " << facesOut << "\n";
+        } else {
+            std::cout << "  " << kWarn << " Failed to write " << facesOut << "\n";
+        }
+    }
+
+    if (!pipeline.hasSplines()) {
+        heading("Result");
+        std::cout << "  " << (ok ? kPass : kFail) << " "
+                  << (ok ? "Psi satisfies Q1-Q5 (Stage 9 not run)."
+                         : "The continuation did not reach a valid layout; see above.")
+                  << "\n";
+        return ok ? 0 : 5;
+    }
+
+    // ---------------------------------------------------------------------
+    // Stage 9 -- the spline reconstruction
+    // ---------------------------------------------------------------------
+    heading("Stage 9  Spline reconstruction (Sec. 5)");
+    const SplineFit &fit = pipeline.getSplines();
+    const SplineFit::Report &sf = fit.getReport();
+
+    std::cout << "  Fitted " << sf.curves << " of " << sf.arcs << " arc(s) to cubic B-splines: "
+              << sf.controlPointsPerArc << " control points each, "
+              << fit.getOptions().segments << " Bezier segment(s)\n";
+    std::cout << "  Deviation from the traced curves: " << std::scientific
+              << std::setprecision(3) << sf.maxDeviation << " worst, " << sf.rmsDeviation
+              << " rms, of the model" << std::defaultfloat;
+    if (sf.worstArc >= 0) std::cout << " (arc " << sf.worstArc << ")";
+    std::cout << "\n";
+    std::cout << "  Patches: " << sf.patches << " of " << sf.faces << " face(s), "
+              << sf.controlPointsPerArc << " x " << sf.controlPointsPerArc
+              << " control points each";
+    if (sf.skipped > 0) std::cout << "; " << sf.skipped << " skipped";
+    std::cout << "\n";
+    std::cout << "  Watertightness: " << sf.sharedArcs
+              << " arc(s) shared by two patches, control points apart by "
+              << std::scientific << std::setprecision(3) << sf.maxSeamGap
+              << ", corners off their node by " << sf.maxCornerGap << std::defaultfloat << "\n";
+    std::cout << "  Worst sampled cell is " << std::fixed << std::setprecision(4)
+              << sf.minCellRatio << " of the mean; " << sf.foldedPatches
+              << " folded patch(es)" << std::defaultfloat << "\n";
+    std::cout << "  Patch area " << std::scientific << std::setprecision(6) << sf.patchArea
+              << " against " << sf.faceArea << " for the same faces of the arrangement"
+              << std::defaultfloat << "\n";
+
+    verdict(sf.curves == sf.arcs, "Every arc was fitted");
+    verdict(sf.underdetermined == 0, "Every arc had more sample points than control points");
+    verdict(sf.skipped == 0, "Every patch of the layout became a Coons patch");
+    verdict(sf.watertight, "Watertight: both patches on an arc carry the same control points");
+    verdict(sf.foldedPatches == 0, "No patch folds");
+    for (const std::string &m : sf.messages) std::cout << "  " << kWarn << " " << m << "\n";
+
+    if (!fitOut.empty()) {
+        if (fit.writeCurvesOBJ(fitOut)) {
+            std::cout << "  Wrote the fitted curves to " << fitOut << "\n";
+        } else {
+            std::cout << "  " << kWarn << " Failed to write " << fitOut << "\n";
+        }
+    }
+    if (!netOut.empty()) {
+        if (fit.writeNetOBJ(netOut)) {
+            std::cout << "  Wrote the control nets to " << netOut << "\n";
+        } else {
+            std::cout << "  " << kWarn << " Failed to write " << netOut << "\n";
+        }
+    }
+    if (!surfOut.empty()) {
+        if (fit.writeSurfaceOBJ(surfOut)) {
+            std::cout << "  Wrote the patches to " << surfOut << "\n";
+        } else {
+            std::cout << "  " << kWarn << " Failed to write " << surfOut << "\n";
+        }
+    }
+
     // ---------------------------------------------------------------------
     heading("Result");
+    if (ok && tr.valid && arep.valid && sf.valid) {
+        std::cout << "  " << kPass << " " << sf.patches
+                  << " watertight bicubic patch(es), C0 across their shared curves and C2 "
+                  << "inside, from a layout satisfying Q1-Q5. Ready for Stage 10 "
+                  << "(refinement and the analysis handoff).\n";
+        return 0;
+    }
+    if (ok && tr.valid) {
+        std::cout << "  " << kWarn
+                  << " Psi is a quadrilateral layout in the sense of Definition 2.1, but the "
+                  << "arrangement is not yet a set of usable patches: "
+                  << (arep.patches - arep.simpleQuads) << " of " << arep.patches
+                  << " face(s) are not quadrilaterals with one arc a side"
+                  << (sf.foldedPatches > 0 ? ", and some of the rest fold when blended" : "")
+                  << ". Sec. 4's remedy is Sec. 3.3's -- raise lambda_5, add the Gamma_topo "
+                  << "constraint for the pair that nearly met, re-run Stage 6 from the "
+                  << "current phi.\n";
+        return 0;
+    }
     if (ok && tr.valid) {
         std::cout << "  " << kPass
                   << " Psi satisfies Q1-Q5: a quadrilateral layout in the sense of "

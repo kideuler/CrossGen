@@ -29,7 +29,8 @@
 //   * The interior cones. HarmonicCut has no notion of a singularity and will
 //     not route anything to one, so the cones are dragged out afterwards by the
 //     Sec. 3.2.2 procedure -- shortest path in the edge graph from each cone to
-//     whatever is already boundary or cut, nearest cone first.
+//     whatever is already boundary or cut, nearest cone first. Options::
+//     conesToBoundary narrows "whatever" to dS alone; see it for why.
 //
 // Sec. 3.2.2 adds that "it is often preferable that these cuts go to, but not
 // through singular points (meaning that a small neighborhood of every singular
@@ -59,6 +60,29 @@ public:
     using EdgeKey = MeshEdgeKey;
     using EdgeKeyHash = MeshEdgeKeyHash;
 
+    struct Options {
+        // Where a cone arc is allowed to stop.
+        //
+        // Sec. 3.2.2 only asks that P end up inside G union dS, so the cheapest
+        // arc -- the one to whatever is nearest, which is usually an arc some
+        // earlier cone already laid -- satisfies it. That is what this class did
+        // unconditionally, and it has a cost the definition does not see. An arc
+        // that stops on an earlier arc puts a degree-three junction in the
+        // middle of G, and a junction is a vertex of Omega whose one-ring is
+        // split into three sectors by two different seams. The immersion of
+        // Stage 4 then has to carry two transitions past a single point, and the
+        // cone at the far end of the tree is separated from dS by every arc
+        // between it and the boundary rather than by its own: the seam it lives
+        // on is a chain of arcs, each with its own quarter-turn, and the layout
+        // of Stage 6 sees the whole chain as one rigid stack of constraints.
+        //
+        // With this on, every cone arc runs to dS itself and is vertex-disjoint
+        // from every other arc, so G becomes a set of independent slits, each
+        // one cone deep. The cut is longer -- that is the trade -- but each cone
+        // reaches the boundary through a seam of its own.
+        bool conesToBoundary = true;
+    };
+
     // One arc of G routed from an interior cone to the rest of the graph.
     struct ConePath {
         int cone = -1;              // the singular vertex, path.front()
@@ -74,6 +98,15 @@ public:
         int harmonicCuts = 0;          // arcs HarmonicCut made, beta when it worked
         int interiorCones = 0;
         int conesRouted = 0;           // interior cones that reached G union dS
+        // With Options::conesToBoundary: arcs that made it to dS, and arcs that
+        // could not and had to stop on an earlier arc after all. A fallback is
+        // not a failure -- the cut is still valid -- but it is the case the
+        // option was meant to avoid, so it is counted rather than hidden.
+        int conesToBoundary = 0;
+        int conesFellBack = 0;
+        // Degree-three (or higher) junctions of G away from dS: one per place
+        // where an arc stopped on another. Zero is what conesToBoundary buys.
+        int interiorJunctions = 0;
         // Cones the graph runs across rather than stopping at, so that they
         // have more than one child in Omega. Legal but not preferred; see the
         // class comment.
@@ -89,7 +122,12 @@ public:
         std::vector<std::string> messages;
     };
 
-    ConeCut(std::shared_ptr<Mesh> mesh, const ConeSingularities &cones);
+    ConeCut(std::shared_ptr<Mesh> mesh, const ConeSingularities &cones,
+            const Options &options);
+    // Options{} cannot be spelled as a default argument here: the member
+    // initialiser above is not yet usable inside the class body.
+    ConeCut(std::shared_ptr<Mesh> mesh, const ConeSingularities &cones)
+        : ConeCut(std::move(mesh), cones, Options()) {}
 
     const Mesh& getOriginalMesh() const { return *orig; }
     std::shared_ptr<Mesh> getOriginalMeshPtr() const { return orig; }
@@ -136,6 +174,7 @@ private:
     void check(const ConeSingularities &cones);
 
     std::shared_ptr<Mesh> orig;
+    Options opts;
     std::unique_ptr<HarmonicCut> harmonic;
 
     Mesh cut;

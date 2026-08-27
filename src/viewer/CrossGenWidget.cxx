@@ -106,9 +106,10 @@ MERIDIANPhase nextMERIDIANPhase(MERIDIANPhase p) {
         case MERIDIANPhase::RicciFlow:  return MERIDIANPhase::Metric;
         case MERIDIANPhase::Metric:     return MERIDIANPhase::Layout;
         case MERIDIANPhase::Layout:     return MERIDIANPhase::Separatrices;
-        case MERIDIANPhase::Separatrices: return MERIDIANPhase::Separatrices;
+        case MERIDIANPhase::Separatrices: return MERIDIANPhase::Patches;
+        case MERIDIANPhase::Patches:    return MERIDIANPhase::Patches;
     }
-    return MERIDIANPhase::Separatrices;
+    return MERIDIANPhase::Patches;
 }
 
 MedialAxisPhase nextMedialAxisPhase(MedialAxisPhase p) {
@@ -185,6 +186,7 @@ const char *meridianPhaseName(MERIDIANPhase p) {
         case MERIDIANPhase::Metric:     return "7) flat cone metric";
         case MERIDIANPhase::Layout:     return "8) layout Psi (Secs. 3.2.2, 3.3)";
         case MERIDIANPhase::Separatrices: return "9) separatrices (Sec. 4, Q5)";
+        case MERIDIANPhase::Patches:    return "10) arrangement and splines (Secs. 4, 5)";
     }
     return "?";
 }
@@ -548,6 +550,8 @@ void CrossGenWidget::doReset() {
     // Each MERIDIAN stage holds on to the ones before it, so they go in
     // reverse: the layout on the labels and the immersion, the immersion on the
     // cut, the flow and the cones, and both the flow and the cut on the cones.
+    splines_.reset();
+    arrangement_.reset();
     separatrices_.reset();
     meridianLayout_.reset();
     meridianLabels_.reset();
@@ -595,6 +599,8 @@ void CrossGenWidget::doReset() {
     layoutAttempted_      = false;
     separatricesAnnounced_ = false;
     separatricesAttempted_ = false;
+    patchesAnnounced_      = false;
+    patchesAttempted_      = false;
 
     view_.cx    = 0.5 * (bounds_.minx + bounds_.maxx);
     view_.cy    = 0.5 * (bounds_.miny + bounds_.maxy);
@@ -2144,6 +2150,145 @@ void CrossGenWidget::runMERIDIANSeparatrices() {
                  "a cone and went on, red ended nowhere");
 }
 
+// Whether Stage 7 came back with something a layout can be read off. Q5 on
+// every curve traced and Psi still satisfying Q1-Q5 after the repair: the two
+// verdicts the separatrix phase already printed. Stage 8's own validation is a
+// different question -- it asks whether the partition is four-sided everywhere
+// -- and it is allowed to fail and be reported. What is not allowed is to build
+// the partition out of curves that never closed.
+bool CrossGenWidget::meridianTraceIsClean() const {
+    if (!separatrices_.has_value() || !meridianLayout_.has_value()) return false;
+    const Separatrices::Report &r = separatrices_->getReport();
+    if (!r.valid) return false;
+    if (r.emitted == 0) return false;
+    return meridianLayout_->getReport().valid;
+}
+
+// Stages 8 and 9: the curves become a planar subdivision of S, and each arc of
+// that subdivision becomes the one cubic B-spline both of its faces share.
+//
+// The two run together because the second is only meaningful on the first and
+// neither is worth a phase of its own to look at: Stage 9 moves the lines of
+// Stage 8 by less than the width they are drawn at, which is the point -- the
+// fit is a reconstruction of the layout, not a change to it. The numbers are
+// where they differ, so both reports are printed in full.
+void CrossGenWidget::runMERIDIANPatches() {
+    patchesAttempted_ = true;
+    if (!separatrices_.has_value() || !meridianLabels_.has_value()) return;
+
+    if (!meridianTraceIsClean()) {
+        // Refusing rather than drawing a layout that is not one. The separatrix
+        // phase has already said which curves failed and offered the dialog
+        // that can do something about them.
+        console_.log("[Patches] not built: Stage 7 did not finish cleanly, so the curves "
+                     "do not partition S. Press 'c' to re-open the connectivity dialog and "
+                     "trace again");
+        return;
+    }
+
+    auto t0 = Clock::now();
+    try {
+        arrangement_.emplace(*separatrices_, *meridianLabels_);
+    } catch (const std::exception &e) {
+        arrangement_.reset();
+        console_.log(std::string("[Patches] arrangement FAILED: ") + e.what());
+        return;
+    }
+    auto t1 = Clock::now();
+
+    const Arrangement::Report &ar = arrangement_->getReport();
+    {
+        std::ostringstream oss;
+        oss << "[Patches] Stage 8: " << ar.nodes << " node(s) (" << ar.coneNodes
+            << " cone, " << ar.crossingNodes << " crossing, " << ar.boundaryHitNodes
+            << " on dS, " << ar.boundaryCornerNodes << " corner) and " << ar.arcs
+            << " arc(s) (" << ar.separatrixArcs << " traced, " << ar.boundaryArcs
+            << " of dS), " << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Patches] " << ar.patches << " patch(es), " << ar.quads
+            << " with four corners, " << ar.simpleQuads << " with one arc per side; they cover "
+            << std::fixed << std::setprecision(6) << ar.areaCoverage << " of S";
+        console_.log(oss.str());
+    }
+    if (ar.tJunctions > 0 || ar.wrongCornerFaces > 0 || ar.coneValenceErrors > 0 ||
+        ar.danglingArcs > 0 || ar.unsharedArcs > 0) {
+        std::ostringstream oss;
+        oss << "[Patches] Sec. 4's validation: " << ar.tJunctions << " T-junction(s), "
+            << ar.wrongCornerFaces << " face(s) without four corners, " << ar.coneValenceErrors
+            << " cone(s) of the wrong valence, " << ar.danglingArcs << " dangling arc(s), "
+            << ar.unsharedArcs << " unshared arc(s) -- the quantisation of Stage 6 has not "
+            << "finished on this model";
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Patches] Stage 8 " << (ar.valid ? "validates [PASS]"
+                                                 : "does not validate [FAIL]");
+        console_.log(oss.str());
+        std::cerr << "[Viewer] " << oss.str() << "\n";
+    }
+
+    auto t2 = Clock::now();
+    try {
+        splines_.emplace(*arrangement_);
+    } catch (const std::exception &e) {
+        splines_.reset();
+        console_.log(std::string("[Patches] spline fit FAILED: ") + e.what());
+        return;
+    }
+    auto t3 = Clock::now();
+
+    const SplineFit::Report &sr = splines_->getReport();
+    {
+        std::ostringstream oss;
+        oss << "[Patches] Stage 9: " << sr.curves << " cubic B-spline(s) of "
+            << sr.controlPointsPerArc << " control points and " << sr.patches
+            << " bicubic patch(es) of " << sr.controlPointsPerArc << "x"
+            << sr.controlPointsPerArc << ", "
+            << formatMs(std::chrono::duration<double, std::milli>(t3 - t2).count());
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Patches] the fit is off the traced curves by at most " << std::scientific
+            << std::setprecision(2) << sr.maxDeviation << " of the model (rms "
+            << sr.rmsDeviation << ")";
+        console_.log(oss.str());
+    }
+    {
+        // The watertightness rule of Sec. 5, measured: an arc is fitted once
+        // and both of its patches are handed the same control points, so the
+        // gap between the two copies is zero exactly or the rule was broken.
+        std::ostringstream oss;
+        oss << "[Patches] shared control points apart by " << std::scientific
+            << std::setprecision(3) << sr.maxSeamGap << " over " << sr.sharedArcs
+            << " shared arc(s): "
+            << (sr.watertight ? "watertight [PASS]" : "not watertight [FAIL]");
+        console_.log(oss.str());
+    }
+    if (sr.foldedPatches > 0) {
+        std::ostringstream oss;
+        oss << "[Patches] " << sr.foldedPatches
+            << " patch(es) fold: the Coons blend of Sec. 5 is bilinear in its four sides and "
+            << "a layout face whose sides bow outwards has no such surface. More Bezier "
+            << "segments do not fix it";
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Patches] Stage 9 " << (sr.valid ? "validates [PASS]"
+                                                 : "does not validate [FAIL]");
+        console_.log(oss.str());
+        std::cerr << "[Viewer] " << oss.str() << "\n";
+    }
+    console_.log("[Patches] the blocks on the model: light blue is a patch side -- the fitted "
+                 "spline where there is one, the traced arc where the fit was skipped -- and "
+                 "green is a node of the arrangement");
+}
+
 // Stages 5 to 7 again from the immersion already computed, at whatever the
 // dialog was last left at.
 //
@@ -2156,8 +2301,14 @@ void CrossGenWidget::runMERIDIANSeparatrices() {
 void CrossGenWidget::rerunMERIDIANConnectivity() {
     if (!immersion_.has_value()) return;
 
-    // Reverse construction order: LayoutEnergy holds references to both of the
-    // others, SubdomainLabels to the immersion.
+    // Reverse construction order: SplineFit holds a reference to the
+    // arrangement, the arrangement to the separatrices and the labels,
+    // LayoutEnergy to the immersion and the labels, SubdomainLabels to the
+    // immersion.
+    splines_.reset();
+    arrangement_.reset();
+    patchesAttempted_ = false;
+    patchesAnnounced_ = false;
     separatrices_.reset();
     meridianLayout_.reset();
     meridianLabels_.reset();
@@ -2254,13 +2405,13 @@ void CrossGenWidget::advancePhase() {
         if (meridianPhase_ != old)
             std::cerr << "[Viewer] MERIDIAN Phase " << meridianPhaseName(meridianPhase_) << "\n";
 
-        // Separatrices is the last phase and it stays that way: 'c' at it
-        // re-opens the connectivity dialog and runs Stages 5 to 7 again from
+        // Patches is the last phase and it stays that way: 'c' at it
+        // re-opens the connectivity dialog and runs Stages 5 to 9 again from
         // the immersion, the way 'c' at UMBER's Simplified phase re-opens the
         // chord dialog. Which pairs of cones are meant to be joined is a
         // judgement about the model, not a constant of the method, and the only
         // way to settle one is to try a number and look at the curves.
-        if (old == MERIDIANPhase::Separatrices && meridianPhase_ == old &&
+        if (old == MERIDIANPhase::Patches && meridianPhase_ == old &&
             immersion_.has_value() && separatricesAttempted_) {
             if (promptMERIDIANConnectivity(*immersion_, psiR_)) {
                 rerunMERIDIANConnectivity();
@@ -2646,6 +2797,25 @@ void CrossGenWidget::runComputations() {
             separatricesAnnounced_ = true;
         } else {
             runMERIDIANSeparatrices();
+        }
+    }
+
+    // ── MERIDIAN: Stages 8 and 9, the arrangement and the patches ────────────
+    //
+    // Only on a clean trace. Stage 8 builds a planar subdivision out of the
+    // curves and Stage 9 fits a surface to its faces; run either on a bundle
+    // that did not close and what comes out is a picture of blocks that are
+    // not there. What Stage 7 already reported is exactly the precondition --
+    // Q5 on every curve, and Psi still a layout after the repair -- so it is
+    // read rather than re-derived.
+    if (mode_ == Mode::MERIDIAN && meridianPhase_ >= MERIDIANPhase::Patches &&
+        separatrices_.has_value() && !patchesAttempted_) {
+        if (!patchesAnnounced_) {
+            console_.log("[Patches] building the arrangement and fitting the splines, "
+                         "this blocks...");
+            patchesAnnounced_ = true;
+        } else {
+            runMERIDIANPatches();
         }
     }
 
@@ -3198,8 +3368,16 @@ void CrossGenWidget::renderMERIDIANModel() {
     // competes with them for exactly the colours they are drawn in.
     const bool showMetric = (meridianPhase_ >= MERIDIANPhase::Metric &&
                              meridianPhase_ != MERIDIANPhase::Separatrices &&
+                             meridianPhase_ != MERIDIANPhase::Patches &&
                              !flatMetric_.edges.empty());
     const bool showU = (meridianPhase_ == MERIDIANPhase::RicciFlow && ricciU_.size() > 0);
+
+    // At the patch phase nothing of the model underneath is drawn at all --
+    // not the wireframe, not dS, not the cones. The block decomposition is the
+    // whole picture there: every patch side is already a curve of S drawn in
+    // full, and a triangulation or a boundary loop under it is clutter that
+    // was the point of the phase to get past.
+    if (meridianPhase_ == MERIDIANPhase::Patches) return;
 
     if (showMetric) {
         // The metric replaces the wireframe rather than covering it: every edge
@@ -3682,6 +3860,14 @@ void CrossGenWidget::renderNormal() {
             }
         } else {
             renderMERIDIANModel();
+            // The blocks over the model, once Stages 8 and 9 have produced
+            // any: this is the whole of what the phase is for, and it is
+            // drawn last so no wireframe edge crosses a patch side.
+            if (meridianPhase_ >= MERIDIANPhase::Patches && arrangement_.has_value()) {
+                viewer::drawLayoutPatches(*arrangement_,
+                                          splines_.has_value() ? &*splines_ : nullptr,
+                                          0.30 * avgEdge_, 3.0f);
+            }
         }
     } else if (mode_ == Mode::MedialAxis) {
         viewer::drawAxis(view_);
@@ -3797,6 +3983,7 @@ void CrossGenWidget::renderNormal() {
                                           "conformal factor u, mean removed");
         } else if (meridianPhase_ >= MERIDIANPhase::Metric &&
                    meridianPhase_ != MERIDIANPhase::Separatrices &&
+                   meridianPhase_ != MERIDIANPhase::Patches &&
                    !flatMetric_.edges.empty()) {
             viewer::drawScalarFieldLegend(fbw(), fbh(), -flatMetric_.absMax, flatMetric_.absMax,
                                           "log(l_flat / l_input), mean removed");
@@ -3817,6 +4004,9 @@ void CrossGenWidget::renderNormal() {
     } else if (mode_ == Mode::MERIDIAN && meridianPhase_ == MERIDIANPhase::Layout &&
                meridianLayout_.has_value()) {
         renderOverlay("press 'p' to swap psi_R / Psi\npress 'r' to restart\npress 'q' to quit");
+    } else if (mode_ == Mode::MERIDIAN && meridianPhase_ == MERIDIANPhase::Patches) {
+        renderOverlay("press 'c' to change the connectivity settings and trace again\n"
+                      "press 'r' to restart\npress 'q' to quit");
     } else if (mode_ == Mode::UMBER && umberPhase_ == UMBERPhase::Simplified) {
         renderOverlay("press 'c' to change the collapse settings\n"
                       "press 'r' to restart\npress 'q' to quit");

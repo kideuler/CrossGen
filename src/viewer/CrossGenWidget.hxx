@@ -13,6 +13,7 @@
 #include "viewer/Geometry.hxx"
 
 #include "mesh/Mesh.hxx"
+#include "MERIDIAN/Arrangement.hxx"
 #include "MERIDIAN/ConeCut.hxx"
 #include "MERIDIAN/MERIDIAN.hxx"
 #include "MERIDIAN/ConeSingularities.hxx"
@@ -20,6 +21,7 @@
 #include "MERIDIAN/LayoutEnergy.hxx"
 #include "MERIDIAN/RicciFlow.hxx"
 #include "MERIDIAN/Separatrices.hxx"
+#include "MERIDIAN/SplineFit.hxx"
 #include "MERIDIAN/SubdomainLabels.hxx"
 #include "Parameterization/CutMesh.hxx"
 #include "Parameterization/HarmonicCut.hxx"
@@ -176,6 +178,26 @@ enum class UMBERPhase {
 //              walks on. The left is where the layout it induces actually is:
 //              this is the left half of the paper's Fig. 9 and what Stages 8
 //              to 10 partition and fit.
+//
+//   Patches    Stages 8 and 9 together, Secs. 4 and 5. One phase rather than
+//              two because neither has a picture the other does not: Stage 8
+//              turns the bundle of curves into a planar subdivision of S --
+//              nodes, arcs, faces -- and Stage 9 replaces each arc by the one
+//              cubic B-spline both of its faces share, which moves the same
+//              lines by less than the width they are drawn at. What is worth
+//              seeing is the partition, and it is the same partition either
+//              way. So the blocks are drawn as the paper's Fig. 12 draws them,
+//              on the model and not in the image: each patch outlined in light
+//              blue along its four sides, and every node of the arrangement --
+//              the cones, the crossings, the boundary hits -- as a green disk.
+//              A block that is missing a corner is a block whose outline runs
+//              straight through a green disk without turning, which is the
+//              T-junction the validation counts.
+//
+//              This phase is only entered when Stage 7 finished cleanly. An
+//              arrangement of curves that did not close is not a layout, and
+//              drawing one as though it were is the one thing this picture
+//              must not do.
 enum class MERIDIANPhase {
     MeshOnly     = 1,
     CrossField   = 2,
@@ -186,6 +208,7 @@ enum class MERIDIANPhase {
     Metric       = 7,
     Layout       = 8,
     Separatrices = 9,
+    Patches      = 10,
 };
 
 // OASIS is a one-shot solve driven by a parameter dialog rather than a
@@ -346,6 +369,12 @@ private:
     // the two blocking stages before it.
     void runMERIDIANSeparatrices();
 
+    // Stages 8 and 9: the arrangement of the traced curves and the bicubic
+    // patches fitted to it. Runs only once Stage 7 has come back with Q5
+    // verified and a valid layout -- see meridianTraceIsClean().
+    void runMERIDIANPatches();
+    bool meridianTraceIsClean() const;
+
     // Whether a parameter domain occupies the right half of the window.
     bool inUVSplitScreen() const;
 
@@ -467,6 +496,10 @@ private:
     // Stage 7, traced on Psi. Holds a reference to the immersion like the three
     // above it, so it is cleared first and never outlives immersion_.
     std::optional<Separatrices>      separatrices_;
+    // Stages 8 and 9. Arrangement holds a reference to the separatrices and the
+    // labels, SplineFit to the arrangement, so they are cleared before either.
+    std::optional<Arrangement>       arrangement_;
+    std::optional<SplineFit>         splines_;
 
     // Guiding field for the OASIS orientation term. Held by shared_ptr because
     // OASIS keeps a reference to it for as long as it lives; separate from
@@ -534,6 +567,8 @@ private:
     bool layoutAttempted_      = false;
     bool separatricesAnnounced_ = false;
     bool separatricesAttempted_ = false;
+    bool patchesAnnounced_      = false;
+    bool patchesAttempted_      = false;
 
     // Chord collapse settings, surviving a reset the way oasisLambda_ does so
     // that the dialog opens on whatever was tried last.

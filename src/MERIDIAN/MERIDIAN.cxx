@@ -83,7 +83,9 @@ bool MERIDIAN::run() {
     }
 
     // --- Stage 2: cutting graph, Sec. 3.2.2 -------------------------------
-    cutter = std::make_unique<ConeCut>(mesh, *cones);
+    ConeCut::Options cutOpts;
+    cutOpts.conesToBoundary = options.coneCutsToBoundary;
+    cutter = std::make_unique<ConeCut>(mesh, *cones, cutOpts);
     const ConeCut::Report &cr = cutter->getReport();
     status.cutIsDisk = cr.isDisk;
     status.allConesOnBoundary = cr.allConesOnBoundary;
@@ -233,6 +235,54 @@ bool MERIDIAN::run() {
         // about its validity, and the repair above is what acts on them.
         status.q5Verified = sr.valid;
     }
+
+    // --- Stage 8: the arrangement, Sec. 4 ---------------------------------
+    // Run even when Stage 6 fell short. A layout that does not satisfy Q5 still
+    // has an arrangement, and the arrangement is where the failure becomes a
+    // *place* -- this face has three corners, that cone is one arc short --
+    // rather than a residual. Sec. 4's own "on failure" list is written against
+    // exactly this output.
+    if (!separatrices || !options.runArrangement) return status.layoutValid;
+    Arrangement::Options aopts;
+    aopts.mergeTolerance = options.arrangementMerge;
+    aopts.cornerTolerance = options.arrangementCorner;
+    aopts.collapseTolerance = options.arrangementCollapse;
+    try {
+        arrangement = std::make_unique<Arrangement>(*separatrices, *labels, aopts);
+    } catch (const std::exception &e) {
+        status.messages.push_back(std::string("Stage 8: could not be built: ") + e.what());
+        return status.layoutValid;
+    }
+    const Arrangement::Report &ar = arrangement->getReport();
+    status.arrangementRan = true;
+    status.layoutNodes = ar.nodes;
+    status.layoutArcs = ar.arcs;
+    status.layoutPatches = ar.patches;
+    status.layoutQuads = ar.simpleQuads;
+    status.layoutCoverage = ar.areaCoverage;
+    status.arrangementValid = ar.valid;
+    for (const std::string &m : ar.messages) status.messages.push_back("Stage 8: " + m);
+
+    // --- Stage 9: the spline reconstruction, Sec. 5 -----------------------
+    if (!options.runSplines) return status.layoutValid;
+    SplineFit::Options fopts;
+    fopts.segments = options.splineSegments;
+    fopts.samples = options.splineSamples;
+    try {
+        splines = std::make_unique<SplineFit>(*arrangement, fopts);
+    } catch (const std::exception &e) {
+        status.messages.push_back(std::string("Stage 9: could not be built: ") + e.what());
+        return status.layoutValid;
+    }
+    const SplineFit::Report &fr2 = splines->getReport();
+    status.splinesRan = true;
+    status.splinePatches = fr2.patches;
+    status.splineControlPoints = fr2.controlPointsPerArc;
+    status.splineMaxDeviation = fr2.maxDeviation;
+    status.splinesWatertight = fr2.watertight;
+    status.splinesValid = fr2.valid;
+    for (const std::string &m : fr2.messages) status.messages.push_back("Stage 9: " + m);
+
     return status.layoutValid;
 }
 

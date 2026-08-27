@@ -46,8 +46,9 @@ struct DSU {
 
 } // namespace
 
-ConeCut::ConeCut(std::shared_ptr<Mesh> mesh, const ConeSingularities &cones)
-    : orig(std::move(mesh)) {
+ConeCut::ConeCut(std::shared_ptr<Mesh> mesh, const ConeSingularities &cones,
+                 const Options &options)
+    : orig(std::move(mesh)), opts(options) {
     if (!orig) throw std::runtime_error("ConeCut: null mesh");
     if (orig->triangles.empty()) throw std::runtime_error("ConeCut: empty mesh");
     if (orig.get() != &cones.getMesh()) {
@@ -130,23 +131,51 @@ std::vector<int> ConeCut::shortestPathToSet(int source,
 // ---------------------------------------------------------------------------
 // routeConePaths()  --  Sec. 3.2.2
 //
-//   targets <- dS
-//   sort interior cones by graph distance to dS, ascending
+//   targets <- dS                       (and, without conesToBoundary, G)
+//   sort interior cones by graph distance to the targets, ascending
 //   for each interior cone c:
-//       p <- shortest path from c to (targets union G), weight l_ij,
-//            forbidding traversal *through* any other cone
+//       p <- shortest path from c to targets, weight l_ij, forbidding
+//            traversal *through* any other cone, and (with conesToBoundary)
+//            any vertex of an arc already laid
 //       G <- G union p
 //
-// The ordering matters for cut length, not for correctness: taking the cone
-// nearest the boundary first lets the ones behind it terminate on the arc it
-// just laid rather than running all the way out on their own.
+// Without conesToBoundary the target set grows as arcs are laid, so a cone
+// behind another one stops on its neighbour's arc rather than running all the
+// way out; the ordering is then a cut-length heuristic and nothing more. That
+// is the letter of Sec. 3.2.2 and it is what this did unconditionally.
+//
+// With conesToBoundary the target set is dS and stays dS, and the vertices of
+// every arc laid so far are added to the forbidden set instead of the target
+// set. Each cone then reaches the boundary along a slit of its own, disjoint
+// from all the others, and G has no junctions away from dS: no vertex of Omega
+// carries two seams, and no cone's route to the boundary is a chain of other
+// cones' arcs with a quarter-turn stacked at every junction between them. The
+// cut is longer -- 5% over the corpus in data/meshes -- and the ordering now
+// decides who gets the direct route rather than only how much edge length is
+// spent. It is left as it was, nearest-first, because on that corpus no cone
+// ever needed the fallback below and so nothing chooses between orderings.
+//
+// Blocking is why the strict route can fail at all. In the continuum a slit
+// from an interior point to dS never disconnects a disk, so a route around an
+// existing arc always exists; on a fixed triangulation the detour may need
+// vertices that are not there, and on a coarse mesh a cone can end up walled
+// off. That is not a reason to give up on the cone -- an unrouted cone is an
+// interior cone in Omega and Definition 2.1 fails outright -- so the cone falls
+// back to the old rule and stops on whatever it can reach. The fallbacks are
+// counted.
 // ---------------------------------------------------------------------------
 void ConeCut::routeConePaths(const ConeSingularities &cones) {
     const int nV = static_cast<int>(orig->vertices.size());
 
-    std::vector<char> isTarget(nV, 0);
-    for (int v : orig->boundaryVertices) isTarget[v] = 1;
-    for (const EdgeKey &e : cutEdges) { isTarget[e.a] = 1; isTarget[e.b] = 1; }
+    // dS, which is a target under either rule and never blocks anything.
+    std::vector<char> onBoundary(nV, 0);
+    for (int v : orig->boundaryVertices) onBoundary[v] = 1;
+
+    // Every vertex of G as it stands: the void arcs now, the cone arcs as they
+    // are laid. Which of the two sets below this feeds is the whole difference
+    // between the two rules.
+    std::vector<char> onGraph(nV, 0);
+    for (const EdgeKey &e : cutEdges) { onGraph[e.a] = 1; onGraph[e.b] = 1; }
 
     // Boundary cones count as off-limits too. One already sits in dS and needs
     // no arc, but an arc *ending* on it splits its one-ring exactly as it would
@@ -158,12 +187,34 @@ void ConeCut::routeConePaths(const ConeSingularities &cones) {
     report.interiorCones = static_cast<int>(interior.size());
     if (interior.empty()) return;
 
-    // Distance from every vertex to the current graph, for the ordering only.
+    // The two rules, as a target set and a forbidden set each. Both are rebuilt
+    // per cone from onBoundary/onGraph, which are what the loop actually
+    // maintains.
+    auto targetsFor = [&](bool strict) {
+        std::vector<char> t = onBoundary;
+        if (!strict) for (int v = 0; v < nV; ++v) if (onGraph[v]) t[v] = 1;
+        return t;
+    };
+    auto forbiddenFor = [&](bool strict, int self) {
+        std::vector<char> f = isCone;
+        if (strict) {
+            // An arc already laid is a wall, except where it is on dS: a slit
+            // may end at the boundary vertex another slit ends at, which is a
+            // point of dS and not a junction of G.
+            for (int v = 0; v < nV; ++v) if (onGraph[v] && !onBoundary[v]) f[v] = 1;
+        }
+        f[self] = 0;
+        return f;
+    };
+
+    // Distance from every vertex to the initial target set, for the ordering
+    // only.
+    const std::vector<char> order0 = targetsFor(opts.conesToBoundary);
     std::vector<double> toGraph(nV, std::numeric_limits<double>::infinity());
     {
         using QItem = std::pair<double, int>;
         std::priority_queue<QItem, std::vector<QItem>, std::greater<QItem>> pq;
-        for (int v = 0; v < nV; ++v) if (isTarget[v]) { toGraph[v] = 0.0; pq.push({0.0, v}); }
+        for (int v = 0; v < nV; ++v) if (order0[v]) { toGraph[v] = 0.0; pq.push({0.0, v}); }
         const auto &vt = orig->vertexTriangles;
         while (!pq.empty()) {
             const auto [d, u] = pq.top();
@@ -189,7 +240,7 @@ void ConeCut::routeConePaths(const ConeSingularities &cones) {
               });
 
     for (const auto &c : interior) {
-        if (isTarget[c.vertex]) {
+        if (onBoundary[c.vertex] || onGraph[c.vertex]) {
             // Already on the graph -- a cone sitting on a void arc. Sec. 3.2.2
             // forbids this, and check() reports it; nothing to route.
             continue;
@@ -197,10 +248,16 @@ void ConeCut::routeConePaths(const ConeSingularities &cones) {
 
         // Every other cone -- interior or boundary -- is off limits both as a
         // waypoint and as a terminus; only the cone being routed is exempt.
-        std::vector<char> forbidden = isCone;
-        forbidden[c.vertex] = 0;
-
-        std::vector<int> path = shortestPathToSet(c.vertex, isTarget, forbidden);
+        std::vector<int> path;
+        bool fellBack = false;
+        if (opts.conesToBoundary) {
+            path = shortestPathToSet(c.vertex, targetsFor(true), forbiddenFor(true, c.vertex));
+            if (path.size() < 2) fellBack = true;
+        }
+        if (path.size() < 2) {
+            path = shortestPathToSet(c.vertex, targetsFor(false), forbiddenFor(false, c.vertex));
+            fellBack = fellBack && path.size() >= 2;
+        }
         if (path.size() < 2) {
             std::ostringstream oss;
             oss << "Cone at vertex " << c.vertex
@@ -222,13 +279,24 @@ void ConeCut::routeConePaths(const ConeSingularities &cones) {
         }
         cp.reachedBoundary = orig->isBoundaryVertex[path.back()];
 
-        // Everything the arc touches is graph from now on, so a later cone can
-        // stop on it. The cone itself is included: a subsequent path must not
-        // end on it either, which keeps every cone a leaf of G.
-        for (int v : path) isTarget[v] = 1;
+        // Everything the arc touches is graph from now on. Under the loose rule
+        // that makes it somewhere a later cone may stop -- the cone itself
+        // included, so that a subsequent path cannot end on it and every cone
+        // stays a leaf of G. Under the strict rule it makes it a wall instead.
+        for (int v : path) onGraph[v] = 1;
 
         conePaths.push_back(std::move(cp));
         ++report.conesRouted;
+        if (fellBack) ++report.conesFellBack;
+        if (conePaths.back().reachedBoundary) ++report.conesToBoundary;
+    }
+
+    if (report.conesFellBack > 0) {
+        std::ostringstream oss;
+        oss << report.conesFellBack << " of " << report.conesRouted
+            << " cone arc(s) could not reach dS without crossing an arc already laid and "
+            << "stopped on that arc instead.";
+        report.messages.push_back(oss.str());
     }
 }
 
@@ -401,6 +469,19 @@ void ConeCut::check(const ConeSingularities &cones) {
                 << "into " << origToCutVerts[c.vertex].size()
                 << " children in Omega (Sec. 3.2.2 prefers, but does not require, otherwise).";
             report.messages.push_back(oss.str());
+        }
+    }
+
+    // Junctions of G away from dS: a vertex with three or more cut edges at it
+    // is a place where one arc stopped on another, and in Omega it is a vertex
+    // whose one-ring is split by two seams instead of one. Under
+    // Options::conesToBoundary there should be none.
+    {
+        std::unordered_map<int, int> degree;
+        degree.reserve(cutEdges.size() * 2);
+        for (const EdgeKey &e : cutEdges) { ++degree[e.a]; ++degree[e.b]; }
+        for (const auto &kv : degree) {
+            if (kv.second >= 3 && !orig->isBoundaryVertex[kv.first]) ++report.interiorJunctions;
         }
     }
 

@@ -6,18 +6,20 @@
 #include <string>
 #include <vector>
 
+#include "MERIDIAN/Arrangement.hxx"
 #include "MERIDIAN/ConeCut.hxx"
 #include "MERIDIAN/ConeSingularities.hxx"
 #include "MERIDIAN/Immersion.hxx"
 #include "MERIDIAN/LayoutEnergy.hxx"
 #include "MERIDIAN/RicciFlow.hxx"
 #include "MERIDIAN/Separatrices.hxx"
+#include "MERIDIAN/SplineFit.hxx"
 #include "MERIDIAN/SubdomainLabels.hxx"
 #include "mesh/Mesh.hxx"
 
 class SIPG;
 
-// Stages 1 to 6 of
+// Stages 1 to 9 of
 //   Shepherd, Gu and Hughes, "Isogeometric model reconstruction of open shells
 //   via Ricci flow and quadrilateral layout-inducing energies", Engineering
 //   Structures 252 (2022) 113602.   (docs/shepherd2022.pdf)
@@ -71,8 +73,24 @@ class SIPG;
 //                        graph by the transitions of Q4, until each terminates
 //                        at a cone or leaves through dS. This is Q5 read back
 //                        off the map as curves rather than as a residual, and
-//                        it is what Stages 8 to 10 partition and fit.
+//                        it is what Stages 8 and 9 partition and fit.
 //                        -> Separatrices
+//
+//   Stage 8  Sec. 4      The arrangement: the curves and dS cut into arcs at
+//                        every node they meet, assembled into a half-edge
+//                        structure, and its faces enumerated. This is where a
+//                        bundle of curves becomes a partition of S, and where
+//                        the paper's validation -- four corners to a face, an
+//                        arc between two faces, a cone with the arcs its index
+//                        prescribes -- is actually run.
+//                        -> Arrangement
+//
+//   Stage 9  Sec. 5      The spline reconstruction: one cubic B-spline per arc,
+//                        fitted once and shared by both patches that meet on
+//                        it, and a bicubic Coons patch per face built from the
+//                        four of them at the control-point level. Fitting each
+//                        arc exactly once is what makes the output watertight.
+//                        -> SplineFit
 //
 // The Gauss-Bonnet check between Stages 1 and 3 is not a formality. Newton's
 // system in the flow is Delta du = Kbar - K with Delta a Laplacian, whose
@@ -90,11 +108,18 @@ class SIPG;
 // comes from -- which is why run() reports Stage 4's flipped-face count rather
 // than only its own convergence.
 //
-// What comes out at the end is Psi, one planar point per vertex of the cut
-// disk, satisfying Q1 to Q5 to whatever tolerance the continuation reached, and
-// the separatrices traced on it. Stages 8 to 10 -- the arrangement of those
-// curves into a layout, the spline fit and the analysis handoff -- read them
-// and are not implemented here.
+// What comes out at the end is a set of bicubic patches meeting C0 across their
+// shared boundary curves and C2 inside, together with everything they were
+// derived from: Psi, the separatrices, and the arrangement. Stage 10 -- the
+// uniform knot-insertion refinement and the export to the analysis solver --
+// reads them and is not implemented here.
+//
+// run() returns Definition 2.1's verdict and nothing else: whether Psi is a
+// quadrilateral layout. Stages 8 and 9 can fail on a map that is a valid layout
+// in that sense -- a T-junction is quantisation that has not converged, not a
+// broken map -- and they report separately, because the remedy for both is the
+// one Sec. 4 gives and Sec. 3.3's repair loop has already applied: more
+// lambda_5 and another Gamma_topo constraint.
 class MERIDIAN {
 public:
     struct Options {
@@ -107,6 +132,12 @@ public:
         bool autoRebalance = true;   // restore Eq. (4) by moving boundary cones
         int minBoundaryIndex = -3;
         int maxBoundaryIndex = 1;
+
+        // Stage 2. Where a cone's arc of the cutting graph is allowed to
+        // stop: dS itself, or (false) the nearest thing already cut, which is
+        // the letter of Sec. 3.2.2 and leaves G a tree with junctions in it.
+        // See ConeCut::Options::conesToBoundary.
+        bool coneCutsToBoundary = true;
 
         // Stage 3
         double ricciTolerance = 1e-8;
@@ -146,6 +177,22 @@ public:
         int separatrixMaxSteps = 50000;
         int separatrixSnapRings = 2;
         bool separatrixDetectCycles = true;
+
+        // Stage 8, Sec. 4. mergeTolerance is how near two nodes must be, as a
+        // fraction of the diagonal of S, to be one node; cornerTolerance is how
+        // far a sector may be from a whole number of quarter turns and still be
+        // read as that number.
+        bool runArrangement = true;
+        double arrangementMerge = 1e-7;
+        double arrangementCorner = 0.35;
+        double arrangementCollapse = 1e-4;
+
+        // Stage 9, Sec. 5. Three cubic segments per arc is 6x6 control points
+        // per patch, which is what the paper uses for the firewall and the
+        // speaker frame; four is the 7x7 of the shock house and the chassis.
+        bool runSplines = true;
+        int splineSegments = 3;
+        int splineSamples = 8;
 
         // Sec. 3.3's remedy, and the "on failure" of Sec. 4's arrangement, run
         // as a loop rather than left to the reader:
@@ -231,6 +278,23 @@ public:
         // constraint. Zero is what a finished layout looks like.
         int separatricesNearMisses = 0;
 
+        // Stage 8
+        bool arrangementRan = false;
+        int layoutNodes = 0;
+        int layoutArcs = 0;
+        int layoutPatches = 0;
+        int layoutQuads = 0;       // patches with four corners and one arc a side
+        double layoutCoverage = 0.0;
+        bool arrangementValid = false;
+
+        // Stage 9
+        bool splinesRan = false;
+        int splinePatches = 0;
+        int splineControlPoints = 0;   // per arc
+        double splineMaxDeviation = 0.0;
+        bool splinesWatertight = false;
+        bool splinesValid = false;
+
         // The repair of Sec. 3.3, as it actually went.
         int repairPasses = 0;
         int repairConstraintsAdded = 0;
@@ -293,6 +357,8 @@ public:
     const SubdomainLabels& getLabels() const { return *labels; }
     const LayoutEnergy& getLayout() const { return *layout; }
     const Separatrices& getSeparatrices() const { return *separatrices; }
+    const Arrangement& getArrangement() const { return *arrangement; }
+    const SplineFit& getSplines() const { return *splines; }
 
     // Null until the stage that builds them has run.
     bool hasCones() const { return cones != nullptr; }
@@ -302,6 +368,8 @@ public:
     bool hasLabels() const { return labels != nullptr; }
     bool hasLayout() const { return layout != nullptr; }
     bool hasSeparatrices() const { return separatrices != nullptr; }
+    bool hasArrangement() const { return arrangement != nullptr; }
+    bool hasSplines() const { return splines != nullptr; }
 
     const Status& getStatus() const { return status; }
 
@@ -323,6 +391,8 @@ private:
     std::unique_ptr<SubdomainLabels> labels;
     std::unique_ptr<LayoutEnergy> layout;
     std::unique_ptr<Separatrices> separatrices;
+    std::unique_ptr<Arrangement> arrangement;
+    std::unique_ptr<SplineFit> splines;
 };
 
 #endif // __MERIDIAN_HXX__

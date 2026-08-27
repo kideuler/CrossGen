@@ -73,6 +73,10 @@ add_library(PolyVector SHARED
     src/MERIDIAN/LayoutEnergy.cxx
     src/MERIDIAN/Separatrices.hxx
     src/MERIDIAN/Separatrices.cxx
+    src/MERIDIAN/Arrangement.hxx
+    src/MERIDIAN/Arrangement.cxx
+    src/MERIDIAN/SplineFit.hxx
+    src/MERIDIAN/SplineFit.cxx
     src/UMBER/Polysquare.hxx
     src/UMBER/Polysquare.cxx
     src/UMBER/MotorcycleGraph.hxx
@@ -153,9 +157,10 @@ target_link_libraries(TestSIPG PRIVATE PolyVector)
 add_executable(TestUMBER src/utils/TestUMBER.cxx)
 target_link_libraries(TestUMBER PRIVATE PolyVector)
 
-# Test MERIDIAN Stages 1-7 (Shepherd, Gu and Hughes 2022, Secs. 3.1-3.3 and 4):
-# cone singularities, cutting graph, Gauss-Bonnet, discrete Ricci flow, the
-# metric immersion, the layout energies, and the separatrices of the result
+# Test MERIDIAN Stages 1-9 (Shepherd, Gu and Hughes 2022, Secs. 3.1-3.3, 4 and
+# 5): cone singularities, cutting graph, Gauss-Bonnet, discrete Ricci flow, the
+# metric immersion, the layout energies, the separatrices of the result, the
+# arrangement they cut S into, and the bicubic patches fitted to it
 add_executable(TestMERIDIAN src/utils/TestMERIDIAN.cxx)
 target_link_libraries(TestMERIDIAN PRIVATE PolyVector)
 
