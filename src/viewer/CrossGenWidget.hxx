@@ -14,6 +14,7 @@
 
 #include "mesh/Mesh.hxx"
 #include "MERIDIAN/ConeCut.hxx"
+#include "MERIDIAN/MERIDIAN.hxx"
 #include "MERIDIAN/ConeSingularities.hxx"
 #include "MERIDIAN/Immersion.hxx"
 #include "MERIDIAN/LayoutEnergy.hxx"
@@ -307,6 +308,36 @@ private:
     // longest of the MERIDIAN stages.
     void runMERIDIANLayout();
 
+    // The connectivity settings of Stages 5 to 7, gathered in one dialog
+    // because they are one decision made in three places.
+    //
+    // What the dialog is for. Q5 asks that every integral curve out of a cone
+    // be finite, and E5 is what makes it so -- but only along the paths of
+    // Gamma_topo it was given. A direction nothing quantised is a geodesic of a
+    // flat cone metric, and it does not end: it winds. So the layout a model
+    // comes out with depends on which connections were found, and *that* is a
+    // judgement about the model rather than a constant of the method. The paper
+    // says as much: it takes Gamma_topo as an input, calls its automatic
+    // generation future work, and places the cones of its own reference figure
+    // by hand.
+    //
+    // The defaults are the ones every model in data/meshes settles on, and the
+    // dialog shows what each of them comes to in image units for *this* model,
+    // which is the only form in which they can be judged.
+    //
+    // Opened after Stage 4 and before Stage 5, because the numbers it reports
+    // -- the mean spacing of the cones, the closest pair of them, the extent of
+    // the image -- are all measurements of psi_R and do not exist until the
+    // immersion does. Cancelling keeps whatever was last used, so the pipeline
+    // runs either way.
+    bool promptMERIDIANConnectivity(const Immersion &imm, const std::vector<Point> &uv);
+
+    // Stages 5 to 7 again from the immersion already computed, at whatever the
+    // dialog was last left at. What 'c' does at the Separatrices phase, in the
+    // spirit of UMBER's Simplified phase: a tolerance is a judgement, and the
+    // only way to settle one is to try a number and look.
+    void rerunMERIDIANConnectivity();
+
     // Stage 7, Sec. 4: march the integral curves out of every cone over Psi,
     // continuing them across the cutting graph, until each one terminates the
     // way Q5 allows. Much quicker than the continuation above it -- a fraction
@@ -507,6 +538,23 @@ private:
     // Chord collapse settings, surviving a reset the way oasisLambda_ does so
     // that the dialog opens on whatever was tried last.
     ChordCollapse::Settings chordSettings_;
+
+    // The connectivity settings of Stages 5 to 7, likewise surviving a reset.
+    // Defaults are the library's own, so the dialog opens on the recommended
+    // values and this struct only records departures from them.
+    struct MERIDIANConnectivity {
+        SubdomainLabels::Options labels;
+        Separatrices::Options    trace;
+        int    repairPasses      = MERIDIAN::Options().repairPasses;
+        int    repairMaxPerPass  = MERIDIAN::Options().repairMaxPerPass;
+        double repairGapLimit    = MERIDIAN::Options().repairGapLimit;
+        double repairLambdaBoost = MERIDIAN::Options().repairLambdaBoost;
+        int    repairOuterSteps  = MERIDIAN::Options().repairOuterSteps;
+    };
+    MERIDIANConnectivity meridianConn_;
+    // Whether the dialog has been shown this run. It opens once, on the way
+    // into the Layout phase, and after that only when asked for.
+    bool meridianConnPrompted_ = false;
 
     // ── view / camera ────────────────────────────────────────────────────────
     viewer::ViewState view_;     // mesh-space view (left panel)

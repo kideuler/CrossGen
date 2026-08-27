@@ -170,6 +170,7 @@ public:
 
     struct Report {
         int outerSteps = 0;
+        int resumes = 0;            // rounds of Sec. 3.3's repair
         int innerIterations = 0;
         int lineSearchFailures = 0;
         int factorisationFallbacks = 0;
@@ -240,8 +241,42 @@ public:
     // back is a quadrilateral layout in the sense of Definition 2.1.
     bool run();
 
+    // Sec. 3.3's remedy for a layout that came back not being one, and Sec. 4's
+    // "on failure" for an arrangement that would not close: continue the
+    // continuation from the map as it now stands, at penalties `lambdaBoost`
+    // times the ones it reached, after the caller has added the connectivity
+    // constraints the separatrices of that map named.
+    //
+    // From the current phi, not from psi_R. The distinction is the paper's and
+    // it is not a matter of speed: psi_R satisfies Q1, Q2 and Q4 and nothing
+    // else, so restarting there throws away every level of lambda already paid
+    // for and re-enters the same local minimum by the same road. Continuing
+    // from phi enters it with the new constraint already switched on, which is
+    // the only thing that has changed.
+    //
+    // Constraint terms are rebuilt first, so any Gamma_topo path added since
+    // the last call is picked up. The labelling is *not* re-read: Gamma_u and
+    // Gamma_v are re-read only when the continuation stalls, which is a
+    // different question from this one.
+    bool resume(int outerSteps, double lambdaBoost);
+
+    // Re-read the subdomains into the constraint terms of Eqs. (15) to (19),
+    // keeping the map. Called by resume(); public because a caller that has
+    // added constraints without wanting to solve again still needs the
+    // residuals in Report to mean something.
+    void rebuildConstraints();
+
     // Psi, one planar point per vertex of Omega. Before run() this is psi_R.
     const std::vector<Point>& getUV() const { return uv; }
+
+    // The map, saved and put back. What the repair loop of MERIDIAN::run()
+    // uses to make itself monotone: a round of Sec. 3.3's remedy adds
+    // constraints and re-minimises, and while that is nearly always an
+    // improvement it is a *different* minimisation, not a continuation of the
+    // same one, so it can land somewhere worse. Being able to go back is what
+    // lets it be tried at all.
+    std::vector<Point> saveMap() const { return uv; }
+    void loadMap(const std::vector<Point> &m);
 
     // Per-triangle det J against the current reference, for drawing the
     // distortion and for checking Q1 from outside.
@@ -292,6 +327,20 @@ private:
         return r;
     }
     bool constraintsUnder(double tol) const;
+
+    // The three verdicts of Definition 2.1 and their conjunction, from the
+    // residuals measure() has just taken. Called at the end of a continuation
+    // and again whenever the map or the constraint set is changed underneath
+    // one -- loadMap() and rebuildConstraints() both do that, and a Report
+    // still describing the map that was rolled back from is worse than no
+    // Report at all.
+    void finaliseVerdict();
+
+    // The outer loop of Sec. 3.3, shared by run() and resume(). The penalties
+    // are whatever the caller left in lambda[]; the schedule multiplies them
+    // between steps, never before the first, so that the map returned is the
+    // one minimised at the largest lambda rather than one level below it.
+    bool continuation(int outerSteps);
 
     double maxStep(const std::vector<double> &x, const std::vector<double> &d) const;
     bool innerSolve(int outer);

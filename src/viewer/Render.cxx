@@ -2200,12 +2200,34 @@ void drawLayoutUV(const Immersion &imm, const SubdomainLabels *labels,
 
 namespace {
 
-void separatrixColor(Separatrices::End e, float &r, float &g, float &b) {
-    switch (e) {
-        case Separatrices::End::Cone:       r = 0.25f; g = 0.90f; b = 0.45f; break;
-        case Separatrices::End::Boundary:   r = 0.35f; g = 0.60f; b = 0.98f; break;
-        case Separatrices::End::Capped:     r = 0.95f; g = 0.20f; b = 0.20f; break;
-        default:                            r = 0.98f; g = 0.65f; b = 0.10f; break;
+// How a curve ended, as the picture wants to say it. Q5's two allowed endings
+// are the first two; the third is not an ending at all but the thing the eye
+// most needs pointed out -- a curve that passed a cone close enough to have
+// been meant to stop at it and went on out through the boundary instead. It
+// looks exactly like a healthy boundary-bound separatrix until it is coloured
+// differently, and it is the commonest symptom of a missing connectivity
+// constraint (Remark 3.1: the patch it leaves behind is a sliver).
+enum class SepClass { Cone = 0, Boundary = 1, Graze = 2, Unterminated = 3, Untraceable = 4 };
+
+SepClass classifySeparatrix(const Separatrices::Curve &c, double window) {
+    switch (c.end) {
+        case Separatrices::End::Cone: return SepClass::Cone;
+        case Separatrices::End::Boundary:
+            return (c.nearestCone >= 0 && std::isfinite(c.nearestConeGap) &&
+                    c.nearestConeGap <= window) ? SepClass::Graze : SepClass::Boundary;
+        case Separatrices::End::Capped:
+        case Separatrices::End::Cycle: return SepClass::Unterminated;
+        default: return SepClass::Untraceable;
+    }
+}
+
+void separatrixColor(SepClass k, float &r, float &g, float &b) {
+    switch (k) {
+        case SepClass::Cone:         r = 0.25f; g = 0.90f; b = 0.45f; break;
+        case SepClass::Boundary:     r = 0.35f; g = 0.60f; b = 0.98f; break;
+        case SepClass::Graze:        r = 0.98f; g = 0.75f; b = 0.15f; break;
+        case SepClass::Unterminated: r = 0.95f; g = 0.20f; b = 0.20f; break;
+        default:                     r = 0.90f; g = 0.35f; b = 0.90f; break;
     }
 }
 
@@ -2219,12 +2241,17 @@ void drawSeparatrices(const Separatrices &sep, Separatrices::Space space,
     std::vector<Point> pts;
     std::vector<int> breaks;
 
+    // The near-miss window in absolute image units, so a boundary-bound curve
+    // that grazed a cone can be told from one that did not.
+    const Separatrices::Report &rep = sep.getReport();
+    const double window = sep.getOptions().nearMissWindow * rep.extent;
+
     // The curves first, then the termini, so a disk is never buried under the
     // line of a curve that happens to pass over it.
     glLineWidth(lineWidth);
     for (const Separatrices::Curve &c : curves) {
         float r, g, b;
-        separatrixColor(c.end, r, g, b);
+        separatrixColor(classifySeparatrix(c, window), r, g, b);
         glColor3f(r, g, b);
 
         pts = sep.polyline(c, space, &breaks);
@@ -2250,25 +2277,39 @@ void drawSeparatrices(const Separatrices &sep, Separatrices::Space space,
     if (endRadius <= 0.0) return;
     for (const Separatrices::Curve &c : curves) {
         if (c.end == Separatrices::End::Cone || c.steps.empty()) continue;
+        const SepClass k = classifySeparatrix(c, window);
         float r, g, b;
-        separatrixColor(c.end, r, g, b);
+        separatrixColor(k, r, g, b);
         drawDisk3D(sep.point(c.steps.back(), true, space), endRadius, r, g, b);
+
+        // A grazing curve is also marked at the cone it passed, not only where
+        // it stopped. That cone is the far end of the connectivity constraint
+        // Sec. 3.3 would add, and it is generally nowhere near the end of the
+        // curve -- which is the whole reason the miss is hard to see.
+        if (k == SepClass::Graze && c.nearestChild >= 0) {
+            const Point at = (space == Separatrices::Space::Image)
+                                 ? sep.getUV()[c.nearestChild]
+                                 : sep.getCutMesh().vertices[c.nearestChild];
+            drawDisk3D(at, endRadius * 1.6, r, g, b);
+        }
     }
 }
 
 void drawSeparatrixLegend(int fbw, int fbh) {
-    struct Row { Separatrices::End end; const char *label; };
+    struct Row { SepClass kind; const char *label; };
     static const Row kRows[] = {
-        { Separatrices::End::Cone,       "ends at a cone"   },
-        { Separatrices::End::Boundary,   "ends through dS"  },
-        { Separatrices::End::Capped,     "hit the step cap" },
-        { Separatrices::End::Degenerate, "not traceable"    },
+        { SepClass::Cone,         "ends at a cone"          },
+        { SepClass::Boundary,     "ends through dS"         },
+        { SepClass::Graze,        "grazed a cone, went on"  },
+        { SepClass::Unterminated, "ended nowhere"           },
+        { SepClass::Untraceable,  "not traceable"           },
     };
+    const int kRowCount = static_cast<int>(sizeof(kRows) / sizeof(kRows[0]));
 
     const float x0 = 20.0f;
     const float sw = 16.0f;
     const float lineH = 22.0f;
-    float y0 = static_cast<float>(fbh) - 290.0f;  // above the cone legend
+    float y0 = static_cast<float>(fbh) - 312.0f;  // above the cone legend
 
     glMatrixMode(GL_PROJECTION);
     glPushMatrix();
@@ -2279,9 +2320,9 @@ void drawSeparatrixLegend(int fbw, int fbh) {
     glLoadIdentity();
 
     glBegin(GL_QUADS);
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < kRowCount; ++i) {
         float r, g, b;
-        separatrixColor(kRows[i].end, r, g, b);
+        separatrixColor(kRows[i].kind, r, g, b);
         glColor3f(r, g, b);
         const float y = y0 + i * lineH;
         glVertex2f(x0, y);
@@ -2296,7 +2337,7 @@ void drawSeparatrixLegend(int fbw, int fbh) {
     glMatrixMode(GL_MODELVIEW);
     glPopMatrix();
 
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < kRowCount; ++i) {
         drawTextOverlay(fbw, fbh, kRows[i].label, x0 + sw + 8.0f, y0 + i * lineH + 2.0f,
                         0.8f, 0.8f, 0.8f);
     }

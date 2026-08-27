@@ -3,9 +3,11 @@
 
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "MERIDIAN/Immersion.hxx"
+#include "MERIDIAN/Separatrices.hxx"
 #include "mesh/Mesh.hxx"
 
 // Stage 5 of Shepherd, Gu and Hughes (2022), Section 3.3: the subdomain
@@ -60,6 +62,33 @@
 // crossing an arc of Gamma_Hol_k rotates the direction label by k quarter
 // turns, which is the whole content of "consistently oriented on the branched
 // covering space".
+//
+// The tracing is Stage 7's, run early: seedTopoPaths() drives Separatrices
+// with a loosened snap tolerance rather than marching on its own. That is not
+// only economy. A seeder with its own idea of which rays leave a cone finds a
+// different set of curves from the one that later checks Q5, and the
+// difference is silent -- it shows up two stages later as a separatrix with no
+// constraint behind it, missing its cone by a hair and running on. In
+// particular the direction extraction has to be the fan sweep of Sec. 3.4 and
+// not a test of the four axis directions against each incident triangle: the
+// second miscounts at a valence-five cone, where +u occurs twice in the fan,
+// and at a boundary vertex, where after Stage 6 the rays land exactly on fan
+// edges. See the Separatrices class comment.
+//
+// Two kinds of curve are worth a constraint and are easy to leave out:
+//
+//   * one that comes back to the cone it left. Q5 says "terminate at a
+//     (possibly identical) singularity", and Fig. 9 is precisely that curve --
+//     out along -du, across the cut, back along -dv to where it started. On
+//     this corpus these are the majority of the separatrices that fail to
+//     terminate, and a seeder that skips them leaves E5 with nothing to say
+//     about the one direction that most needs quantising.
+//
+//   * a second, distinct curve between a pair of cones that are already joined
+//     by one. They are different constraints; keeping only the nearer of the
+//     two leaves the other free to miss. Hence the deduplication is by the two
+//     *ends* -- cone, child and direction -- and not by the pair of cones, so
+//     that the same curve traced from both ends still collapses to one.
 //
 // A subcurve endpoint is generally *not* a vertex -- it is where the curve met
 // a seam, part way along an edge -- so it is stored as a Site, an affine
@@ -126,6 +155,12 @@ public:
         int fromCone = -1, toCone = -1;   // slots in Immersion::getConeVertices()
         double seedGap = 0.0;             // how near the seeding separatrix passed
         int seamCrossings = 0;
+        // Which pass put it here: 0 for the seeding on psi_R, then 1, 2, ...
+        // for each round of Sec. 3.3's repair on the map as it then stood. A
+        // path added late is one the seeding could not see, because psi_R and
+        // Psi are far enough apart that a connection visible on one need not be
+        // visible on the other.
+        int pass = 0;
     };
 
     struct Options {
@@ -151,6 +186,20 @@ public:
         // infeasible.
         double nearMissTolerance = 0.15;
         int maxTraceSteps = 50000;
+
+        // Seed the curve that comes back to the cone it left -- Q5's "possibly
+        // identical" case, and the curve the paper draws in Fig. 9. Off is what
+        // this code used to do implicitly, and it is worth having as a switch
+        // only to be able to see what it costs: on this corpus turning it off
+        // is what leaves separatrices winding until the step cap.
+        bool seedSelfReturns = true;
+
+        // Keep every distinct connection rather than one per pair of cones.
+        // Two separatrices joining the same two cones in different directions
+        // are two constraints; collapsing them to one leaves the other free to
+        // miss its cone. The same curve traced from both ends still collapses,
+        // because the key is the pair of *ends* and not the pair of cones.
+        bool seedAllConnections = true;
 
         // Feature chains are split where the image direction turns by more than
         // this, so that an L-shaped feature is two chains with two labels rather
@@ -187,7 +236,12 @@ public:
         int separatricesCapped = 0;
 
         int topoPaths = 0;
+        int topoSelfReturns = 0;    // of those, curves back to their own cone
+        int topoExtraPerPair = 0;   // and second-and-later curves of a pair
+        int topoAddedByRepair = 0;  // paths added after the seeding, pass > 0
         double meanConeSpacing = 0.0;
+        double seedSnapTolerance = 0.0; // what the seeding traced with, absolute
+        int seedSnapRings = 0;
         double maxTopoResidual = 0.0;   // worst |sum of advances| as it stands
 
         std::vector<std::string> messages;
@@ -220,6 +274,38 @@ public:
     // and the remaining labels follow from the transitions it crosses.
     bool addTopoPath(const std::vector<int> &omegaPath, int firstDir);
 
+    // Add the constraint a traced separatrix names: the path from the cone it
+    // left to the cone it reached, or -- when it reached none -- to the one it
+    // came nearest. Already subdivided by G and already carrying its direction
+    // labels, so nothing is recomputed. Returns false when the curve names no
+    // pair, or when the pair of ends is one Gamma_topo already has.
+    bool addTopoPath(const Separatrices::Curve &c, int pass = 0);
+
+    // Sec. 3.3's repair, and Sec. 4's "on failure" of the arrangement: take the
+    // separatrices of the map as it now stands that terminated at neither a
+    // cone nor dS, or slipped past one on their way out, and give E5 the
+    // constraint each of them names. `window` is how near a curve has to have
+    // passed, as a fraction of the image extent. Returns how many were new.
+    //
+    // This is what the seeding on psi_R cannot do on its own: psi_R and Psi are
+    // far apart -- that is the whole point of Stage 6 -- so a connection that
+    // is obvious on the finished layout need not have been visible on the map
+    // it started from.
+    //
+    // `maxAdd` caps how many are taken in one pass, nearest first. The cap
+    // earns its place on the models whose cones Stage 1 left clustered: there,
+    // a dozen constraints switched on at once move the map somewhere none of
+    // them is satisfied, while the nearest two or three are satisfiable and,
+    // once satisfied, change which of the rest are still wanted. Zero or
+    // negative means all of them.
+    int adoptCurves(const Separatrices &sep, double window, int pass, int maxAdd = 0);
+
+    // Undo the tail of Gamma_topo, back to `keep` paths, releasing the pairs
+    // they had claimed so a later pass may propose them again. The other half
+    // of making the repair monotone: a round that came back worse is taken
+    // back whole, constraints and map together.
+    void truncateTopoPaths(size_t keep);
+
     const std::vector<BoundaryEdge>& boundaryEdges() const { return bEdges; }
     const std::vector<BoundaryChain>& boundaryChains() const { return bChains; }
     const std::vector<FeatureChain>& featureChains() const { return fChains; }
@@ -231,6 +317,13 @@ public:
     const std::vector<int>& seamPairArc() const { return imm->getSeamPairArc(); }
     const std::vector<double>& seamPairLength() const { return imm->getSeamPairLength(); }
     const std::vector<Immersion::Arc>& arcs() const { return imm->getArcs(); }
+
+    // The mean distance from a cone to its nearest other cone, in the given
+    // map: the scale a "near miss" is measured against. Static because it is
+    // wanted before this object exists -- a caller choosing the near-miss
+    // tolerance for a particular model needs to know what a fraction of the
+    // spacing comes to in image units.
+    static double meanConeSpacing(const Immersion &imm, const std::vector<Point> &uv);
 
     // phi at a site, for a given map.
     static Point evaluate(const std::vector<Point> &uv, const Site &s) {
@@ -262,21 +355,25 @@ private:
     void buildFeatures(const std::vector<Point> &uv);
     void labelFeatures(const std::vector<Point> &uv);
 
-    // One traced separatrix. Terminates at a cone, at dS, or at the step cap.
-    struct Trace {
-        std::vector<TopoPath::Sub> subs;
-        int hitCone = -1;      // cone slot, or -1
-        double gap = 0.0;      // how far the snap moved the curve
-        bool leftDomain = false;
-        bool capped = false;
-        bool degenerate = false;   // the ray never entered its starting triangle
-        int seamCrossings = 0;
-    };
-    Trace traceSeparatrix(const std::vector<Point> &uv, int startVertex, int face,
-                          int tangentDir, double coneTol) const;
+    // The mean distance from a cone to its nearest other cone in `uv`, which is
+    // the scale a "near miss" is measured against, and the tracer settings that
+    // follow from it.
+    double coneSpacing(const std::vector<Point> &uv) const {
+        return meanConeSpacing(*imm, uv);
+    }
+    Separatrices::Options seedTracerOptions(const std::vector<Point> &uv,
+                                            double spacing) const;
 
-    // Local edge of face f joining local corners m and n.
-    static int localEdgeBetween(int m, int n) { return ((m + 1) % 3 == n) ? m : n; }
+    // The identity of one end of a connection: the cone, which of its children
+    // in Omega, and the direction of travel there. A curve and the same curve
+    // traced from its far end give the same unordered pair of these, which is
+    // what lets the deduplication keep two genuinely different curves between
+    // one pair of cones while still collapsing a curve found twice.
+    static long long endToken(int cone, int child, int dir) {
+        return ((static_cast<long long>(cone) * 1000003LL + child) * 4) +
+               (((dir % 4) + 4) % 4);
+    }
+    static long long topoKeyOf(long long a, long long b);
 
     const Immersion *imm = nullptr;
     Options options;
@@ -285,16 +382,19 @@ private:
     std::vector<BoundaryChain> bChains;
     std::vector<FeatureChain> fChains;
     std::vector<TopoPath> tPaths;
+    // The pairs of ends already constrained, so that the repair can add to
+    // Gamma_topo across several passes without ever adding the same path twice,
+    // and the key each path claimed, so truncateTopoPaths() can release them.
+    std::unordered_set<long long> topoKeys;
+    std::vector<long long> tPathKeys;
 
     // Omega edge lookup, and the seam partner of every seam child edge.
     std::unordered_map<EdgeKey, int, EdgeKeyHash> cutEdgeIndex;
     // key -> 2 * pairIndex + (0 for the plus child, 1 for the minus child)
     std::unordered_map<EdgeKey, int, EdgeKeyHash> seamSide;
-    // Omega boundary edges whose parent lies in dS, as a fast test, and the
-    // same question asked of a vertex -- which the tracer needs when a curve
-    // runs into a boundary vertex head-on rather than crossing an edge.
+    // Omega boundary edges whose parent lies in dS rather than in a cut, as a
+    // fast test.
     std::vector<char> parentOnBoundary;   // per Omega edge
-    std::vector<char> vertexOnRealBoundary;
 
     Report report;
 };

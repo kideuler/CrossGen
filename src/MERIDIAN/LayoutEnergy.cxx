@@ -6,6 +6,7 @@
 #include <limits>
 #include <map>
 #include <sstream>
+#include <string>
 
 namespace {
 
@@ -750,11 +751,53 @@ bool LayoutEnergy::run() {
 
     measure(true);
     report.energyStart = energy(x);
+    return continuation(options.outerSteps);
+}
 
+// ---------------------------------------------------------------------------
+void LayoutEnergy::finaliseVerdict() {
+    report.injective = report.invertedTriangles == 0;
+    report.constraintsMet = constraintsUnder(options.constraintTolerance);
+    report.anglesHeld = report.coneValenceChanges == 0 &&
+                        report.maxConeAngleResidual < options.angleTolerance;
+    report.valid = report.injective && report.constraintsMet && report.anglesHeld;
+}
+
+// ---------------------------------------------------------------------------
+void LayoutEnergy::loadMap(const std::vector<Point> &m) {
+    if (m.size() != uv.size()) return;
+    uv = m;
+    for (int v = 0; v < nV; ++v) { x[dofU(v)] = uv[v][0]; x[dofV(v)] = uv[v][1]; }
+    updateExtent();
+    measure(false);
+    finaliseVerdict();
+}
+
+// ---------------------------------------------------------------------------
+void LayoutEnergy::rebuildConstraints() {
+    buildConstraintTerms();
+    measure(false);
+    finaliseVerdict();
+}
+
+// ---------------------------------------------------------------------------
+// resume()  --  Sec. 3.3's "raise lambda_5 and re-run from the current phi"
+// ---------------------------------------------------------------------------
+bool LayoutEnergy::resume(int outerSteps, double lambdaBoost) {
+    rebuildConstraints();
+    if (lambdaBoost > 0.0) {
+        for (int j = 2; j <= 5; ++j) lambda[j] *= lambdaBoost;
+    }
+    ++report.resumes;
+    return continuation(outerSteps);
+}
+
+// ---------------------------------------------------------------------------
+bool LayoutEnergy::continuation(int outerSteps) {
     double previousWorst = kInf;
     double previousAngle = kInf;
     bool stalled = false;
-    for (int outer = 0; outer < options.outerSteps; ++outer) {
+    for (int outer = 0; outer < outerSteps; ++outer) {
         // The schedule is applied *before* the solve, not after, so that the
         // last minimisation is the one at the largest lambda rather than one
         // level below it -- and so that Report::lambdaFinal is the lambda the
@@ -808,15 +851,18 @@ bool LayoutEnergy::run() {
     for (int j = 2; j <= 5; ++j) report.lambdaFinal[j - 2] = lambda[j];
 
     measure(false);
-    report.injective = report.invertedTriangles == 0;
-    report.constraintsMet = constraintsUnder(options.constraintTolerance);
-    report.anglesHeld = report.coneValenceChanges == 0 &&
-                        report.maxConeAngleResidual < options.angleTolerance;
-    report.valid = report.injective && report.constraintsMet && report.anglesHeld;
+    finaliseVerdict();
+
+    // Both diagnostics below are about the state this call left the map in, and
+    // resume() may be about to change it, so they say which round they came
+    // from rather than reading as the last word.
+    const std::string round = report.resumes == 0
+        ? std::string("The continuation")
+        : ("Repair pass " + std::to_string(report.resumes) + " of the continuation");
 
     if (!report.constraintsMet) {
         std::ostringstream oss;
-        oss << "The continuation stopped with constraints unmet: Q3 " << report.maxBoundaryResidual
+        oss << round << " stopped with constraints unmet: Q3 " << report.maxBoundaryResidual
             << ", features " << report.maxFeatureResidual
             << ", Q4 " << report.maxSeamResidual
             << ", Q5 " << report.maxTopoResidual

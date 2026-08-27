@@ -13,7 +13,11 @@
 #include <QFormLayout>
 #include <QKeyEvent>
 #include <QLabel>
+#include <QPushButton>
+#include <QScreen>
+#include <QScrollArea>
 #include <QSpinBox>
+#include <QVBoxLayout>
 #include <QMouseEvent>
 #include <QWheelEvent>
 #include <QTimer>
@@ -23,6 +27,7 @@
 #include <cmath>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
@@ -1476,6 +1481,342 @@ void CrossGenWidget::runRicciFlow() {
 // the thing to look at. A continuation that runs but does not converge is not
 // terminal -- what it produced is still a map, still worth drawing, and its
 // residuals are what say which property it failed.
+// ── MERIDIAN connectivity dialog ─────────────────────────────────────────────
+
+// Sec. 3.3's Gamma_topo, Sec. 3.4's snap tolerance and Sec. 3.3's repair, in
+// one place, because they are one decision made three times.
+//
+// The decision is which pairs of cones are meant to be joined by an integral
+// curve. E5 makes the curves that are told to close, close; a direction it was
+// not told about is a geodesic of a flat cone metric, which does not end -- it
+// winds until the step cap. So which connections were found is what decides
+// whether a model comes out with a layout or with a handful of curves running
+// forever, and it is a judgement about the model rather than a constant of the
+// method. The paper agrees: Gamma_topo is an input there, its automatic
+// generation is listed as future work, and the cones of the reference figure
+// were placed by hand.
+//
+// Every field here has a default that the whole of data/meshes settles on, and
+// the panel beside them says what each comes to in image units for *this*
+// model, which is the only form in which any of them can be judged.
+bool CrossGenWidget::promptMERIDIANConnectivity(const Immersion &imm,
+                                                const std::vector<Point> &uv) {
+    const Immersion::Report &ir = imm.getReport();
+    const double extent = std::hypot(ir.uvMax[0] - ir.uvMin[0], ir.uvMax[1] - ir.uvMin[1]);
+    const double spacing = SubdomainLabels::meanConeSpacing(imm, uv);
+
+    // The closest two *distinct* cones come in the image. It is the number the
+    // widened tolerances have to stay under, and on a model where Stage 1 left a
+    // cluster it is very much smaller than the mean spacing.
+    double closest = std::numeric_limits<double>::infinity();
+    {
+        const auto &children = imm.getConeChildren();
+        for (size_t i = 0; i < children.size(); ++i) {
+            for (size_t j = i + 1; j < children.size(); ++j) {
+                for (int a : children[i]) {
+                    for (int b : children[j]) closest = std::min(closest, normP(uv[a] - uv[b]));
+                }
+            }
+        }
+    }
+
+    QDialog dlg(this);
+    dlg.setWindowTitle("MERIDIAN — cone connectivity (Sec. 3.3, Gamma_topo)");
+
+    // ── Stage 5: how the connections are found on psi_R ──────────────────────
+    auto *nearMissBox = new QDoubleSpinBox(&dlg);
+    nearMissBox->setRange(0.005, 0.60);
+    nearMissBox->setDecimals(3);
+    nearMissBox->setSingleStep(0.01);
+    nearMissBox->setValue(meridianConn_.labels.nearMissTolerance);
+    nearMissBox->setToolTip(
+        "How near a separatrix of psi_R has to pass a cone for the pair to be\n"
+        "seeded as a connectivity constraint, as a fraction of the mean spacing\n"
+        "between cones.\n\n"
+        "0.15 (recommended) is the largest value at which every model in\n"
+        "data/meshes still converges. Too small and Remark 3.1's sliver problem\n"
+        "survives, because the constraints that would have pinned the layout\n"
+        "together were never seeded. Too large and paths are seeded between cones\n"
+        "that were never meant to be joined: E5 then asks for a set of integral\n"
+        "curves that no map has, and the continuation does not converge slowly --\n"
+        "the barrier fights a penalty it cannot satisfy and det J is driven to 0.");
+
+    auto *selfReturnBox = new QCheckBox("seed curves that return to their own cone", &dlg);
+    selfReturnBox->setChecked(meridianConn_.labels.seedSelfReturns);
+    selfReturnBox->setToolTip(
+        "Q5 allows a separatrix to terminate at a \"possibly identical\"\n"
+        "singularity, and the paper's Fig. 9 is exactly that curve: out of a cone\n"
+        "along -du, across the cut, back along -dv to where it started.\n\n"
+        "Recommended on. With it off, the one direction that most often needs\n"
+        "quantising has nothing constraining it, and the curve winds instead of\n"
+        "closing.");
+
+    auto *allConnBox = new QCheckBox("keep every distinct curve between a pair of cones", &dlg);
+    allConnBox->setChecked(meridianConn_.labels.seedAllConnections);
+    allConnBox->setToolTip(
+        "Two separatrices can join the same two cones in different directions,\n"
+        "and they are two constraints, not one. With this off, only the nearer\n"
+        "of the two is kept and the other is free to miss.\n\n"
+        "The same curve found from both of its ends still collapses to one\n"
+        "either way -- the deduplication is on the pair of ends, not the pair of\n"
+        "cones.");
+
+    // ── Stage 7: what counts as arriving ─────────────────────────────────────
+    auto *snapBox = new QDoubleSpinBox(&dlg);
+    snapBox->setRange(1e-9, 1e-2);
+    snapBox->setDecimals(9);
+    snapBox->setSingleStep(1e-6);
+    snapBox->setValue(meridianConn_.trace.coneSnapTolerance);
+    snapBox->setToolTip(
+        "Sec. 3.4's snap tolerance, as a fraction of the image extent. The\n"
+        "paper's table value is 1e-6 and it is the recommended one.\n\n"
+        "It is tempting to raise this when curves miss, and it is the wrong\n"
+        "knob. Stage 6 stops when its residuals are under 1e-6 of the extent, so\n"
+        "a curve whose connection E5 was actually told about arrives well inside\n"
+        "1e-6, while one it was not told about arrives wherever the geometry puts\n"
+        "it. Raising the tolerance makes the second kind terminate at the price of\n"
+        "a patch corner visibly off its cone. The repair below gives E5 the\n"
+        "missing constraint instead, which is Sec. 3.3's own remedy.");
+
+    auto *ringsBox = new QSpinBox(&dlg);
+    ringsBox->setRange(0, 32);
+    ringsBox->setValue(meridianConn_.trace.coneSnapRings);
+    ringsBox->setToolTip(
+        "How far from the curve a cone may be, counted in triangles, and still be\n"
+        "a candidate to snap to.\n\n"
+        "0 is the paper's rule exactly: only the cones at the corners of the\n"
+        "triangle being crossed. The restriction is not an optimisation -- Psi\n"
+        "overlaps itself, so a cone matched by image distance alone can be one the\n"
+        "curve is nowhere near on S -- but it is tighter than it needs to be, and\n"
+        "on a fine mesh a one-ring can be narrower than the tolerance. 2 is\n"
+        "recommended; the distance test still gates every candidate.");
+
+    auto *stepsBox = new QSpinBox(&dlg);
+    stepsBox->setRange(1000, 2000000);
+    stepsBox->setSingleStep(10000);
+    stepsBox->setValue(meridianConn_.trace.maxSteps);
+    stepsBox->setToolTip("Sec. 3.4's cap on triangle crossings. A curve that reaches it is\n"
+                         "reported, not truncated silently.");
+
+    auto *cycleBox = new QCheckBox("stop a curve once it is provably winding", &dlg);
+    cycleBox->setChecked(meridianConn_.trace.detectCycles);
+    cycleBox->setToolTip(
+        "Away from its cones Psi is flat and a separatrix is one of its\n"
+        "geodesics, so a curve Q5 does not close does not wander off -- it winds,\n"
+        "and it winds until the step cap. Stopping it when it re-enters a triangle\n"
+        "it has already crossed, in the same direction and on the same isoline to\n"
+        "within the snap tolerance, reaches the same conclusion in a few hundred\n"
+        "steps instead of fifty thousand, and reports it as a closed orbit rather\n"
+        "than as \"ran out of budget\".\n\nRecommended on.");
+
+    // ── Sec. 3.3's repair ────────────────────────────────────────────────────
+    auto *repairBox = new QSpinBox(&dlg);
+    repairBox->setRange(0, 20);
+    repairBox->setValue(meridianConn_.repairPasses);
+    repairBox->setToolTip(
+        "Rounds of Sec. 3.3's remedy: take the separatrices of Psi that ended\n"
+        "nowhere, and the ones that slipped past a cone on their way out through\n"
+        "dS, give E5 the constraint each of them names, raise lambda_5, and\n"
+        "re-run Stage 6 from the current phi -- never from psi_R.\n\n"
+        "This is what the seeding on psi_R cannot do by itself: Stage 6 moves the\n"
+        "map a long way, and a connection that is plain on the finished layout\n"
+        "need never have been visible on the map it started from.\n\n"
+        "0 disables the repair. A round that comes back worse is taken back\n"
+        "whole, map and constraints together, so more rounds cannot make the\n"
+        "result worse than fewer -- only slower.");
+
+    auto *repairMaxBox = new QSpinBox(&dlg);
+    repairMaxBox->setRange(0, 64);
+    repairMaxBox->setValue(meridianConn_.repairMaxPerPass);
+    repairMaxBox->setToolTip(
+        "How many constraints one round may add, nearest miss first; 0 for all\n"
+        "of them.\n\n"
+        "4 is recommended. On a model whose cones Stage 1 left clustered, a dozen\n"
+        "constraints switched on at once move the map somewhere none of them is\n"
+        "satisfied, while the nearest few are satisfiable -- and once satisfied\n"
+        "they change which of the rest are still wanted.");
+
+    auto *repairGapBox = new QDoubleSpinBox(&dlg);
+    repairGapBox->setRange(1e-7, 1e-1);
+    repairGapBox->setDecimals(7);
+    repairGapBox->setSingleStep(1e-4);
+    repairGapBox->setValue(meridianConn_.repairGapLimit);
+    repairGapBox->setToolTip(
+        "How near a separatrix of Psi has to have passed a cone, as a fraction of\n"
+        "the image extent, before the repair counts the pair as one that was meant\n"
+        "to be joined. 1e-3 recommended.\n\n"
+        "This is also the window the report's near-miss count is taken over, and\n"
+        "the threshold at which the viewer colours a curve amber rather than blue.");
+
+    auto *repairBoostBox = new QDoubleSpinBox(&dlg);
+    repairBoostBox->setRange(1.0, 1000.0);
+    repairBoostBox->setDecimals(1);
+    repairBoostBox->setValue(meridianConn_.repairLambdaBoost);
+    repairBoostBox->setToolTip("Sec. 3.3's \"raise lambda_5\": the factor the penalties are\n"
+                               "multiplied by before each repair round. 10 is the paper's\n"
+                               "growth factor and the recommended value.");
+
+    auto *repairOuterBox = new QSpinBox(&dlg);
+    repairOuterBox->setRange(1, 40);
+    repairOuterBox->setValue(meridianConn_.repairOuterSteps);
+    repairOuterBox->setToolTip("Outer penalty steps per repair round.");
+
+    // ── the live panel ───────────────────────────────────────────────────────
+    auto *derived = new QLabel(&dlg);
+    derived->setTextFormat(Qt::PlainText);
+    derived->setStyleSheet("font-family: monospace;");
+
+    auto updateDerived = [&, nearMissBox, snapBox, repairGapBox, derived]() {
+        const double seedTol = nearMissBox->value() * spacing;
+        const double snapAbs = snapBox->value() * extent;
+        const double gapAbs = repairGapBox->value() * extent;
+
+        std::ostringstream oss;
+        oss << std::scientific << std::setprecision(3);
+        oss << "image extent          " << extent << "\n"
+            << "mean cone spacing     " << spacing << "\n"
+            << "closest cone pair     ";
+        if (std::isfinite(closest)) oss << closest; else oss << "n/a (fewer than two cones)";
+        oss << "\n"
+            << "seeding tolerance     " << seedTol << "   (Stage 5)\n"
+            << "snap tolerance        " << snapAbs << "   (Stage 7)\n"
+            << "near-miss window      " << gapAbs << "   (repair)\n";
+
+        // The one arithmetic mistake this dialog exists to prevent: a tolerance
+        // wider than the cones are apart, which hands curves to whichever of a
+        // clustered pair happens to be a hair nearer. The separation cap in
+        // Separatrices stops it doing damage; saying so is better than letting
+        // it be silently clamped.
+        if (std::isfinite(closest)) {
+            if (seedTol > 0.5 * closest) {
+                oss << "\nThe seeding tolerance is more than half the distance between the two\n"
+                       "closest cones. Constraints will be capped at a quarter of that\n"
+                       "distance; consider a smaller fraction of the mean spacing.";
+            }
+            if (gapAbs > 0.5 * closest) {
+                oss << "\nThe near-miss window is more than half the distance between the two\n"
+                       "closest cones, so the repair may propose a pair that was never meant\n"
+                       "to be joined.";
+            }
+        }
+        if (ir.clusteredConePairs > 0) {
+            oss << "\n" << ir.clusteredConePairs
+                << " pair(s) of cones are clustered (Sec. 3.1). Q2 -- the cone angles --\n"
+                   "is what will limit this model, not the connectivity: Eq. (15)'s 1/l_e\n"
+                   "weighting leaves the largest angular error on the shortest edges, which\n"
+                   "are the ones between clustered cones. The remedy is Stage 1's, to merge\n"
+                   "the cluster into one cone of the summed index.";
+        }
+        derived->setText(QString::fromStdString(oss.str()));
+    };
+    QObject::connect(nearMissBox, &QDoubleSpinBox::valueChanged, &dlg, updateDerived);
+    QObject::connect(snapBox, &QDoubleSpinBox::valueChanged, &dlg, updateDerived);
+    QObject::connect(repairGapBox, &QDoubleSpinBox::valueChanged, &dlg, updateDerived);
+    updateDerived();
+
+    auto syncRepair = [repairBox, repairMaxBox, repairGapBox, repairBoostBox, repairOuterBox]() {
+        const bool on = repairBox->value() > 0;
+        repairMaxBox->setEnabled(on);
+        repairGapBox->setEnabled(on);
+        repairBoostBox->setEnabled(on);
+        repairOuterBox->setEnabled(on);
+    };
+    QObject::connect(repairBox, &QSpinBox::valueChanged, &dlg, syncRepair);
+    syncRepair();
+
+    auto *restore = new QPushButton("Restore recommended", &dlg);
+    QObject::connect(restore, &QPushButton::clicked, &dlg,
+                     [&, nearMissBox, selfReturnBox, allConnBox, snapBox, ringsBox, stepsBox,
+                      cycleBox, repairBox, repairMaxBox, repairGapBox, repairBoostBox,
+                      repairOuterBox]() {
+        const SubdomainLabels::Options l;
+        const Separatrices::Options t;
+        const MERIDIAN::Options m;
+        nearMissBox->setValue(l.nearMissTolerance);
+        selfReturnBox->setChecked(l.seedSelfReturns);
+        allConnBox->setChecked(l.seedAllConnections);
+        snapBox->setValue(t.coneSnapTolerance);
+        ringsBox->setValue(t.coneSnapRings);
+        stepsBox->setValue(t.maxSteps);
+        cycleBox->setChecked(t.detectCycles);
+        repairBox->setValue(m.repairPasses);
+        repairMaxBox->setValue(m.repairMaxPerPass);
+        repairGapBox->setValue(m.repairGapLimit);
+        repairBoostBox->setValue(m.repairLambdaBoost);
+        repairOuterBox->setValue(m.repairOuterSteps);
+    });
+
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    buttons->button(QDialogButtonBox::Cancel)->setText("Keep current");
+    buttons->addButton(restore, QDialogButtonBox::ResetRole);
+    QObject::connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    QObject::connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+
+    auto section = [&dlg](const char *text) {
+        auto *l = new QLabel(text, &dlg);
+        l->setStyleSheet("font-weight: bold; margin-top: 8px;");
+        return l;
+    };
+
+    // The form is tall enough to overflow a laptop screen, so it goes in a
+    // scroll area with the buttons pinned below it rather than at the end of
+    // the form, where they would be the first thing off the bottom.
+    auto *page = new QWidget(&dlg);
+    auto *form = new QFormLayout(page);
+    form->addRow(section("Stage 5 — seeding Gamma_topo on psi_R"));
+    form->addRow("near-miss tolerance (of cone spacing)", nearMissBox);
+    form->addRow(selfReturnBox);
+    form->addRow(allConnBox);
+
+    form->addRow(section("Stage 7 — tracing the separatrices of Psi"));
+    form->addRow("snap tolerance (of image extent)", snapBox);
+    form->addRow("snap search radius (triangles)", ringsBox);
+    form->addRow("step cap", stepsBox);
+    form->addRow(cycleBox);
+
+    form->addRow(section("Sec. 3.3 — repair from the traced curves"));
+    form->addRow("repair rounds", repairBox);
+    form->addRow("constraints per round (0 = all)", repairMaxBox);
+    form->addRow("near-miss window (of image extent)", repairGapBox);
+    form->addRow("lambda growth per round", repairBoostBox);
+    form->addRow("outer steps per round", repairOuterBox);
+
+    form->addRow(section("This model"));
+    form->addRow(derived);
+
+    auto *scroll = new QScrollArea(&dlg);
+    scroll->setWidget(page);
+    scroll->setWidgetResizable(true);
+    scroll->setFrameShape(QFrame::NoFrame);
+
+    auto *outer = new QVBoxLayout(&dlg);
+    outer->addWidget(scroll, 1);
+    outer->addWidget(buttons, 0);
+
+    // Fit the natural height where it fits, and scroll where it does not.
+    const QRect avail = screen() ? screen()->availableGeometry() : QRect(0, 0, 1200, 900);
+    dlg.resize(std::min(page->sizeHint().width() + 48, avail.width() - 80),
+               std::min(page->sizeHint().height() + 80, avail.height() - 80));
+
+    if (dlg.exec() != QDialog::Accepted) return false;
+
+    meridianConn_.labels.nearMissTolerance = nearMissBox->value();
+    meridianConn_.labels.seedSelfReturns = selfReturnBox->isChecked();
+    meridianConn_.labels.seedAllConnections = allConnBox->isChecked();
+    meridianConn_.labels.maxTraceSteps = stepsBox->value();
+    meridianConn_.trace.coneSnapTolerance = snapBox->value();
+    meridianConn_.trace.coneSnapRings = ringsBox->value();
+    meridianConn_.trace.maxSteps = stepsBox->value();
+    meridianConn_.trace.detectCycles = cycleBox->isChecked();
+    meridianConn_.trace.nearMissWindow = repairGapBox->value();
+    meridianConn_.repairPasses = repairBox->value();
+    meridianConn_.repairMaxPerPass = repairMaxBox->value();
+    meridianConn_.repairGapLimit = repairGapBox->value();
+    meridianConn_.repairLambdaBoost = repairBoostBox->value();
+    meridianConn_.repairOuterSteps = repairOuterBox->value();
+    return true;
+}
+
 void CrossGenWidget::runMERIDIANLayout() {
     layoutAttempted_ = true;
     if (!coneCut_.has_value() || !ricci_.has_value() || !cones_.has_value()) return;
@@ -1549,10 +1890,20 @@ void CrossGenWidget::runMERIDIANLayout() {
         return;
     }
 
+    // The connectivity settings are asked for here rather than on the way into
+    // the mode: every number in them is a fraction of something psi_R measures
+    // -- the spacing of the cones, the extent of the image -- and none of those
+    // exist until Stage 4 has run. Cancelling keeps whatever was last used, so
+    // the pipeline runs either way.
+    if (!meridianConnPrompted_) {
+        meridianConnPrompted_ = true;
+        promptMERIDIANConnectivity(*immersion_, psiR_);
+    }
+
     // ── Stage 5: subdomain labelling ─────────────────────────────────────────
     t0 = Clock::now();
     try {
-        meridianLabels_.emplace(*immersion_);
+        meridianLabels_.emplace(*immersion_, meridianConn_.labels);
     } catch (const std::exception &e) {
         meridianLabels_.reset();
         console_.log(std::string("[Labels] FAILED: ") + e.what());
@@ -1577,6 +1928,20 @@ void CrossGenWidget::runMERIDIANLayout() {
             << " chain(s); Gamma_topo: " << sr.topoPaths << " path(s) from "
             << sr.separatrices << " separatrix/-ces (" << sr.separatricesToCone
             << " to a cone, " << sr.separatricesCapped << " unresolved)";
+        console_.log(oss.str());
+    }
+    {
+        // The two kinds of constraint that are easy to leave out, counted, so
+        // that turning either of them off in the dialog shows in the log rather
+        // than only in the layout two stages later.
+        std::ostringstream oss;
+        oss << "[Labels] of those paths, " << sr.topoSelfReturns
+            << " return to the cone they left (Q5's \"possibly identical\" case, Fig. 9) and "
+            << sr.topoExtraPerPair << " are a second curve between a pair already joined;"
+            << " near-miss tolerance " << std::fixed << std::setprecision(3)
+            << meridianConn_.labels.nearMissTolerance << " of the mean cone spacing = "
+            << std::scientific << std::setprecision(2) << sr.seedSnapTolerance
+            << " in image units, searched over " << sr.seedSnapRings << " ring(s)";
         console_.log(oss.str());
     }
     for (const std::string &m : sr.messages) console_.log("[Labels] " + m);
@@ -1648,11 +2013,40 @@ void CrossGenWidget::runMERIDIANLayout() {
 // diagnosis Sec. 3.3 asks for when the layout is not yet a layout.
 void CrossGenWidget::runMERIDIANSeparatrices() {
     separatricesAttempted_ = true;
-    if (!immersion_.has_value() || !meridianLayout_.has_value()) return;
+    if (!immersion_.has_value() || !meridianLayout_.has_value() ||
+        !meridianLabels_.has_value()) return;
 
     auto t0 = Clock::now();
+
+    MERIDIAN::RepairOptions ropts;
+    ropts.passes = meridianConn_.repairPasses;
+    ropts.maxPerPass = meridianConn_.repairMaxPerPass;
+    ropts.gapLimit = meridianConn_.repairGapLimit;
+    ropts.lambdaBoost = meridianConn_.repairLambdaBoost;
+    ropts.outerSteps = meridianConn_.repairOuterSteps;
+
+    Separatrices::Options topts = meridianConn_.trace;
+    topts.nearMissWindow = meridianConn_.repairGapLimit;
+
+    MERIDIAN::RepairResult rep;
     try {
-        separatrices_.emplace(*immersion_, meridianLayout_->getUV());
+        rep = MERIDIAN::traceAndRepair(*meridianLabels_, *meridianLayout_, topts, ropts,
+                                       [this](const std::string &m) {
+                                           // "Stage 5: ..." and friends, retagged
+                                           // with the names the console already
+                                           // uses for those stages.
+                                           static const char *kTag[3] = {
+                                               "[Labels] ", "[Layout] ", "[Separatrices] "};
+                                           const size_t colon = m.find(": ");
+                                           if (colon == std::string::npos || m.size() < 7) {
+                                               console_.log(m);
+                                               return;
+                                           }
+                                           const int stage = m[6] - '5';
+                                           console_.log((stage >= 0 && stage < 3 ? kTag[stage]
+                                                                                 : "[MERIDIAN] ") +
+                                                        m.substr(colon + 2));
+                                       });
     } catch (const std::exception &e) {
         separatrices_.reset();
         console_.log(std::string("[Separatrices] FAILED: ") + e.what());
@@ -1661,14 +2055,20 @@ void CrossGenWidget::runMERIDIANSeparatrices() {
     }
     auto t1 = Clock::now();
 
-    // If the Layout phase was left showing psi_R the right panel is fitted to
-    // it, and this phase always shows Psi; refit before the first frame.
-    if (showPsiR_) {
-        showPsiR_ = false;
-        viewer::computeLayoutBounds(meridianLayout_->getUV(), uvView_.cx, uvView_.cy,
-                                    uvView_.baseW, uvView_.baseH);
-        uvView_.zoom = 1.0;
+    if (!rep.separatrices) {
+        separatrices_.reset();
+        console_.log("[Separatrices] the curves could not be traced");
+        return;
     }
+    separatrices_.emplace(std::move(*rep.separatrices));
+
+    // The repair moves Psi, so the panel fitted to the map Stage 6 first
+    // returned is fitted to the wrong one. Refit before the first frame; and if
+    // the Layout phase was left showing psi_R, this phase always shows Psi.
+    showPsiR_ = false;
+    viewer::computeLayoutBounds(meridianLayout_->getUV(), uvView_.cx, uvView_.cy,
+                                uvView_.baseW, uvView_.baseH);
+    uvView_.zoom = 1.0;
 
     const Separatrices::Report &r = separatrices_->getReport();
     {
@@ -1682,7 +2082,8 @@ void CrossGenWidget::runMERIDIANSeparatrices() {
     {
         std::ostringstream oss;
         oss << "[Separatrices] ends: " << r.endedAtCone << " at a cone, " << r.endedAtBoundary
-            << " out through dS, " << r.capped << " capped";
+            << " out through dS, " << r.cycled << " on a closed orbit, " << r.capped
+            << " at the step cap";
         if (r.stuck > 0 || r.degenerate > 0)
             oss << ", " << r.stuck << " stuck, " << r.degenerate << " degenerate";
         oss << "; " << r.triangleSteps << " triangle crossing(s), " << r.seamCrossings
@@ -1701,13 +2102,34 @@ void CrossGenWidget::runMERIDIANSeparatrices() {
             << "; pullback continuity " << r.maxPullbackGap << " of the model";
         console_.log(oss.str());
     }
-    if (r.capped > 0) {
+    if (rep.passesTaken > 0 || rep.constraintsAdded > 0 || rep.rolledBack > 0) {
         std::ostringstream oss;
-        oss << "[Separatrices] " << r.capped
-            << " curve(s) still running at the cap; nearest miss " << std::scientific
-            << std::setprecision(2) << r.worstMissGap
-            << " of the image -- away from the cones these are geodesics of a flat cone "
-               "metric, so a direction no Gamma_topo constraint quantised does not close";
+        oss << "[Repair] " << rep.passesTaken << " round(s) of Sec. 3.3's remedy added "
+            << rep.constraintsAdded << " connectivity constraint(s) and re-ran Stage 6 from "
+            << "the current phi; Gamma_topo now has "
+            << meridianLabels_->getReport().topoPaths << " path(s)";
+        if (rep.rolledBack > 0) oss << " (" << rep.rolledBack << " round taken back as worse)";
+        console_.log(oss.str());
+
+        const LayoutEnergy::Report &er = meridianLayout_->getReport();
+        std::ostringstream oss2;
+        oss2 << "[Repair] Q3 " << std::scientific << std::setprecision(2)
+             << er.maxBoundaryResidual << ", Q4 " << er.maxSeamResidual << ", Q5 "
+             << er.maxTopoResidual << ", det J >= " << std::fixed << std::setprecision(4)
+             << er.minDetJ << "; Psi "
+             << (er.valid ? "satisfies Q1-Q5 [PASS]" : "is not yet a layout [FAIL]");
+        console_.log(oss2.str());
+    }
+    if (r.nearMisses + r.grazes > 0) {
+        // The thing the eye cannot pick out of the picture on its own. These
+        // are the amber curves.
+        std::ostringstream oss;
+        oss << "[Separatrices] " << r.nearMisses << " unterminated and " << r.grazes
+            << " boundary-bound curve(s) passed within " << std::scientific
+            << std::setprecision(2) << r.nearMissWindow
+            << " of the image extent of a cone without stopping at it -- each is a "
+            << "quadrilateral of poor aspect ratio (Remark 3.1). Press 'c' to re-open the "
+            << "connectivity dialog and try a wider near-miss window or more repair rounds";
         console_.log(oss.str());
     }
     {
@@ -1717,9 +2139,72 @@ void CrossGenWidget::runMERIDIANSeparatrices() {
         console_.log(oss.str());
         std::cerr << "[Viewer] " << oss.str() << "\n";
     }
-    for (const std::string &m : r.messages) console_.log("[Separatrices] " + m);
     console_.log("[Separatrices] left = the curves on the model (Fig. 9), right = the same "
-                 "curves on Psi. Green ends at a cone, blue leaves through dS, red hit the cap");
+                 "curves on Psi. Green ends at a cone, blue leaves through dS, amber grazed "
+                 "a cone and went on, red ended nowhere");
+}
+
+// Stages 5 to 7 again from the immersion already computed, at whatever the
+// dialog was last left at.
+//
+// Stage 4 is not repeated: psi_R is a property of the flat metric and the cut,
+// and nothing in this dialog touches either. What is repeated is the labelling,
+// the continuation and the tracing -- which is the expensive part, and the
+// point: how near a separatrix has to pass a cone before the pair is said to be
+// connected is a judgement about the model, and the only way to settle one is
+// to try a number and look.
+void CrossGenWidget::rerunMERIDIANConnectivity() {
+    if (!immersion_.has_value()) return;
+
+    // Reverse construction order: LayoutEnergy holds references to both of the
+    // others, SubdomainLabels to the immersion.
+    separatrices_.reset();
+    meridianLayout_.reset();
+    meridianLabels_.reset();
+
+    auto t0 = Clock::now();
+    try {
+        meridianLabels_.emplace(*immersion_, meridianConn_.labels);
+    } catch (const std::exception &e) {
+        meridianLabels_.reset();
+        console_.log(std::string("[Labels] FAILED: ") + e.what());
+        return;
+    }
+    const SubdomainLabels::Report &sr = meridianLabels_->getReport();
+    {
+        std::ostringstream oss;
+        oss << "[Labels] Gamma_topo re-seeded: " << sr.topoPaths << " path(s) ("
+            << sr.topoSelfReturns << " back to their own cone, " << sr.topoExtraPerPair
+            << " a second curve of a pair) at a near-miss tolerance of " << std::fixed
+            << std::setprecision(3) << meridianConn_.labels.nearMissTolerance
+            << " of the mean cone spacing";
+        console_.log(oss.str());
+    }
+
+    bool ok = false;
+    try {
+        meridianLayout_.emplace(*immersion_, *meridianLabels_);
+        ok = meridianLayout_->run();
+    } catch (const std::exception &e) {
+        meridianLayout_.reset();
+        console_.log(std::string("[Layout] FAILED: ") + e.what());
+        return;
+    }
+    auto t1 = Clock::now();
+    {
+        const LayoutEnergy::Report &er = meridianLayout_->getReport();
+        std::ostringstream oss;
+        oss << "[Layout] re-run: " << er.outerSteps << " outer step(s), Q3 "
+            << std::scientific << std::setprecision(2) << er.maxBoundaryResidual << ", Q4 "
+            << er.maxSeamResidual << ", Q5 " << er.maxTopoResidual << "; Psi "
+            << (ok ? "satisfies Q1-Q5 [PASS]" : "is not yet a layout [FAIL]") << ", "
+            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+    }
+
+    separatricesAttempted_ = false;
+    separatricesAnnounced_ = true;   // the notice has been on screen once already
+    runMERIDIANSeparatrices();
 }
 
 // ── phase advancement ────────────────────────────────────────────────────────
@@ -1768,6 +2253,19 @@ void CrossGenWidget::advancePhase() {
         meridianPhase_ = nextMERIDIANPhase(meridianPhase_);
         if (meridianPhase_ != old)
             std::cerr << "[Viewer] MERIDIAN Phase " << meridianPhaseName(meridianPhase_) << "\n";
+
+        // Separatrices is the last phase and it stays that way: 'c' at it
+        // re-opens the connectivity dialog and runs Stages 5 to 7 again from
+        // the immersion, the way 'c' at UMBER's Simplified phase re-opens the
+        // chord dialog. Which pairs of cones are meant to be joined is a
+        // judgement about the model, not a constant of the method, and the only
+        // way to settle one is to try a number and look at the curves.
+        if (old == MERIDIANPhase::Separatrices && meridianPhase_ == old &&
+            immersion_.has_value() && separatricesAttempted_) {
+            if (promptMERIDIANConnectivity(*immersion_, psiR_)) {
+                rerunMERIDIANConnectivity();
+            }
+        }
     }
 }
 

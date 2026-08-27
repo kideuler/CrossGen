@@ -217,7 +217,14 @@ void usage(const char *argv0) {
               << "  --no-layout        stop after Stage 4\n"
               << "  --no-trace         skip Stage 7 (separatrix tracing)\n"
               << "  --snap <t>         cone snap tolerance, of the extent (default 1e-6)\n"
+              << "  --snap-rings <n>   cone snap search radius, in faces (default 2)\n"
               << "  --max-steps <n>    separatrix step cap             (default 50000)\n"
+              << "  --no-cycles        do not stop a curve once it is provably winding\n"
+              << "  --no-self-returns  do not seed Gamma_topo for a curve back to its own cone\n"
+              << "  --one-per-pair     keep only one Gamma_topo path per pair of cones\n"
+              << "  --repair <n>       rounds of Sec. 3.3's repair       (default 6)\n"
+              << "  --repair-max <n>   constraints per round, 0 = all    (default 4)\n"
+              << "  --repair-gap <f>   near-miss window, of the extent   (default 1e-3)\n"
               << "  --curves <n>       list at most n separatrices     (default 10)\n"
               << "  --psi <file.obj>   write psi_R, the Stage 4 immersion\n"
               << "  --layout <file.obj> write Psi, the Stage 6 result\n"
@@ -256,7 +263,14 @@ int main(int argc, char **argv) {
         else if (a == "--no-layout")               opts.runLayout = false;
         else if (a == "--no-trace")                opts.runSeparatrices = false;
         else if (a == "--snap" && i + 1 < argc)    opts.separatrixSnap = std::stod(argv[++i]);
+        else if (a == "--snap-rings" && i + 1 < argc) opts.separatrixSnapRings = std::stoi(argv[++i]);
         else if (a == "--max-steps" && i + 1 < argc) opts.separatrixMaxSteps = std::stoi(argv[++i]);
+        else if (a == "--no-cycles")               opts.separatrixDetectCycles = false;
+        else if (a == "--no-self-returns")         opts.seedSelfReturns = false;
+        else if (a == "--one-per-pair")            opts.seedAllConnections = false;
+        else if (a == "--repair" && i + 1 < argc)  opts.repairPasses = std::stoi(argv[++i]);
+        else if (a == "--repair-max" && i + 1 < argc) opts.repairMaxPerPass = std::stoi(argv[++i]);
+        else if (a == "--repair-gap" && i + 1 < argc) opts.repairGapLimit = std::stod(argv[++i]);
         else if (a == "--curves" && i + 1 < argc)  curveListLimit = std::stoi(argv[++i]);
         else if (a == "--psi" && i + 1 < argc)     psiOut = argv[++i];
         else if (a == "--layout" && i + 1 < argc)  layoutOut = argv[++i];
@@ -661,11 +675,19 @@ int main(int argc, char **argv) {
                   << " was called the surface's only singularity\n";
     }
     std::cout << "  Ends: " << tr.endedAtCone << " at a cone, " << tr.endedAtBoundary
-              << " out through dS, " << tr.capped << " capped";
+              << " out through dS, " << tr.cycled << " on a closed orbit, " << tr.capped
+              << " at the step cap";
     if (tr.stuck > 0 || tr.degenerate > 0) {
         std::cout << ", " << tr.stuck << " stuck, " << tr.degenerate << " degenerate";
     }
     std::cout << "\n";
+    if (tr.nearMisses > 0 || tr.grazes > 0) {
+        std::cout << "  Near misses within " << std::scientific << std::setprecision(2)
+                  << tr.nearMissWindow << " of the image extent: " << tr.nearMisses
+                  << " unterminated, " << tr.grazes
+                  << " that grazed a cone and left through dS anyway" << std::defaultfloat
+                  << "\n";
+    }
     std::cout << "  " << tr.triangleSteps << " triangle crossing(s), longest curve "
               << tr.maxTriangleSteps << "; " << tr.seamCrossings
               << " seam crossing(s), most on one curve " << tr.maxSeamCrossings << "\n";
@@ -718,6 +740,9 @@ int main(int argc, char **argv) {
                 case Separatrices::End::Capped:
                     std::cout << std::setw(14) << std::left << "step cap" << std::right;
                     break;
+                case Separatrices::End::Cycle:
+                    std::cout << std::setw(14) << std::left << "closed orbit" << std::right;
+                    break;
                 case Separatrices::End::Stuck:
                     std::cout << std::setw(14) << std::left << "stuck" << std::right;
                     break;
@@ -749,13 +774,21 @@ int main(int argc, char **argv) {
     // direction nothing has quantised does not close -- it fills the model and
     // leaves through dS eventually or not at all. Remark 3.1 is this same fact
     // stated as patch counts.
-    if (tr.capped == 0) {
+    if (tr.capped + tr.cycled == 0) {
         std::cout << "  " << kPass
                   << " Q5: every separatrix terminates at a cone or leaves through dS\n";
     } else {
-        std::cout << "  " << kWarn << " " << tr.capped << " of " << tr.emitted
-                  << " separatrices ran past the step cap: Q5 holds on the Gamma_topo paths "
+        std::cout << "  " << kWarn << " " << (tr.capped + tr.cycled) << " of " << tr.emitted
+                  << " separatrices terminated at neither: Q5 holds on the Gamma_topo paths "
                   << "E5 was given, not on every integral curve\n";
+    }
+    if (tr.grazes > 0) {
+        std::cout << "  " << kWarn << " " << tr.grazes
+                  << " separatrix/ces passed within " << std::scientific << std::setprecision(2)
+                  << tr.nearMissWindow << " of the image extent of a cone and left through dS "
+                  << "instead of stopping at it" << std::defaultfloat
+                  << ": Q5 is satisfied but each is a quadrilateral of poor aspect ratio "
+                  << "(Remark 3.1), and a connectivity constraint is what closes it\n";
     }
     for (const std::string &m : tr.messages) std::cout << "  " << kWarn << " " << m << "\n";
 

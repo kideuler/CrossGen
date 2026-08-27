@@ -44,6 +44,7 @@ Separatrices::Separatrices(const Immersion &immersion, const std::vector<Point> 
     buildTables();
     buildEmitters();
     measureExtent();
+    buildSnapNeighbourhood();
     traceAll();
     check();
 }
@@ -216,6 +217,83 @@ void Separatrices::measureExtent() {
     }
     modelExtent = std::hypot(mhi[0] - mlo[0], mhi[1] - mlo[1]);
     if (!(modelExtent > 0.0)) modelExtent = 1.0;
+}
+
+// ---------------------------------------------------------------------------
+// buildSnapNeighbourhood()
+//
+// The two things that make a snap sound, precomputed once so the marching can
+// use them without a search:
+//
+//   faceCones[f]      the cone children within Options::coneSnapRings faces of
+//                     f. Zero rings is the paper's rule -- the cones at the
+//                     corners of f -- and the BFS below reproduces it exactly,
+//                     because the seed of the walk is the set of faces incident
+//                     to the cone.
+//
+//   childSnapTol[c]   how far a curve may be from cone child c and still be
+//                     snapped to it: the option's tolerance, capped at a
+//                     fraction of the distance to the nearest child of a
+//                     *different* cone. Where cones are well separated the cap
+//                     never binds; where Stage 1 left a cluster it is the only
+//                     thing standing between a curve and the wrong cone.
+// ---------------------------------------------------------------------------
+void Separatrices::buildSnapNeighbourhood() {
+    const Mesh &cm = imm->getCutMesh();
+    faceCones.assign(cm.triangles.size(), {});
+    childSnapTol.assign(cm.vertices.size(), 0.0);
+
+    const int rings = std::max(0, options.coneSnapRings);
+
+    std::vector<int> frontier, next;
+    std::vector<int> mark(cm.triangles.size(), -1);
+
+    for (int slot = 0; slot < static_cast<int>(coneChildren.size()); ++slot) {
+        for (int c : coneChildren[slot]) {
+            if (c < 0 || c >= static_cast<int>(cm.vertices.size())) continue;
+
+            // The separation cap. Only children of *other* cones count: two
+            // children of the same cone are the same point of S, and a curve
+            // handed to either of them has reached the same singularity.
+            double sep = std::numeric_limits<double>::infinity();
+            for (int other = 0; other < static_cast<int>(coneChildren.size()); ++other) {
+                if (other == slot) continue;
+                for (int d : coneChildren[other]) {
+                    if (d < 0 || d >= static_cast<int>(uv.size())) continue;
+                    sep = std::min(sep, normP(uv[c] - uv[d]));
+                }
+            }
+            double tol = snapTol;
+            if (std::isfinite(sep) && options.coneSnapSeparationCap > 0.0) {
+                tol = std::min(tol, options.coneSnapSeparationCap * sep);
+            }
+            childSnapTol[c] = tol;
+
+            frontier.clear();
+            const auto &vt = cm.vertexTriangles;
+            for (int i = vt.rowPtr[c]; i < vt.rowPtr[c + 1]; ++i) {
+                const int f = vt.colIdx[i];
+                if (mark[f] == c) continue;
+                mark[f] = c;
+                faceCones[f].push_back(c);
+                frontier.push_back(f);
+            }
+            for (int r = 0; r < rings; ++r) {
+                next.clear();
+                for (int f : frontier) {
+                    for (int q = 0; q < 3; ++q) {
+                        const int g = cm.triangleAdjacency[f][q];
+                        if (g < 0 || mark[g] == c) continue;
+                        mark[g] = c;
+                        faceCones[g].push_back(c);
+                        next.push_back(g);
+                    }
+                }
+                frontier.swap(next);
+                if (frontier.empty()) break;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -470,6 +548,7 @@ void Separatrices::traceAll() {
                 case End::Cone:     ++report.endedAtCone; break;
                 case End::Boundary: ++report.endedAtBoundary; break;
                 case End::Capped:   ++report.capped; break;
+                case End::Cycle:    ++report.cycled; break;
                 case End::Stuck:    ++report.stuck; break;
                 case End::Degenerate: ++report.degenerate; break;
             }
@@ -519,6 +598,7 @@ Separatrices::Curve Separatrices::trace(int slot, int child, int face, int dirT,
     cv.fanAngle = fanAngle;
     cv.end = End::Capped;
     cv.nearestConeGap = std::numeric_limits<double>::infinity();
+    cv.snapTolerance = snapTol;
 
     const double tiny = 1e-12 * extent;
     const double vertexEps = 1e-9 * extent;
@@ -530,6 +610,21 @@ Separatrices::Curve Separatrices::trace(int slot, int child, int face, int dirT,
     std::array<double, 3> entryB = baryUnit(f, child);
     int fanSpins = 0;
 
+    // The subdivision of the curve by G, accumulated as it goes. A subcurve
+    // runs from the cone (or from the far bank of the last cut crossed) to the
+    // next crossing, and carries the direction whose advance E5 sums -- which
+    // is the coordinate the curve holds *constant*, so it is the normal of the
+    // direction of travel, one quarter turn on.
+    Site subStart{child, -1, 0.0};
+    auto closeSub = [&](const Site &to) { cv.subs.push_back(Sub{subStart, to, (dir + 1) % 4}); };
+
+    // The state the cycle test is on: which triangle, travelling which way, and
+    // on which isoline. Two passes through the same triangle in the same
+    // direction closer together than the snap tolerance are the same pass as
+    // far as anything downstream is concerned -- the second was offered every
+    // cone the first was -- so the curve is winding and will not stop.
+    std::unordered_map<long long, std::vector<double>> visited;
+
     auto pushStep = [&](const std::array<double, 3> &a, const std::array<double, 3> &b) {
         Step st;
         st.face = f;
@@ -540,11 +635,49 @@ Separatrices::Curve Separatrices::trace(int slot, int child, int face, int dirT,
         cv.steps.push_back(st);
     };
 
+    // A cone came within `d` of the curve at the point `hit`. Record it if it
+    // is the closest so far, together with the truncation of the curve there,
+    // so that a curve which never terminates still names a path between two
+    // cones for Sec. 3.3's repair to constrain.
+    auto noteApproach = [&](int w, int other, double d) {
+        if (d >= cv.nearestConeGap) return;
+        cv.nearestConeGap = d;
+        cv.nearestCone = other;
+        cv.nearestChild = w;
+        cv.nearestDir = dir;
+        cv.nearestSubCount = static_cast<int>(cv.subs.size());
+        cv.nearestTail = Sub{subStart, Site{w, -1, 0.0}, (dir + 1) % 4};
+    };
+
     for (int step = 0; step < options.maxSteps; ++step) {
         const int tc = dir % 2;        // the coordinate the curve advances in
         const int cc = 1 - tc;         // the one it holds constant
         const double sgn = (dir < 2) ? 1.0 : -1.0;
         const double c0 = p[cc];
+
+        // Sec. 4's cap, read as a state rather than as a count. See the comment
+        // on Options::detectCycles for why a curve that does not terminate
+        // winds rather than escapes, and why that makes this test decisive
+        // instead of merely a heuristic saving of steps.
+        if (options.detectCycles || options.maxFaceRevisits > 0) {
+            std::vector<double> &seen = visited[static_cast<long long>(f) * 4 + dir];
+            if (options.detectCycles) {
+                for (double prev : seen) {
+                    if (std::fabs(prev - c0) <= snapTol) {
+                        cv.end = End::Cycle;
+                        cv.endDir = dir;
+                        return cv;
+                    }
+                }
+            }
+            if (options.maxFaceRevisits > 0 &&
+                static_cast<int>(seen.size()) >= options.maxFaceRevisits) {
+                cv.end = End::Cycle;
+                cv.endDir = dir;
+                return cv;
+            }
+            seen.push_back(c0);
+        }
 
         const Triangle &t = cm.triangles[f];
         int best = -1;
@@ -597,6 +730,10 @@ Separatrices::Curve Separatrices::trace(int slot, int child, int face, int dirT,
                 cv.endDir = dir;
                 cv.nearestConeGap = 0.0;
                 cv.nearestCone = vertCone[w];
+                cv.nearestChild = w;
+                cv.nearestDir = dir;
+                closeSub(Site{w, -1, 0.0});
+                cv.nearestSubCount = static_cast<int>(cv.subs.size());
                 return cv;
             }
 
@@ -612,6 +749,7 @@ Separatrices::Curve Separatrices::trace(int slot, int child, int face, int dirT,
             if (w >= 0 && vertexOnRealBoundary[w]) {
                 cv.end = End::Boundary;   // Q5 case 2, met at a vertex
                 cv.endDir = dir;
+                closeSub(Site{w, -1, 0.0});
                 return cv;
             }
             // The fan ends at a seam: the curve met the cutting graph head-on
@@ -628,6 +766,8 @@ Separatrices::Curve Separatrices::trace(int slot, int child, int face, int dirT,
                     if (g >= 0) {
                         ++fanSpins;
                         ++cv.seamCrossings;
+                        closeSub(Site{w, -1, 0.0});
+                        subStart = Site{it->second.partner, -1, 0.0};
                         f = g;
                         dir = nd;
                         entryEdge = -1;
@@ -643,16 +783,17 @@ Separatrices::Curve Separatrices::trace(int slot, int child, int face, int dirT,
         }
         fanSpins = 0;
 
-        // Q5 case 1. Only the cones at the corners of the triangle being
-        // crossed are candidates: Psi overlaps itself, so image distance alone
-        // would match cones the curve is nowhere near on S, and a cone within
-        // the snap tolerance on S is one whose one-ring the curve is inside.
+        // Q5 case 1. The candidates are the cones near the triangle being
+        // crossed -- near on S, which is what faceCones was built to say --
+        // rather than every cone in the model: Psi overlaps itself, so image
+        // distance alone would match cones the curve is nowhere near. Each
+        // carries its own tolerance, the option's value capped by how close
+        // the next cone is.
         const Point seg = bestP - p;
         const double segLen = normP(seg);
         int snapSlot = -1, snapChild = -1;
-        double snapGap = snapTol, snapS = 0.0;
-        for (int q = 0; q < 3; ++q) {
-            const int w = t[q];
+        double snapGap = std::numeric_limits<double>::infinity(), snapS = 0.0;
+        for (int w : faceCones[f]) {
             const int other = vertCone[w];
             if (other < 0) continue;
             double ss = 0.0;
@@ -661,9 +802,11 @@ Separatrices::Curve Separatrices::trace(int slot, int child, int face, int dirT,
             // termination. Once the curve is away it is a candidate like any
             // other -- a separatrix returning to its own singularity is Q5's
             // "possibly identical" case and the curve of the paper's Fig. 9.
-            if (w == child && cv.imageLength + ss * segLen <= snapTol) continue;
-            if (d < cv.nearestConeGap) { cv.nearestConeGap = d; cv.nearestCone = other; }
-            if (d < snapGap) { snapGap = d; snapSlot = other; snapChild = w; snapS = ss; }
+            if (w == child && cv.imageLength + ss * segLen <= childSnapTol[w]) continue;
+            noteApproach(w, other, d);
+            if (d <= childSnapTol[w] && d < snapGap) {
+                snapGap = d; snapSlot = other; snapChild = w; snapS = ss;
+            }
         }
         if (snapSlot >= 0) {
             const Point hit = p + seg * snapS;
@@ -673,6 +816,10 @@ Separatrices::Curve Separatrices::trace(int slot, int child, int face, int dirT,
             cv.toChild = snapChild;
             cv.gap = snapGap;
             cv.endDir = dir;
+            cv.snapTolerance = childSnapTol[snapChild];
+            cv.nearestDir = dir;
+            closeSub(Site{snapChild, -1, 0.0});
+            cv.nearestSubCount = static_cast<int>(cv.subs.size());
             return cv;
         }
 
@@ -696,6 +843,7 @@ Separatrices::Curve Separatrices::trace(int slot, int child, int face, int dirT,
         if (parentOnBoundary[e]) {
             cv.end = End::Boundary;
             cv.endDir = dir;
+            closeSub(Site{x, y, bestT});
             return cv;
         }
 
@@ -731,6 +879,9 @@ Separatrices::Curve Separatrices::trace(int slot, int child, int face, int dirT,
         if (tf < 0) { cv.end = End::Stuck; cv.endDir = dir; return cv; }
 
         ++cv.seamCrossings;
+        closeSub(Site{x, y, bestT});
+        subStart = Site{ta, tb, tPar};
+
         const Triangle &tt = cm.triangles[tf];
         const int la = localOf(tt, ta), lb = localOf(tt, tb);
         entryEdge = (la < 0 || lb < 0) ? -1 : localEdgeBetween(la, lb);
@@ -744,7 +895,6 @@ Separatrices::Curve Separatrices::trace(int slot, int child, int face, int dirT,
     cv.endDir = dir;
     return cv;
 }
-
 // ---------------------------------------------------------------------------
 int Separatrices::faceContaining(int w, int dirT, int exclude) const {
     const Mesh &cm = imm->getCutMesh();
@@ -863,6 +1013,37 @@ bool Separatrices::writeOBJ(const std::string &filename, Space space) const {
 }
 
 // ---------------------------------------------------------------------------
+// unconstrainedCurves()
+//
+// Sec. 3.3's diagnosis, as a list rather than as a count: the curves whose
+// connectivity E5 was not told about. Two kinds, and they are the same missing
+// constraint seen from two sides -- one where the curve winds because nothing
+// quantised its direction, one where it slips past the cone it should have
+// stopped at and out through the boundary. Nearest first, because the nearest
+// is the one the continuation was closest to getting right and therefore the
+// one a constraint will cost least to satisfy.
+// ---------------------------------------------------------------------------
+std::vector<int> Separatrices::unconstrainedCurves(double window) const {
+    if (!(window > 0.0)) window = options.nearMissWindow;
+    const double limit = window * extent;
+
+    std::vector<int> out;
+    for (size_t i = 0; i < traced.size(); ++i) {
+        const Curve &c = traced[i];
+        if (c.nearestCone < 0 || !std::isfinite(c.nearestConeGap)) continue;
+        if (c.nearestConeGap > limit) continue;
+        if (c.end == End::Cone) continue;          // E5 already has this one
+        if (c.end == End::Degenerate) continue;    // it never was a separatrix
+        if (c.connection().empty()) continue;
+        out.push_back(static_cast<int>(i));
+    }
+    std::sort(out.begin(), out.end(), [this](int a, int b) {
+        return traced[a].nearestConeGap < traced[b].nearestConeGap;
+    });
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 // check()
 // ---------------------------------------------------------------------------
 void Separatrices::check() {
@@ -885,7 +1066,7 @@ void Separatrices::check() {
 
     for (size_t i = 0; i < traced.size(); ++i) {
         const Curve &c = traced[i];
-        if (c.end == End::Cone || c.end == End::Boundary) continue;
+        if (resolved(c.end)) continue;
         const double g = std::isfinite(c.nearestConeGap) ? c.nearestConeGap : extent;
         if (report.worstMissCurve < 0 || g > report.worstMissGap) {
             report.worstMissGap = g;
@@ -893,9 +1074,26 @@ void Separatrices::check() {
         }
     }
 
-    report.valid = report.fanFailures == 0 && report.capped == 0 && report.stuck == 0 &&
-                   report.degenerate == 0 && report.emitted == report.prescribed &&
-                   report.maxPullbackGap < 1e-9;
+    // The two counts that say what the missing constraints are. A curve that
+    // does not terminate but passed close to a cone is a pair E5 was never told
+    // to join; so is a curve that terminated at dS a hair past one. Both are in
+    // the list unconstrainedCurves() returns.
+    report.nearMissWindow = options.nearMissWindow;
+    const double window = options.nearMissWindow * extent;
+    report.nearMisses = 0;
+    report.grazes = 0;
+    for (const Curve &c : traced) {
+        if (!std::isfinite(c.nearestConeGap) || c.nearestCone < 0) continue;
+        if (!resolved(c.end)) {
+            if (c.nearestConeGap <= window) ++report.nearMisses;
+        } else if (c.end == End::Boundary && c.nearestConeGap <= window) {
+            ++report.grazes;
+        }
+    }
+
+    report.valid = report.fanFailures == 0 && report.capped == 0 && report.cycled == 0 &&
+                   report.stuck == 0 && report.degenerate == 0 &&
+                   report.emitted == report.prescribed && report.maxPullbackGap < 1e-9;
 
     if (report.maxPullbackGap >= 1e-9) {
         std::ostringstream oss;
@@ -905,13 +1103,25 @@ void Separatrices::check() {
         report.messages.push_back(oss.str());
     }
 
-    if (report.capped > 0) {
+    if (report.capped > 0 || report.cycled > 0) {
         std::ostringstream oss;
-        oss << report.capped << " separatrix/ces reached the step cap of " << options.maxSteps
-            << " without terminating at a cone or leaving through dS: Q5 does not hold on "
-            << "this map. Sec. 3.3's remedy is upstream -- raise lambda_5, add a Gamma_topo "
-            << "constraint for the pair that nearly met, and re-run Stage 6 from the current "
-            << "phi rather than from psi_R.";
+        oss << (report.capped + report.cycled)
+            << " separatrix/ces terminated at neither a cone nor dS (" << report.cycled
+            << " on a closed orbit, " << report.capped << " at the step cap of "
+            << options.maxSteps << "): Q5 does not hold on this map. Sec. 3.3's remedy is "
+            << "upstream -- raise lambda_5, add a Gamma_topo constraint for the pair that "
+            << "nearly met, and re-run Stage 6 from the current phi rather than from psi_R.";
+        report.messages.push_back(oss.str());
+    }
+    if (report.nearMisses > 0 || report.grazes > 0) {
+        std::ostringstream oss;
+        oss << report.nearMisses << " unterminated and " << report.grazes
+            << " boundary-bound separatrix/ces passed within " << options.nearMissWindow
+            << " of the image extent of a cone without stopping at it. Each names a pair "
+            << "that a connectivity constraint would join, and each is a quadrilateral of "
+            << "poor aspect ratio if it is not joined (Remark 3.1); unconstrainedCurves() "
+            << "lists them and Curve::connection() is the path Sec. 3.3's repair adds. "
+            << "Some may already be constrained and merely not yet converged.";
         report.messages.push_back(oss.str());
     }
     if (report.stuck > 0) {

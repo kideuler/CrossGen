@@ -3,20 +3,11 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
-#include <queue>
+#include <memory>
 #include <sstream>
 #include <unordered_set>
 
 namespace {
-
-// Distance from a point to a segment, and where along the segment that was.
-double pointSegmentDistance(const Point &p, const Point &a, const Point &b) {
-    const Point ab = b - a;
-    const double denom = dotP(ab, ab);
-    double t = 0.0;
-    if (denom > 0.0) t = std::max(0.0, std::min(1.0, dotP(p - a, ab) / denom));
-    return normP(p - (a + ab * t));
-}
 
 inline int localOf(const Triangle &t, int v) {
     if (t[0] == v) return 0;
@@ -72,13 +63,10 @@ void SubdomainLabels::buildSeamTables() {
     }
 
     parentOnBoundary.assign(cm.edges.size(), 0);
-    vertexOnRealBoundary.assign(cm.vertices.size(), 0);
     for (int e = 0; e < static_cast<int>(cm.edges.size()); ++e) {
         auto it = origEdgeIndex.find(EdgeKey(c2o[cm.edges[e][0]], c2o[cm.edges[e][1]]));
         if (it != origEdgeIndex.end() && om.isBoundaryEdge[it->second]) {
             parentOnBoundary[e] = 1;
-            vertexOnRealBoundary[cm.edges[e][0]] = 1;
-            vertexOnRealBoundary[cm.edges[e][1]] = 1;
         }
     }
 
@@ -377,241 +365,17 @@ void SubdomainLabels::relabel(const std::vector<Point> &uv) {
 }
 
 // ---------------------------------------------------------------------------
-// traceSeparatrix()  --  the marching of Sec. 3.4, used here only as a seeder
+// meanConeSpacing()
 //
-// Inside a triangle phi is affine, so an isoline of the constrained coordinate
-// is a straight segment and the exit point is a linear interpolation along one
-// edge. Three things can end the walk, and they are the three cases Q5 lists:
-// the curve reaches a cone, it leaves through dS, or it runs out of steps --
-// the last being the diagnosis "Q5 does not hold yet" rather than a bug.
-//
-// A seam is not an end. The curve leaves Omega through the child edge on one
-// side of an arc and re-enters through the child edge on the other, with the
-// point carried across by the arc's transition and the direction rotated by its
-// k quarter turns. That rotation is exactly what makes the direction label of
-// the next subcurve differ from this one's, and it is the whole reason E5 needs
-// a label per subcurve instead of one per path.
+// The scale a "near miss" is measured against: the mean distance from each cone
+// to its nearest other cone, in the image. A tolerance in absolute units means
+// nothing here -- the Ricci metric is only defined up to a scale -- and one as
+// a fraction of the whole image means nothing either, because what makes two
+// cones candidates for being joined is how they stand relative to the other
+// cones, not to the model's bounding box.
 // ---------------------------------------------------------------------------
-SubdomainLabels::Trace SubdomainLabels::traceSeparatrix(const std::vector<Point> &uv,
-                                                        int startVertex, int face,
-                                                        int tangentDir, double coneTol) const {
-    Trace tr;
-    const Mesh &cm = imm->getCutMesh();
-    const auto &pairs = imm->getSeamPairs();
-    const auto &pairArc = imm->getSeamPairArc();
-    const auto &arcList = imm->getArcs();
-    const std::vector<int> &vCone = imm->getCutVertexCone();
-    const std::vector<int> &coneVert = imm->getConeVertices();
-
-    const int startCone = vCone[startVertex];
-
-    const Point &lo = imm->getReport().uvMin;
-    const Point &hi = imm->getReport().uvMax;
-    const double scale = std::max(hi[0] - lo[0], hi[1] - lo[1]);
-    const double tiny = 1e-12 * std::max(scale, 1e-30);
-    const double vertexEps = 1e-9 * std::max(scale, 1e-30);
-
-    int f = face;
-    int entryEdge = -1;
-    int dirT = ((tangentDir % 4) + 4) % 4;
-    Site subStart{startVertex, -1, 0.0};
-    Point p = uv[startVertex];
-    int fanSpins = 0;   // consecutive vertex rotations, so a fan cannot cycle
-
-    for (int step = 0; step < options.maxTraceSteps; ++step) {
-        const int tc = dirT % 2;          // the coordinate the curve advances in
-        const int cc = 1 - tc;            // the one it holds constant
-        const double s = (dirT < 2) ? 1.0 : -1.0;
-        const double c0 = p[cc];
-
-        const Triangle &t = cm.triangles[f];
-        int best = -1;
-        double bestT = 0.0, bestAdv = tiny;
-        Point bestP{0.0, 0.0};
-
-        for (int q = 0; q < 3; ++q) {
-            if (q == entryEdge) continue;
-            const int m = q, n = (q + 1) % 3;
-            const double A = uv[t[m]][cc];
-            const double B = uv[t[n]][cc];
-            const double den = B - A;
-            if (std::fabs(den) < 1e-300) continue;   // the edge is on the isoline
-            const double tt = (c0 - A) / den;
-            if (tt < -1e-9 || tt > 1.0 + 1e-9) continue;
-            const Point P = uv[t[m]] * (1.0 - tt) + uv[t[n]] * tt;
-            const double adv = (P[tc] - p[tc]) * s;
-            if (adv > bestAdv) { bestAdv = adv; best = q; bestT = tt; bestP = P; }
-        }
-        if (best < 0) {
-            // No exit edge, which on a non-degenerate triangle means one thing:
-            // the curve arrived exactly at a *vertex*, and continues into a
-            // different triangle of that vertex's fan rather than out of this
-            // one. It is not a rare case -- Stage 4 puts the boundary on the
-            // axes, so an axis-parallel isoline runs into boundary vertices
-            // head-on all the time -- and without it the walk simply stops in
-            // the middle of the domain and Q5 looks unsatisfiable when it is
-            // not. Rotate around the fan to whichever triangle's angular sector
-            // contains the direction of travel.
-            int w = -1;
-            for (int q = 0; q < 3; ++q) {
-                if (normP(p - uv[t[q]]) <= vertexEps) { w = t[q]; break; }
-            }
-            int nf = -1;
-            if (w >= 0 && fanSpins < 32) {
-                const Point e = axis(dirT);
-                const auto &vt = cm.vertexTriangles;
-                for (int i = vt.rowPtr[w]; i < vt.rowPtr[w + 1] && nf < 0; ++i) {
-                    const int g = vt.colIdx[i];
-                    if (g == f) continue;
-                    const int lw = localOf(cm.triangles[g], w);
-                    if (lw < 0) continue;
-                    const Point A = normalizeP(uv[cm.triangles[g][(lw + 1) % 3]] - uv[w]);
-                    const Point B = normalizeP(uv[cm.triangles[g][(lw + 2) % 3]] - uv[w]);
-                    if (cross2(A, e) > -1e-9 && cross2(e, B) > 1e-9) nf = g;
-                }
-            }
-            if (nf >= 0) {
-                ++fanSpins;
-                f = nf;
-                entryEdge = -1;
-                p = uv[w];
-                continue;
-            }
-            // Nothing in the fan takes the direction: either the curve leaves
-            // the domain at this vertex, or the fan is a seam and the walk
-            // cannot be continued without a transition at a point rather than
-            // across an edge, which is beyond what a seeder needs.
-            if (w >= 0 && vertexOnRealBoundary[w]) {
-                tr.subs.push_back({subStart, Site{w, -1, 0.0}, (dirT + 1) % 4});
-                tr.leftDomain = true;
-                return tr;
-            }
-            if (step == 0) tr.degenerate = true;
-            tr.capped = true;
-            break;
-        }
-        fanSpins = 0;
-
-        // Q5 case 1: the curve came near a cone. The snap is what turns a
-        // near-miss into a connectivity constraint, and how near it came is the
-        // residual E5 will be asked to drive to zero.
-        int snapped = -1;
-        double snappedGap = coneTol;
-        for (int slot = 0; slot < static_cast<int>(coneVert.size()); ++slot) {
-            if (slot == startCone) continue;
-            for (int child : imm->getConeChildren()[slot]) {
-                if (child == startVertex) continue;
-                const double d = pointSegmentDistance(uv[child], p, bestP);
-                if (d < snappedGap) { snappedGap = d; snapped = slot; }
-            }
-        }
-        if (snapped >= 0 && step >= 1) {
-            int child = -1;
-            double bestD = std::numeric_limits<double>::infinity();
-            for (int c : imm->getConeChildren()[snapped]) {
-                const double d = pointSegmentDistance(uv[c], p, bestP);
-                if (d < bestD) { bestD = d; child = c; }
-            }
-            tr.subs.push_back({subStart, Site{child, -1, 0.0}, (dirT + 1) % 4});
-            tr.hitCone = snapped;
-            tr.gap = snappedGap;
-            return tr;
-        }
-
-        const int e = cm.triangleEdges[f][best];
-        const int nb = cm.triangleAdjacency[f][best];
-        const int x = t[best], y = t[(best + 1) % 3];
-
-        if (nb >= 0) {
-            const Triangle &tn = cm.triangles[nb];
-            const int lx = localOf(tn, x), ly = localOf(tn, y);
-            entryEdge = (lx < 0 || ly < 0) ? -1 : localEdgeBetween(lx, ly);
-            f = nb;
-            p = bestP;
-            continue;
-        }
-
-        // Q5 case 2: out through dS.
-        if (parentOnBoundary[e]) {
-            tr.subs.push_back({subStart, Site{x, y, bestT}, (dirT + 1) % 4});
-            tr.leftDomain = true;
-            return tr;
-        }
-
-        // Q5 case 3: across a seam.
-        auto it = seamSide.find(EdgeKey(x, y));
-        if (it == seamSide.end()) { tr.capped = true; break; }
-        const int pairIdx = it->second / 2;
-        const bool onPlus = (it->second % 2) == 0;
-        const auto &pr = pairs[pairIdx];
-        const int k = arcList[pairArc[pairIdx]].k;
-
-        int ta = -1, tb = -1, newDir = dirT;
-        double tPar = bestT;
-        if (onPlus) {
-            // Leaving through the plus child, so the transition to apply is the
-            // inverse and the direction turns back by k.
-            tPar = (x == pr[0]) ? bestT : 1.0 - bestT;
-            ta = pr[2]; tb = pr[3];
-            newDir = ((dirT - k) % 4 + 4) % 4;
-        } else {
-            tPar = (x == pr[2]) ? bestT : 1.0 - bestT;
-            ta = pr[0]; tb = pr[1];
-            newDir = ((dirT + k) % 4 + 4) % 4;
-        }
-
-        auto ie = cutEdgeIndex.find(EdgeKey(ta, tb));
-        if (ie == cutEdgeIndex.end()) { tr.capped = true; break; }
-        const int te = ie->second;
-        const int tf = cm.edgeTriangles[te][0] >= 0 ? cm.edgeTriangles[te][0]
-                                                    : cm.edgeTriangles[te][1];
-        if (tf < 0) { tr.capped = true; break; }
-
-        tr.subs.push_back({subStart, Site{x, y, bestT}, (dirT + 1) % 4});
-        ++tr.seamCrossings;
-
-        const Triangle &tt2 = cm.triangles[tf];
-        const int la = localOf(tt2, ta), lb = localOf(tt2, tb);
-        entryEdge = (la < 0 || lb < 0) ? -1 : localEdgeBetween(la, lb);
-        f = tf;
-        dirT = newDir;
-        subStart = Site{ta, tb, tPar};
-        p = evaluate(uv, subStart);
-    }
-
-    tr.capped = true;
-    return tr;
-}
-
-// ---------------------------------------------------------------------------
-// seedTopoPaths()  --  Sec. 3.3, "seeding Gamma_topo in practice"
-//
-// Emit the separatrices of every cone, follow each one, and whenever one passes
-// within tolerance of another cone, keep the traced path as a connectivity
-// constraint between the two.
-//
-// The directions are read straight off the map rather than by walking the fan
-// and accumulating angle: a ray leaves the cone along +u, +v, -u or -v, and it
-// belongs to whichever incident triangle's angular sector contains it. That is
-// the same set of rays -- a cone of index I has total angle 2pi - (pi/2) I, so
-// four axis directions swept over 5pi/2 give five rays at a valence-five cone
-// and three over 3pi/2 give three at a valence-three one, which is exactly the
-// n = 4 - I of Sec. 3.4 -- without needing a fan order that a boundary vertex
-// may not have.
-// ---------------------------------------------------------------------------
-void SubdomainLabels::seedTopoPaths(const std::vector<Point> &uv) {
-    tPaths.clear();
-    report.separatrices = report.separatricesToBoundary = 0;
-    report.separatricesToCone = report.separatricesCapped = 0;
-    report.topoPaths = 0;
-
-    const Mesh &cm = imm->getCutMesh();
-    const std::vector<int> &coneVert = imm->getConeVertices();
-    const auto &children = imm->getConeChildren();
-    if (coneVert.size() < 2) return;
-
-    // The scale a "near miss" is measured against: the mean distance from each
-    // cone to its nearest other cone, in the image.
+double SubdomainLabels::meanConeSpacing(const Immersion &imm, const std::vector<Point> &uv) {
+    const auto &children = imm.getConeChildren();
     double acc = 0.0;
     int counted = 0;
     for (size_t i = 0; i < children.size(); ++i) {
@@ -625,118 +389,277 @@ void SubdomainLabels::seedTopoPaths(const std::vector<Point> &uv) {
         }
         if (std::isfinite(best)) { acc += best; ++counted; }
     }
-    report.meanConeSpacing = counted ? acc / counted : 0.0;
-    if (!(report.meanConeSpacing > 0.0)) return;
-    const double tol = options.nearMissTolerance * report.meanConeSpacing;
+    return counted ? acc / counted : 0.0;
+}
 
-    // slot pair -> index into tPaths, so a pair of cones found twice keeps only
-    // the trace that came closest.
-    std::unordered_map<long long, int> seen;
+// ---------------------------------------------------------------------------
+// seedTracerOptions()
+//
+// Stage 7's tracer, set up to look for near misses instead of terminations.
+//
+// Two of the settings have to move together and the reason is worth stating,
+// because getting one of them right and not the other is a silent failure. The
+// snap tolerance is widened from Sec. 3.4's 1e-6 of the extent to the near-miss
+// tolerance -- that is the point of the seeding. But a cone is only ever
+// offered to a curve if it is within Options::coneSnapRings faces of the
+// triangle being crossed, and that restriction exists because Psi overlaps
+// itself, so it cannot simply be dropped. Widen the tolerance without widening
+// the neighbourhood and the seeder quietly stops finding the misses it was
+// widened to find.
+//
+// So the radius is derived from the tolerance: an image distance of `tol` is,
+// since psi_R is an isometry of the flat metric, about tol / (mean edge) faces
+// on S. Clamped at both ends -- never fewer than two rings, never more than
+// thirty-two, which is where the cost of the breadth-first walk starts to show.
+// ---------------------------------------------------------------------------
+Separatrices::Options SubdomainLabels::seedTracerOptions(const std::vector<Point> &uv,
+                                                          double spacing) const {
+    const Mesh &cm = imm->getCutMesh();
 
-    for (int slot = 0; slot < static_cast<int>(coneVert.size()); ++slot) {
-        for (int c : children[slot]) {
-            // The directions that run *along* the boundary of Omega at this
-            // cone. Sec. 3.4: a cone on the boundary of valence n emits n - 2
-            // separatrices into the interior, because two of its n grid
-            // directions lie in dS. Since Stage 4 put the boundary on the axes,
-            // those two directions are exactly axis directions and would
-            // otherwise be emitted and then traced along the boundary edge.
-            std::vector<Point> along;
-            {
-                const auto &vt0 = cm.vertexTriangles;
-                for (int i = vt0.rowPtr[c]; i < vt0.rowPtr[c + 1]; ++i) {
-                    const int f0 = vt0.colIdx[i];
-                    for (int q = 0; q < 3; ++q) {
-                        if (cm.triangleAdjacency[f0][q] >= 0) continue;
-                        const int a0 = cm.triangles[f0][q];
-                        const int b0 = cm.triangles[f0][(q + 1) % 3];
-                        if (a0 != c && b0 != c) continue;
-                        const int other = (a0 == c) ? b0 : a0;
-                        along.push_back(normalizeP(uv[other] - uv[c]));
-                    }
-                }
-            }
-            auto runsAlongBoundary = [&](const Point &e) {
-                for (const Point &d0 : along) {
-                    if (std::fabs(cross2(e, d0)) < 1e-9 && dotP(e, d0) > 0.0) return true;
-                }
-                return false;
-            };
+    Point lo{std::numeric_limits<double>::infinity(),
+             std::numeric_limits<double>::infinity()};
+    Point hi{-lo[0], -lo[1]};
+    for (const Point &p : uv) {
+        lo[0] = std::min(lo[0], p[0]); hi[0] = std::max(hi[0], p[0]);
+        lo[1] = std::min(lo[1], p[1]); hi[1] = std::max(hi[1], p[1]);
+    }
+    double extent = uv.empty() ? 1.0 : std::hypot(hi[0] - lo[0], hi[1] - lo[1]);
+    if (!(extent > 0.0)) extent = 1.0;
 
-            const auto &vt = cm.vertexTriangles;
-            for (int i = vt.rowPtr[c]; i < vt.rowPtr[c + 1]; ++i) {
-                const int f = vt.colIdx[i];
-                const Triangle &t = cm.triangles[f];
-                const int lc = localOf(t, c);
-                if (lc < 0) continue;
-                const Point A = uv[t[(lc + 1) % 3]] - uv[c];
-                const Point B = uv[t[(lc + 2) % 3]] - uv[c];
+    double edgeAcc = 0.0;
+    int edgeCount = 0;
+    for (const auto &e : cm.edges) {
+        edgeAcc += normP(uv[e[0]] - uv[e[1]]);
+        ++edgeCount;
+    }
+    const double meanEdge = edgeCount ? edgeAcc / edgeCount : extent;
 
-                const Point An = normalizeP(A);
-                const Point Bn = normalizeP(B);
+    const double tol = options.nearMissTolerance * spacing;
 
-                for (int d = 0; d < 4; ++d) {
-                    const Point e = axis(d);
-                    // The sector of a positively oriented triangle at c runs
-                    // from A to B counter-clockwise. The test is half-open --
-                    // closed at A, open at B -- so a direction lying exactly
-                    // along a shared edge belongs to one of the two faces and
-                    // not to both. That is not a pedantic edge case here:
-                    // Stage 4 rotates the whole immersion onto the axes, so a
-                    // boundary that came out rectilinear has many edges exactly
-                    // parallel to a grid direction.
-                    if (!(cross2(An, e) > -1e-9 && cross2(e, Bn) > 1e-9)) continue;
-                    if (runsAlongBoundary(e)) continue;
+    Separatrices::Options so;
+    so.coneSnapTolerance = tol / extent;
+    so.coneSnapRings = (meanEdge > 0.0)
+        ? std::max(2, std::min(32, static_cast<int>(std::ceil(tol / meanEdge)) + 1))
+        : 2;
+    // The separation cap is what stops the widened tolerance handing a curve to
+    // the wrong member of a clustered pair. It is not optional here the way it
+    // is at Sec. 3.4's tolerance, where nothing is near enough to be confused.
+    so.coneSnapSeparationCap = 0.25;
+    so.maxSteps = options.maxTraceSteps;
+    so.nearMissWindow = tol / extent;
+    return so;
+}
 
-                    Trace tr = traceSeparatrix(uv, c, f, d, tol);
-                    // A ray that could not take even one step was not a
-                    // separatrix; it left along an edge of the fan.
-                    if (tr.degenerate) continue;
-                    ++report.separatrices;
-                    if (tr.leftDomain) ++report.separatricesToBoundary;
-                    else if (tr.hitCone >= 0) ++report.separatricesToCone;
-                    else ++report.separatricesCapped;
+// ---------------------------------------------------------------------------
+long long SubdomainLabels::topoKeyOf(long long a, long long b) {
+    const long long lo = std::min(a, b), hi = std::max(a, b);
+    // Two 64-bit tokens folded into one. The mix is arbitrary; only collisions
+    // between *different* pairs would matter and the token space is far larger
+    // than any cone set here.
+    return lo * 1000000007LL + hi;
+}
 
-                    if (tr.hitCone < 0 || tr.hitCone == slot || tr.subs.empty()) continue;
+// ---------------------------------------------------------------------------
+void SubdomainLabels::truncateTopoPaths(size_t keep) {
+    if (keep >= tPaths.size()) return;
+    for (size_t i = keep; i < tPaths.size() && i < tPathKeys.size(); ++i) {
+        topoKeys.erase(tPathKeys[i]);
+        if (tPaths[i].pass > 0) --report.topoAddedByRepair;
+        if (tPaths[i].fromCone == tPaths[i].toCone) --report.topoSelfReturns;
+    }
+    tPaths.resize(keep);
+    tPathKeys.resize(std::min(tPathKeys.size(), keep));
+    report.topoPaths = static_cast<int>(tPaths.size());
+}
 
-                    const int lo = std::min(slot, tr.hitCone);
-                    const int hi = std::max(slot, tr.hitCone);
-                    const long long key = static_cast<long long>(lo) * 1000003LL + hi;
+// ---------------------------------------------------------------------------
+// addTopoPath()  --  from a traced separatrix
+//
+// The curve already is the path: Separatrices subdivides it by G as it marches
+// and labels each subcurve with the coordinate E5 is to sum, so there is no
+// geometry to recompute and, more to the point, no second opinion about where
+// the seams were crossed or which quarter turn was applied there.
+// ---------------------------------------------------------------------------
+bool SubdomainLabels::addTopoPath(const Separatrices::Curve &c, int pass) {
+    const int other = c.otherCone();
+    if (c.cone < 0 || other < 0) return false;
+    if (!options.seedSelfReturns && other == c.cone) return false;
 
-                    TopoPath tp;
-                    tp.subs = std::move(tr.subs);
-                    tp.fromCone = slot;
-                    tp.toCone = tr.hitCone;
-                    tp.seedGap = tr.gap;
-                    tp.seamCrossings = tr.seamCrossings;
+    const int otherChild = (c.end == Separatrices::End::Cone) ? c.toChild : c.nearestChild;
+    if (otherChild < 0) return false;
 
-                    auto it = seen.find(key);
-                    if (it == seen.end()) {
-                        seen.emplace(key, static_cast<int>(tPaths.size()));
-                        tPaths.push_back(std::move(tp));
-                    } else if (tp.seedGap < tPaths[it->second].seedGap) {
-                        tPaths[it->second] = std::move(tp);
-                    }
-                }
-            }
+    const std::vector<Separatrices::Sub> subs = c.connection();
+    if (subs.empty()) return false;
+
+    // The two ends, each as (cone, child, direction of travel). The far end is
+    // recorded as the direction a trace *from* there would leave in, which is
+    // the reverse of the direction the curve arrived in -- so that the same
+    // curve found from either end produces the same unordered pair.
+    const int arriveDir = (c.end == Separatrices::End::Cone) ? c.endDir : c.nearestDir;
+    const long long ka = endToken(c.cone, c.child, c.dir);
+    const long long kb = endToken(other, otherChild, (arriveDir + 2) % 4);
+
+    long long dedupA = ka, dedupB = kb;
+    if (!options.seedAllConnections) {
+        // The old behaviour: one path per pair of cones, whichever was found
+        // first. Kept as a switch so the cost of it can be seen rather than
+        // argued about.
+        dedupA = endToken(std::min(c.cone, other), 0, 0);
+        dedupB = endToken(std::max(c.cone, other), 0, 0);
+    }
+    const long long key = topoKeyOf(dedupA, dedupB);
+    if (!topoKeys.insert(key).second) return false;
+
+    TopoPath tp;
+    tp.subs.reserve(subs.size());
+    for (const Separatrices::Sub &s : subs) {
+        TopoPath::Sub o;
+        o.from = Site{s.from.a, s.from.b, s.from.t};
+        o.to = Site{s.to.a, s.to.b, s.to.t};
+        o.dir = s.dir;
+        tp.subs.push_back(o);
+    }
+    tp.fromCone = c.cone;
+    tp.toCone = other;
+    tp.seedGap = (c.end == Separatrices::End::Cone) ? c.gap : c.nearestConeGap;
+    tp.seamCrossings = c.seamCrossings;
+    tp.pass = pass;
+
+    if (other == c.cone) ++report.topoSelfReturns;
+    if (pass > 0) ++report.topoAddedByRepair;
+    tPathKeys.push_back(key);
+    tPaths.push_back(std::move(tp));
+    report.topoPaths = static_cast<int>(tPaths.size());
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// seedTopoPaths()  --  Sec. 3.3, "seeding Gamma_topo in practice"
+//
+// Trace every separatrix of the map with the snap tolerance widened from
+// Sec. 3.4's 1e-6 to the near-miss tolerance, and keep as a connectivity
+// constraint every curve that reached a cone under it. Widening the tolerance
+// is exactly the "look for one that passes close to a cone without hitting it"
+// of the recipe: under Sec. 3.4's tolerance it would not have hit, under this
+// one it does, and the distance it was moved by is the residual E5 is then
+// asked to drive to zero.
+// ---------------------------------------------------------------------------
+void SubdomainLabels::seedTopoPaths(const std::vector<Point> &uv) {
+    tPaths.clear();
+    tPathKeys.clear();
+    topoKeys.clear();
+    report.separatrices = report.separatricesToBoundary = 0;
+    report.separatricesToCone = report.separatricesCapped = 0;
+    report.topoPaths = report.topoSelfReturns = 0;
+    report.topoExtraPerPair = report.topoAddedByRepair = 0;
+
+    const std::vector<int> &coneVert = imm->getConeVertices();
+    if (coneVert.empty()) return;
+
+    report.meanConeSpacing = coneSpacing(uv);
+    if (!(report.meanConeSpacing > 0.0)) {
+        // One cone, or none: there is no pair to join and nothing to seed. Not
+        // a failure -- a rectangle with four convex corners is exactly this.
+        return;
+    }
+
+    const Separatrices::Options so = seedTracerOptions(uv, report.meanConeSpacing);
+    report.seedSnapRings = so.coneSnapRings;
+
+    std::unique_ptr<Separatrices> sep;
+    try {
+        sep = std::make_unique<Separatrices>(*imm, uv, so);
+    } catch (const std::exception &e) {
+        report.messages.push_back(
+            std::string("Gamma_topo could not be seeded: the separatrices of psi_R would "
+                        "not trace (") + e.what() + "). Remark 3.1's sliver layout is what "
+            "Stage 6 will produce without them.");
+        return;
+    }
+
+    const Separatrices::Report &sr = sep->getReport();
+    report.seedSnapTolerance = sr.snapTolerance;
+    report.separatrices = sr.emitted;
+    report.separatricesToCone = sr.endedAtCone;
+    report.separatricesToBoundary = sr.endedAtBoundary;
+    report.separatricesCapped = sr.capped + sr.cycled + sr.stuck;
+
+    // Count the pairs as they go by, so that the two things this used to leave
+    // out can be reported rather than merely fixed.
+    std::unordered_set<long long> pairsSeen;
+    for (const Separatrices::Curve &c : sep->curves()) {
+        if (c.end != Separatrices::End::Cone) continue;
+        const int lo = std::min(c.cone, c.toCone), hi = std::max(c.cone, c.toCone);
+        const long long pk = static_cast<long long>(lo) * 1000003LL + hi;
+        const bool firstOfPair = pairsSeen.insert(pk).second;
+        if (addTopoPath(c, 0) && !firstOfPair && c.cone != c.toCone) {
+            ++report.topoExtraPerPair;
         }
     }
 
-    report.topoPaths = static_cast<int>(tPaths.size());
     report.maxTopoResidual = 0.0;
     for (const TopoPath &p : tPaths) {
         report.maxTopoResidual = std::max(report.maxTopoResidual,
                                           std::fabs(topoResidual(uv, p)));
     }
+
+    {
+        std::ostringstream oss;
+        oss << "Gamma_topo seeded with " << report.topoPaths << " path(s) from "
+            << report.separatrices << " separatrix/ces of psi_R, at a near-miss tolerance of "
+            << options.nearMissTolerance << " of the mean cone spacing ("
+            << report.seedSnapTolerance << " in image units, over " << report.seedSnapRings
+            << " ring(s) of faces): " << report.topoSelfReturns << " back to their own cone, "
+            << report.topoExtraPerPair << " a second curve between a pair already joined.";
+        report.messages.push_back(oss.str());
+    }
     if (report.separatricesCapped > 0) {
         std::ostringstream oss;
-        oss << report.separatricesCapped << " separatrix/ces neither reached a cone nor left "
-            << "through dS within the step cap; Q5 does not hold on psi_R, which is what "
-            << "Stage 6 is for.";
+        oss << report.separatricesCapped << " separatrix/ces of psi_R neither reached a cone "
+            << "nor left through dS; Q5 does not hold on psi_R, which is what Stage 6 is for.";
         report.messages.push_back(oss.str());
     }
 }
 
+// ---------------------------------------------------------------------------
+// adoptCurves()  --  Sec. 3.3's repair, and Sec. 4's "on failure"
+//
+// The seeding above runs on psi_R because that is the only map there is when
+// Stage 5 runs. Stage 6 then moves it a long way -- that is its whole job -- and
+// a connection that is plain on the finished layout can have been invisible on
+// the map it started from, and the other way round. So after Stage 7 has traced
+// the separatrices of Psi, the ones that ended nowhere, and the ones that
+// slipped past a cone on their way out through dS, each name a pair E5 was
+// never told to join. Adding them and re-running the continuation *from the
+// current phi* is the paper's remedy, and re-running it from psi_R would be
+// throwing away everything the continuation has already bought.
+// ---------------------------------------------------------------------------
+int SubdomainLabels::adoptCurves(const Separatrices &sep, double window, int pass,
+                                 int maxAdd) {
+    // unconstrainedCurves() returns them nearest first, and nearest is the
+    // right order to take them in: the curve that came closest to its cone is
+    // the one the continuation was closest to getting right, so it is both the
+    // most likely to have been meant and the cheapest to satisfy.
+    const std::vector<int> wanted = sep.unconstrainedCurves(window);
+    int added = 0;
+    for (int i : wanted) {
+        if (maxAdd > 0 && added >= maxAdd) break;
+        if (addTopoPath(sep.curves()[i], pass)) ++added;
+    }
+    if (added > 0) {
+        std::ostringstream oss;
+        oss << "Repair pass " << pass << ": " << added << " connectivity constraint(s) added "
+            << "for separatrices that terminated at neither a cone nor dS, or passed within "
+            << window << " of the image extent of a cone without stopping at it";
+        if (maxAdd > 0 && static_cast<int>(wanted.size()) > added) {
+            oss << " (the " << added << " nearest of " << wanted.size() << " candidates)";
+        }
+        oss << ".";
+        report.messages.push_back(oss.str());
+    }
+    report.topoPaths = static_cast<int>(tPaths.size());
+    return added;
+}
 // ---------------------------------------------------------------------------
 // addTopoPath()
 //
@@ -786,6 +709,15 @@ bool SubdomainLabels::addTopoPath(const std::vector<int> &omegaPath, int firstDi
     const std::vector<int> &vCone = imm->getCutVertexCone();
     tp.fromCone = vCone[omegaPath.front()];
     tp.toCone = vCone[omegaPath.back()];
+
+    // A hand-written path claims its pair of ends like a traced one, so that
+    // the seeding and the repair do not later propose the same connection --
+    // and so that tPathKeys stays parallel to tPaths for truncateTopoPaths().
+    const long long key = topoKeyOf(
+        endToken(tp.fromCone, omegaPath.front(), firstDir),
+        endToken(tp.toCone, omegaPath.back(), (dirT + 2) % 4));
+    topoKeys.insert(key);
+    tPathKeys.push_back(key);
     tPaths.push_back(std::move(tp));
     report.topoPaths = static_cast<int>(tPaths.size());
     return true;

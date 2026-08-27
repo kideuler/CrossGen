@@ -1,6 +1,7 @@
 #ifndef __MERIDIAN_HXX__
 #define __MERIDIAN_HXX__
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -130,6 +131,12 @@ public:
         // automatically from near-misses of the separatrices on psi_R.
         bool seedTopoConstraints = true;
         double topoNearMiss = 0.15;  // as a fraction of the mean cone spacing
+        // Q5's "possibly identical" case -- the curve of Fig. 9, out of a cone
+        // and back to it -- and the second and later curves joining a pair of
+        // cones already joined by one. Both are constraints in their own right
+        // and both are easy to drop; see SubdomainLabels::Options.
+        bool seedSelfReturns = true;
+        bool seedAllConnections = true;
 
         // Stage 7. The snap tolerance is Sec. 3.4's, as a fraction of the image
         // extent; the step cap is what turns a curve that never terminates into
@@ -137,6 +144,41 @@ public:
         bool runSeparatrices = true;
         double separatrixSnap = 1e-6;
         int separatrixMaxSteps = 50000;
+        int separatrixSnapRings = 2;
+        bool separatrixDetectCycles = true;
+
+        // Sec. 3.3's remedy, and the "on failure" of Sec. 4's arrangement, run
+        // as a loop rather than left to the reader:
+        //
+        //     trace the separatrices of Psi
+        //     for each that ended at neither a cone nor dS, and for each that
+        //         slipped past a cone on its way out through dS,
+        //         add the Gamma_topo constraint it names
+        //     raise lambda_5 and re-run Stage 6 *from the current phi*
+        //     trace again
+        //
+        // This is what the seeding at Stage 5 cannot do by itself. Gamma_topo
+        // is seeded on psi_R, because psi_R is the only map there is when
+        // Stage 5 runs, and Stage 6 then moves it a long way -- that is the
+        // whole point of Stage 6. A connection that is plain on the finished
+        // layout need never have been visible on the map it started from.
+        //
+        // repairGapLimit is how near a curve has to have passed its cone, as a
+        // fraction of the image extent, before the pair counts as one that was
+        // meant to be joined. Too large and E5 is asked for a set of integral
+        // curves that no map has, which does not converge slowly: the barrier
+        // fights a penalty it cannot satisfy and det J is driven to zero.
+        int repairPasses = 6;
+        double repairGapLimit = 1e-3;
+        double repairLambdaBoost = 10.0;
+        int repairOuterSteps = 4;
+        // How many constraints one pass may add, nearest first; 0 for all of
+        // them. Four is what the corpus in data/meshes settles on: it is the
+        // largest value at which every model that a repair helps at all is
+        // still helped, and small enough that the pass stays satisfiable on the
+        // models whose cones Stage 1 left clustered. See
+        // SubdomainLabels::adoptCurves for why a cap helps at all.
+        int repairMaxPerPass = 4;
     };
 
     struct Status {
@@ -165,6 +207,8 @@ public:
         int boundaryEdgesU = 0, boundaryEdgesV = 0;
         int featureChains = 0;
         int topoPaths = 0;
+        int topoSelfReturns = 0;    // paths back to the cone they left, Fig. 9
+        int topoExtraPerPair = 0;   // second and later curves of one cone pair
 
         // Stage 6
         bool layoutRan = false;
@@ -181,7 +225,15 @@ public:
         int separatrices = 0;
         int separatricesToCone = 0;
         int separatricesToBoundary = 0;
-        int separatricesUnresolved = 0;   // capped, stuck or degenerate
+        int separatricesUnresolved = 0;   // capped, cycling, stuck or degenerate
+        // Curves that terminated at neither a cone nor dS, or slipped past one
+        // on the way out, and were near enough for the pair to be worth a
+        // constraint. Zero is what a finished layout looks like.
+        int separatricesNearMisses = 0;
+
+        // The repair of Sec. 3.3, as it actually went.
+        int repairPasses = 0;
+        int repairConstraintsAdded = 0;
         // Every separatrix ended the way Q5 allows and every cone emitted the
         // number its index prescribes. Stage 6 asserts Q5 through the residual
         // of E5, which is a statement about the Gamma_topo paths it was given;
@@ -190,6 +242,37 @@ public:
 
         std::vector<std::string> messages;
     };
+
+    // Sec. 3.3's repair, as options and as a result. Separate from Options
+    // because traceAndRepair() is usable on its own -- the viewer drives Stages
+    // 4 to 7 itself, one keypress at a time, and runs this rather than a second
+    // copy of it.
+    struct RepairOptions {
+        int passes = 6;
+        int maxPerPass = 4;
+        double gapLimit = 1e-3;
+        double lambdaBoost = 10.0;
+        int outerSteps = 4;
+    };
+
+    struct RepairResult {
+        // The tracing of the map that came back, which is the map the caller's
+        // LayoutEnergy now holds.
+        std::unique_ptr<Separatrices> separatrices;
+        bool traced = false;
+        int passesTaken = 0;
+        int constraintsAdded = 0;
+        int rolledBack = 0;
+    };
+
+    // Stage 7, then Sec. 3.3's remedy applied in a loop until the separatrices
+    // all terminate the way Q5 allows or there is nothing further to add. Both
+    // stages are taken by reference and left holding the result. Messages are
+    // reported through `log`, already prefixed with the stage they came from.
+    static RepairResult traceAndRepair(SubdomainLabels &labels, LayoutEnergy &layout,
+                                       const Separatrices::Options &trace,
+                                       const RepairOptions &opts,
+                                       const std::function<void(const std::string &)> &log);
 
     explicit MERIDIAN(std::shared_ptr<Mesh> mesh);
     MERIDIAN(std::shared_ptr<Mesh> mesh, const Options &opts);
