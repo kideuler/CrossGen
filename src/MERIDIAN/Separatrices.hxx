@@ -131,6 +131,21 @@ class LayoutEnergy;
 // cone (Options::coneSnapSeparationCap), which is what keeps a clustered pair
 // from swallowing each other's curves.
 //
+// Two cones are never candidates at all:
+//
+//   * the one the curve was emitted from, until the curve has cleared its
+//     neighbourhood -- see coneHomeReach. Without that every separatrix is a
+//     near miss of its own singularity, because for its first few triangles it
+//     is beside it, and the repair loop then spends its rounds on constraints
+//     that say nothing.
+//   * a cone with no separatrix to give. On dS a cone of index I emits 1 - I
+//     of them and carries 3 - I arcs of the layout, so at I = +1 -- a convex
+//     right-angled corner -- it emits none, and Q5 pairs a terminating curve
+//     with one of the cone's own separatrices traced backwards, so there is
+//     nothing for a curve to be paired with. Letting one terminate there
+//     anyway puts three arcs in a sector of pi/2 and costs both patches that
+//     meet at the corner their fourth side.
+//
 // ### Footnote 3
 //
 // If S is an annulus with no singularities, Q5 is vacuous and there is nothing
@@ -565,8 +580,36 @@ private:
     std::vector<std::vector<int>> faceCones;
     // Per Omega vertex, the snap tolerance a cone child there is allowed --
     // the option's value, capped by Options::coneSnapSeparationCap times the
-    // distance to the nearest child of a *different* cone. Zero elsewhere.
+    // distance to the nearest child of a *different* cone. Zero elsewhere, and
+    // zero too at a cone that has no separatrix to give: a cone on dS of index
+    // I emits 1 - I of them and has 3 - I incident arcs of the layout, so at
+    // I = +1 -- a convex corner, a right angle of the patch on either side of
+    // it -- it emits none and none may terminate there either. Letting one
+    // terminate there anyway is not a small error: the corner comes out with
+    // three arcs in a sector of pi/2, which is a T-junction at the one place a
+    // layout cannot have one, and the two patches that meet at the corner both
+    // lose their fourth side.
     std::vector<double> childSnapTol;
+
+    // Per cone slot, how far a curve has to travel before its *own* cone is a
+    // candidate again: the radius of the cone's one-ring in the image.
+    //
+    // Some such exclusion is necessary, because a separatrix starts at its cone
+    // and for its first few triangles is still beside it -- so without one,
+    // every curve in the corpus is a near miss of its own singularity, and a
+    // near miss is what Sec. 3.3's repair reads as a pair of cones E5 was never
+    // told to join. The exclusion the seeding needs is wider still: Stage 5
+    // traces at a snap tolerance of Options::nearMissTolerance of the mean cone
+    // spacing rather than Sec. 3.4's 1e-6, and at that width a curve one
+    // triangle out of the fan is comfortably inside its own cone's snap radius
+    // and terminates there before it can reach anything else. So the clearance
+    // actually applied is the larger of the two, max(snapTol, this), which is
+    // the one-ring at Stage 7's tolerance and the snap radius at Stage 5's.
+    //
+    // Q5's "possibly identical" case -- out of a cone and back to it, the curve
+    // of Fig. 9 -- is unaffected: a curve that really returns has gone that far
+    // and further, and once it has, its own cone is a candidate like any other.
+    std::vector<double> coneHomeReach;
 
     double extent = 1.0;        // diagonal of the image, Psi(Omega)
     double modelExtent = 1.0;   // diagonal of S, for the pulled-back curves

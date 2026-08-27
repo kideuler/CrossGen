@@ -210,6 +210,26 @@ public:
         // what the layout looks like without them.
         bool keepUnresolved = true;
 
+        // End such a curve at the first layout edge it meets rather than
+        // wherever the step cap or the cycle test happened to stop it.
+        //
+        // Away from the cones Psi is flat and a separatrix is one of its
+        // geodesics, so a curve Q5 does not close does not run off anywhere: it
+        // winds, and where it stops is an artefact of the cap. The part of it
+        // that means something is the part before it first crossed a curve that
+        // *is* closed, because up to there it was cutting a face in two and
+        // after there it is only cutting pieces of a face it has already left.
+        // Ending it at that crossing turns a dangling node -- an edge with a
+        // loose end, which is not a subdivision of S at all and which nothing
+        // downstream can mesh -- into a T-junction, which is a defect the paper
+        // names, which is reported as one, and which a quad mesher can at least
+        // resolve with a transition.
+        //
+        // It does not make Q5 hold and is not meant to; Sec. 3.3's repair,
+        // which MERIDIAN::traceAndRepair runs to exhaustion first, is what does
+        // that. This is what to do with what is left.
+        bool trimUnresolvedAtCrossings = true;
+
         // Add a node at any point of dS where the boundary turns a quarter in
         // the image without a cone there to account for it. Q3 puts each
         // component of dS - G on a coordinate line and Stage 3 drove the
@@ -268,6 +288,9 @@ public:
         int clusteredCones = 0;      // two cones a sliver apart, left alone
         int selfCrossings = 0;       // a separatrix that crossed itself
         int parallelOverlaps = 0;    // two segments too nearly collinear to cut
+        // Curves Q5 did not close that were ended at a layout edge instead of
+        // being left with a loose end. See Options::trimUnresolvedAtCrossings.
+        int trimmedCurves = 0;
 
         int faces = 0;
         int patches = 0;             // faces inside S
@@ -379,6 +402,7 @@ private:
     void collapseShortArcs();
     void collectSegments();
     void findCrossings();
+    void trimUnresolved();
     void buildEndNodes();
     void buildBoundaryNodes();
     void splitCurves();

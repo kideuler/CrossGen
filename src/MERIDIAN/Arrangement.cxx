@@ -71,6 +71,7 @@ Arrangement::Arrangement(const Separatrices &separatrices, const SubdomainLabels
     buildBoundaryNodes();
     collectSegments();
     findCrossings();
+    trimUnresolved();
     splitCurves();
     buildBoundaryArcs();
     collapseShortArcs();
@@ -563,6 +564,62 @@ void Arrangement::findCrossings() {
 // a face, so a step is a straight segment in barycentric coordinates and a
 // fraction of the way along it is the same fraction of the way between the two
 // triples. Nothing is re-projected and nothing is searched for.
+// ---------------------------------------------------------------------------
+// trimUnresolved()
+//
+// A curve Q5 did not close, ended at the first layout edge it met.
+//
+// "Layout edge" means an arc of a curve that *is* closed, or dS. A crossing
+// with another unclosed curve will not do: two curves that both wind and are
+// both cut at their mutual crossing leave a node of degree two in the middle of
+// a face and no more of a subdivision than the loose ends they started with.
+// So the nodes worth stopping at are marked from the closed curves and from the
+// boundary first, and the winding curve is then cut at the first of them it
+// reaches.
+//
+// A curve that meets none of them is left alone. Nothing is gained by moving
+// its loose end somewhere else, and the diagnosis -- danglingNodes, and the
+// message that goes with it -- is the one the caller needs.
+// ---------------------------------------------------------------------------
+void Arrangement::trimUnresolved() {
+    if (!options.trimUnresolvedAtCrossings) return;
+    const std::vector<Separatrices::Curve> &curves = sep->curves();
+
+    std::vector<char> onLayout(nodes.size(), 0);
+    for (size_t c = 0; c < curves.size(); ++c) {
+        if (curveDropped[c] || !Separatrices::resolved(curves[c].end)) continue;
+        for (const Event &e : curveEvents[c]) {
+            if (e.node >= 0 && e.node < static_cast<int>(onLayout.size())) onLayout[e.node] = 1;
+        }
+    }
+    for (size_t n = 0; n < nodes.size(); ++n) {
+        if (nodes[n].onBoundary || nodes[n].kind == NodeKind::Cone) onLayout[n] = 1;
+    }
+
+    for (size_t c = 0; c < curves.size(); ++c) {
+        if (curveDropped[c] || Separatrices::resolved(curves[c].end)) continue;
+        std::vector<Event> &ev = curveEvents[c];
+        if (ev.size() < 2) continue;
+        std::sort(ev.begin(), ev.end(),
+                  [](const Event &a, const Event &b) { return a.param < b.param; });
+
+        size_t cut = ev.size();
+        for (size_t k = 1; k < ev.size(); ++k) {
+            if (ev[k].param <= 1e-9) continue;
+            const int n = ev[k].node;
+            if (n < 0 || n >= static_cast<int>(onLayout.size())) continue;
+            if (nodes[n].kind == NodeKind::Dangling) continue;
+            if (!onLayout[n]) continue;
+            cut = k;
+            break;
+        }
+        if (cut + 1 >= ev.size()) continue;   // nothing to cut away
+
+        ev.resize(cut + 1);
+        ++report.trimmedCurves;
+    }
+}
+
 // ---------------------------------------------------------------------------
 void Arrangement::splitCurves() {
     const std::vector<Separatrices::Curve> &curves = sep->curves();
@@ -1261,8 +1318,12 @@ void Arrangement::checkFeatures() {
 // saying exactly which face failed and how.
 // ---------------------------------------------------------------------------
 void Arrangement::check() {
-    report.nodes = static_cast<int>(nodes.size());
     for (const Node &n : nodes) {
+        // A node no half-edge leaves is not part of the layout. The only ones
+        // are the loose ends trimUnresolved() cut away; counting them would
+        // report a dangling node that is no longer there.
+        if (n.out.empty() && n.kind != NodeKind::Cone) continue;
+        ++report.nodes;
         switch (n.kind) {
             case NodeKind::Cone: ++report.coneNodes; break;
             case NodeKind::Crossing: ++report.crossingNodes; break;

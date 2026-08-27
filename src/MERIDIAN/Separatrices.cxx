@@ -242,6 +242,7 @@ void Separatrices::buildSnapNeighbourhood() {
     const Mesh &cm = imm->getCutMesh();
     faceCones.assign(cm.triangles.size(), {});
     childSnapTol.assign(cm.vertices.size(), 0.0);
+    coneHomeReach.assign(coneChildren.size(), 0.0);
 
     const int rings = std::max(0, options.coneSnapRings);
 
@@ -249,6 +250,13 @@ void Separatrices::buildSnapNeighbourhood() {
     std::vector<int> mark(cm.triangles.size(), -1);
 
     for (int slot = 0; slot < static_cast<int>(coneChildren.size()); ++slot) {
+        // A cone on dS of index I emits 1 - I separatrices; at I >= 1 that is
+        // none, and a cone that emits none is a cone none may terminate at.
+        // Q5 pairs a terminating curve with one of the cone's own separatrices
+        // traced backwards, so there is nothing for it to be paired with.
+        const bool givesRays = coneOnBoundary[slot] ? (1 - coneIndex[slot] > 0)
+                                                    : (4 - coneIndex[slot] > 0);
+
         for (int c : coneChildren[slot]) {
             if (c < 0 || c >= static_cast<int>(cm.vertices.size())) continue;
 
@@ -263,8 +271,8 @@ void Separatrices::buildSnapNeighbourhood() {
                     sep = std::min(sep, normP(uv[c] - uv[d]));
                 }
             }
-            double tol = snapTol;
-            if (std::isfinite(sep) && options.coneSnapSeparationCap > 0.0) {
+            double tol = givesRays ? snapTol : 0.0;
+            if (tol > 0.0 && std::isfinite(sep) && options.coneSnapSeparationCap > 0.0) {
                 tol = std::min(tol, options.coneSnapSeparationCap * sep);
             }
             childSnapTol[c] = tol;
@@ -273,6 +281,13 @@ void Separatrices::buildSnapNeighbourhood() {
             const auto &vt = cm.vertexTriangles;
             for (int i = vt.rowPtr[c]; i < vt.rowPtr[c + 1]; ++i) {
                 const int f = vt.colIdx[i];
+                for (int q = 0; q < 3; ++q) {
+                    const int n = cm.triangles[f][q];
+                    if (n != c) {
+                        coneHomeReach[slot] = std::max(coneHomeReach[slot],
+                                                       normP(uv[n] - uv[c]));
+                    }
+                }
                 if (mark[f] == c) continue;
                 mark[f] = c;
                 faceCones[f].push_back(c);
@@ -625,6 +640,11 @@ Separatrices::Curve Separatrices::trace(int slot, int child, int face, int dirT,
     // cone the first was -- so the curve is winding and will not stop.
     std::unordered_map<long long, std::vector<double>> visited;
 
+    // How far the curve has to have travelled before the cone it was emitted
+    // from is a candidate again -- to snap to or to record an approach to.
+    // See Separatrices::coneHomeReach.
+    const double homeReach = std::max(snapTol, coneHomeReach[slot]);
+
     auto pushStep = [&](const std::array<double, 3> &a, const std::array<double, 3> &b) {
         Step st;
         st.face = f;
@@ -796,13 +816,19 @@ Separatrices::Curve Separatrices::trace(int slot, int child, int face, int dirT,
         for (int w : faceCones[f]) {
             const int other = vertCone[w];
             if (other < 0) continue;
+            // A cone with no separatrix to give is a cone no curve may end at.
+            if (!(childSnapTol[w] > 0.0)) continue;
+            // The cone it left from is not a termination for as long as the
+            // curve is still inside that cone's fan -- and not a near miss
+            // either, which is the more expensive of the two mistakes, because
+            // a near miss is what Sec. 3.3's repair reads as a pair of cones E5
+            // was never told to join. Once the curve is away it is a candidate
+            // like any other: a separatrix returning to its own singularity is
+            // Q5's "possibly identical" case and the curve of the paper's
+            // Fig. 9.
             double ss = 0.0;
             const double d = segmentClosest(uv[w], p, bestP, ss);
-            // The cone it left from, before it has gone anywhere, is not a
-            // termination. Once the curve is away it is a candidate like any
-            // other -- a separatrix returning to its own singularity is Q5's
-            // "possibly identical" case and the curve of the paper's Fig. 9.
-            if (w == child && cv.imageLength + ss * segLen <= childSnapTol[w]) continue;
+            if (other == slot && cv.imageLength + ss * segLen <= homeReach) continue;
             noteApproach(w, other, d);
             if (d <= childSnapTol[w] && d < snapGap) {
                 snapGap = d; snapSlot = other; snapChild = w; snapS = ss;

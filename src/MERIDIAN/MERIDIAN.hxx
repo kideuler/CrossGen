@@ -186,6 +186,10 @@ public:
         double arrangementMerge = 1e-7;
         double arrangementCorner = 0.35;
         double arrangementCollapse = 1e-4;
+        // End a separatrix Q5 did not close at the first layout edge it meets,
+        // as a T-junction, rather than leaving it with a loose end in the
+        // middle of a face. See Arrangement::Options::trimUnresolvedAtCrossings.
+        bool arrangementTrim = true;
 
         // Stage 9, Sec. 5. Three cubic segments per arc is 6x6 control points
         // per patch, which is what the paper uses for the firewall and the
@@ -226,6 +230,12 @@ public:
         // models whose cones Stage 1 left clustered. See
         // SubdomainLabels::adoptCurves for why a cap helps at all.
         int repairMaxPerPass = 4;
+        // Whether a repair round is judged on the arrangement its curves cut S
+        // into as well as on the curves themselves. See
+        // RepairOptions::scoreArrangement.
+        bool repairScoresArrangement = true;
+        // Rounds in a row that may fail to improve before the loop gives up.
+        int repairPatience = 2;
     };
 
     struct Status {
@@ -317,6 +327,29 @@ public:
         double gapLimit = 1e-3;
         double lambdaBoost = 10.0;
         int outerSteps = 4;
+
+        // Score each round on the arrangement the curves cut S into, not only
+        // on the curves.
+        //
+        // Q5 is a statement about the curves and the loop has to have it, but a
+        // caller does not want curves, it wants patches: the failure that costs
+        // it a patch is a face with three corners or a cone one arc short, and
+        // those are counted in Stage 8 and nowhere earlier. Two rounds can be
+        // indistinguishable in unterminated curves and grazes and differ by
+        // three broken patches, and without this the loop cannot tell them
+        // apart and keeps whichever came second. Stage 8 costs well under a
+        // percent of a round, so there is no reason not to look.
+        bool scoreArrangement = true;
+        Arrangement::Options arrangement;
+
+        // How many rounds in a row may fail to improve before the loop gives
+        // up. One is the old behaviour -- stop at the first round that does not
+        // pay -- and it is a round too few: a constraint that only helps once
+        // its partner is also in costs on the round it is added and pays on the
+        // next, which is exactly what a pair of clustered cones does. Whatever
+        // the loop ends on, the map and the paths of the best round it saw are
+        // what it returns, so patience can only cost time.
+        int patience = 2;
     };
 
     struct RepairResult {

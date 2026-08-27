@@ -296,6 +296,10 @@ void LayoutEnergy::buildConstraintTerms() {
         if (t.coeffs.empty()) continue;
         cterms.push_back(std::move(t));
     }
+
+    // The proxy's pattern is the union of the mesh's blocks and these terms',
+    // so it changes exactly when they do and has to be rebuilt with them.
+    buildHessianPattern();
 }
 
 // ---------------------------------------------------------------------------
@@ -338,34 +342,31 @@ double LayoutEnergy::energy(const std::vector<double> &xx, double *o1, double *o
 // invite them to disagree.
 // ---------------------------------------------------------------------------
 bool LayoutEnergy::model(const std::vector<double> &xx, std::vector<double> &grad,
-                         std::vector<Eigen::Triplet<double>> &trips) const {
+                         Eigen::SparseMatrix<double> &H) const {
     grad.assign(2 * nV, 0.0);
-    trips.clear();
-    trips.reserve(cm->triangles.size() * 144 + cterms.size() * 16);
-
-    std::vector<int> reduced(2 * nV, -1);
-    int n = 0;
-    for (int d = 0; d < 2 * nV; ++d) {
-        if (d == dofU(options.pinnedVertex) || d == dofV(options.pinnedVertex)) continue;
-        reduced[d] = n++;
-    }
-
-    auto push = [&](const std::vector<std::pair<int, double>> &c, double w2, double res) {
-        for (const auto &ci : c) grad[ci.first] += 2.0 * w2 * res * ci.second;
-        for (const auto &ci : c) {
-            const int ri = reduced[ci.first];
-            if (ri < 0) continue;
-            for (const auto &cj : c) {
-                const int rj = reduced[cj.first];
-                if (rj < 0) continue;
-                trips.emplace_back(ri, rj, 2.0 * w2 * ci.second * cj.second);
-            }
-        }
-    };
+    double *val = H.valuePtr();
+    if (val) std::fill(val, val + H.nonZeros(), 0.0);
 
     // --- E1, by the SLIM proxy -------------------------------------------
+    //
+    // The 6x6 local block is written down whole rather than assembled from the
+    // four rank-one pieces one (p, q) at a time. Collecting them costs nothing
+    // and is exact: with
+    //
+    //     c^{pq}_{ak} = W_{pa} g^q_k,   g^q = (-(M_{0q} + M_{1q}), M_{0q}, M_{1q})
+    //
+    // the four outer products sum to
+    //
+    //     sum_{pq} c^{pq}_{ak} c^{pq}_{bl} = (W^T W)_{ab} (sum_q g^q_k g^q_l)
+    //
+    // and W is symmetric, so the block is 2 w (W^2 (x) G): a Kronecker product
+    // of a 2x2 with a 3x3, thirty-six numbers from a dozen multiplications
+    // rather than a hundred and forty-four triplets from four heap allocations.
+    // The same collection applies to the gradient, where the four residuals
+    // W(J - R)_{pq} assemble into the single 2x2 B = W^2 (J - R).
     double J[4];
-    for (int t = 0; t < static_cast<int>(cm->triangles.size()); ++t) {
+    const int nT = static_cast<int>(cm->triangles.size());
+    for (int t = 0; t < nT; ++t) {
         jacobian(xx, t, J);
         const double det = J[0] * J[3] - J[1] * J[2];
         if (!(det > 0.0)) return false;
@@ -378,44 +379,177 @@ bool LayoutEnergy::model(const std::vector<double> &xx, std::vector<double> &gra
         // W = U diag(w0, w1) U^T.
         const double W[4] = {w0 * c * c + w1 * sn * sn, (w0 - w1) * c * sn,
                              (w0 - w1) * c * sn,       w0 * sn * sn + w1 * c * c};
-        // R = U V^T, the nearest rotation.
+        // J - R, R = U V^T being the nearest rotation.
         const double cr = std::cos(s.rot), sr = std::sin(s.rot);
-        const double Rm[4] = {cr, -sr, sr, cr};
-        const double WR[4] = {W[0] * Rm[0] + W[1] * Rm[2], W[0] * Rm[1] + W[1] * Rm[3],
-                              W[2] * Rm[0] + W[3] * Rm[2], W[2] * Rm[1] + W[3] * Rm[3]};
-        const double WJ[4] = {W[0] * J[0] + W[1] * J[2], W[0] * J[1] + W[1] * J[3],
-                              W[2] * J[0] + W[3] * J[2], W[2] * J[1] + W[3] * J[3]};
+        const double D[4] = {J[0] - cr, J[1] + sr, J[2] - sr, J[3] - cr};
+
+        const double W2[4] = {W[0] * W[0] + W[1] * W[2], W[0] * W[1] + W[1] * W[3],
+                              W[2] * W[0] + W[3] * W[2], W[2] * W[1] + W[3] * W[3]};
+        const double B[4] = {W2[0] * D[0] + W2[1] * D[2], W2[0] * D[1] + W2[1] * D[3],
+                             W2[2] * D[0] + W2[3] * D[2], W2[2] * D[1] + W2[3] * D[3]};
+
+        const auto &M = refM[t];
+        const double g[2][3] = {{-(M[0] + M[2]), M[0], M[2]},
+                                {-(M[1] + M[3]), M[1], M[3]}};
+        double G[3][3];
+        for (int k = 0; k < 3; ++k) {
+            for (int l = 0; l < 3; ++l) G[k][l] = g[0][k] * g[0][l] + g[1][k] * g[1][l];
+        }
 
         const Triangle &tri = cm->triangles[t];
-        const auto &M = refM[t];
         // The proxy carries a factor of one half so that its gradient is the
         // true gradient of A * D(sigma) and not twice it; without that, E1
         // would silently outweigh E2..E5 by a factor of two.
-        const double w2 = 0.5 * lambda[1] * refArea[t];
+        const double w = 2.0 * (0.5 * lambda[1] * refArea[t]);
 
-        for (int p = 0; p < 2; ++p) {
-            for (int q = 0; q < 2; ++q) {
-                std::vector<std::pair<int, double>> coeff;
-                coeff.reserve(6);
-                for (int a = 0; a < 2; ++a) {
-                    const double wpa = W[2 * p + a];
-                    if (wpa == 0.0) continue;
-                    const double m0 = M[0 * 2 + q];
-                    const double m1 = M[1 * 2 + q];
-                    coeff.push_back({2 * tri[0] + a, -wpa * (m0 + m1)});
-                    coeff.push_back({2 * tri[1] + a, wpa * m0});
-                    coeff.push_back({2 * tri[2] + a, wpa * m1});
+        for (int a = 0; a < 2; ++a) {
+            for (int k = 0; k < 3; ++k) {
+                grad[2 * tri[k] + a] += w * (B[2 * a] * g[0][k] + B[2 * a + 1] * g[1][k]);
+            }
+        }
+
+        const int *slot = triSlot.data() + 36 * t;
+        for (int a = 0; a < 2; ++a) {
+            for (int b = 0; b < 2; ++b) {
+                const double wab = w * W2[2 * a + b];
+                if (wab == 0.0) continue;
+                for (int k = 0; k < 3; ++k) {
+                    const int *row = slot + (a * 3 + k) * 6 + b * 3;
+                    for (int l = 0; l < 3; ++l) {
+                        if (row[l] >= 0) val[row[l]] += wab * G[k][l];
+                    }
                 }
-                push(coeff, w2, WJ[2 * p + q] - WR[2 * p + q]);
             }
         }
     }
 
     // --- E2 to E5, exactly ------------------------------------------------
-    for (const Term &t : cterms) {
-        push(t.coeffs, lambda[t.which] * t.gweight, residualOf(t, xx));
+    for (size_t i = 0; i < cterms.size(); ++i) {
+        const Term &t = cterms[i];
+        const double w2 = lambda[t.which] * t.gweight;
+        const double res = residualOf(t, xx);
+        const int k = static_cast<int>(t.coeffs.size());
+        const int *slot = termSlot.data() + termSlotStart[i];
+        for (int p = 0; p < k; ++p) grad[t.coeffs[p].first] += 2.0 * w2 * res * t.coeffs[p].second;
+        for (int p = 0; p < k; ++p) {
+            const double cp = 2.0 * w2 * t.coeffs[p].second;
+            const int *row = slot + p * k;
+            for (int q = 0; q < k; ++q) {
+                if (row[q] >= 0) val[row[q]] += cp * t.coeffs[q].second;
+            }
+        }
     }
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// buildHessianPattern()
+//
+// Where every local entry of the proxy Hessian lands, worked out once. The
+// pattern is the union of a 6x6 block per triangle -- (u, v) at its three
+// vertices -- and a k x k block per constraint term over its own coefficient
+// list, with the two pinned dofs struck out and the diagonal added whether or
+// not anything writes to it. Nothing in that list depends on x, on lambda or on
+// the SLIM weights, which is why it can be a fixed array scattered into rather
+// than a triplet list rebuilt, sorted and collapsed at every inner iteration.
+//
+// The diagonal is there for innerSolve()'s Tikhonov fallback: a shift added to
+// entries that already exist leaves the pattern alone, and leaving the pattern
+// alone is what lets the symbolic factorisation be computed once per constraint
+// set instead of once per solve.
+// ---------------------------------------------------------------------------
+void LayoutEnergy::buildHessianPattern() {
+    reducedDof.assign(2 * nV, -1);
+    nReduced = 0;
+    for (int d = 0; d < 2 * nV; ++d) {
+        if (d == dofU(options.pinnedVertex) || d == dofV(options.pinnedVertex)) continue;
+        reducedDof[d] = nReduced++;
+    }
+
+    const int nT = static_cast<int>(cm->triangles.size());
+    triSlot.assign(static_cast<size_t>(36) * nT, -1);
+
+    termSlotStart.assign(cterms.size() + 1, 0);
+    size_t total = 0;
+    for (size_t i = 0; i < cterms.size(); ++i) {
+        termSlotStart[i] = static_cast<int>(total);
+        total += cterms[i].coeffs.size() * cterms[i].coeffs.size();
+    }
+    termSlotStart.back() = static_cast<int>(total);
+    termSlot.assign(total, -1);
+
+    analysed = false;
+    diagSlot.assign(std::max(0, nReduced), -1);
+    if (nReduced == 0) { Hproxy.resize(0, 0); return; }
+
+    std::vector<Eigen::Triplet<double>> pat;
+    pat.reserve(static_cast<size_t>(nReduced) + static_cast<size_t>(36) * nT + total);
+    for (int i = 0; i < nReduced; ++i) pat.emplace_back(i, i, 0.0);
+
+    std::vector<int> ld(6, -1);
+    for (int t = 0; t < nT; ++t) {
+        const Triangle &tri = cm->triangles[t];
+        for (int a = 0; a < 2; ++a) {
+            for (int k = 0; k < 3; ++k) ld[a * 3 + k] = reducedDof[2 * tri[k] + a];
+        }
+        for (int r = 0; r < 6; ++r) {
+            if (ld[r] < 0) continue;
+            for (int q = 0; q < 6; ++q) {
+                if (ld[q] < 0) continue;
+                pat.emplace_back(ld[r], ld[q], 0.0);
+            }
+        }
+    }
+    for (const Term &t : cterms) {
+        for (const auto &ci : t.coeffs) {
+            const int ri = reducedDof[ci.first];
+            if (ri < 0) continue;
+            for (const auto &cj : t.coeffs) {
+                const int rj = reducedDof[cj.first];
+                if (rj < 0) continue;
+                pat.emplace_back(ri, rj, 0.0);
+            }
+        }
+    }
+
+    Hproxy.resize(nReduced, nReduced);
+    Hproxy.setFromTriplets(pat.begin(), pat.end());
+    Hproxy.makeCompressed();
+
+    const int *outer = Hproxy.outerIndexPtr();
+    const int *inner = Hproxy.innerIndexPtr();
+    auto slotOf = [&](int r, int col) -> int {
+        const int *b = inner + outer[col], *e = inner + outer[col + 1];
+        const int *it = std::lower_bound(b, e, r);
+        return (it != e && *it == r) ? static_cast<int>(it - inner) : -1;
+    };
+
+    for (int i = 0; i < nReduced; ++i) diagSlot[i] = slotOf(i, i);
+
+    for (int t = 0; t < nT; ++t) {
+        const Triangle &tri = cm->triangles[t];
+        for (int a = 0; a < 2; ++a) {
+            for (int k = 0; k < 3; ++k) ld[a * 3 + k] = reducedDof[2 * tri[k] + a];
+        }
+        int *slot = triSlot.data() + 36 * t;
+        for (int r = 0; r < 6; ++r) {
+            for (int q = 0; q < 6; ++q) {
+                slot[r * 6 + q] = (ld[r] < 0 || ld[q] < 0) ? -1 : slotOf(ld[r], ld[q]);
+            }
+        }
+    }
+    for (size_t i = 0; i < cterms.size(); ++i) {
+        const Term &t = cterms[i];
+        const int k = static_cast<int>(t.coeffs.size());
+        int *slot = termSlot.data() + termSlotStart[i];
+        for (int p = 0; p < k; ++p) {
+            const int ri = reducedDof[t.coeffs[p].first];
+            for (int q = 0; q < k; ++q) {
+                const int rj = reducedDof[t.coeffs[q].first];
+                slot[p * k + q] = (ri < 0 || rj < 0) ? -1 : slotOf(ri, rj);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -472,42 +606,37 @@ bool LayoutEnergy::innerSolve(int outer) {
     // stopping test below needs the extent of the image this solve starts from,
     // not psi_R's.
     updateExtent();
-    std::vector<double> grad, dir(2 * nV, 0.0), trial(2 * nV, 0.0);
-    std::vector<Eigen::Triplet<double>> trips;
+    if (nReduced == 0) return false;
 
-    std::vector<int> reduced(2 * nV, -1);
-    int n = 0;
-    for (int d = 0; d < 2 * nV; ++d) {
-        if (d == dofU(options.pinnedVertex) || d == dofV(options.pinnedVertex)) continue;
-        reduced[d] = n++;
-    }
-    if (n == 0) return false;
+    std::vector<double> grad, dir(2 * nV, 0.0), trial(2 * nV, 0.0);
+    Eigen::VectorXd rhs(nReduced), sol;
 
     bool moved = false;
     for (int it = 0; it < options.innerIterations; ++it) {
-        if (!model(x, grad, trips)) {
+        if (!model(x, grad, Hproxy)) {
             report.messages.push_back("The map inverted before the model could be built.");
             return moved;
         }
 
-        Eigen::SparseMatrix<double> H(n, n);
-        H.setFromTriplets(trips.begin(), trips.end());
+        for (int d = 0; d < 2 * nV; ++d) if (reducedDof[d] >= 0) rhs[reducedDof[d]] = -grad[d];
 
-        Eigen::VectorXd rhs(n);
-        for (int d = 0; d < 2 * nV; ++d) if (reduced[d] >= 0) rhs[reduced[d]] = -grad[d];
+        // The ordering and the elimination tree come from the pattern, which
+        // has not changed since buildHessianPattern() and will not change until
+        // the constraint set does; only the numbers have.
+        if (!analysed) { ldlt.analyzePattern(Hproxy); analysed = true; }
 
-        Eigen::VectorXd sol;
+        double *val = Hproxy.valuePtr();
         bool solved = false;
-        double reg = 0.0;
+        double reg = 0.0, applied = 0.0;
         for (int attempt = 0; attempt < 4 && !solved; ++attempt) {
-            Eigen::SparseMatrix<double> A = H;
-            if (reg > 0.0) {
-                Eigen::SparseMatrix<double> I(n, n);
-                I.setIdentity();
-                A += I * reg;
+            if (reg != applied) {
+                const double delta = reg - applied;
+                for (int i = 0; i < nReduced; ++i) {
+                    if (diagSlot[i] >= 0) val[diagSlot[i]] += delta;
+                }
+                applied = reg;
             }
-            Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> ldlt;
-            ldlt.compute(A);
+            ldlt.factorize(Hproxy);
             if (ldlt.info() == Eigen::Success) {
                 sol = ldlt.solve(rhs);
                 if (ldlt.info() == Eigen::Success && sol.allFinite()) solved = true;
@@ -518,9 +647,11 @@ bool LayoutEnergy::innerSolve(int outer) {
                 // so a failure here is conditioning rather than indefiniteness;
                 // a Tikhonov shift is the right response and biases the
                 // direction towards gradient descent, which the line search
-                // then makes safe.
+                // then makes safe. Added on the diagonal the pattern already
+                // carries, so the symbolic factorisation still holds.
                 double biggest = 1.0;
-                for (const auto &tr : trips) biggest = std::max(biggest, std::fabs(tr.value()));
+                const int nz = static_cast<int>(Hproxy.nonZeros());
+                for (int i = 0; i < nz; ++i) biggest = std::max(biggest, std::fabs(val[i]));
                 reg = (reg == 0.0) ? 1e-9 * biggest : reg * 100.0;
             }
         }
@@ -530,7 +661,7 @@ bool LayoutEnergy::innerSolve(int outer) {
         }
 
         std::fill(dir.begin(), dir.end(), 0.0);
-        for (int d = 0; d < 2 * nV; ++d) if (reduced[d] >= 0) dir[d] = sol[reduced[d]];
+        for (int d = 0; d < 2 * nV; ++d) if (reducedDof[d] >= 0) dir[d] = sol[reducedDof[d]];
 
         double slope = 0.0, dnorm = 0.0;
         for (int d = 0; d < 2 * nV; ++d) {
@@ -541,7 +672,7 @@ bool LayoutEnergy::innerSolve(int outer) {
         if (!(slope < 0.0)) {
             // Cannot happen with a positive semi-definite proxy and a nonzero
             // step, but a regularised solve that stopped early can produce it.
-            for (int d = 0; d < 2 * nV; ++d) dir[d] = (reduced[d] >= 0) ? -grad[d] : 0.0;
+            for (int d = 0; d < 2 * nV; ++d) dir[d] = (reducedDof[d] >= 0) ? -grad[d] : 0.0;
             slope = 0.0;
             for (int d = 0; d < 2 * nV; ++d) slope += grad[d] * dir[d];
             if (!(slope < 0.0)) break;
@@ -942,8 +1073,8 @@ double LayoutEnergy::checkGradient(int samples, double h) const {
     }
 
     std::vector<double> grad;
-    std::vector<Eigen::Triplet<double>> trips;
-    if (!model(xt, grad, trips)) return kInf;
+    Eigen::SparseMatrix<double> H = Hproxy;
+    if (!model(xt, grad, H)) return kInf;
 
     double scale = 0.0;
     for (double g : grad) scale = std::max(scale, std::fabs(g));

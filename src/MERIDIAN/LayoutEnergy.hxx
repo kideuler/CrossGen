@@ -313,8 +313,30 @@ private:
 
     // The quadratic model at x: gradient of the true objective, and the
     // Hessian of the proxy. Returns false if the map has already inverted.
+    //
+    // `H` is written *into an existing pattern* -- buildHessianPattern()'s --
+    // rather than assembled from a triplet list. Both halves of that matter and
+    // neither is a micro-optimisation. The pattern of the proxy Hessian depends
+    // on the mesh and on the constraint set and on nothing else: not on x, not
+    // on lambda, not on the SLIM weights. Rebuilding it from ~570k triplets at
+    // every inner iteration -- sorting them, collapsing the duplicates, and
+    // then handing the result to a factorisation that recomputes its fill
+    // ordering from scratch -- was a little under half of the whole pipeline's
+    // running time on this corpus, all of it spent rediscovering the same
+    // answer. Written this way the inner iteration scatters into a fixed array
+    // and the ordering is computed once per constraint set.
     bool model(const std::vector<double> &x, std::vector<double> &grad,
-               std::vector<Eigen::Triplet<double>> &trips) const;
+               Eigen::SparseMatrix<double> &H) const;
+
+    // The sparsity of that proxy, and the slot in its value array that each
+    // local contribution lands in. Rebuilt whenever the constraint set changes
+    // -- which is buildConstraintTerms(), and therefore also relabel() and
+    // rebuildConstraints() -- and never otherwise.
+    //
+    // The diagonal is always in the pattern even where nothing writes to it, so
+    // that the Tikhonov shift of innerSolve()'s fallback can be added in place
+    // without changing the pattern and forcing a re-analysis.
+    void buildHessianPattern();
 
     // The constraint terms. E2 to E5 are exactly quadratic in the unknowns
     // with a zero target, so each is a single squared linear form and the
@@ -385,6 +407,27 @@ private:
     std::vector<double> refArea;
     std::vector<Term> cterms;
     Reference currentReference = Reference::Ricci;
+
+    // --- the proxy Hessian, assembled in place ----------------------------
+    // reducedDof maps a dof to its row of the reduced system, or -1 for the two
+    // pinned ones. Hproxy carries the pattern; triSlot and termSlot say where
+    // each local entry goes in its value array, in the same order model()
+    // produces them (a triangle contributes a 6x6 block over
+    // (u,v) x (its three vertices); a constraint term a k x k block over its
+    // own coefficient list). A -1 slot is an entry against a pinned dof.
+    std::vector<int> reducedDof;
+    int nReduced = 0;
+    Eigen::SparseMatrix<double> Hproxy;
+    std::vector<int> triSlot;        // 36 per triangle
+    std::vector<int> termSlotStart;  // cterms.size() + 1 prefix sums
+    std::vector<int> termSlot;       // k*k per term
+    std::vector<int> diagSlot;       // nReduced, for the Tikhonov shift
+
+    // The symbolic half of the factorisation, which depends on the pattern and
+    // not on the values, so it survives every inner iteration at every level of
+    // lambda. `analysed` is cleared with the pattern.
+    Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> ldlt;
+    bool analysed = false;
 
     double lambda[6] = {1.0, 1.0, 0.0, 0.0, 0.0, 0.0};   // lambda[1..5]
     // Diagonal of the image, the scale residuals are read against. Kept current

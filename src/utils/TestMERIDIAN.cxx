@@ -235,6 +235,9 @@ void usage(const char *argv0) {
               << "  --merge <t>        node merge tolerance, of the model  (default 1e-7)\n"
               << "  --corner <r>       corner tolerance, radians           (default 0.35)\n"
               << "  --collapse <t>     sliver-arc tolerance, of the model  (default 1e-4)\n"
+              << "  --no-trim          leave a winding separatrix's loose end where it stopped\n"
+              << "  --no-arr-score     judge a repair round on the curves alone, not the layout\n"
+              << "  --patience <n>     repair rounds that may fail to improve  (default 2)\n"
               << "  --arcs <file.obj>  write the layout arcs on the model\n"
               << "  --faces <file.obj> write the layout faces as polylines\n"
               << "  --no-splines       skip Stage 9 (spline reconstruction)\n"
@@ -295,6 +298,9 @@ int main(int argc, char **argv) {
         else if (a == "--merge" && i + 1 < argc)   opts.arrangementMerge = std::stod(argv[++i]);
         else if (a == "--corner" && i + 1 < argc)  opts.arrangementCorner = std::stod(argv[++i]);
         else if (a == "--collapse" && i + 1 < argc) opts.arrangementCollapse = std::stod(argv[++i]);
+        else if (a == "--no-trim")                 opts.arrangementTrim = false;
+        else if (a == "--no-arr-score")            opts.repairScoresArrangement = false;
+        else if (a == "--patience" && i + 1 < argc) opts.repairPatience = std::stoi(argv[++i]);
         else if (a == "--arcs" && i + 1 < argc)    arcsOut = argv[++i];
         else if (a == "--faces" && i + 1 < argc)   facesOut = argv[++i];
         else if (a == "--no-splines")              opts.runSplines = false;
@@ -897,6 +903,11 @@ int main(int argc, char **argv) {
             std::cout << ", " << arep.clusteredCones << " clustered cone pair(s) left alone";
         }
         std::cout << "\n";
+    }
+    if (arep.trimmedCurves > 0) {
+        std::cout << "  " << arep.trimmedCurves << " separatrix/ces that Q5 did not close were "
+                  << "ended at the first layout edge they met, as T-junctions rather than "
+                  << "loose ends\n";
     }
     if (arep.featureChains > 0) {
         std::cout << "  Feature chains: " << arep.featureChainsCovered << " of "

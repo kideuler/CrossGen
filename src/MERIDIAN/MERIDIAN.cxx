@@ -201,6 +201,12 @@ bool MERIDIAN::run() {
     ropts.gapLimit = options.repairGapLimit;
     ropts.lambdaBoost = options.repairLambdaBoost;
     ropts.outerSteps = options.repairOuterSteps;
+    ropts.scoreArrangement = options.runArrangement && options.repairScoresArrangement;
+    ropts.patience = options.repairPatience;
+    ropts.arrangement.mergeTolerance = options.arrangementMerge;
+    ropts.arrangement.cornerTolerance = options.arrangementCorner;
+    ropts.arrangement.collapseTolerance = options.arrangementCollapse;
+    ropts.arrangement.trimUnresolvedAtCrossings = options.arrangementTrim;
 
     RepairResult rep = traceAndRepair(*labels, *layout, sopts, ropts,
                                       [&](const std::string &m) {
@@ -247,6 +253,7 @@ bool MERIDIAN::run() {
     aopts.mergeTolerance = options.arrangementMerge;
     aopts.cornerTolerance = options.arrangementCorner;
     aopts.collapseTolerance = options.arrangementCollapse;
+    aopts.trimUnresolvedAtCrossings = options.arrangementTrim;
     try {
         arrangement = std::make_unique<Arrangement>(*separatrices, *labels, aopts);
     } catch (const std::exception &e) {
@@ -359,20 +366,46 @@ MERIDIAN::RepairResult MERIDIAN::traceAndRepair(SubdomainLabels &labels, LayoutE
     if (!retrace()) return out;
     out.traced = true;
 
+    // What "better" means, in order: not inverted -- a map that folded is never
+    // an improvement, whatever its residuals; then Q5 itself, the curves that
+    // terminated nowhere; then how far the arrangement is from being a set of
+    // patches, which is what a caller actually wanted; then Remark 3.1's sliver
+    // count, the curves that grazed a cone on their way out.
+    //
+    // Q5 stays ahead of the arrangement rather than the other way round, and
+    // the corpus is what settles it: scored the other way the loop will take a
+    // round that mends one broken patch at the price of two more curves that
+    // wind, because a curve that winds is only one defect in Stage 8 -- the
+    // T-junction trimUnresolvedAtCrossings ends it at -- while being a much
+    // worse thing to have. The arrangement is what separates rounds that Q5
+    // cannot tell apart, which is the job it was added for.
     auto quality = [&]() {
         const Separatrices::Report &r = out.separatrices->getReport();
-        return std::array<int, 3>{layout.getReport().invertedTriangles,
-                                  r.capped + r.cycled + r.stuck + r.degenerate,
+        int defects = 0;
+        if (opts.scoreArrangement) {
+            try {
+                Arrangement ar(*out.separatrices, labels, opts.arrangement);
+                const Arrangement::Report &a = ar.getReport();
+                defects = a.wrongCornerFaces + a.tJunctions + a.coneValenceErrors +
+                          a.danglingNodes + a.unsharedArcs;
+            } catch (const std::exception &) {
+                defects = 1 << 20;   // an arrangement that would not build at all
+            }
+        }
+        return std::array<int, 4>{layout.getReport().invertedTriangles,
+                                  r.capped + r.cycled + r.stuck + r.degenerate, defects,
                                   r.nearMisses + r.grazes};
     };
 
-    std::array<int, 3> best = quality();
+    std::array<int, 4> best = quality();
     std::vector<Point> bestMap = layout.saveMap();
+    size_t bestPaths = labels.topoPaths().size();
+    bool atBest = true;
+    int stale = 0;
 
     for (int pass = 1; pass <= opts.passes; ++pass) {
-        if (best[1] == 0 && best[2] == 0) break;
+        if (best[1] == 0 && best[2] == 0 && best[3] == 0) break;
 
-        const size_t before = labels.topoPaths().size();
         const int added = labels.adoptCurves(*out.separatrices, opts.gapLimit, pass,
                                              opts.maxPerPass);
         if (added == 0) {
@@ -388,35 +421,54 @@ MERIDIAN::RepairResult MERIDIAN::traceAndRepair(SubdomainLabels &labels, LayoutE
         drainLayout();
 
         const bool traced = retrace();
-        const std::array<int, 3> now =
-            traced ? quality() : std::array<int, 3>{1 << 20, 1 << 20, 1 << 20};
-
-        if (now > best) {
-            std::ostringstream oss;
-            oss << "Stage 6: repair pass " << pass << " left the layout worse than it found "
-                << "it (" << now[1] << " separatrix/ces terminating nowhere and " << now[2]
-                << " grazing a cone, against " << best[1] << " and " << best[2]
-                << " before), so its " << added << " constraint(s) and the map they produced "
-                << "were taken back. What stands is the last map that improved.";
-            log(oss.str());
-
-            // Order matters: the paths go first so that rebuildConstraints()
-            // assembles Eqs. (15) to (19) over the set that is being kept, and
-            // loadMap() goes last so that the residuals and the verdict in the
-            // Report are the ones of the map actually being returned.
-            labels.truncateTopoPaths(before);
-            layout.rebuildConstraints();
-            layout.loadMap(bestMap);
-            ++out.rolledBack;
-            retrace();
-            break;
-        }
+        const std::array<int, 4> now =
+            traced ? quality() : std::array<int, 4>{1 << 20, 1 << 20, 1 << 20, 1 << 20};
 
         out.passesTaken = pass;
         out.constraintsAdded += added;
-        best = now;
-        bestMap = layout.saveMap();
-        if (!traced) break;
+
+        if (now < best) {
+            best = now;
+            bestMap = layout.saveMap();
+            bestPaths = labels.topoPaths().size();
+            atBest = true;
+            stale = 0;
+        } else {
+            // Not an improvement. That is not by itself a reason to stop: a
+            // round adds the constraint for one pair of cones, and a pair that
+            // needs two constraints to be worth anything -- the second cone of
+            // a cluster, the far side of a seam -- costs before it pays. What
+            // is a reason to stop is `patience` of them in a row, by which
+            // point the constraint set is being added to and nothing is coming
+            // of it.
+            atBest = false;
+            ++stale;
+            if (!traced || stale >= std::max(1, opts.patience)) break;
+        }
+    }
+
+    // Back to the best round the loop saw, which is what makes it monotone:
+    // more rounds cannot leave a worse result than fewer, only a slower one.
+    // That is what allows the repair to be on by default.
+    //
+    // Order matters. The paths go first so that rebuildConstraints() assembles
+    // Eqs. (15) to (19) over the set that is being kept; loadMap() goes last so
+    // that the residuals and the verdict in the Report are the ones of the map
+    // actually being returned.
+    if (!atBest) {
+        std::ostringstream oss;
+        oss << "Stage 6: the last " << stale << " repair pass(es) did not improve on what "
+            << "they found (" << best[1] << " separatrix/ces terminating nowhere, " << best[2]
+            << " defect(s) in the arrangement, " << best[3] << " grazing a cone), so their "
+            << "constraints and the maps they produced were taken back. What stands is the "
+            << "last round that improved.";
+        log(oss.str());
+
+        labels.truncateTopoPaths(bestPaths);
+        layout.rebuildConstraints();
+        layout.loadMap(bestMap);
+        ++out.rolledBack;
+        retrace();
     }
 
     // The Stage 7 diagnostics of the map that is actually being returned, and
