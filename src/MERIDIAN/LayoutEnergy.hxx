@@ -107,6 +107,43 @@
 // restarting the distortion term from a different notion of undistorted, and
 // the continuation never settles.
 //
+// ### Why the reference switch is off here, and the relabel is not
+//
+// The paper's S is a midsurface embedded in R^3, and there "the Euclidean
+// geometry the surface came with" means its induced metric -- a curved metric,
+// whose curvature the Ricci metric redistributes into the cones but does not
+// invent. The two references then really are two nearby notions of undistorted
+// and alternating between them is a genuine escape.
+//
+// This codebase is planar. The domain arrives as a flat triangulation, so its
+// Euclidean metric has an angle sum of exactly 2pi at every interior vertex:
+// it has **no cones at all**. The Ricci metric has the cone angles Stage 1
+// prescribed, 2pi - (pi/2) I. So on a planar input the two references do not
+// differ by a choice of local minimum, they differ by the whole cone structure,
+// and "J is a rotation" and Q2 are contradictory statements about the same
+// vertex. E1 cannot win that argument -- lambda_2..5 reach 1e5 to 1e7 and the
+// constraints are met to machine precision -- so it settles it the only way it
+// can: the map becomes an isometry of the *model* everywhere except the cones,
+// and the entire (pi/2) I of angle defect is crammed into the cone's one ring.
+//
+// That is not a subtle degradation. On geom003, a disk, psi_R hands over cone
+// fans of six triangles at 44.1 to 45.9 degrees apiece -- the conformal answer.
+// One switch to the Euclidean reference turns the same fan into
+// 26.6, 12.1, 58.6, 148.6, 11.7, 12.5, still summing to the required 270. The
+// separatrices leave along the image axes, so two of the three leave inside the
+// single fat triangle, the layout's centre patch acquires four reflex corners
+// on the model, its Coons blend folds, and Stage 10 inverts elements it cannot
+// smooth out. The layout is topologically perfect throughout -- the O-grid a
+// disk should get -- and geometrically unusable.
+//
+// Rescaling the Euclidean reference to the Ricci one's total area does not help
+// (measured: identical result), which is the check that this is about the cones
+// and not about the 140x global scale between the two.
+//
+// So `alternateReference` defaults to false. The relabel escape is unaffected
+// by any of this and stays on: it re-reads Gamma_u / Gamma_v from the current
+// map and says nothing about what "undistorted" means.
+//
 // ### One departure from a uniform lambda schedule
 //
 // lambda_2, lambda_3 and lambda_5 start at lambda_init because their
@@ -162,7 +199,11 @@ public:
         int maxBacktracks = 50;
 
         Reference reference = Reference::Ricci;
-        bool alternateReference = true;
+
+        // Off: on a planar input the Euclidean reference has no cones, so it
+        // fights Q2 rather than offering a second local minimum. See "Why the
+        // reference switch is off here" above.
+        bool alternateReference = false;
         bool relabel = true;
 
         int pinnedVertex = 0;

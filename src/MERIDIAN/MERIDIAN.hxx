@@ -163,7 +163,12 @@ public:
         double lambdaGrowth = 10.0;
         int outerSteps = 16;
         int innerIterations = 60;
-        bool alternateReference = true;
+        // Stage 6's stall escape that swaps E1's reference metric between the
+        // Ricci one and the model's own Euclidean one. Off, because a planar
+        // model has no cones in its Euclidean metric and the switch then
+        // shreds the cone one-rings to satisfy Q2; LayoutEnergy.hxx, "Why the
+        // reference switch is off here", has the measurement.
+        bool alternateReference = false;
         bool relabelBetweenSteps = true;
 
         // Gamma_topo. Remark 3.1: without the connectivity constraints a

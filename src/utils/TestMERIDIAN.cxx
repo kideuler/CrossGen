@@ -214,6 +214,9 @@ void usage(const char *argv0) {
               << "  --lambda <l>       initial lambda_2..lambda_5    (default 1e-2)\n"
               << "  --growth <g>       lambda growth per outer step  (default 10)\n"
               << "  --near-miss <f>    Gamma_topo seeding tolerance      (default 0.15)\n"
+              << "  --alt-ref          let a stalled Stage 6 swap E1's reference to\n"
+              << "                     the model's Euclidean metric (off; it has no\n"
+              << "                     cones, so it shreds the cone one-rings)\n"
               << "  --no-topo          skip the Gamma_topo seeding (E5 off)\n"
               << "  --no-layout        stop after Stage 4\n"
               << "  --no-trace         skip Stage 7 (separatrix tracing)\n"
@@ -287,6 +290,7 @@ int main(int argc, char **argv) {
         else if (a == "--inner" && i + 1 < argc)   opts.innerIterations = std::stoi(argv[++i]);
         else if (a == "--lambda" && i + 1 < argc)  opts.lambdaInit = std::stod(argv[++i]);
         else if (a == "--growth" && i + 1 < argc)  opts.lambdaGrowth = std::stod(argv[++i]);
+        else if (a == "--alt-ref")                 opts.alternateReference = true;
         else if (a == "--no-topo")                 opts.seedTopoConstraints = false;
         else if (a == "--near-miss" && i + 1 < argc) opts.topoNearMiss = std::stod(argv[++i]);
         else if (a == "--no-layout")               opts.runLayout = false;
