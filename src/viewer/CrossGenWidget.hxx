@@ -21,6 +21,7 @@
 #include "MERIDIAN/LayoutEnergy.hxx"
 #include "MERIDIAN/RicciFlow.hxx"
 #include "MERIDIAN/Separatrices.hxx"
+#include "MERIDIAN/QuadMesh.hxx"
 #include "MERIDIAN/SplineFit.hxx"
 #include "MERIDIAN/SubdomainLabels.hxx"
 #include "Parameterization/CutMesh.hxx"
@@ -209,6 +210,7 @@ enum class MERIDIANPhase {
     Layout       = 8,
     Separatrices = 9,
     Patches      = 10,
+    Mesh         = 11,
 };
 
 // OASIS is a one-shot solve driven by a parameter dialog rather than a
@@ -375,6 +377,21 @@ private:
     void runMERIDIANPatches();
     bool meridianTraceIsClean() const;
 
+    // Stage 10: the quadrilateral mesh itself. A target edge length is a
+    // judgement about the model in the same way the connectivity tolerance is,
+    // so the phase opens on a dialog and 'c' at it opens the dialog again --
+    // one number, tried and looked at.
+    //
+    // Cancelling leaves whatever mesh is already there, so backing out of the
+    // dialog is never destructive.
+    bool promptMERIDIANMesh();
+
+    // Builds the mesh at the settings the dialog was left at, with the Winslow
+    // smoothing off: this is the grid transfinite interpolation gives, which is
+    // the one that answers whether the interval assignment was right. The
+    // smoothed mesh is a different question and TestMERIDIAN asks it.
+    void runMERIDIANMesh();
+
     // Whether a parameter domain occupies the right half of the window.
     bool inUVSplitScreen() const;
 
@@ -500,6 +517,8 @@ private:
     // labels, SplineFit to the arrangement, so they are cleared before either.
     std::optional<Arrangement>       arrangement_;
     std::optional<SplineFit>         splines_;
+    // Stage 10, holding a reference to the fit, so it is cleared before it.
+    std::optional<QuadMesh>          quadMesh_;
 
     // Guiding field for the OASIS orientation term. Held by shared_ptr because
     // OASIS keeps a reference to it for as long as it lives; separate from
@@ -569,6 +588,18 @@ private:
     bool separatricesAttempted_ = false;
     bool patchesAnnounced_      = false;
     bool patchesAttempted_      = false;
+    bool meshAttempted_         = false;
+
+    // Stage 10 settings, surviving a reset the way the connectivity ones do so
+    // that the dialog opens on whatever was last tried. The defaults are
+    // QuadMesh's own except for the smoothing, which the viewer never runs.
+    struct MERIDIANMeshSettings {
+        double target      = 0.05;
+        int    minEdges    = 1;
+        int    maxEdges    = 0;      // 0 = no ceiling
+        bool   useSplines  = true;
+    };
+    MERIDIANMeshSettings meshSettings_;
 
     // Chord collapse settings, surviving a reset the way oasisLambda_ does so
     // that the dialog opens on whatever was tried last.

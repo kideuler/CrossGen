@@ -290,6 +290,35 @@ bool MERIDIAN::run() {
     status.splinesValid = fr2.valid;
     for (const std::string &m : fr2.messages) status.messages.push_back("Stage 9: " + m);
 
+    // --- Stage 10: the quadrilateral mesh -------------------------------
+    // Run on whatever Stage 8 closed. A layout with three broken patches still
+    // meshes everywhere else, and the fraction of S left uncovered is a more
+    // useful statement of the damage than refusing to mesh at all.
+    if (!options.runQuadMesh) return status.layoutValid;
+    QuadMesh::Options qopts;
+    qopts.targetEdgeLength = options.quadTargetEdge;
+    qopts.minIntervals = options.quadMinIntervals;
+    qopts.maxIntervals = options.quadMaxIntervals;
+    qopts.useSplines = options.quadUseSplines;
+    qopts.smoothingPasses = options.quadSmoothingPasses;
+    qopts.smoothingThreshold = options.quadSmoothingThreshold;
+    try {
+        quads = std::make_unique<QuadMesh>(*splines, qopts);
+    } catch (const std::exception &e) {
+        status.messages.push_back(std::string("Stage 10: could not be built: ") + e.what());
+        return status.layoutValid;
+    }
+    const QuadMesh::Report &qr = quads->getReport();
+    status.quadMeshRan = true;
+    status.meshVertices = qr.vertices;
+    status.meshQuads = qr.quads;
+    status.meshChords = qr.chords;
+    status.meshUnmeshedPatches = qr.unmeshedPatches;
+    status.meshMinScaledJacobian = qr.minScaledJacobian;
+    status.meshConforming = qr.conforming;
+    status.meshValid = qr.valid;
+    for (const std::string &m : qr.messages) status.messages.push_back("Stage 10: " + m);
+
     return status.layoutValid;
 }
 

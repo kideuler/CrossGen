@@ -15,6 +15,7 @@
 #include "MERIDIAN/Immersion.hxx"
 #include "MERIDIAN/RicciFlow.hxx"
 #include "MERIDIAN/Separatrices.hxx"
+#include "MERIDIAN/QuadMesh.hxx"
 #include "MERIDIAN/SplineFit.hxx"
 #include "MERIDIAN/SubdomainLabels.hxx"
 #include "Parameterization/CutMesh.hxx"
@@ -418,5 +419,21 @@ void drawSeparatrixLegend(int fbw, int fbh);
 // faces of the subdivision too, and they are not blocks.
 void drawLayoutPatches(const Arrangement &arr, const SplineFit *fit,
                        double nodeRadius, float lineWidth, int samples = 16);
+
+// MERIDIAN Stage 10: the quadrilateral mesh the interval assignment and the
+// transfinite interpolation produced, drawn on S as edges only.
+//
+// A quad whose signed area is not positive is filled first, in red, before any
+// edge goes down. A folded element is not visible from its wireframe -- the
+// four edges of a bowtie look like the four edges of a quad -- and the whole
+// reason to look at this picture rather than read the report is to see where
+// the folds are, so they are given the one thing the rest of the mesh has not
+// got: a fill.
+//
+// `blockLineWidth` > 0 draws the block walls over the interior edges in a
+// second, heavier pass, which is what makes the structure legible: the interior
+// of a block is a regular grid, and where two of them meet the rows either
+// match or they do not.
+void drawQuadMesh(const QuadMesh &qm, float lineWidth, float blockLineWidth);
 
 } // namespace viewer

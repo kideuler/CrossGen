@@ -107,9 +107,10 @@ MERIDIANPhase nextMERIDIANPhase(MERIDIANPhase p) {
         case MERIDIANPhase::Metric:     return MERIDIANPhase::Layout;
         case MERIDIANPhase::Layout:     return MERIDIANPhase::Separatrices;
         case MERIDIANPhase::Separatrices: return MERIDIANPhase::Patches;
-        case MERIDIANPhase::Patches:    return MERIDIANPhase::Patches;
+        case MERIDIANPhase::Patches:    return MERIDIANPhase::Mesh;
+        case MERIDIANPhase::Mesh:       return MERIDIANPhase::Mesh;
     }
-    return MERIDIANPhase::Patches;
+    return MERIDIANPhase::Mesh;
 }
 
 MedialAxisPhase nextMedialAxisPhase(MedialAxisPhase p) {
@@ -187,6 +188,7 @@ const char *meridianPhaseName(MERIDIANPhase p) {
         case MERIDIANPhase::Layout:     return "8) layout Psi (Secs. 3.2.2, 3.3)";
         case MERIDIANPhase::Separatrices: return "9) separatrices (Sec. 4, Q5)";
         case MERIDIANPhase::Patches:    return "10) arrangement and splines (Secs. 4, 5)";
+        case MERIDIANPhase::Mesh:       return "11) quadrilateral mesh (Sec. 5)";
     }
     return "?";
 }
@@ -363,6 +365,24 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
                 runOASIS();
         } else if (mode_ != Mode::Unselected) {
             advancePhase();
+        }
+        break;
+
+    case Qt::Key_N:
+        // The connectivity dialog of Stages 5 to 7. It used to sit on 'c' at
+        // the Patches phase, which was the last one; Stage 10 is now, and 'c'
+        // there re-opens the mesh dialog. Which pairs of cones are meant to be
+        // joined is still a judgement about the model that only trying a number
+        // settles, so it keeps a key of its own.
+        if (mode_ == Mode::MERIDIAN && meridianPhase_ >= MERIDIANPhase::Patches &&
+            immersion_.has_value() && separatricesAttempted_) {
+            if (promptMERIDIANConnectivity(*immersion_, psiR_)) {
+                rerunMERIDIANConnectivity();
+                // Stages 8 and 9 are gone with the trace, and so is the mesh
+                // that stood on them; step back to the phase that rebuilds
+                // them rather than drawing over a stale one.
+                meridianPhase_ = MERIDIANPhase::Patches;
+            }
         }
         break;
 
@@ -550,6 +570,7 @@ void CrossGenWidget::doReset() {
     // Each MERIDIAN stage holds on to the ones before it, so they go in
     // reverse: the layout on the labels and the immersion, the immersion on the
     // cut, the flow and the cones, and both the flow and the cut on the cones.
+    quadMesh_.reset();
     splines_.reset();
     arrangement_.reset();
     separatrices_.reset();
@@ -601,6 +622,7 @@ void CrossGenWidget::doReset() {
     separatricesAttempted_ = false;
     patchesAnnounced_      = false;
     patchesAttempted_      = false;
+    meshAttempted_         = false;
 
     view_.cx    = 0.5 * (bounds_.minx + bounds_.maxx);
     view_.cy    = 0.5 * (bounds_.miny + bounds_.maxy);
@@ -2289,6 +2311,210 @@ void CrossGenWidget::runMERIDIANPatches() {
                  "green is a node of the arrangement");
 }
 
+// ── MERIDIAN Stage 10: the mesh dialog ───────────────────────────────────────
+//
+// One number matters here and the dialog says so: the target edge length, in
+// the units the model is in. Everything else on it is either a bound that is
+// almost never wanted or a switch for telling a meshing artefact apart from a
+// fitting one.
+//
+// The derived line under the spin box is the point of opening a dialog at all
+// rather than hard-coding 0.05. A target is an absolute length, and whether it
+// is a sensible one is a question about this model's size -- so the diagonal of
+// S and the number of edges that target puts across it are shown next to it,
+// and they move as the number does.
+bool CrossGenWidget::promptMERIDIANMesh() {
+    if (!splines_.has_value() || !arrangement_.has_value() || !mesh_) return false;
+
+    // The same diagonal QuadMesh measures for itself, off the same vertices.
+    Point lo{ std::numeric_limits<double>::infinity(),
+              std::numeric_limits<double>::infinity() };
+    Point hi{ -lo[0], -lo[1] };
+    for (const Point &p : mesh_->vertices) {
+        lo[0] = std::min(lo[0], p[0]); lo[1] = std::min(lo[1], p[1]);
+        hi[0] = std::max(hi[0], p[0]); hi[1] = std::max(hi[1], p[1]);
+    }
+    const double diag = std::hypot(hi[0] - lo[0], hi[1] - lo[1]);
+    const double extent = (diag > 0.0) ? diag : 1.0;
+
+    QDialog dlg(this);
+    dlg.setWindowTitle("MERIDIAN — Stage 10, quadrilateral mesh");
+
+    auto *targetBox = new QDoubleSpinBox(&dlg);
+    targetBox->setRange(1e-4, 10.0);
+    targetBox->setDecimals(4);
+    targetBox->setSingleStep(0.01);
+    targetBox->setValue(meshSettings_.target);
+    targetBox->setToolTip(
+        "Target length of a mesh edge, in the units of the model.\n"
+        "An absolute length, not a fraction: it is the same number\n"
+        "whatever the model is, and the line below says what it means here.");
+
+    auto *derived = new QLabel(&dlg);
+    derived->setTextFormat(Qt::PlainText);
+
+    const int patches = static_cast<int>(splines_->patches().size());
+    auto updateDerived = [targetBox, derived, extent, patches]() {
+        const double h = targetBox->value();
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(4)
+            << "diagonal of S                 = " << extent << "\n"
+            << "edges across it   diag / h    = " << std::setprecision(1)
+            << (extent / h) << "\n"
+            << patches << " patch(es) to mesh";
+        derived->setText(QString::fromStdString(oss.str()));
+    };
+    QObject::connect(targetBox, &QDoubleSpinBox::valueChanged, &dlg, updateDerived);
+    updateDerived();
+
+    // The floor is what keeps a chord across a thin sliver from vanishing; the
+    // ceiling is a guard against a target so fine the mesh will not fit in
+    // memory. Neither is normally touched, and a chord that hits one is
+    // reported as clamped, because the interval assignment did not choose it.
+    auto *minBox = new QSpinBox(&dlg);
+    minBox->setRange(1, 64);
+    minBox->setValue(meshSettings_.minEdges);
+    minBox->setToolTip("Fewest edges any chord may be given.");
+
+    auto *maxBox = new QSpinBox(&dlg);
+    maxBox->setRange(0, 4096);
+    maxBox->setValue(meshSettings_.maxEdges);
+    maxBox->setSpecialValueText("none");
+    maxBox->setToolTip("Most edges any chord may be given. 0 for no ceiling.");
+
+    auto *splineBox = new QCheckBox("place the nodes on the Stage 9 splines", &dlg);
+    splineBox->setChecked(meshSettings_.useSplines);
+    splineBox->setToolTip(
+        "On, the sides are sampled along the fitted B-splines and the interiors\n"
+        "come from the bicubic patch, so every node lies on the reconstructed\n"
+        "surface. Off, the traced polylines are used instead and the interiors\n"
+        "are a discrete Coons blend of them — the layout with no fit trusted\n"
+        "anywhere, which is what tells a meshing artefact from a fitting one.");
+
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    buttons->button(QDialogButtonBox::Ok)->setText("Mesh");
+    QObject::connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    QObject::connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+
+    auto *form = new QFormLayout(&dlg);
+    form->addRow("target edge length", targetBox);
+    form->addRow("implied sizing", derived);
+    form->addRow("fewest edges per chord", minBox);
+    form->addRow("most edges per chord", maxBox);
+    form->addRow(splineBox);
+    form->addRow(new QLabel("The grid is transfinite interpolation only:\n"
+                            "no smoothing is run on it.", &dlg));
+    form->addRow(buttons);
+
+    if (dlg.exec() != QDialog::Accepted) return false;
+
+    meshSettings_.target     = targetBox->value();
+    meshSettings_.minEdges   = minBox->value();
+    meshSettings_.maxEdges   = maxBox->value();
+    meshSettings_.useSplines = splineBox->isChecked();
+    return true;
+}
+
+// Stage 10, at the dialog's settings and with the smoothing off.
+//
+// Deliberately the raw transfinite grid: Winslow moves interior nodes off the
+// spacing the interval assignment chose for them, which is a good trade on a
+// folded block and a bad one everywhere else, and it is the assignment that
+// this phase is a picture of. What the smoothing buys is measured in
+// TestMERIDIAN, where the before and the after can be put side by side.
+void CrossGenWidget::runMERIDIANMesh() {
+    meshAttempted_ = true;
+    quadMesh_.reset();
+    if (!splines_.has_value()) {
+        console_.log("[Mesh] not built: Stage 9 produced no patches to mesh");
+        return;
+    }
+
+    QuadMesh::Options qopts;
+    qopts.targetEdgeLength = meshSettings_.target;
+    qopts.minIntervals     = meshSettings_.minEdges;
+    qopts.maxIntervals     = meshSettings_.maxEdges;
+    qopts.useSplines       = meshSettings_.useSplines;
+    qopts.smoothingPasses  = 0;   // the grid TFI gives, and nothing after it
+
+    auto t0 = Clock::now();
+    try {
+        quadMesh_.emplace(*splines_, qopts);
+    } catch (const std::exception &e) {
+        quadMesh_.reset();
+        console_.log(std::string("[Mesh] FAILED: ") + e.what());
+        return;
+    }
+    auto t1 = Clock::now();
+
+    const QuadMesh::Report &qr = quadMesh_->getReport();
+    {
+        std::ostringstream oss;
+        oss << "[Mesh] Stage 10: " << qr.quads << " quad(s) on " << qr.vertices
+            << " vertices over " << qr.blocks << " block(s), "
+            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+    }
+    {
+        // The assignment, and what it bought, read back off the finished mesh
+        // rather than asserted: the chords are what was chosen, the edge
+        // lengths are what came out.
+        std::ostringstream oss;
+        oss << "[Mesh] " << qr.chords << " chord(s) over " << qr.arcsAssigned
+            << " arc(s), " << qr.minIntervals << " to " << qr.maxIntervals
+            << " edges each (mean " << std::fixed << std::setprecision(2)
+            << qr.meanIntervals << ")";
+        if (qr.clampedChords > 0) oss << ", " << qr.clampedChords << " clamped by a bound";
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Mesh] edges " << std::fixed << std::setprecision(4) << qr.minEdge
+            << " to " << qr.maxEdge << " against a target of " << qr.target
+            << " (worst " << std::setprecision(2) << qr.worstEdgeRatio
+            << "x, rms log ratio " << std::setprecision(3) << qr.edgeRatioRms << ")";
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Mesh] scaled Jacobian " << std::fixed << std::setprecision(4)
+            << qr.minScaledJacobian << " worst, " << qr.meanScaledJacobian << " mean";
+        if (qr.invertedQuads > 0) {
+            oss << " -- " << qr.invertedQuads << " element(s) fold";
+            if (qr.reflexCorners > 0)
+                oss << " at " << qr.reflexCorners << " block corner(s) whose angle on the "
+                    << "model is more than pi, which no grid can cover unreversed";
+        }
+        console_.log(oss.str());
+    }
+    if (qr.unmeshedPatches > 0) {
+        std::ostringstream oss;
+        oss << "[Mesh] " << qr.unmeshedPatches
+            << " patch(es) not meshed -- Stage 8 did not close them as quadrilaterals of "
+            << "one arc a side; they are " << std::fixed << std::setprecision(4)
+            << qr.unmeshedArea << " of S and are left blank";
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Mesh] " << qr.interiorEdges << " interior and " << qr.boundaryEdges
+            << " boundary edge(s), " << qr.nonManifoldEdges << " used a third time, "
+            << qr.cracks << " crack(s): "
+            << (qr.conforming ? "conforming [PASS]" : "not conforming [FAIL]");
+        console_.log(oss.str());
+    }
+    for (const std::string &m : qr.messages) console_.log("[Mesh] " + m);
+    {
+        std::ostringstream oss;
+        oss << "[Mesh] Stage 10 " << (qr.valid ? "validates [PASS]"
+                                               : "does not validate [FAIL]");
+        console_.log(oss.str());
+        std::cerr << "[Viewer] " << oss.str() << "\n";
+    }
+    console_.log("[Mesh] transfinite grid, unsmoothed: grey is a mesh edge, blue a block "
+                 "wall, red a folded element. Press 'c' to mesh again at another target");
+}
+
 // Stages 5 to 7 again from the immersion already computed, at whatever the
 // dialog was last left at.
 //
@@ -2305,6 +2531,8 @@ void CrossGenWidget::rerunMERIDIANConnectivity() {
     // arrangement, the arrangement to the separatrices and the labels,
     // LayoutEnergy to the immersion and the labels, SubdomainLabels to the
     // immersion.
+    quadMesh_.reset();
+    meshAttempted_ = false;
     splines_.reset();
     arrangement_.reset();
     patchesAttempted_ = false;
@@ -2405,17 +2633,22 @@ void CrossGenWidget::advancePhase() {
         if (meridianPhase_ != old)
             std::cerr << "[Viewer] MERIDIAN Phase " << meridianPhaseName(meridianPhase_) << "\n";
 
-        // Patches is the last phase and it stays that way: 'c' at it
-        // re-opens the connectivity dialog and runs Stages 5 to 9 again from
-        // the immersion, the way 'c' at UMBER's Simplified phase re-opens the
-        // chord dialog. Which pairs of cones are meant to be joined is a
-        // judgement about the model, not a constant of the method, and the only
-        // way to settle one is to try a number and look at the curves.
-        if (old == MERIDIANPhase::Patches && meridianPhase_ == old &&
-            immersion_.has_value() && separatricesAttempted_) {
-            if (promptMERIDIANConnectivity(*immersion_, psiR_)) {
-                rerunMERIDIANConnectivity();
-            }
+        // Mesh is the last phase and it stays that way: 'c' at it re-opens the
+        // Stage 10 dialog, so a target edge length can be tried, looked at, and
+        // tried again, the way 'c' at UMBER's Simplified phase re-opens the
+        // chord dialog. The connectivity dialog, which used to sit on this key
+        // at the Patches phase, moved to 'n' -- the two are both judgements
+        // about the model and both need re-opening, and one key cannot carry
+        // them both.
+        if (old == MERIDIANPhase::Patches && meridianPhase_ == MERIDIANPhase::Mesh) {
+            // Stages 8 and 9 are built by the frame after the one that asked
+            // for them, so they may not be there yet on the frame that
+            // advanced. Build them now rather than opening a dialog on a
+            // pipeline that has not run.
+            if (!patchesAttempted_) runMERIDIANPatches();
+        }
+        if (meridianPhase_ == MERIDIANPhase::Mesh && splines_.has_value()) {
+            if (promptMERIDIANMesh()) runMERIDIANMesh();
         }
     }
 }
@@ -3372,12 +3605,14 @@ void CrossGenWidget::renderMERIDIANModel() {
                              !flatMetric_.edges.empty());
     const bool showU = (meridianPhase_ == MERIDIANPhase::RicciFlow && ricciU_.size() > 0);
 
-    // At the patch phase nothing of the model underneath is drawn at all --
-    // not the wireframe, not dS, not the cones. The block decomposition is the
-    // whole picture there: every patch side is already a curve of S drawn in
-    // full, and a triangulation or a boundary loop under it is clutter that
-    // was the point of the phase to get past.
-    if (meridianPhase_ == MERIDIANPhase::Patches) return;
+    // At the patch and mesh phases nothing of the model underneath is drawn at
+    // all -- not the wireframe, not dS, not the cones. The block decomposition
+    // is the whole picture there: every patch side is already a curve of S
+    // drawn in full, and a triangulation or a boundary loop under it is clutter
+    // that was the point of the phase to get past. It is worse at the mesh
+    // phase than at the patch one, where the quadrilaterals are near the size
+    // of the triangles beneath them and the two grids read as one.
+    if (meridianPhase_ >= MERIDIANPhase::Patches) return;
 
     if (showMetric) {
         // The metric replaces the wireframe rather than covering it: every edge
@@ -3863,7 +4098,14 @@ void CrossGenWidget::renderNormal() {
             // The blocks over the model, once Stages 8 and 9 have produced
             // any: this is the whole of what the phase is for, and it is
             // drawn last so no wireframe edge crosses a patch side.
-            if (meridianPhase_ >= MERIDIANPhase::Patches && arrangement_.has_value()) {
+            if (meridianPhase_ == MERIDIANPhase::Mesh && quadMesh_.has_value()) {
+                // Stage 10 draws its own block walls off the blocks it built,
+                // so drawLayoutPatches would only lay a second, differently
+                // sourced copy of them over the first. A face Stage 10 could
+                // not mesh has no wall here, which is the point: the blank is
+                // where the mesh is not.
+                viewer::drawQuadMesh(*quadMesh_, 1.0f, 2.5f);
+            } else if (meridianPhase_ >= MERIDIANPhase::Patches && arrangement_.has_value()) {
                 viewer::drawLayoutPatches(*arrangement_,
                                           splines_.has_value() ? &*splines_ : nullptr,
                                           0.30 * avgEdge_, 3.0f);
@@ -4004,8 +4246,13 @@ void CrossGenWidget::renderNormal() {
     } else if (mode_ == Mode::MERIDIAN && meridianPhase_ == MERIDIANPhase::Layout &&
                meridianLayout_.has_value()) {
         renderOverlay("press 'p' to swap psi_R / Psi\npress 'r' to restart\npress 'q' to quit");
+    } else if (mode_ == Mode::MERIDIAN && meridianPhase_ == MERIDIANPhase::Mesh) {
+        renderOverlay("press 'c' to mesh again at another target edge length\n"
+                      "press 'n' to change the connectivity settings and trace again\n"
+                      "press 'r' to restart\npress 'q' to quit");
     } else if (mode_ == Mode::MERIDIAN && meridianPhase_ == MERIDIANPhase::Patches) {
-        renderOverlay("press 'c' to change the connectivity settings and trace again\n"
+        renderOverlay("press 'c' to mesh the patches (Stage 10)\n"
+                      "press 'n' to change the connectivity settings and trace again\n"
                       "press 'r' to restart\npress 'q' to quit");
     } else if (mode_ == Mode::UMBER && umberPhase_ == UMBERPhase::Simplified) {
         renderOverlay("press 'c' to change the collapse settings\n"

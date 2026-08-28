@@ -2360,6 +2360,85 @@ void drawLayoutPatches(const Arrangement &arr, const SplineFit *fit,
     }
 }
 
+void drawQuadMesh(const QuadMesh &qm, float lineWidth, float blockLineWidth) {
+    const std::vector<Point> &V = qm.vertices();
+    const std::vector<std::array<int, 4>> &Q = qm.quads();
+    if (V.empty() || Q.empty()) return;
+
+    auto ok = [&](int v) { return v >= 0 && v < static_cast<int>(V.size()); };
+    auto signedArea = [&](const std::array<int, 4> &q) {
+        double a = 0.0;
+        for (int k = 0; k < 4; ++k) {
+            const Point &p = V[q[k]];
+            const Point &n = V[q[(k + 1) & 3]];
+            a += p[0] * n[1] - n[0] * p[1];
+        }
+        return 0.5 * a;
+    };
+
+    // The folds, filled, underneath everything else.
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glColor4f(0.92f, 0.22f, 0.22f, 0.55f);
+    glBegin(GL_QUADS);
+    for (const auto &q : Q) {
+        if (!ok(q[0]) || !ok(q[1]) || !ok(q[2]) || !ok(q[3])) continue;
+        if (signedArea(q) > 0.0) continue;
+        for (int k = 0; k < 4; ++k) glVertex2d(V[q[k]][0], V[q[k]][1]);
+    }
+    glEnd();
+    glDisable(GL_BLEND);
+
+    // Every edge once. An interior edge is shared by two quads and would
+    // otherwise be laid down twice, which on a translucent line reads as a
+    // darker line and makes the grid look like it has a pattern in it.
+    std::vector<std::pair<int, int>> edges;
+    edges.reserve(Q.size() * 4);
+    for (const auto &q : Q) {
+        for (int k = 0; k < 4; ++k) {
+            int a = q[k], b = q[(k + 1) & 3];
+            if (!ok(a) || !ok(b) || a == b) continue;
+            edges.emplace_back(std::min(a, b), std::max(a, b));
+        }
+    }
+    std::sort(edges.begin(), edges.end());
+    edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
+
+    glColor3f(0.78f, 0.80f, 0.84f);
+    glLineWidth(lineWidth);
+    glBegin(GL_LINES);
+    for (const auto &e : edges) {
+        glVertex2d(V[e.first][0],  V[e.first][1]);
+        glVertex2d(V[e.second][0], V[e.second][1]);
+    }
+    glEnd();
+    glLineWidth(1.0f);
+
+    if (blockLineWidth <= 0.0f) return;
+
+    // The block walls: the four sides of each structured grid, taken off the
+    // block's own vertex array rather than off the arrangement, so a block that
+    // was skipped leaves a gap here exactly as it does in the mesh.
+    glColor3f(0.42f, 0.74f, 1.0f);
+    glLineWidth(blockLineWidth);
+    for (const QuadMesh::Block &b : qm.blocks()) {
+        const int ns = b.ns, nt = b.nt;
+        if (ns < 1 || nt < 1) continue;
+        if (static_cast<int>(b.vert.size()) != (ns + 1) * (nt + 1)) continue;
+        auto at = [&](int i, int j) { return b.vert[j * (ns + 1) + i]; };
+        auto strip = [&](auto next) {
+            glBegin(GL_LINE_STRIP);
+            next();
+            glEnd();
+        };
+        strip([&] { for (int i = 0; i <= ns; ++i) if (ok(at(i, 0)))  glVertex2d(V[at(i, 0)][0],  V[at(i, 0)][1]); });
+        strip([&] { for (int i = 0; i <= ns; ++i) if (ok(at(i, nt))) glVertex2d(V[at(i, nt)][0], V[at(i, nt)][1]); });
+        strip([&] { for (int j = 0; j <= nt; ++j) if (ok(at(0, j)))  glVertex2d(V[at(0, j)][0],  V[at(0, j)][1]); });
+        strip([&] { for (int j = 0; j <= nt; ++j) if (ok(at(ns, j))) glVertex2d(V[at(ns, j)][0], V[at(ns, j)][1]); });
+    }
+    glLineWidth(1.0f);
+}
+
 void drawSeparatrixLegend(int fbw, int fbh) {
     struct Row { SepClass kind; const char *label; };
     static const Row kRows[] = {

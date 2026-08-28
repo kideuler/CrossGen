@@ -11,6 +11,7 @@
 #include "MERIDIAN/ConeSingularities.hxx"
 #include "MERIDIAN/Immersion.hxx"
 #include "MERIDIAN/LayoutEnergy.hxx"
+#include "MERIDIAN/QuadMesh.hxx"
 #include "MERIDIAN/RicciFlow.hxx"
 #include "MERIDIAN/Separatrices.hxx"
 #include "MERIDIAN/SplineFit.hxx"
@@ -92,6 +93,14 @@ class SIPG;
 //                        arc exactly once is what makes the output watertight.
 //                        -> SplineFit
 //
+//   Stage 10             The quadrilateral mesh on those patches. One integer
+//                        per *chord* of the layout -- the class of arcs that
+//                        must agree because they face each other across a
+//                        patch -- chosen against a global target edge length,
+//                        then each arc cut once at equal arc length and both
+//                        its patches given the same nodes.
+//                        -> QuadMesh
+//
 // The Gauss-Bonnet check between Stages 1 and 3 is not a formality. Newton's
 // system in the flow is Delta du = Kbar - K with Delta a Laplacian, whose
 // kernel is the constants; the residual has to be orthogonal to that kernel for
@@ -110,9 +119,10 @@ class SIPG;
 //
 // What comes out at the end is a set of bicubic patches meeting C0 across their
 // shared boundary curves and C2 inside, together with everything they were
-// derived from: Psi, the separatrices, and the arrangement. Stage 10 -- the
-// uniform knot-insertion refinement and the export to the analysis solver --
-// reads them and is not implemented here.
+// derived from: Psi, the separatrices, the arrangement, and a conforming
+// all-quadrilateral mesh of the patches at a prescribed edge length. The
+// uniform knot-insertion refinement and the export to an analysis solver read
+// them and are not implemented here.
 //
 // run() returns Definition 2.1's verdict and nothing else: whether Psi is a
 // quadrilateral layout. Stages 8 and 9 can fail on a map that is a valid layout
@@ -197,6 +207,24 @@ public:
         bool runSplines = true;
         int splineSegments = 3;
         int splineSamples = 8;
+
+        // Stage 10: the quadrilateral mesh on those patches. The target edge
+        // length is absolute, in the units of the model; the corpus is
+        // normalised into [0,1]^2, so 0.05 is one twentieth of the model and
+        // is the default for that reason. See QuadMesh for how one integer per
+        // chord is chosen from it.
+        bool runQuadMesh = true;
+        double quadTargetEdge = 0.05;
+        int quadMinIntervals = 1;
+        int quadMaxIntervals = 0;
+        // Place the nodes along the Stage 9 fits. Off, they go on the traced
+        // polylines instead, which tells a meshing artefact apart from a
+        // fitting one. See QuadMesh::Options::useSplines.
+        bool quadUseSplines = true;
+        // Winslow sweeps over the interior of each block, the boundary held.
+        // Zero leaves the transfinite grid alone. See QuadMesh::smooth().
+        int quadSmoothingPasses = 500;
+        double quadSmoothingThreshold = 0.0;
 
         // Sec. 3.3's remedy, and the "on failure" of Sec. 4's arrangement, run
         // as a loop rather than left to the reader:
@@ -297,6 +325,16 @@ public:
         double layoutCoverage = 0.0;
         bool arrangementValid = false;
 
+        // Stage 10
+        bool quadMeshRan = false;
+        int meshVertices = 0;
+        int meshQuads = 0;
+        int meshChords = 0;
+        int meshUnmeshedPatches = 0;
+        double meshMinScaledJacobian = 0.0;
+        bool meshConforming = false;
+        bool meshValid = false;
+
         // Stage 9
         bool splinesRan = false;
         int splinePatches = 0;
@@ -392,6 +430,7 @@ public:
     const Separatrices& getSeparatrices() const { return *separatrices; }
     const Arrangement& getArrangement() const { return *arrangement; }
     const SplineFit& getSplines() const { return *splines; }
+    const QuadMesh& getQuadMesh() const { return *quads; }
 
     // Null until the stage that builds them has run.
     bool hasCones() const { return cones != nullptr; }
@@ -403,6 +442,7 @@ public:
     bool hasSeparatrices() const { return separatrices != nullptr; }
     bool hasArrangement() const { return arrangement != nullptr; }
     bool hasSplines() const { return splines != nullptr; }
+    bool hasQuadMesh() const { return quads != nullptr; }
 
     const Status& getStatus() const { return status; }
 
@@ -426,6 +466,7 @@ private:
     std::unique_ptr<Separatrices> separatrices;
     std::unique_ptr<Arrangement> arrangement;
     std::unique_ptr<SplineFit> splines;
+    std::unique_ptr<QuadMesh> quads;
 };
 
 #endif // __MERIDIAN_HXX__

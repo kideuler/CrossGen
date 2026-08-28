@@ -245,7 +245,17 @@ void usage(const char *argv0) {
               << "  --samples <n>      patch sampling grid                 (default 8)\n"
               << "  --fit <file.obj>   write the fitted arc curves\n"
               << "  --net <file.obj>   write the patch control nets\n"
-              << "  --surf <file.obj>  write the reconstructed patches\n";
+              << "  --surf <file.obj>  write the reconstructed patches\n"
+              << "  --no-mesh          skip Stage 10 (quadrilateral meshing)\n"
+              << "  --target <h>       target edge length, model units      (default 0.05)\n"
+              << "  --min-edges <n>    fewest edges per chord               (default 1)\n"
+              << "  --max-edges <n>    most edges per chord, 0 = no cap     (default 0)\n"
+              << "  --polyline-mesh    mesh the traced arcs, not the spline fits\n"
+              << "  --smooth <n>       Winslow sweeps per block, 0 = off      (default 500)\n"
+              << "  --smooth-below <j> smooth blocks worse than this Jacobian (default 0)\n"
+              << "  --chords <n>       list at most n chords                (default 0)\n"
+              << "  --mesh <file.obj>  write the quadrilateral mesh\n"
+              << "  --mesh-vtu <f.vtu> write it as a VTK unstructured grid\n";
 }
 
 } // namespace
@@ -257,9 +267,10 @@ int main(int argc, char **argv) {
     const std::string path = argv[1];
     MERIDIAN::Options opts;
     std::string cutOut, psiOut, layoutOut, sepOut, sepUVOut;
-    std::string arcsOut, facesOut, fitOut, netOut, surfOut;
+    std::string arcsOut, facesOut, fitOut, netOut, surfOut, meshOut, meshVTUOut;
     int coneListLimit = 20;
     int curveListLimit = 10;
+    int chordListLimit = 0;
 
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
@@ -309,6 +320,16 @@ int main(int argc, char **argv) {
         else if (a == "--fit" && i + 1 < argc)     fitOut = argv[++i];
         else if (a == "--net" && i + 1 < argc)     netOut = argv[++i];
         else if (a == "--surf" && i + 1 < argc)    surfOut = argv[++i];
+        else if (a == "--no-mesh")                 opts.runQuadMesh = false;
+        else if (a == "--target" && i + 1 < argc)  opts.quadTargetEdge = std::stod(argv[++i]);
+        else if (a == "--min-edges" && i + 1 < argc) opts.quadMinIntervals = std::stoi(argv[++i]);
+        else if (a == "--max-edges" && i + 1 < argc) opts.quadMaxIntervals = std::stoi(argv[++i]);
+        else if (a == "--polyline-mesh")           opts.quadUseSplines = false;
+        else if (a == "--smooth" && i + 1 < argc)  opts.quadSmoothingPasses = std::stoi(argv[++i]);
+        else if (a == "--smooth-below" && i + 1 < argc) opts.quadSmoothingThreshold = std::stod(argv[++i]);
+        else if (a == "--chords" && i + 1 < argc)  chordListLimit = std::stoi(argv[++i]);
+        else if (a == "--mesh" && i + 1 < argc)    meshOut = argv[++i];
+        else if (a == "--mesh-vtu" && i + 1 < argc) meshVTUOut = argv[++i];
         else { std::cerr << "Unknown option: " << a << "\n"; usage(argv[0]); return 1; }
     }
 
@@ -320,7 +341,7 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    std::cout << "MERIDIAN -- Shepherd, Gu and Hughes (2022), Stages 1-9\n";
+    std::cout << "MERIDIAN -- Shepherd, Gu and Hughes (2022), Stages 1-9, then meshing\n";
     std::cout << "Mesh: " << path << "\n";
     std::cout << "  " << mesh->vertices.size() << " vertices, "
               << mesh->edges.size() << " edges, "
@@ -1024,13 +1045,131 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (!pipeline.hasQuadMesh()) {
+        heading("Result");
+        std::cout << "  " << (ok ? kPass : kFail) << " "
+                  << (ok ? "Psi satisfies Q1-Q5 (Stage 10 not run)."
+                         : "The continuation did not reach a valid layout; see above.")
+                  << "\n";
+        return ok ? 0 : 5;
+    }
+
+    // ---------------------------------------------------------------------
+    // Stage 10 -- the quadrilateral mesh
+    // ---------------------------------------------------------------------
+    heading("Stage 10  Quadrilateral meshing (chords and interval assignment)");
+    const QuadMesh &qm = pipeline.getQuadMesh();
+    const QuadMesh::Report &qr = qm.getReport();
+
+    std::cout << "  Target edge length " << std::fixed << std::setprecision(4) << qr.target
+              << " on a model " << qr.modelExtent << " across" << std::defaultfloat << "\n";
+    std::cout << "  Chords: " << qr.chords << " over " << qr.arcsAssigned
+              << " arc(s); " << qr.minIntervals << " to " << qr.maxIntervals
+              << " edge(s) each, mean " << std::fixed << std::setprecision(2)
+              << qr.meanIntervals << std::defaultfloat;
+    if (qr.clampedChords > 0) {
+        std::cout << "  (" << qr.clampedChords << " held at the floor or the cap)";
+    }
+    std::cout << "\n";
+    std::cout << "  Mesh: " << qr.vertices << " vertices, " << qr.quads
+              << " quadrilateral(s) in " << qr.blocks << " structured block(s)";
+    if (qr.unmeshedPatches > 0) {
+        std::cout << "; " << qr.unmeshedPatches << " patch(es) left unmeshed, "
+                  << std::fixed << std::setprecision(2) << (100.0 * qr.unmeshedArea)
+                  << "% of S" << std::defaultfloat;
+    }
+    std::cout << "\n";
+    // The spread is the price of the integer constraint: a chord that runs
+    // through patches of different sizes has one count for all of them, so an
+    // arc at either end of its length range is cut into edges away from the
+    // target. The rms log ratio is what the assignment minimised.
+    std::cout << "  Edge length in [" << std::fixed << std::setprecision(4) << qr.minEdge
+              << ", " << qr.maxEdge << "], mean " << qr.meanEdge
+              << "; worst is " << std::setprecision(2) << qr.worstEdgeRatio
+              << "x the target, rms log ratio " << std::setprecision(3) << qr.edgeRatioRms
+              << std::defaultfloat << "\n";
+    std::cout << "  Scaled Jacobian " << std::fixed << std::setprecision(4)
+              << qr.minScaledJacobian << " worst, " << qr.meanScaledJacobian << " mean; "
+              << qr.invertedQuads << " inverted element(s)" << std::defaultfloat << "\n";
+    if (opts.quadSmoothingPasses > 0 && qr.smoothedBlocks > 0) {
+        std::cout << "  Winslow smoothing: " << qr.smoothedBlocks << " block(s), at most "
+                  << qr.smoothingSweeps << " sweep(s) on one; before it the worst scaled "
+                  << "Jacobian was " << std::fixed << std::setprecision(4)
+                  << qr.minScaledJacobianBefore << " with " << qr.invertedBefore
+                  << " inverted element(s)" << std::defaultfloat << "\n";
+    }
+    if (qr.reflexCorners > 0) {
+        // Not a defect of this stage and worth saying so where it is reported:
+        // a layout corner the model turns more than a half turn at reverses the
+        // element there whatever the grid does, and the remedy is upstream.
+        std::cout << "  " << kWarn << " " << qr.reflexCorners
+                  << " corner(s) of the layout turn through more than a half turn on the "
+                  << "model; a structured grid reverses its corner element at each of them "
+                  << "and no smoothing can reach it\n";
+    }
+    std::cout << "  Element area from " << std::scientific << std::setprecision(3)
+              << qr.minQuadArea << " to " << qr.maxQuadArea << "; the mesh covers "
+              << std::fixed << std::setprecision(6)
+              << (qr.patchArea > 0.0 ? qr.meshArea / qr.patchArea : 0.0)
+              << " of the patches it was built on" << std::defaultfloat << "\n";
+    std::cout << "  Edges: " << qr.interiorEdges << " shared by two elements, "
+              << qr.boundaryEdges << " on the boundary of the mesh";
+    if (qr.nonManifoldEdges > 0) std::cout << ", " << qr.nonManifoldEdges << " used by more";
+    if (qr.cracks > 0) std::cout << "; " << qr.cracks << " coincident vertex pair(s)";
+    std::cout << "\n";
+
+    if (chordListLimit > 0 && !qm.chords().empty()) {
+        std::cout << "     chord   arcs  edges   ideal    shortest arc   longest arc\n";
+        int shown = 0;
+        for (size_t c = 0; c < qm.chords().size(); ++c) {
+            if (shown++ >= chordListLimit) {
+                std::cout << "     ... " << (qm.chords().size() - chordListLimit) << " more\n";
+                break;
+            }
+            const QuadMesh::Chord &ch = qm.chords()[c];
+            std::cout << "  " << std::setw(8) << c
+                      << std::setw(7) << ch.arcs.size()
+                      << std::setw(7) << ch.intervals
+                      << std::setw(9) << std::fixed << std::setprecision(2) << ch.idealIntervals
+                      << std::setw(12) << std::setprecision(4) << ch.minLength
+                      << std::setw(14) << ch.maxLength << std::defaultfloat
+                      << (ch.clamped ? "  (clamped)" : "") << "\n";
+        }
+    }
+
+    verdict(qr.quads > 0, "The layout produced a mesh");
+    verdict(qr.nonManifoldEdges == 0,
+            "Conforming: every edge is shared by two elements or bounds the mesh");
+    verdict(qr.cracks == 0, "Watertight: no two vertices sit at the same point");
+    verdict(qr.invertedQuads == 0, "No element is inverted");
+    verdict(qr.unmeshedPatches == 0, "Every patch of the layout was meshed");
+    for (const std::string &m : qr.messages) std::cout << "  " << kWarn << " " << m << "\n";
+
+    if (!meshOut.empty()) {
+        if (qm.writeOBJ(meshOut)) std::cout << "  Wrote the quad mesh to " << meshOut << "\n";
+        else std::cout << "  " << kWarn << " Failed to write " << meshOut << "\n";
+    }
+    if (!meshVTUOut.empty()) {
+        if (qm.writeVTU(meshVTUOut)) std::cout << "  Wrote the quad mesh to " << meshVTUOut << "\n";
+        else std::cout << "  " << kWarn << " Failed to write " << meshVTUOut << "\n";
+    }
+
     // ---------------------------------------------------------------------
     heading("Result");
-    if (ok && tr.valid && arep.valid && sf.valid) {
+    if (ok && tr.valid && arep.valid && sf.valid && qr.valid) {
         std::cout << "  " << kPass << " " << sf.patches
                   << " watertight bicubic patch(es), C0 across their shared curves and C2 "
-                  << "inside, from a layout satisfying Q1-Q5. Ready for Stage 10 "
-                  << "(refinement and the analysis handoff).\n";
+                  << "inside, from a layout satisfying Q1-Q5, meshed into " << qr.quads
+                  << " conforming quadrilateral(s) at a target edge length of " << qr.target
+                  << ".\n";
+        return 0;
+    }
+    if (ok && tr.valid && arep.valid && sf.valid) {
+        std::cout << "  " << kWarn << " " << sf.patches
+                  << " watertight bicubic patch(es) from a layout satisfying Q1-Q5, but the "
+                  << "mesh on them is not clean: " << qr.invertedQuads << " inverted element(s), "
+                  << qr.nonManifoldEdges << " over-used edge(s), " << qr.cracks
+                  << " coincident vertex pair(s).\n";
         return 0;
     }
     if (ok && tr.valid) {
@@ -1040,9 +1179,12 @@ int main(int argc, char **argv) {
                   << (arep.patches - arep.simpleQuads) << " of " << arep.patches
                   << " face(s) are not quadrilaterals with one arc a side"
                   << (sf.foldedPatches > 0 ? ", and some of the rest fold when blended" : "")
-                  << ". Sec. 4's remedy is Sec. 3.3's -- raise lambda_5, add the Gamma_topo "
-                  << "constraint for the pair that nearly met, re-run Stage 6 from the "
-                  << "current phi.\n";
+                  << ". They were left out of the mesh, which covers the other "
+                  << std::fixed << std::setprecision(2) << (100.0 * (1.0 - qr.unmeshedArea))
+                  << "% of S in " << std::defaultfloat << qr.quads
+                  << " quadrilateral(s). Sec. 4's remedy is Sec. 3.3's -- raise lambda_5, add "
+                  << "the Gamma_topo constraint for the pair that nearly met, re-run Stage 6 "
+                  << "from the current phi.\n";
         return 0;
     }
     if (ok && tr.valid) {

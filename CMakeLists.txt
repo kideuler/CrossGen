@@ -77,6 +77,8 @@ add_library(PolyVector SHARED
     src/MERIDIAN/Arrangement.cxx
     src/MERIDIAN/SplineFit.hxx
     src/MERIDIAN/SplineFit.cxx
+    src/MERIDIAN/QuadMesh.hxx
+    src/MERIDIAN/QuadMesh.cxx
     src/UMBER/Polysquare.hxx
     src/UMBER/Polysquare.cxx
     src/UMBER/MotorcycleGraph.hxx
