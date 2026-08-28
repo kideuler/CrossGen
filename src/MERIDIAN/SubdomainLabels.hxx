@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "MERIDIAN/Immersion.hxx"
+#include "MERIDIAN/Interfaces.hxx"
 #include "MERIDIAN/Separatrices.hxx"
 #include "mesh/Mesh.hxx"
 
@@ -140,6 +141,42 @@ public:
         double fluxU = 0.0, fluxV = 0.0;  // |u(end) - u(start)|, likewise v
         double length = 0.0;
         bool onSeam = false;         // the chain runs along an arc of G
+
+        // Where it came from, when the chains were built from a material
+        // interface network rather than from the edges alone. `branch` indexes
+        // Interfaces::branches(); `dir` is the direction of travel the node
+        // quantisation gave it, in the {+u, +v, -u, -v} numbering, and is what
+        // `label` is read off. -1 and 0 when there is no network.
+        int branch = -1;
+        int dir = 0;
+        bool dirKnown = false;
+    };
+
+    // One sector of one node of the material interface network, as a constraint
+    // on Psi: the two curves that bound it, and the number of quarter turns the
+    // layout has to put between them. This is what E6 of Stage 6 is summed over.
+    //
+    // Both curves are read as a tangent at the *same* child of the node in
+    // Omega -- the node is one vertex of S but the cutting graph may have split
+    // it into several, and a tangent taken at one child and another taken at a
+    // different one are not in the same frame. Where the cut runs through the
+    // sector itself there is no common child and the sector is dropped, which
+    // is what `spansCut` records; Q4 already holds that pair together across
+    // the seam, so nothing is lost but the count is worth having.
+    struct InterfaceCorner {
+        int node = -1;                 // index into Interfaces::nodes()
+        int vertex = -1;               // the node's child in Omega
+        int a = -1, b = -1;            // the far end of each of the two rays
+        double la = 0.0, lb = 0.0;     // their flat lengths
+        // The lengths the two tangents are divided by before they are compared.
+        // They start at the flat lengths above and are re-read off the current
+        // map between outer steps -- see refreshInterfaceScales(), which is
+        // where the reason lives.
+        double sa = 0.0, sb = 0.0;
+        int quarters = 1;              // q_s: the turn from ray a to ray b
+        bool onBoundary = false;
+        bool aIsBoundary = false, bIsBoundary = false;  // a ray along dS
+        double sector = 0.0;           // the angle it has on the model, radians
     };
 
     // One path of Gamma_topo, already subdivided by G.
@@ -211,6 +248,24 @@ public:
         // boundaries between the physical surfaces of the .geo -- which is what
         // the viewer already draws as feature edges.
         bool materialFeatures = true;
+
+        // Build E6's sector constraints from the interface network's nodes.
+        // Only has an effect when the network was handed in; without one there
+        // are no nodes and nothing to constrain.
+        bool interfaceCorners = true;
+
+        // Take the label of an interface chain from the node quantisation
+        // propagated along the network, rather than from the chain's own flux.
+        //
+        // The flux rule is right for an isolated feature and wrong at a
+        // junction, and the failure is not a near miss. Three interfaces meet
+        // at a triple point with sectors of one, one and two quarters; the
+        // labels that follow are u, v, u -- the third branch collinear with the
+        // first. Read off the flux of psi_R instead, all three can come out u,
+        // which asks E3 for a map holding u constant on three curves leaving
+        // one point in three directions. There is no such map, so the
+        // continuation spends every outer step failing to reach it.
+        bool propagateInterfaceLabels = true;
     };
 
     struct Report {
@@ -226,6 +281,16 @@ public:
         int featureEdges = 0;
         int featureChains = 0;
         int featureChainsU = 0, featureChainsV = 0;
+        // Chains whose label came from the network's own quantisation rather
+        // than from their flux, and interface nodes the propagation could not
+        // reach (a component with no chain long enough to seed it).
+        int featureChainsPropagated = 0;
+        int interfaceCorners = 0;
+        int interfaceCornersSpanningCut = 0;
+        // Sectors whose two labels disagree with the flux reading. A large
+        // count is not an error -- it is the propagation doing its job -- but
+        // it is the number that says how much E3 was being asked for before.
+        int featureLabelsCorrected = 0;
 
         int seamArcs = 0;
         int holonomyCount[4] = {0, 0, 0, 0};
@@ -252,6 +317,33 @@ public:
     // cannot see yet.
     explicit SubdomainLabels(const Immersion &immersion);
     SubdomainLabels(const Immersion &immersion, const Options &opts);
+    // With the material interface network of Stage 0b. `interfaces` is held by
+    // pointer and has to outlive this object; null is the single-material case
+    // and gives exactly the two-argument behaviour.
+    SubdomainLabels(const Immersion &immersion, const Options &opts,
+                    const Interfaces *interfaces);
+
+    // Re-read the lengths E6 divides its two tangents by from the map as it now
+    // stands.
+    //
+    // E6 compares b/s_b against R_q (a/s_a), which asserts two things at once:
+    // that the two tangents are q quarter turns apart, which is the sector
+    // condition and is what the term is for, and that |b|/s_b = |a|/s_a, which
+    // is a statement about how much the map stretches the two rays. With s
+    // fixed at the flat lengths the second one says the stretch is the same in
+    // both directions -- local conformality at the node -- and on a domain
+    // whose interfaces meet obliquely that is a real cost: geom013's groove
+    // faces meet dS at 58 and 122 degrees and both have to become 90, so the
+    // map there *is* anisotropic, and asking it not to be leaves E1 and E6 at
+    // an equilibrium with the sector 0.4 rad out and det J at 1e-5.
+    //
+    // Re-reading s from the current map between outer steps removes that
+    // second assertion: at the point it is taken, |a|/s_a = |b|/s_b = 1 by
+    // construction, so what is left of the term is the angle. It is the
+    // ordinary lagged normalisation of a scale-invariant constraint, and the
+    // problem stays exactly quadratic inside each outer step, which is what the
+    // proxy needs.
+    void refreshInterfaceScales(const std::vector<Point> &uv);
 
     // Re-derive the Gamma_u / Gamma_v labels from a map that has moved.
     // Sec. 3.3 lists this as an optional step between penalty levels: the
@@ -309,6 +401,8 @@ public:
     const std::vector<BoundaryEdge>& boundaryEdges() const { return bEdges; }
     const std::vector<BoundaryChain>& boundaryChains() const { return bChains; }
     const std::vector<FeatureChain>& featureChains() const { return fChains; }
+    const std::vector<InterfaceCorner>& interfaceCorners() const { return iCorners; }
+    const Interfaces* getInterfaces() const { return itf; }
     const std::vector<TopoPath>& topoPaths() const { return tPaths; }
 
     // The seam terms come straight from Stage 4; they are re-exported here so
@@ -354,6 +448,12 @@ private:
     void buildBoundaryChains(const std::vector<Point> &uv);
     void buildFeatures(const std::vector<Point> &uv);
     void labelFeatures(const std::vector<Point> &uv);
+    void buildInterfaceCorners();
+    // Directions for every ray of the network, propagated from one seed per
+    // connected component through the node quantisation. Returns the per-branch
+    // direction of travel out of node0, or an empty vector when there is no
+    // network to propagate through.
+    std::vector<int> propagateDirections(const std::vector<Point> &uv);
 
     // The mean distance from a cone to its nearest other cone in `uv`, which is
     // the scale a "near miss" is measured against, and the tracer settings that
@@ -376,11 +476,16 @@ private:
     static long long topoKeyOf(long long a, long long b);
 
     const Immersion *imm = nullptr;
+    const Interfaces *itf = nullptr;
     Options options;
 
     std::vector<BoundaryEdge> bEdges;
     std::vector<BoundaryChain> bChains;
     std::vector<FeatureChain> fChains;
+    std::vector<InterfaceCorner> iCorners;
+    // Direction of travel out of node0 for each branch of the network, in the
+    // {+u, +v, -u, -v} numbering, or -1 where the propagation never reached it.
+    std::vector<int> branchDir;
     std::vector<TopoPath> tPaths;
     // The pairs of ends already constrained, so that the repair can add to
     // Gamma_topo across several passes without ever adding the same path twice,

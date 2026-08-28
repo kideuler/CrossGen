@@ -80,6 +80,7 @@ public:
         int valence = 4;        // 4 - I inside, 3 - I on the boundary
         double raw = 0.0;       // I(v) before the integer snap
         bool fromRebalance = false; // index moved by rebalance(), not measured
+        bool prescribed = false;    // set by prescribe(), not read off the field
     };
 
     // Everything Eq. (4) and Eq. (7) have to say about the current cone set.
@@ -121,6 +122,66 @@ public:
     // Direct form, for a field that did not come from SIPG: one exp(4 i theta)
     // per triangle, in the same convention as SIPG::u_k.
     ConeSingularities(std::shared_ptr<Mesh> mesh, const Eigen::VectorXcd &crossField);
+
+    // Overwrite I(v) at vertices whose index the geometry fixes rather than the
+    // field -- the nodes of the material interface network of Stage 0b.
+    //
+    // The field cannot supply these and it is not a matter of resolution. A
+    // cross field is a section of a bundle over the *surface*; it knows nothing
+    // about the material tags, so at a triple junction it reports whatever the
+    // boundary conditions elsewhere happened to propagate, and at a landing it
+    // reports the boundary corner it can see and not the interface it cannot.
+    // Meanwhile the layout has no freedom there at all: every sector between
+    // two incident interfaces has to be a whole number of quadrilaterals, which
+    // fixes the cone angle, which fixes I(v). See Interfaces::quantiseNode.
+    //
+    // A prescribed index is exact in the same sense an interior winding number
+    // is, so rebalance() will not move it and reports it as unavailable.
+    // Prescribing an index of zero is meaningful and is the common case: it
+    // says the geometry has looked and there is no cone here, which a field
+    // that read one has to be overruled on.
+    void prescribe(const std::vector<std::pair<int, int>> &fixed);
+
+    // Whether prescribe() set the index at each vertex.
+    const std::vector<char>& getPrescribed() const { return prescribed; }
+    // How much the prescription moved the field's own reading, summed over the
+    // vertices it touched: the honest measure of how far the field was from
+    // knowing the interfaces were there.
+    int prescriptionShift() const { return lastPrescriptionShift; }
+
+    // Index units cancelDipoles() annihilated.
+    int cancelledUnits() const { return lastCancelledUnits; }
+
+    // Annihilate interior cones of opposite index that lie in the same group.
+    //
+    // `group` is one label per vertex; only two cones sharing a non-negative
+    // label may cancel. Stage 0b supplies the material region, which is the
+    // label that matters: a cross field aligned to a curved interface puts a
+    // +1/-1 pair on the concave side of every strongly curved stretch of it --
+    // three of them on geom011's corrugation, one at each extremum of the
+    // cosine -- and both members of such a pair are in the *same* region. The
+    // pair therefore contributes nothing to that region's Gauss-Bonnet count
+    // and nothing to Eq. (4), and it is a property of the smoothest field
+    // rather than of the layout: removing it takes away two cones, their two
+    // cuts and the patches their separatrices carve, and leaves every count
+    // exactly where it was.
+    //
+    // The pair that *spans* an interface is the opposite case and is never
+    // touched, because the two labels differ: geom001's +1 sits inside the
+    // quarter disk and its -1 outside, and each of them is the whole of its own
+    // region's deficit. Cancelling those two is precisely the mistake that
+    // leaves the quarter disk one quarter turn short and sends Stage 0b looking
+    // for somewhere to put a corner.
+    //
+    // Closest pair first, so what goes is the tightest cluster -- Sec. 3.1's
+    // own remedy for cones the field put somewhere the geometry does not
+    // justify, in the case where the two indices sum to zero and repositioning
+    // them onto each other annihilates them. Prescribed cones are never moved,
+    // and neither are cones on dS: their index is the rounded one and
+    // rebalance() is what is written against them.
+    //
+    // Returns the number of index units cancelled.
+    int cancelDipoles(const std::vector<int> &group);
 
     // Move index units between boundary cones until Eq. (4) holds. Each unit
     // goes to whichever boundary vertex is cheapest, cost being how much
@@ -194,6 +255,7 @@ private:
     std::vector<double> rawIndex;       // the unrounded value per vertex
     std::vector<char> measured;         // whether rawIndex[v] means anything
     std::vector<char> movedByRebalance; // index units placed by rebalance()
+    std::vector<char> prescribed;       // index fixed by prescribe(), not measured
     std::vector<double> inputCurvature; // K_v, Eq. (6)
     std::vector<double> targetCurvature;// Kbar_v, Eq. (9)
 
@@ -201,6 +263,8 @@ private:
 
     int minBoundaryIndex = -3;
     int maxBoundaryIndex = 1;
+    int lastPrescriptionShift = 0;
+    int lastCancelledUnits = 0;
     int lastRebalanceUnits = 0;
     double lastRebalanceCost = 0.0;
 };

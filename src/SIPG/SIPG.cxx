@@ -6,6 +6,14 @@
 #include <unordered_set>
 
 // ---------------------------------------------------------------------------
+void SIPG::setAlignedInteriorEdges(const std::vector<int> &edges) {
+    edgeAligned.assign(mesh->edges.size(), 0);
+    for (int e : edges) {
+        if (e >= 0 && e < static_cast<int>(edgeAligned.size())) edgeAligned[e] = 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // initialize()  --  Algorithm 1 from Section 10 of the paper
 //
 // Assembles the p=0 DG/SIPG matrices M, K and boundary RHS b, then
@@ -53,6 +61,7 @@ void SIPG::initialize() {
     // --- Interior edges ---
     for (int edgeIdx = 0; edgeIdx < static_cast<int>(mesh->edges.size()); ++edgeIdx) {
         if (mesh->isBoundaryEdge[edgeIdx]) continue; // handled separately below
+        if (isAlignedEdge(edgeIdx)) continue;        // ditto, one side at a time
 
         int ti = mesh->edgeTriangles[edgeIdx][0]; // K_i
         int tj = mesh->edgeTriangles[edgeIdx][1]; // K_j
@@ -80,13 +89,24 @@ void SIPG::initialize() {
         stiffTrips.emplace_back(tj, tj, std::complex<double>( kappa, 0.0));
     }
 
-    // --- Boundary edges ---
-    // Also accumulate weighted-average BC value per boundary triangle for hard pinning.
+    // --- Boundary edges, and the interior edges the caller asked to align to ---
+    //
+    // Both are one-sided Dirichlet data of the same kind: a curve the field has
+    // to be tangent to, seen from the triangle on one side of it. A boundary
+    // edge has one such triangle and an aligned interior edge has two, and the
+    // only difference in the assembly is that the second one is also visited.
+    // Also accumulate weighted-average BC value per triangle for hard pinning.
     std::unordered_map<int, std::complex<double>> bcWeightedSum; // numerator: sum(kappa * ge)
     std::unordered_map<int, double>               bcWeightTotal; // denominator: sum(kappa)
 
-    for (int edgeIdx : mesh->boundaryEdges) {
-        int ti = mesh->edgeTriangles[edgeIdx][0]; // K_i (only triangle on this edge)
+    // Pin triangle `ti` to the tangent of `edgeIdx`. A triangle can be pinned by
+    // more than one edge -- a corner of dS, a triangle straddling a junction --
+    // and the pins are then averaged, which is what makes exp(4i theta) the
+    // right thing to average: two edges that meet at a right angle carry the
+    // same value and reinforce, and only edges genuinely off the same cross
+    // pull against each other.
+    auto pinToEdge = [&](int edgeIdx, int ti) {
+        if (ti < 0) return;
 
         // Edge endpoints (stored as (min, max) vertex indices, but we need oriented order)
         // Use the triangle's local ordering to get CCW orientation
@@ -97,6 +117,7 @@ void SIPG::initialize() {
                 break;
             }
         }
+        if (localEdge < 0) return;
         const Triangle &tri = mesh->triangles[ti];
         int va = tri[localEdge];
         int vb = tri[(localEdge + 1) % 3];
@@ -105,13 +126,16 @@ void SIPG::initialize() {
         const Point &pb = mesh->vertices[vb];
         double dx = pb[0] - pa[0], dy = pb[1] - pa[1];
         double edgeLen = std::sqrt(dx * dx + dy * dy);
-        if (edgeLen < 1e-14) continue;
+        if (edgeLen < 1e-14) return;
 
         // Normal height and penalty
         double hi = 2.0 * area[ti] / edgeLen;
+        if (hi < 1e-14) return;
         double kappa = gamma * edgeLen / hi;
 
-        // Boundary tangent angle theta_e and spin-4 value g_e = exp(4i * theta_e)
+        // Tangent angle theta_e and spin-4 value g_e = exp(4i * theta_e). The
+        // orientation of the edge does not enter: exp(4i theta) is what a cross
+        // is, and a cross has no head.
         double theta = std::atan2(dy, dx);
         std::complex<double> ge = std::exp(std::complex<double>(0.0, 4.0 * theta));
 
@@ -122,6 +146,15 @@ void SIPG::initialize() {
         // Accumulate for hard BC map
         bcWeightedSum[ti] += kappa * ge;
         bcWeightTotal[ti] += kappa;
+    };
+
+    for (int edgeIdx : mesh->boundaryEdges) {
+        pinToEdge(edgeIdx, mesh->edgeTriangles[edgeIdx][0]); // the only triangle on it
+    }
+    for (int edgeIdx = 0; edgeIdx < static_cast<int>(edgeAligned.size()); ++edgeIdx) {
+        if (!edgeAligned[edgeIdx] || mesh->isBoundaryEdge[edgeIdx]) continue;
+        pinToEdge(edgeIdx, mesh->edgeTriangles[edgeIdx][0]);
+        pinToEdge(edgeIdx, mesh->edgeTriangles[edgeIdx][1]);
     }
 
     // Normalise each boundary triangle's BC to the unit circle.
@@ -167,7 +200,7 @@ void SIPG::initialize() {
     const std::complex<double> czero(0.0, 0.0);
     const std::complex<double> cone (1.0, 0.0);
 
-    // Build a fast lookup for boundary triangles
+    // Build a fast lookup for pinned triangles (on dS or on an aligned edge)
     std::unordered_set<int> bndTriSet;
     for (const auto &[ti, _] : boundaryTriangleBC) bndTriSet.insert(ti);
 

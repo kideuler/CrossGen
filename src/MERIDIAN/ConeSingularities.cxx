@@ -64,6 +64,7 @@ ConeSingularities::ConeSingularities(std::shared_ptr<Mesh> m, const Eigen::Vecto
     rawIndex.assign(nV, 0.0);
     measured.assign(nV, 0);
     movedByRebalance.assign(nV, 0);
+    prescribed.assign(nV, 0);
     targetCurvature.assign(nV, 0.0);
 
     computeInputCurvature();
@@ -312,6 +313,7 @@ void ConeSingularities::rebuildCones() {
         c.valence = (c.onBoundary ? 3 : 4) - c.index;
         c.raw = rawIndex[v];
         c.fromRebalance = movedByRebalance[v] != 0;
+        c.prescribed = !prescribed.empty() && prescribed[v] != 0;
         cones.push_back(c);
     }
 
@@ -434,6 +436,74 @@ ConeSingularities::GaussBonnetReport ConeSingularities::gaussBonnet() const {
 // the same currency Sec. 3.1 spends by hand ("adding or removing boundary
 // cones") with the choice made by how weak the evidence for each cone was.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// prescribe()
+// ---------------------------------------------------------------------------
+void ConeSingularities::prescribe(const std::vector<std::pair<int, int>> &fixed) {
+    const int nV = static_cast<int>(mesh->vertices.size());
+    if (static_cast<int>(prescribed.size()) != nV) prescribed.assign(nV, 0);
+    lastPrescriptionShift = 0;
+
+    for (const auto &p : fixed) {
+        const int v = p.first;
+        if (v < 0 || v >= nV || !active[v]) continue;
+        lastPrescriptionShift += std::abs(p.second - index[v]);
+        index[v] = p.second;
+        // The unrounded value becomes the prescribed one: it is what rebalance()
+        // costs a move against, and a prescribed index is not a rounding of
+        // anything, so there is nothing for it to be a rounding of.
+        rawIndex[v] = static_cast<double>(p.second);
+        measured[v] = 1;
+        prescribed[v] = 1;
+        movedByRebalance[v] = 0;
+    }
+    rebuildCones();
+}
+
+// ---------------------------------------------------------------------------
+// cancelDipoles()
+// ---------------------------------------------------------------------------
+int ConeSingularities::cancelDipoles(const std::vector<int> &group) {
+    lastCancelledUnits = 0;
+    const int nV = static_cast<int>(mesh->vertices.size());
+    if (static_cast<int>(group.size()) < nV) return 0;
+
+    auto movable = [&](int v) {
+        return active[v] && !mesh->isBoundaryVertex[v] && group[v] >= 0 &&
+               (prescribed.empty() || prescribed[v] == 0);
+    };
+
+    while (true) {
+        // The closest pair of opposite sign sharing a group. Interior cones are
+        // few -- eight is the corpus's largest -- so the quadratic scan is the
+        // whole of the search.
+        int bestA = -1, bestB = -1;
+        double bestD = std::numeric_limits<double>::infinity();
+        for (int a = 0; a < nV; ++a) {
+            if (index[a] == 0 || !movable(a)) continue;
+            for (int b = a + 1; b < nV; ++b) {
+                if (index[b] == 0 || !movable(b)) continue;
+                if (group[a] != group[b]) continue;
+                if ((index[a] > 0) == (index[b] > 0)) continue;
+                const double d = normP(mesh->vertices[a] - mesh->vertices[b]);
+                if (d < bestD) { bestD = d; bestA = a; bestB = b; }
+            }
+        }
+        if (bestA < 0) break;
+
+        const int units = std::min(std::abs(index[bestA]), std::abs(index[bestB]));
+        index[bestA] -= (index[bestA] > 0 ? units : -units);
+        index[bestB] -= (index[bestB] > 0 ? units : -units);
+        rawIndex[bestA] = index[bestA];
+        rawIndex[bestB] = index[bestB];
+        lastCancelledUnits += units;
+    }
+
+    if (lastCancelledUnits > 0) rebuildCones();
+    return lastCancelledUnits;
+}
+
+// ---------------------------------------------------------------------------
 int ConeSingularities::rebalance() {
     GaussBonnetReport rep = gaussBonnet();
     if (rep.admissible) { lastRebalanceUnits = 0; lastRebalanceCost = 0.0; return 0; }
@@ -448,6 +518,7 @@ int ConeSingularities::rebalance() {
         double bestDelta = std::numeric_limits<double>::infinity();
 
         for (int v : mesh->boundaryVertices) {
+            if (!prescribed.empty() && prescribed[v]) continue;   // fixed by geometry
             const int next = index[v] + step;
             if (next < minBoundaryIndex || next > maxBoundaryIndex) continue;
             const double before = std::fabs(static_cast<double>(index[v]) - rawIndex[v]);

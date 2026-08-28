@@ -59,6 +59,8 @@ add_library(PolyVector SHARED
     src/UMBER/UMBER.cxx
     src/MERIDIAN/MERIDIAN.hxx
     src/MERIDIAN/MERIDIAN.cxx
+    src/MERIDIAN/Interfaces.hxx
+    src/MERIDIAN/Interfaces.cxx
     src/MERIDIAN/ConeSingularities.hxx
     src/MERIDIAN/ConeSingularities.cxx
     src/MERIDIAN/ConeCut.hxx

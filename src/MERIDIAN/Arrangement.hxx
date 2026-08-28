@@ -94,10 +94,18 @@ public:
         Crossing,        // two separatrices met inside a face
         BoundaryHit,     // a separatrix left transversely through dS
         BoundaryCorner,  // dS changes its label here without a cone to explain it
+        InterfaceNode,   // a node of the material interface network, Stage 0b
+        InterfaceHit,    // a separatrix crossed an interface
         Dangling         // a separatrix that Q5 did not close simply stopped
     };
 
-    enum class ArcKind { Separatrix, Boundary };
+    // Boundary and Interface arcs are both runs of mesh edges and are built the
+    // same way; the difference is which faces they bound. A boundary arc has
+    // the model on one side and nothing on the other, and that is how a patch
+    // is told from a hole. An interface arc has a patch on both sides -- which
+    // is the whole point of it, since the two are different materials and no
+    // element may straddle them.
+    enum class ArcKind { Separatrix, Boundary, Interface };
 
     // One node of the arrangement. `angle` is the layout angle of each outgoing
     // half-edge, accumulated around the node's fan in the image and therefore
@@ -140,6 +148,11 @@ public:
         // image of the face the arc is actually in and in no other.
         int faceFrom = -1, faceTo = -1;
         int bdFrom = -1, bdTo = -1;
+        // For an interface arc, the directed interface edge each end leaves
+        // along, and which branch of the network it came from.
+        int ifFrom = -1, ifTo = -1;
+        int branch = -1;
+        int matLeft = 0, matRight = 0;
 
         std::vector<Point> points;             // the polyline on S, from -> to
         double modelLength = 0.0;
@@ -178,6 +191,8 @@ public:
 
         double area = 0.0;       // signed, on S; negative for the unbounded face
         bool patch = false;      // lies inside S
+        int material = 0;        // the material of the region it lies in, or 0
+        bool mixed = false;      // sampled points found more than one material
         bool quad = false;       // exactly four corners
         bool simple = false;     // and exactly one arc per side
         int tJunctions = 0;      // nodes it passes through without turning
@@ -280,7 +295,12 @@ public:
         int mergedNodes = 0;         // crossings that turned out to coincide
         int isolatedCones = 0;       // cones with no arc at all
 
-        int arcs = 0, separatrixArcs = 0, boundaryArcs = 0;
+        int arcs = 0, separatrixArcs = 0, boundaryArcs = 0, interfaceArcs = 0;
+        int interfaceNodes = 0, interfaceHitNodes = 0;
+        // Patches whose interior is not all one material. Zero is what an
+        // interface-respecting layout looks like and is the property the whole
+        // multi-material extension exists to produce.
+        int mixedPatches = 0;
         int degenerateArcs = 0;
         int duplicateCurves = 0;     // traced from both ends; the second dropped
         int collapsedArcs = 0;       // slivers whose two ends were one node
@@ -405,8 +425,12 @@ private:
     void trimUnresolved();
     void buildEndNodes();
     void buildBoundaryNodes();
+    void buildInterfaceNodes();
+    void findInterfaceCrossings();
     void splitCurves();
     void buildBoundaryArcs();
+    void buildInterfaceArcs();
+    void classifyMaterials();
     void buildAngles();
     void linkHalfEdges();
     void extractFaces();
@@ -424,6 +448,8 @@ private:
     double imageAngle(int f, int v) const;
     // The image direction of a directed edge of dS, read in its own face.
     Point dirEdgeImage(int be) const;
+    // The same for a directed interface edge, read in the face named on it.
+    Point dirInterfaceImage(int ie) const;
     // The layout angle at node n of a direction leaving it into face f.
     double layoutAngle(int n, int f, const Point &imageDir, const Point &modelDir);
 
@@ -455,6 +481,15 @@ private:
     std::vector<DirEdge> dirBoundary;            // ordered dS edges, model on left
     std::vector<int> boundaryOut;                // vertex -> its outgoing dS edge
     std::vector<std::vector<Event>> boundaryEvents; // per entry of dirBoundary
+    // The interface network, walked branch by branch: dirInterface holds every
+    // interface edge directed the way its branch runs, branchStart says where
+    // each branch's run begins, and interfaceEvents carries the separatrix
+    // crossings on each edge in the same way boundaryEvents does for dS.
+    const Interfaces *itf = nullptr;
+    std::vector<DirEdge> dirInterface;
+    std::vector<std::vector<Event>> interfaceEvents;
+    std::vector<int> branchStart;                // branch -> first dirInterface
+    std::vector<int> branchCount;                // ... and how many
     // Gamma_u / Gamma_v per edge of dS, carried over from Stage 5.
     std::unordered_map<MeshEdgeKey, int, MeshEdgeKeyHash> edgeLabel;
     std::vector<char> fanBuilt;                  // per vertex

@@ -208,6 +208,23 @@ void usage(const char *argv0) {
               << "  --no-rebalance     do not repair Eq. (4) automatically\n"
               << "  --cut-to-graph     cone cuts may stop on an earlier cut, not only dS\n"
               << "  --cut <file.obj>   write the cut disk Omega\n"
+              << "  --no-interfaces    ignore the material tags: no Stage 0b, no E6\n"
+              << "  --no-field-interfaces  leave the Stage 0 field aligned to dS alone\n"
+              << "  --no-cancel-dipoles    keep the +1/-1 cone pairs on curved interfaces\n"
+              << "  --no-e6            keep the interface network but drop E6, so the\n"
+              << "                     interfaces are held by E3 alone\n"
+              << "  --no-prescribe     leave the cone index at an interface node to the\n"
+              << "                     cross field rather than to the geometry\n"
+              << "  --no-propagate     label each interface chain by its own flux rather\n"
+              << "                     than by the node quantisation\n"
+              << "  --lag-e6           re-read E6's tangent lengths from the map between\n"
+              << "                     outer steps (off; it costs more than it buys)\n"
+              << "  --fit-interfaces   mesh the interfaces on their spline fits like every\n"
+              << "                     other arc, rather than on the traced curves\n"
+              << "  --kink <deg>       interface corner threshold        (default 45)\n"
+              << "  --loop-splits <n>  arcs a closed interface is cut into (default 4)\n"
+              << "  --nodes <n>        list at most n interface nodes    (default 12)\n"
+              << "  --interfaces <f.obj> write the interface network as polylines\n"
               << "  --cones <n>        list at most n cones          (default 20)\n"
               << "  --outer <n>        penalty continuation steps    (default 10)\n"
               << "  --inner <n>        inner iterations per step     (default 40)\n"
@@ -274,6 +291,8 @@ int main(int argc, char **argv) {
     int coneListLimit = 20;
     int curveListLimit = 10;
     int chordListLimit = 0;
+    int interfaceListLimit = 12;
+    std::string interfacesOut;
 
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
@@ -285,6 +304,20 @@ int main(int argc, char **argv) {
         else if (a == "--no-rebalance")            opts.autoRebalance = false;
         else if (a == "--cut-to-graph")            opts.coneCutsToBoundary = false;
         else if (a == "--cut" && i + 1 < argc)     cutOut = argv[++i];
+        else if (a == "--no-interfaces")           opts.materialInterfaces = false;
+        else if (a == "--no-field-interfaces")     opts.alignFieldToInterfaces = false;
+        else if (a == "--no-cancel-dipoles")       opts.cancelInterfaceDipoles = false;
+        else if (a == "--no-e6")                   opts.interfaceCorners = false;
+        else if (a == "--no-prescribe")            opts.prescribeInterfaceCones = false;
+        else if (a == "--no-propagate")            opts.propagateInterfaceLabels = false;
+        else if (a == "--lag-e6")                  opts.lagInterfaceScales = true;
+        else if (a == "--fit-interfaces")          opts.quadInterfacesOnTracedArcs = false;
+        else if (a == "--kink" && i + 1 < argc)
+            opts.interfaceKinkAngle = std::stod(argv[++i]) * M_PI / 180.0;
+        else if (a == "--loop-splits" && i + 1 < argc)
+            opts.interfaceLoopSplits = std::stoi(argv[++i]);
+        else if (a == "--nodes" && i + 1 < argc)   interfaceListLimit = std::stoi(argv[++i]);
+        else if (a == "--interfaces" && i + 1 < argc) interfacesOut = argv[++i];
         else if (a == "--cones" && i + 1 < argc)   coneListLimit = std::stoi(argv[++i]);
         else if (a == "--outer" && i + 1 < argc)   opts.outerSteps = std::stoi(argv[++i]);
         else if (a == "--inner" && i + 1 < argc)   opts.innerIterations = std::stoi(argv[++i]);
@@ -370,6 +403,86 @@ int main(int argc, char **argv) {
               << ", residual " << std::scientific << std::setprecision(3)
               << pipeline.getField().error << std::defaultfloat << "\n";
     verdict(st.fieldConverged, "Field converged");
+
+    // ---------------------------------------------------------------------
+    // Stage 0b -- the material interface network
+    // ---------------------------------------------------------------------
+    if (pipeline.hasInterfaces() && pipeline.getInterfaces().multiMaterial()) {
+        heading("Stage 0b  Material interfaces (feature lines from the material tags)");
+        const Interfaces &itf = pipeline.getInterfaces();
+        const Interfaces::Report &fr = itf.getReport();
+
+        std::cout << "  " << fr.materials << " material(s) in " << fr.regions
+                  << " connected region(s); " << fr.interfaceEdges
+                  << " interface edge(s) in " << fr.branches << " branch(es)\n";
+        std::cout << "  Nodes: " << fr.nodes << " -- " << fr.junctions << " junction, "
+                  << fr.landings << " on dS, " << fr.kinks << " kink, "
+                  << fr.loopSplits << " loop split";
+        if (fr.dangling) std::cout << ", " << fr.dangling << " dangling";
+        std::cout << "\n";
+        std::cout << "  Sectors: " << fr.illPosedNodes << " of " << fr.nodes
+                  << " node(s) are more than "
+                  << std::fixed << std::setprecision(0) << (10.0)
+                  << " degrees from whole quarter turns; the worst is "
+                  << std::setprecision(1) << (fr.worstSectorResidual * 180.0 / M_PI)
+                  << " degrees" << std::defaultfloat;
+        if (fr.worstSectorNode >= 0 && fr.worstSectorNode < static_cast<int>(itf.nodes().size())) {
+            std::cout << " (at vertex " << itf.nodes()[fr.worstSectorNode].vertex << ")";
+        }
+        std::cout << "\n";
+        std::cout << "  Cones prescribed from the geometry: " << fr.prescribedCones
+                  << ", summing to " << std::showpos << fr.prescribedIndexSum << std::noshowpos
+                  << "; the field was " << st.interfacePrescriptionShift
+                  << " index unit(s) away from them\n";
+        std::cout << "  Region balance: " << fr.regionsBalanced << " of " << fr.regions
+                  << " satisfy sum I + sum (2 - q) = 4 chi";
+        if (fr.quartersMoved || fr.cornersInserted) {
+            std::cout << ", after moving " << fr.quartersMoved << " quarter turn(s) and "
+                      << "inserting " << fr.cornersInserted << " corner(s)";
+        }
+        std::cout << "\n";
+
+        if (interfaceListLimit > 0) {
+            std::cout << "     vertex  kind       I   sectors (deg -> quarters)\n";
+            int shown = 0;
+            for (const Interfaces::Node &n : itf.nodes()) {
+                if (shown++ >= interfaceListLimit) {
+                    std::cout << "     ... " << (itf.nodes().size() - shown + 1) << " more\n";
+                    break;
+                }
+                const char *kind = n.kind == Interfaces::NodeKind::Junction  ? "junction"
+                                 : n.kind == Interfaces::NodeKind::Landing   ? "landing "
+                                 : n.kind == Interfaces::NodeKind::Kink      ? "kink    "
+                                 : n.kind == Interfaces::NodeKind::LoopSplit ? "loopsplit"
+                                 : n.kind == Interfaces::NodeKind::Balance   ? "balance "
+                                                                             : "dangling";
+                std::cout << "     " << std::setw(6) << n.vertex << "  " << kind << " "
+                          << std::showpos << std::setw(3) << n.index << std::noshowpos << "   ";
+                for (size_t k = 0; k < n.sector.size(); ++k) {
+                    std::cout << std::fixed << std::setprecision(0)
+                              << (n.sector[k] * 180.0 / M_PI) << "->" << n.quarters[k]
+                              << (k + 1 < n.sector.size() ? ", " : "") << std::defaultfloat;
+                }
+                if (n.rebalanced) std::cout << "  (rebalanced)";
+                if (!n.wellPosed) std::cout << "  [ill-posed]";
+                std::cout << "\n";
+            }
+        }
+
+        verdict(fr.dangling == 0, "Every interface branch runs between two nodes");
+        verdict(fr.regionsBalanced == fr.regions,
+                "Every material region can be a whole number of quadrilaterals");
+        if (fr.illPosedNodes > 0) {
+            std::cout << "  " << kWarn << " " << fr.illPosedNodes
+                      << " node(s) are ill-posed for a vertex-based cross field: no single "
+                      << "cross is tangent to all the interfaces meeting there. The layout "
+                      << "absorbs the turn, the field cannot represent it.\n";
+        }
+        if (!interfacesOut.empty()) {
+            const bool w = itf.writeOBJ(interfacesOut);
+            std::cout << "  " << (w ? "Wrote " : "Could not write ") << interfacesOut << "\n";
+        }
+    }
 
     // ---------------------------------------------------------------------
     // Stage 1 -- cone singularities and Gauss-Bonnet
@@ -632,6 +745,17 @@ int main(int argc, char **argv) {
     std::cout << "  Features: " << sr.featureEdges << " edge(s) in " << sr.featureChains
               << " chain(s) -> Gamma_u^feat " << sr.featureChainsU
               << ", Gamma_v^feat " << sr.featureChainsV << "\n";
+    if (sr.interfaceCorners > 0 || sr.featureChainsPropagated > 0) {
+        std::cout << "  Interfaces: " << sr.featureChainsPropagated
+                  << " chain(s) labelled from the node quantisation ("
+                  << sr.featureLabelsCorrected << " where the flux said otherwise), "
+                  << sr.interfaceCorners << " sector(s) for E6";
+        if (sr.interfaceCornersSpanningCut > 0) {
+            std::cout << "; " << sr.interfaceCornersSpanningCut
+                      << " dropped where the cutting graph runs through the sector";
+        }
+        std::cout << "\n";
+    }
     std::cout << "  Separatrices traced: " << sr.separatrices << " -> "
               << sr.separatricesToCone << " to a cone, " << sr.separatricesToBoundary
               << " out through dS, " << sr.separatricesCapped << " unresolved\n";
@@ -662,9 +786,10 @@ int main(int argc, char **argv) {
     std::cout << "  Outer steps: " << er.outerSteps << " of " << opts.outerSteps
               << ", inner iterations " << er.innerIterations
               << ", line-search stops " << er.lineSearchFailures << "\n";
-    std::cout << "  lambda_2..5 reached " << std::scientific << std::setprecision(2)
+    std::cout << "  lambda_2..6 reached " << std::scientific << std::setprecision(2)
               << er.lambdaFinal[0] << ", " << er.lambdaFinal[1] << ", "
-              << er.lambdaFinal[2] << ", " << er.lambdaFinal[3] << std::defaultfloat;
+              << er.lambdaFinal[2] << ", " << er.lambdaFinal[3] << ", "
+              << er.lambdaFinal[4] << std::defaultfloat;
     if (er.referenceSwitches || er.relabels) {
         std::cout << "   (" << er.referenceSwitches << " reference switch(es), "
                   << er.relabels << " relabel(s))";
@@ -677,7 +802,7 @@ int main(int argc, char **argv) {
               << er.energyStart << ", at the end " << er.energyEnd
               << "   E1 " << er.e1 << ", E2 " << er.e2
               << ", E3 " << er.e3 << ", E4 " << er.e4 << ", E5 " << er.e5
-              << std::defaultfloat << "\n";
+              << ", E6 " << er.e6 << std::defaultfloat << "\n";
     std::cout << "  Residuals (relative to the image extent)\n";
     std::cout << "     Q3 boundary  " << std::scientific << std::setprecision(3)
               << er.initialBoundaryResidual << "  ->  " << er.maxBoundaryResidual << "\n";
@@ -686,6 +811,17 @@ int main(int argc, char **argv) {
               << er.maxSeamResidual << "\n";
     std::cout << "     Q5 topo      " << er.initialTopoResidual << "  ->  "
               << er.maxTopoResidual << std::defaultfloat << "\n";
+    if (er.interfaceCorners > 0) {
+        std::cout << "  E6: the worst interface sector is " << std::scientific
+                  << std::setprecision(3) << er.maxInterfaceResidual
+                  << " rad from the quarter turns the model has there"
+                  << std::defaultfloat;
+        if (er.interfaceCornerChanges > 0) {
+            std::cout << "; " << er.interfaceCornerChanges
+                      << " turned a different whole number of quarters";
+        }
+        std::cout << "\n";
+    }
     std::cout << "  det J in [" << std::fixed << std::setprecision(4) << er.minDetJ
               << ", ...], " << er.invertedTriangles << " inverted triangle(s)"
               << std::defaultfloat << "\n";
@@ -706,6 +842,10 @@ int main(int argc, char **argv) {
     verdict(er.maxSeamResidual < 1e-6, "Q4: seam transitions are exactly R_k");
     verdict(er.maxBoundaryResidual < 1e-6, "Q3: every curve of dS is on a coordinate line");
     verdict(er.maxFeatureResidual < 1e-6, "Feature chains are layout edges");
+    if (er.interfaceCorners > 0) {
+        verdict(er.interfaceCornerChanges == 0 && er.maxInterfaceResidual < 1e-3,
+                "E6: every interface sector turns the quarters the model has");
+    }
     verdict(sr.topoPaths == 0 || er.maxTopoResidual < 1e-6,
             "Q5: the connectivity constraints are met");
     verdict(er.anglesHeld, "Q2: every cone kept the angle Stage 1 prescribed for it");
@@ -891,6 +1031,12 @@ int main(int argc, char **argv) {
     std::cout << "  Nodes: " << arep.nodes << " -- " << arep.coneNodes << " cone, "
               << arep.crossingNodes << " separatrix crossing, " << arep.boundaryHitNodes
               << " on dS, " << arep.boundaryCornerNodes << " boundary corner";
+    if (arep.interfaceNodes > 0) {
+        std::cout << ", " << arep.interfaceNodes << " interface node";
+    }
+    if (arep.interfaceHitNodes > 0) {
+        std::cout << ", " << arep.interfaceHitNodes << " separatrix on an interface";
+    }
     if (arep.danglingNodes > 0) std::cout << ", " << arep.danglingNodes << " dangling";
     if (arep.mergedNodes > 0) std::cout << "  (" << arep.mergedNodes << " coincided)";
     std::cout << "\n";
@@ -900,6 +1046,7 @@ int main(int argc, char **argv) {
               << " second copy/ies dropped\n";
     std::cout << "  Arcs: " << arep.arcs << " -- " << arep.separatrixArcs << " separatrix, "
               << arep.boundaryArcs << " on dS";
+    if (arep.interfaceArcs > 0) std::cout << ", " << arep.interfaceArcs << " on an interface";
     if (arep.degenerateArcs > 0) std::cout << ", " << arep.degenerateArcs << " degenerate";
     if (arep.danglingArcs > 0) std::cout << ", " << arep.danglingArcs << " dangling";
     std::cout << "\n";
@@ -956,6 +1103,9 @@ int main(int argc, char **argv) {
     verdict(arep.tJunctions == 0, "No T-junction: every node a patch passes turns a quarter");
     verdict(arep.simpleQuads == arep.patches, "Every patch has one arc on each side");
     verdict(arep.unsharedArcs == 0, "Every arc separates two patches, or a patch from dS");
+    if (st.materials > 1) {
+        verdict(arep.mixedPatches == 0, "Every patch lies inside one material");
+    }
     verdict(arep.coneValenceErrors == 0 && arep.isolatedCones == 0,
             "Every cone has the arcs its index prescribes");
     verdict(arep.areaCoverage > 0.999 && arep.areaCoverage < 1.001, "The patches tile S");
@@ -1121,6 +1271,16 @@ int main(int argc, char **argv) {
     if (qr.nonManifoldEdges > 0) std::cout << ", " << qr.nonManifoldEdges << " used by more";
     if (qr.cracks > 0) std::cout << "; " << qr.cracks << " coincident vertex pair(s)";
     std::cout << "\n";
+    if (st.materials > 1) {
+        std::cout << "  Materials: " << qr.materials << " on the elements, "
+                  << qr.interfaceEdges << " element edge(s) shared by two of them, "
+                  << qr.mixedQuads << " element(s) straddling an interface";
+        if (qr.unlocatedQuads > 0) {
+            std::cout << " (" << qr.unlocatedQuads
+                      << " took theirs from the nearest triangle)";
+        }
+        std::cout << "\n";
+    }
 
     if (chordListLimit > 0 && !qm.chords().empty()) {
         std::cout << "     chord   arcs  edges   ideal    shortest arc   longest arc\n";
@@ -1147,6 +1307,9 @@ int main(int argc, char **argv) {
     verdict(qr.cracks == 0, "Watertight: no two vertices sit at the same point");
     verdict(qr.invertedQuads == 0, "No element is inverted");
     verdict(qr.unmeshedPatches == 0, "Every patch of the layout was meshed");
+    if (st.materials > 1) {
+        verdict(qr.mixedQuads == 0, "No element straddles a material interface");
+    }
     for (const std::string &m : qr.messages) std::cout << "  " << kWarn << " " << m << "\n";
 
     if (!meshOut.empty()) {

@@ -169,6 +169,24 @@ public:
         // tells a meshing artefact apart from a fitting one.
         bool useSplines = true;
 
+        // Place the nodes of a *material interface* arc on the traced curve
+        // even when everything else is placed on the Stage 9 fit.
+        //
+        // The two kinds of arc are not the same kind of object. A separatrix is
+        // a curve the pipeline chose, and approximating it with three cubics is
+        // a modelling decision the fit is entitled to make. An interface is a
+        // curve the input gave, an element that crosses it carries two
+        // materials, and three cubics are not always enough: geom011's
+        // interface is a cosine whose radius of curvature is about three
+        // element lengths, the fit misses it by 4.8e-2 of the model -- a whole
+        // element -- and 31 of its 984 elements come out with the interface
+        // running through them. Meshed on the traced arc instead, none do.
+        //
+        // It costs nothing anywhere else: on an interface the fit follows, the
+        // two curves agree to the fit's deviation, which is 1e-15 on the
+        // straight-interface models in the corpus.
+        bool interfacesOnTracedArcs = true;
+
         // Stations per direction used to measure a patch's isoparametric line
         // lengths, which are the data the interval assignment is chosen from.
         int spanSamples = 16;
@@ -278,7 +296,27 @@ public:
         int nonManifoldEdges = 0;
         int cracks = 0;
 
+        // Materials, on a multi-material model. Every element carries the
+        // material of the region it lies in, and an element that straddles an
+        // interface -- centroid in one material, an edge midpoint in another --
+        // is one no analysis code can integrate. Zero of those is the property
+        // the whole multi-material path exists to produce, so it is measured on
+        // the finished elements rather than inferred from the layout.
+        int materials = 0;
+        int mixedQuads = 0;
+        // Elements every sample of which fell outside the triangulation, so the
+        // material came from the nearest triangle instead. Not a defect -- a
+        // Coons patch may bulge a fraction of an element past a curved piece of
+        // dS -- but worth counting, because a large number of them means the
+        // fit and the model have parted company.
+        int unlocatedQuads = 0;
+        // Element edges lying on a material interface. They are the ones two
+        // materials share, and both sides carry the same nodes by construction
+        // because the interface is a single arc of the layout.
+        int interfaceEdges = 0;
+
         bool conforming = false;      // no third use of an edge, no cracks
+        bool materialsPure = false;   // no element straddles an interface
         bool valid = false;           // ... and every patch meshed, none folded
 
         std::vector<std::string> messages;
@@ -289,6 +327,9 @@ public:
 
     const std::vector<Point>& vertices() const { return verts; }
     const std::vector<std::array<int, 4>>& quads() const { return cells; }
+    // The material id of each element, from the region of the input mesh its
+    // centroid lies in. All 1s on a single-material model.
+    const std::vector<int>& quadMaterials() const { return cellMaterial; }
     const std::vector<Block>& blocks() const { return grids; }
     const std::vector<Chord>& chords() const { return chordList; }
     const Report& getReport() const { return report; }
@@ -312,6 +353,7 @@ private:
     void meshArcs();
     void meshPatches();
     void smooth();
+    void classifyMaterials();
     void check();
 
     // Arc length along a fitted arc, tabulated at uniform parameter, and its
@@ -333,6 +375,7 @@ private:
 
     std::vector<Point> verts;
     std::vector<std::array<int, 4>> cells;
+    std::vector<int> cellMaterial;
     std::vector<int> cellBlock;             // per quad, its Block
     std::vector<Block> grids;
     std::vector<Chord> chordList;

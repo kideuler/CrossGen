@@ -52,6 +52,52 @@
 //       the same bracket midsurface gives 1898 sliver patches without it and 73
 //       usable ones with it.
 //
+//   E6  interface sectors -- not in the paper, and needed as soon as the
+//       features are the interfaces of a multi-material domain rather than the
+//       trim curves of one. For each sector of the interface network, with
+//       tangents a and b at the node that bound it and q the quarter turns
+//       Stage 0b measured between them,
+//
+//           E6 = sum  (l_a + l_b)/2  || b/l_b  -  R_q (a/l_a) ||^2
+//
+//       written on tangents in exactly the way E4 is, so that the translation
+//       drops out and only the turn is held.
+//
+//       ### Why E3 is not enough
+//
+//       E3 holds each interface on a coordinate line, which is a statement
+//       about one curve at a time. Everything that makes a network of curves a
+//       *layout* lives between them and E3 cannot see it. Three interfaces meet
+//       at a triple point: E3 says each is an isoline, and is equally satisfied
+//       whether the three leave at 90, 90, 180 degrees in the image -- the
+//       sectors the model actually has -- or all three along the same axis,
+//       which is degenerate and which the barrier will happily settle for
+//       because it is cheaper. An interface reaching dS: E3 says the interface
+//       is an isoline and E2 says dS is one, and nothing at all says they are
+//       different isolines, so the interface is free to fold onto the boundary.
+//       A corner where an interface turns: E3 splits it into two chains and
+//       says each is an isoline, which two collinear chains satisfy exactly.
+//
+//       In every one of those the missing statement is the same, and it is the
+//       one the geometry already fixed: how many quarter turns lie between two
+//       curves at the point where they meet. That is what E6 asserts, and it is
+//       the reason a multi-material layout comes out with its interfaces on it
+//       rather than beside it.
+//
+//       ### Why it is quadratic
+//
+//       The obvious form of "these two tangents are q quarter turns apart" is a
+//       condition on their angles, which is not quadratic in (u, v), and the
+//       obvious repair -- cross(R_q a, b) = 0 -- is bilinear, which is worse.
+//       Writing it as b = R_q a instead is linear in the unknowns and its
+//       square is one more term of exactly the kind E2..E5 already are, at the
+//       price of also asserting |b| = |a|: the map stretches the two rays
+//       equally at that one vertex. That is a real extra assumption and it is a
+//       mild one -- it is local conformality at the node and nowhere else, and
+//       E4 has been asserting the same thing across every seam edge since Stage
+//       4 -- and it is what makes the term cost nothing to add to the existing
+//       proxy.
+//
 // E5 is real-valued rather than integer-valued, and that is the paper's central
 // numerical claim -- the mixed-integer optimisation that [48,49,51,53,60] need
 // is avoided entirely, because "the two endpoints lie on a common isoline" is
@@ -206,6 +252,26 @@ public:
         bool alternateReference = false;
         bool relabel = true;
 
+        // Re-read the lengths E6 divides its two tangents by from the map
+        // between outer steps, instead of leaving them at the flat metric's.
+        //
+        // The argument for it is clean and the measurement does not support it,
+        // so it is off. Written on flat lengths, E6 asserts the sector *and*
+        // that the map stretches the two rays of it equally -- local
+        // conformality at the node -- and that second half is a real extra
+        // demand where the interfaces meet obliquely. Lagging the lengths
+        // removes it and leaves the angle alone, and it does what it says: on
+        // geom013, whose groove faces meet dS at 58 and 122 degrees, the worst
+        // sector goes from 0.41 rad out to 0.035.
+        //
+        // The layouts are worse. Over data/meshes/multimat the unmeshed area
+        // rises on geom010 (20.2% to 27.1%), geom012 (60.1% to 64.2%) and
+        // geom013 (77.2% to 91.1%), and falls on geom007 alone (78.5% to
+        // 66.2%). The conformality E6 was accidentally asking for turns out to
+        // be regularising the continuation near the nodes, and giving it up
+        // costs more than the sector residual it buys.
+        bool lagInterfaceScales = false;
+
         int pinnedVertex = 0;
     };
 
@@ -218,11 +284,12 @@ public:
         int relabels = 0;
         int referenceSwitches = 0;
 
-        double lambdaFinal[4] = {0.0, 0.0, 0.0, 0.0};   // lambda_2 .. lambda_5
+        double lambdaFinal[5] = {0.0, 0.0, 0.0, 0.0, 0.0};   // lambda_2 .. lambda_6
         double energyStart = 0.0, energyEnd = 0.0;
         // The five energies at the end, unweighted.
         double e1 = 0.0, e2 = 0.0, e3 = 0.0, e4 = 0.0, e5 = 0.0;
 
+        double e6 = 0.0;
         // One residual per property of Definition 2.1, each in the units the
         // property is stated in. The three lengths are divided by the extent of
         // the image, so the tolerance is a relative one.
@@ -230,6 +297,17 @@ public:
         double maxFeatureResidual = 0.0;    // features
         double maxSeamResidual = 0.0;       // Q4
         double maxTopoResidual = 0.0;       // Q5
+        // E6: the worst sector of the interface network, as the length by which
+        // the two tangents bounding it miss being a quarter turn apart, over the
+        // extent of the image. Reported alongside the count of sectors whose
+        // turn came out as a *different* whole number of quarters from the one
+        // the model has -- the same distinction Q2 draws between a cone that
+        // drifted and a cone that changed valence, and the same reason for
+        // drawing it: an interface corner that turned the wrong way is a layout
+        // with the interface somewhere else, not a layout with a slack residual.
+        double maxInterfaceResidual = 0.0;
+        int interfaceCornerChanges = 0;
+        int interfaceCorners = 0;
         double minDetJ = 0.0;               // Q1, against the current reference
         double maxConeAngleResidual = 0.0;  // Q2, against the prescribed angle
         double maxRegularAngleResidual = 0.0;
@@ -343,14 +421,15 @@ private:
     struct Term {
         std::vector<std::pair<int, double>> coeffs;  // (dof, coefficient)
         double gweight = 0.0;    // the geometric weight, l_e^-1 or 1; no lambda
-        int which = 0;           // which of E2..E5 this term belongs to
+        int which = 0;           // which of E2..E6 this term belongs to
     };
 
     void buildReference(Reference ref);
     void jacobian(const std::vector<double> &x, int t, double J[4]) const;
 
     double energy(const std::vector<double> &x, double *e1 = nullptr, double *e2 = nullptr,
-                  double *e3 = nullptr, double *e4 = nullptr, double *e5 = nullptr) const;
+                  double *e3 = nullptr, double *e4 = nullptr, double *e5 = nullptr,
+                  double *e6 = nullptr) const;
 
     // The quadratic model at x: gradient of the true objective, and the
     // Hessian of the proxy. Returns false if the map has already inverted.
@@ -384,6 +463,14 @@ private:
     // coefficient lists only have to be rebuilt when the labelling changes --
     // never when lambda or x moves.
     void buildConstraintTerms();
+    // Rewrite E6's coefficients from the map as it now stands, in place. The
+    // dofs each term touches do not change -- only the lengths the two tangents
+    // are divided by -- so the proxy's pattern and its symbolic factorisation
+    // both survive, which is what makes this affordable once per outer step.
+    // See SubdomainLabels::refreshInterfaceScales for why it is done at all.
+    void refreshInterfaceTerms();
+    // Where E6's terms start in cterms, and how many there are.
+    size_t e6Start = 0, e6Count = 0;
     static double residualOf(const Term &t, const std::vector<double> &x) {
         double r = 0.0;
         for (const auto &c : t.coeffs) r += c.second * x[c.first];
@@ -470,7 +557,7 @@ private:
     Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> ldlt;
     bool analysed = false;
 
-    double lambda[6] = {1.0, 1.0, 0.0, 0.0, 0.0, 0.0};   // lambda[1..5]
+    double lambda[7] = {1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0};   // lambda[1..6]
     // Diagonal of the image, the scale residuals are read against. Kept current
     // by updateExtent() -- see the note there for why a stale one is not a
     // cosmetic error in the reporting but an early stop of the continuation.

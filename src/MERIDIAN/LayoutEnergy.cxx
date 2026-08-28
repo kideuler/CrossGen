@@ -297,16 +297,99 @@ void LayoutEnergy::buildConstraintTerms() {
         cterms.push_back(std::move(t));
     }
 
+    // E6, the interface sectors. Written on tangents in the same way E4 is, so
+    // that the node's own position drops out and only the turn between the two
+    // rays is held:  b / l_b  =  R_q ( a / l_a ).
+    //
+    // The two rays share the node, so its dofs appear in both halves and the
+    // coefficients are accumulated before being written out -- and where q is
+    // even they partly cancel, which is exactly right and is why the sum has to
+    // be taken before the term is built rather than after.
+    if (options.lagInterfaceScales && uv.size() == static_cast<size_t>(nV)) {
+        labels->refreshInterfaceScales(uv);
+    }
+    e6Start = cterms.size();
+    for (const auto &ic : labels->interfaceCorners()) {
+        if (!(ic.sa > 0.0) || !(ic.sb > 0.0)) continue;
+        double Q[4];
+        quarterTurn(ic.quarters, Q);
+        for (int p = 0; p < 2; ++p) {
+            std::map<int, double> acc;
+            acc[2 * ic.b + p] += 1.0 / ic.sb;
+            acc[2 * ic.vertex + p] -= 1.0 / ic.sb;
+            for (int c = 0; c < 2; ++c) {
+                const double q = Q[2 * p + c];
+                if (q == 0.0) continue;
+                acc[2 * ic.a + c] -= q / ic.sa;
+                acc[2 * ic.vertex + c] += q / ic.sa;
+            }
+            Term t;
+            t.which = 6;
+            t.gweight = 0.5 * (ic.la + ic.lb);
+            for (const auto &kv : acc) {
+                if (kv.second != 0.0) t.coeffs.push_back({kv.first, kv.second});
+            }
+            if (t.coeffs.empty()) continue;
+            cterms.push_back(std::move(t));
+        }
+    }
+
+    e6Count = cterms.size() - e6Start;
+
     // The proxy's pattern is the union of the mesh's blocks and these terms',
     // so it changes exactly when they do and has to be rebuilt with them.
     buildHessianPattern();
 }
 
 // ---------------------------------------------------------------------------
+// refreshInterfaceTerms()
+// ---------------------------------------------------------------------------
+void LayoutEnergy::refreshInterfaceTerms() {
+    if (!options.lagInterfaceScales) return;
+    if (e6Count == 0 || uv.size() != static_cast<size_t>(nV)) return;
+    labels->refreshInterfaceScales(uv);
+
+    size_t at = e6Start;
+    for (const auto &ic : labels->interfaceCorners()) {
+        if (!(ic.sa > 0.0) || !(ic.sb > 0.0)) continue;
+        double Q[4];
+        quarterTurn(ic.quarters, Q);
+        for (int p = 0; p < 2; ++p) {
+            std::map<int, double> acc;
+            acc[2 * ic.b + p] += 1.0 / ic.sb;
+            acc[2 * ic.vertex + p] -= 1.0 / ic.sb;
+            for (int c = 0; c < 2; ++c) {
+                const double q = Q[2 * p + c];
+                if (q == 0.0) continue;
+                acc[2 * ic.a + c] -= q / ic.sa;
+                acc[2 * ic.vertex + c] += q / ic.sa;
+            }
+            std::vector<std::pair<int, double>> coeffs;
+            for (const auto &kv : acc) {
+                if (kv.second != 0.0) coeffs.push_back({kv.first, kv.second});
+            }
+            if (coeffs.empty()) continue;
+            if (at >= e6Start + e6Count) return;
+            // The dofs are the same ones as when the pattern was built -- the
+            // node and the far end of each ray -- so only the values move. If
+            // that ever stopped being true the slots would be wrong, so it is
+            // checked rather than assumed.
+            if (cterms[at].coeffs.size() != coeffs.size()) { ++at; continue; }
+            bool same = true;
+            for (size_t k = 0; k < coeffs.size(); ++k) {
+                if (cterms[at].coeffs[k].first != coeffs[k].first) same = false;
+            }
+            if (same) cterms[at].coeffs = std::move(coeffs);
+            ++at;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // energy()  --  Eq. (13)
 // ---------------------------------------------------------------------------
 double LayoutEnergy::energy(const std::vector<double> &xx, double *o1, double *o2,
-                            double *o3, double *o4, double *o5) const {
+                            double *o3, double *o4, double *o5, double *o6) const {
     double E1 = 0.0;
     double J[4];
     for (int t = 0; t < static_cast<int>(cm->triangles.size()); ++t) {
@@ -316,7 +399,7 @@ double LayoutEnergy::energy(const std::vector<double> &xx, double *o1, double *o
         E1 += refArea[t] * symmetricDirichlet(J, det);
     }
 
-    double E[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    double E[7] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
     for (const Term &t : cterms) {
         const double r = residualOf(t, xx);
         E[t.which] += t.gweight * r * r;
@@ -327,9 +410,10 @@ double LayoutEnergy::energy(const std::vector<double> &xx, double *o1, double *o
     if (o3) *o3 = E[3];
     if (o4) *o4 = E[4];
     if (o5) *o5 = E[5];
+    if (o6) *o6 = E[6];
 
     return lambda[1] * E1 + lambda[2] * E[2] + lambda[3] * E[3] +
-           lambda[4] * E[4] + lambda[5] * E[5];
+           lambda[4] * E[4] + lambda[5] * E[5] + lambda[6] * E[6];
 }
 
 // ---------------------------------------------------------------------------
@@ -780,6 +864,33 @@ void LayoutEnergy::measure(bool initial) {
                                           std::fabs(labels->topoResidual(uv, tp)) / extent);
     }
 
+    // E6: how far each sector of the interface network is from the whole number
+    // of quarter turns the model has there.
+    //
+    // Measured as an *angle* and not as the length E6 minimises. The energy is
+    // written on b/l_b - R_q(a/l_a), whose norm also carries the difference in
+    // how much the map stretches the two rays; that part is E1's business and
+    // is not a defect -- an anisotropic layout is still a layout -- so folding
+    // it into the verdict would fail models that are perfectly aligned and
+    // merely not conformal. The angle between the two tangents is the whole of
+    // what the sector condition says and it is scale-free.
+    report.maxInterfaceResidual = 0.0;
+    report.interfaceCornerChanges = 0;
+    report.interfaceCorners = static_cast<int>(labels->interfaceCorners().size());
+    for (const auto &ic : labels->interfaceCorners()) {
+        const Point a = uv[ic.a] - uv[ic.vertex];
+        const Point b = uv[ic.b] - uv[ic.vertex];
+        if (!(normP(a) > 0.0) || !(normP(b) > 0.0)) continue;
+        double turn = std::atan2(cross2(a, b), dotP(a, b));   // in (-pi, pi]
+        if (turn < 0.0) turn += 2.0 * M_PI;                   // in [0, 2pi)
+        const double want = M_PI_2 * ic.quarters;
+        double res = turn - want;
+        while (res > M_PI) res -= 2.0 * M_PI;
+        while (res < -M_PI) res += 2.0 * M_PI;
+        report.maxInterfaceResidual = std::max(report.maxInterfaceResidual, std::fabs(res));
+        if (std::lround(turn / M_PI_2) != (ic.quarters % 4)) ++report.interfaceCornerChanges;
+    }
+
     // Q1, and the angle sums for Q2.
     std::vector<double> angleAt(nV, 0.0);
     double J[4];
@@ -867,7 +978,7 @@ bool LayoutEnergy::constraintsUnder(double tol) const {
 // ---------------------------------------------------------------------------
 bool LayoutEnergy::run() {
     lambda[1] = options.lambda1;
-    for (int j = 2; j <= 5; ++j) lambda[j] = options.lambdaInit;
+    for (int j = 2; j <= 6; ++j) lambda[j] = options.lambdaInit;
     // E4 is the one constraint psi_R already satisfies exactly, so its penalty
     // has a different job from the others: not to *reach* Q4 over the course of
     // the continuation but to hold it while E2, E3 and E5 drag the map around.
@@ -917,7 +1028,7 @@ void LayoutEnergy::rebuildConstraints() {
 bool LayoutEnergy::resume(int outerSteps, double lambdaBoost) {
     rebuildConstraints();
     if (lambdaBoost > 0.0) {
-        for (int j = 2; j <= 5; ++j) lambda[j] *= lambdaBoost;
+        for (int j = 2; j <= 6; ++j) lambda[j] *= lambdaBoost;
     }
     ++report.resumes;
     return continuation(outerSteps);
@@ -934,7 +1045,7 @@ bool LayoutEnergy::continuation(int outerSteps) {
         // level below it -- and so that Report::lambdaFinal is the lambda the
         // returned map was actually produced at.
         if (outer > 0) {
-            for (int j = 2; j <= 5; ++j) lambda[j] *= options.lambdaGrowth;
+            for (int j = 2; j <= 6; ++j) lambda[j] *= options.lambdaGrowth;
             if (stalled && options.alternateReference) {
                 currentReference = (currentReference == Reference::Ricci)
                                        ? Reference::Euclidean : Reference::Ricci;
@@ -945,6 +1056,11 @@ bool LayoutEnergy::continuation(int outerSteps) {
                 labels->relabel(uv);
                 buildConstraintTerms();
                 ++report.relabels;
+            } else {
+                // E6's normalisation is lagged, so it is re-read at every level
+                // and not only when the continuation stalls. The relabel branch
+                // above has already done it as part of rebuilding the terms.
+                refreshInterfaceTerms();
             }
         }
 
@@ -960,7 +1076,9 @@ bool LayoutEnergy::continuation(int outerSteps) {
         // after the length residuals have arrived.
         if (constraintsUnder(options.constraintTolerance) &&
             report.coneValenceChanges == 0 &&
-            report.maxConeAngleResidual < options.angleTolerance) {
+            report.maxConeAngleResidual < options.angleTolerance &&
+            report.interfaceCornerChanges == 0 &&
+            report.maxInterfaceResidual < options.angleTolerance) {
             break;
         }
         if (report.invertedTriangles > 0) {
@@ -978,8 +1096,9 @@ bool LayoutEnergy::continuation(int outerSteps) {
         previousWorst = worst;
     }
 
-    report.energyEnd = energy(x, &report.e1, &report.e2, &report.e3, &report.e4, &report.e5);
-    for (int j = 2; j <= 5; ++j) report.lambdaFinal[j - 2] = lambda[j];
+    report.energyEnd = energy(x, &report.e1, &report.e2, &report.e3, &report.e4,
+                              &report.e5, &report.e6);
+    for (int j = 2; j <= 6; ++j) report.lambdaFinal[j - 2] = lambda[j];
 
     measure(false);
     finaliseVerdict();

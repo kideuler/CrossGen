@@ -19,4 +19,4 @@ A purely 2D implementation of Cross-fields along with block decomposition
 - [x] Try medial axis again.
 - [X] Change mesh cutting a little so singularities do not lie on the same cut. Should conditions better.
 - [X] Tracing.
-- [ ] Multi-materials in MERIDIAN through alignment to feature lines in energy.
+- [X] Multi-materials in MERIDIAN through alignment to feature lines in energy.

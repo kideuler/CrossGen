@@ -87,13 +87,22 @@ void Separatrices::buildTables() {
     }
 
     parentOnBoundary.assign(cm.edges.size(), 0);
+    parentIsFeature.assign(cm.edges.size(), 0);
     vertexOnRealBoundary.assign(cm.vertices.size(), 0);
+    const bool tagged = om.triangleMatId.size() == om.triangles.size();
     for (int e = 0; e < static_cast<int>(cm.edges.size()); ++e) {
         auto it = origEdgeIndex.find(EdgeKey(c2o[cm.edges[e][0]], c2o[cm.edges[e][1]]));
-        if (it != origEdgeIndex.end() && om.isBoundaryEdge[it->second]) {
+        if (it == origEdgeIndex.end()) continue;
+        if (om.isBoundaryEdge[it->second]) {
             parentOnBoundary[e] = 1;
             vertexOnRealBoundary[cm.edges[e][0]] = 1;
             vertexOnRealBoundary[cm.edges[e][1]] = 1;
+        } else if (tagged) {
+            const int f0 = om.edgeTriangles[it->second][0];
+            const int f1 = om.edgeTriangles[it->second][1];
+            if (f0 >= 0 && f1 >= 0 && om.triangleMatId[f0] != om.triangleMatId[f1]) {
+                parentIsFeature[e] = 1;
+            }
         }
     }
 
@@ -147,6 +156,32 @@ void Separatrices::buildEmitters() {
     coneChildren = imm->getConeChildren();
     vertCone = imm->getCutVertexCone();
     if (vertCone.size() != cm.vertices.size()) vertCone.assign(cm.vertices.size(), -1);
+
+    // The nodes of the material interface network, added as emitters. They are
+    // not cones -- Stage 1 put no curvature at them and Options::extraEmitters
+    // carries only the ones whose index is zero as often as not -- but they are
+    // singular points of the *layout*, and the layout edges that leave them
+    // have to be traced or the faces they bound come back with the wrong number
+    // of corners. See Options::extraEmitters.
+    {
+        const auto &o2c = imm->getCut().getOriginalToCutVertices();
+        const std::vector<int> &index = imm->getCones().getIndices();
+        for (int v : options.extraEmitters) {
+            if (v < 0 || v >= static_cast<int>(o2c.size()) || o2c[v].empty()) continue;
+            bool already = false;
+            for (int cv : coneVertex) if (cv == v) already = true;
+            if (already) continue;
+            coneVertex.push_back(v);
+            coneIndex.push_back(v < static_cast<int>(index.size()) ? index[v] : 0);
+            coneChildren.push_back(o2c[v]);
+            for (int child : o2c[v]) {
+                if (child >= 0 && child < static_cast<int>(vertCone.size())) {
+                    vertCone[child] = static_cast<int>(coneVertex.size()) - 1;
+                }
+            }
+            ++report.interfaceEmitters;
+        }
+    }
 
     coneOnBoundary.assign(coneVertex.size(), 0);
     for (size_t i = 0; i < coneVertex.size(); ++i) {
@@ -471,6 +506,7 @@ bool Separatrices::sweepCone(int slot, std::vector<Sector> &out, bool &closed) c
 // ---------------------------------------------------------------------------
 void Separatrices::traceAll() {
     traced.clear();
+    const Mesh &cm = imm->getCutMesh();
 
     for (int slot = 0; slot < static_cast<int>(coneVertex.size()); ++slot) {
         std::vector<Sector> fan;
@@ -554,6 +590,36 @@ void Separatrices::traceAll() {
             while (si + 1 < fan.size() && fan[si + 1].acc <= a) ++si;
 
             const Sector &s = fan[si];
+
+            // A ray that lands on the start edge of its sector runs *along* a
+            // mesh edge, and if that edge is a material interface then the
+            // layout edge in that direction is the interface itself: Stage 8
+            // has it as an arc already and a separatrix on top of it is a
+            // second copy of the same edge, which gives the node twice the
+            // arcs its index prescribes and a face of no area between them.
+            // Both ends of the sector are tested and not only the one the
+            // search landed on. A ray whose angle falls a rounding below a
+            // sector boundary stays in the previous sector, where it is at the
+            // *end* rather than at the start, and testing only the start misses
+            // exactly the rays that lie on a fan edge -- which after Stage 6 is
+            // every ray that lies on an interface, since that is what E6 was
+            // for.
+            if (options.suppressAlongFeatures) {
+                const int fromV = cm.triangles[s.face][(s.lc + 1) % 3];
+                const int toV = cm.triangles[s.face][(s.lc + 2) % 3];
+                int along = -1;
+                if (a - s.acc <= options.featureRayTolerance) along = fromV;
+                else if ((s.acc + s.angle) - a <= options.featureRayTolerance) along = toV;
+                if (along >= 0) {
+                    auto ie = cutEdgeIndex.find(EdgeKey(s.child, along));
+                    if (ie != cutEdgeIndex.end() && parentIsFeature[ie->second]) {
+                        ++report.suppressedAlongFeatures;
+                        --report.prescribed;
+                        continue;
+                    }
+                }
+            }
+
             const double abs = s.startAngle + (a - s.acc);
             const int dir = ((static_cast<int>(std::lround(abs / M_PI_2)) % 4) + 4) % 4;
 

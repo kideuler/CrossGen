@@ -28,6 +28,34 @@ public:
 
     void initialize();
 
+    // Interior edges the field is to be aligned to, on top of dS.
+    //
+    // The MBO field is boundary-aligned and nothing else: its only Dirichlet
+    // data is the tangent of dS, so on a multi-material domain it reads the
+    // material interfaces as ordinary interior edges and runs straight through
+    // them. That is wrong for a layout, because an interface is a curve the
+    // output has to keep exactly as dS is -- and the cost of ignoring it is not
+    // a slightly worse field, it is the wrong *singularities*: each material
+    // region carries its own index count, and the cones that count asks for
+    // simply are not there in a field that never saw the interface.
+    //
+    // Passing the interface edges here makes them one-sided Dirichlet edges on
+    // both sides, exactly as a boundary edge is on its one side, so the field is
+    // tangent to the interface from either material and its holonomy is then
+    // read per region. Call before initialize(); an empty set is the old
+    // behaviour and is what a single-material mesh gives.
+    // The two triangles on such an edge are pinned outright, the way a boundary
+    // triangle is. Leaving them in the diffusion instead, so that the alignment
+    // only competes with smoothness at the SIPG penalty weight, was measured
+    // and is worse: on a strongly curved interface it drops the +1/-1 pairs
+    // that a smoothest aligned field carries (which is what is wanted) but it
+    // also collapses the pair a *material* boundary genuinely needs onto the
+    // interface itself -- geom001's two cones land 0.14 apart astride the arc
+    // instead of 0.72 apart in the middle of their own regions. The pairs that
+    // are not wanted come off in Stage 1 instead; see
+    // ConeSingularities::cancelDipoles.
+    void setAlignedInteriorEdges(const std::vector<int> &edges);
+
     void step();
 
     void computeSingularities();
@@ -52,9 +80,18 @@ private:
     double gamma;        // SIPG penalty parameter
     int maxIterations;   // maximum number of iterations
 
+    // Interior edges promoted to aligned (Dirichlet) edges, per edge of the
+    // mesh. Empty when there are none, which is the single-material case.
+    std::vector<char> edgeAligned;
+
     // Hard Dirichlet BC per boundary triangle: triangle index -> prescribed exp(4i*theta)
     // Computed from the dominant boundary edge tangent in initialize(); applied after each step.
+    // Triangles on an aligned interior edge are pinned the same way.
     std::unordered_map<int, std::complex<double>> boundaryTriangleBC;
+
+    bool isAlignedEdge(int e) const {
+        return e >= 0 && e < static_cast<int>(edgeAligned.size()) && edgeAligned[e];
+    }
 };
 
 #endif // __SIPG_HXX__

@@ -1,6 +1,8 @@
 #include "MERIDIAN/QuadMesh.hxx"
 
 #include <algorithm>
+#include <map>
+#include <set>
 #include <cmath>
 #include <fstream>
 #include <limits>
@@ -76,6 +78,7 @@ QuadMesh::QuadMesh(const SplineFit &f, const Options &opts)
     meshArcs();
     meshPatches();
     smooth();
+    classifyMaterials();
     check();
 }
 
@@ -89,7 +92,11 @@ QuadMesh::QuadMesh(const SplineFit &f, const Options &opts)
 // ---------------------------------------------------------------------------
 Point QuadMesh::evaluateArc(int arc, double u) const {
     u = std::max(0.0, std::min(1.0, u));
-    if (options.useSplines && arc < static_cast<int>(fit->curves().size()) &&
+    const bool onInterface =
+        arc >= 0 && arc < static_cast<int>(arr->getArcs().size()) &&
+        arr->getArcs()[arc].kind == Arrangement::ArcKind::Interface;
+    if (options.useSplines && !(onInterface && options.interfacesOnTracedArcs) &&
+        arc < static_cast<int>(fit->curves().size()) &&
         !fit->curves()[arc].ctrl.empty()) {
         return fit->evaluate(fit->curves()[arc], u);
     }
@@ -624,6 +631,111 @@ void QuadMesh::smooth() {
 // worth having -- an error in the index arithmetic above shows up here as a
 // crack or a third use of an edge and nowhere else.
 // ---------------------------------------------------------------------------
+// classifyMaterials()
+//
+// The material of every element, and whether any of them straddles an
+// interface.
+//
+// This is the property the whole multi-material path exists to produce, and it
+// is measured on the finished elements rather than inferred from the layout,
+// because it is the thing that is actually true or false about the output: an
+// element straddling an interface carries two materials, and no analysis code
+// can integrate one. Five samples per element -- the centroid and the four edge
+// midpoints -- located in the input triangulation, which is where the material
+// tags live. An element inside one region has all five agree; one lying across
+// an interface does not, whatever the layout says about itself.
+//
+// The edge midpoints are the samples that matter. A centroid alone would call
+// an element pure whenever the interface clipped only a corner of it, which is
+// exactly the case a nearly-aligned layout produces and exactly the one worth
+// catching.
+// ---------------------------------------------------------------------------
+void QuadMesh::classifyMaterials() {
+    const Mesh &m = arr->getMesh();
+    cellMaterial.assign(cells.size(), 0);
+    report.materials = 0;
+    report.mixedQuads = report.unlocatedQuads = report.interfaceEdges = 0;
+    if (m.triangleMatId.size() != m.triangles.size()) return;
+
+    std::set<int> seen;
+    for (size_t k = 0; k < cells.size(); ++k) {
+        const std::array<int, 4> &q = cells[k];
+        Point c{0.0, 0.0};
+        for (int i = 0; i < 4; ++i) c = c + verts[q[i]];
+        c = c / 4.0;
+
+        // Five points of the element's *interior*: the centroid and the four
+        // half-way points from it to the corners.
+        //
+        // The obvious sampling -- the edge midpoints, nudged inwards -- is
+        // wrong, and wrong in the direction that reports a defect where there
+        // is none. An element edge lying on a curved interface is a chord of
+        // it, so its midpoint is off the interface by the sagitta whichever
+        // side the element is on; on geom011, whose interface is a cosine with
+        // a radius of curvature of about three element lengths, that put 37 of
+        // 984 elements on the wrong side of their own edge. Nothing is wrong
+        // with those elements: a straight-sided quadrilateral cannot follow a
+        // curve exactly and is not meant to. What would be wrong is an element
+        // the interface runs *through*, and the interior is where to look for
+        // that.
+        std::vector<Point> samples{c};
+        for (int i = 0; i < 4; ++i) samples.push_back((c + verts[q[i]]) * 0.5);
+
+        int mat = 0;
+        bool mixed = false;
+        for (const Point &p : samples) {
+            const int t = m.findTriangleContainingPoint(p);
+            if (t < 0) continue;
+            const int id = m.triangleMatId[t];
+            if (mat == 0) mat = id;
+            else if (id != mat) mixed = true;
+        }
+        if (mat == 0) {
+            // Every sample fell outside the triangulation, which happens where
+            // the Coons patch bulges a fraction of an element past a curved
+            // piece of dS. The element is still in the model and still in one
+            // material; the nearest triangle says which.
+            ++report.unlocatedQuads;
+            double best = std::numeric_limits<double>::infinity();
+            for (size_t t = 0; t < m.triangles.size(); ++t) {
+                const Triangle &tri = m.triangles[t];
+                const Point g = (m.vertices[tri[0]] + m.vertices[tri[1]] + m.vertices[tri[2]]) / 3.0;
+                const double d = normP(g - c);
+                if (d < best) { best = d; mat = m.triangleMatId[t]; }
+            }
+            if (mat == 0) continue;
+        }
+        cellMaterial[k] = mat;
+        seen.insert(mat);
+        if (mixed) ++report.mixedQuads;
+    }
+    report.materials = static_cast<int>(seen.size());
+
+    // Element edges two materials share. Both sides carry the same nodes by
+    // construction -- the interface is one arc of the layout, meshed once --
+    // so this is a count of what the two regions have in common and not a
+    // check that they meet.
+    std::map<std::pair<int, int>, std::pair<int, int>> edgeMat;
+    for (size_t k = 0; k < cells.size(); ++k) {
+        if (cellMaterial[k] == 0) continue;
+        for (int i = 0; i < 4; ++i) {
+            int a = cells[k][i], b = cells[k][(i + 1) % 4];
+            if (a > b) std::swap(a, b);
+            auto &slot = edgeMat[{a, b}];
+            if (slot.first == 0) slot.first = cellMaterial[k];
+            else if (slot.second == 0) slot.second = cellMaterial[k];
+        }
+    }
+    for (const auto &kv : edgeMat) {
+        if (kv.second.first != 0 && kv.second.second != 0 &&
+            kv.second.first != kv.second.second) {
+            ++report.interfaceEdges;
+        }
+    }
+    report.materialsPure = report.mixedQuads == 0;
+}
+
+// ---------------------------------------------------------------------------
 void QuadMesh::check() {
     report.vertices = static_cast<int>(verts.size());
     report.quads = static_cast<int>(cells.size());
@@ -740,7 +852,7 @@ void QuadMesh::check() {
 
     report.conforming = report.nonManifoldEdges == 0 && report.cracks == 0;
     report.valid = report.conforming && report.invertedQuads == 0 &&
-                   report.unmeshedPatches == 0;
+                   report.unmeshedPatches == 0 && report.mixedQuads == 0;
 
     if (report.unmeshedPatches > 0) {
         report.messages.push_back(
@@ -819,6 +931,11 @@ bool QuadMesh::writeVTU(const std::string &filename) const {
     for (size_t k = 0; k < cells.size(); ++k) {
         out << "          " << (k < cellBlock.size() ? cellBlock[k] : -1) << "\n";
     }
+    out << "        <DataArray type=\"Int32\" Name=\"material\" format=\"ascii\">\n";
+    for (size_t k = 0; k < cells.size(); ++k) {
+        out << "          " << (k < cellMaterial.size() ? cellMaterial[k] : 0) << "\n";
+    }
+    out << "        </DataArray>\n";
     out << "        </DataArray>\n      </CellData>\n";
     out << "    </Piece>\n  </UnstructuredGrid>\n</VTKFile>\n";
     return true;

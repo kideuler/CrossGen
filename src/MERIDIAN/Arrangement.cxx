@@ -69,16 +69,20 @@ Arrangement::Arrangement(const Separatrices &separatrices, const SubdomainLabels
     dedupeCurves();
     buildEndNodes();
     buildBoundaryNodes();
+    buildInterfaceNodes();
     collectSegments();
     findCrossings();
+    findInterfaceCrossings();
     trimUnresolved();
     splitCurves();
     buildBoundaryArcs();
+    buildInterfaceArcs();
     collapseShortArcs();
     buildAngles();
     linkHalfEdges();
     extractFaces();
     classifyFaces();
+    classifyMaterials();
     if (options.checkFeatures) checkFeatures();
     check();
 }
@@ -788,6 +792,237 @@ void Arrangement::buildBoundaryArcs() {
 }
 
 // ---------------------------------------------------------------------------
+// buildInterfaceNodes()
+//
+// The nodes of the material interface network are nodes of the layout. Stage 0b
+// already decided which vertices they are and how many quarter turns the layout
+// makes in each sector at them, and Stage 6 has just spent its whole
+// continuation making Psi agree; all that is left here is to put them in.
+//
+// A node that already carries one -- a cone the field put on an interface, or a
+// landing, which is on dS and may already be a boundary corner -- keeps the one
+// it has. The kinds are not interchangeable downstream: a cone's valence is
+// checked against its index and an interface node's is not.
+// ---------------------------------------------------------------------------
+void Arrangement::buildInterfaceNodes() {
+    itf = lab->getInterfaces();
+    if (!itf || !itf->multiMaterial()) { itf = nullptr; return; }
+
+    for (const Interfaces::Node &nd : itf->nodes()) {
+        const int v = nd.vertex;
+        if (v < 0 || v >= static_cast<int>(vertexNode.size())) continue;
+        if (vertexNode[v] >= 0) continue;   // already a cone, or a corner of dS
+        const int id = addNode(orig->vertices[v], NodeKind::InterfaceNode);
+        nodes[id].vertex = v;
+        nodes[id].onBoundary = orig->isBoundaryVertex[v];
+        vertexNode[v] = id;
+    }
+
+    // Every interface edge, directed the way its branch runs, so that a branch
+    // is a contiguous run of dirInterface and an event on it has a parameter
+    // that is an index into that run plus a fraction.
+    const std::vector<Interfaces::Branch> &brs = itf->branches();
+    branchStart.assign(brs.size(), 0);
+    branchCount.assign(brs.size(), 0);
+    for (size_t b = 0; b < brs.size(); ++b) {
+        branchStart[b] = static_cast<int>(dirInterface.size());
+        const Interfaces::Branch &br = brs[b];
+        for (size_t i = 0; i + 1 < br.verts.size() && i < br.edges.size(); ++i) {
+            DirEdge de;
+            de.a = br.verts[i];
+            de.b = br.verts[i + 1];
+            de.edge = br.edges[i];
+            de.face = orig->edgeTriangles[de.edge][0] >= 0 ? orig->edgeTriangles[de.edge][0]
+                                                           : orig->edgeTriangles[de.edge][1];
+            dirInterface.push_back(de);
+        }
+        branchCount[b] = static_cast<int>(dirInterface.size()) - branchStart[b];
+    }
+    interfaceEvents.assign(dirInterface.size(), {});
+}
+
+// ---------------------------------------------------------------------------
+// findInterfaceCrossings()
+//
+// Where a separatrix meets an interface. Same question as findCrossings(), and
+// asked the same way -- triangle-locally, on the model -- but between a step of
+// a curve and an edge of the triangulation rather than between two steps.
+//
+// A separatrix crosses an interface *at* an edge of the mesh, so the crossing
+// is the endpoint of one step and the start of the next and is found twice, once
+// from each side. That is exactly the case the node merge tolerance exists for,
+// and the event dedupe in splitCurves() takes care of the curve's own copy.
+// ---------------------------------------------------------------------------
+void Arrangement::findInterfaceCrossings() {
+    if (!itf) return;
+
+    // Which entries of dirInterface each face of S carries.
+    std::vector<std::vector<int>> faceInterface(orig->triangles.size());
+    for (size_t i = 0; i < dirInterface.size(); ++i) {
+        for (int k = 0; k < 2; ++k) {
+            const int f = orig->edgeTriangles[dirInterface[i].edge][k];
+            if (f >= 0) faceInterface[f].push_back(static_cast<int>(i));
+        }
+    }
+
+    for (size_t f = 0; f < faceSegs.size(); ++f) {
+        if (faceInterface[f].empty()) continue;
+        for (int si : faceSegs[f]) {
+            const Seg &p = segs[si];
+            for (int ii : faceInterface[f]) {
+                const DirEdge &de = dirInterface[ii];
+                const Point qa = orig->vertices[de.a];
+                const Point qb = orig->vertices[de.b];
+
+                const Point r = p.b - p.a;
+                const Point sdir = qb - qa;
+                const double den = cross2(r, sdir);
+                const double scale = normP(r) * normP(sdir);
+                if (std::fabs(den) <= 1e-12 * scale) continue;   // running along it
+                const Point w = qa - p.a;
+                const double tp = cross2(w, sdir) / den;
+                const double tq = cross2(w, r) / den;
+                const double ep = mergeTol / std::max(normP(r), 1e-300);
+                const double eq = mergeTol / std::max(normP(sdir), 1e-300);
+                if (tp < -ep || tp > 1.0 + ep) continue;
+                if (tq < -eq || tq > 1.0 + eq) continue;
+
+                const double cq = std::max(0.0, std::min(1.0, tq));
+                const Point hit = qa + sdir * cq;
+                const int id = findOrAddCrossing(hit, static_cast<int>(f));
+                if (nodes[id].kind == NodeKind::Crossing) nodes[id].kind = NodeKind::InterfaceHit;
+                curveEvents[p.curve].push_back(
+                    Event{p.step + std::max(0.0, std::min(1.0, tp)), id});
+                interfaceEvents[ii].push_back(Event{cq, id});
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// buildInterfaceArcs()
+//
+// Each branch of the network, cut at every node on it. Structurally the same
+// walk as buildBoundaryArcs(), and different in one way that matters: a branch
+// is a path and not a cycle, so its two ends are always nodes -- Stage 0b made
+// them so -- and there is no anchoring case to handle.
+// ---------------------------------------------------------------------------
+void Arrangement::buildInterfaceArcs() {
+    if (!itf || dirInterface.empty()) return;
+    const std::vector<Interfaces::Branch> &brs = itf->branches();
+
+    for (size_t b = 0; b < brs.size(); ++b) {
+        const int base = branchStart[b], n = branchCount[b];
+        if (n <= 0) continue;
+
+        std::vector<std::pair<double, int>> stops;
+        for (int i = 0; i < n; ++i) {
+            const DirEdge &de = dirInterface[base + i];
+            if (vertexNode[de.a] >= 0) stops.push_back({static_cast<double>(i), vertexNode[de.a]});
+            std::vector<Event> &ev = interfaceEvents[base + i];
+            std::sort(ev.begin(), ev.end(),
+                      [](const Event &x, const Event &y) { return x.param < y.param; });
+            for (const Event &e : ev) stops.push_back({i + e.param, e.node});
+        }
+        if (vertexNode[dirInterface[base + n - 1].b] >= 0) {
+            stops.push_back({static_cast<double>(n), vertexNode[dirInterface[base + n - 1].b]});
+        }
+        // Two stops at the same point -- a crossing that landed on a node -- are
+        // one stop, and a branch with fewer than two is not an arc.
+        std::sort(stops.begin(), stops.end());
+        std::vector<std::pair<double, int>> keep;
+        for (const auto &st : stops) {
+            if (!keep.empty() && (st.second == keep.back().second ||
+                                  st.first - keep.back().first < 1e-9)) {
+                continue;
+            }
+            keep.push_back(st);
+        }
+        if (keep.size() < 2) continue;
+
+        for (size_t k = 0; k + 1 < keep.size(); ++k) {
+            const double p0 = keep[k].first, p1 = keep[k + 1].first;
+            Arc arc;
+            arc.kind = ArcKind::Interface;
+            arc.branch = static_cast<int>(b);
+            arc.from = keep[k].second;
+            arc.to = keep[k + 1].second;
+            arc.matLeft = brs[b].matLeft;
+            arc.matRight = brs[b].matRight;
+
+            arc.points.push_back(nodes[arc.from].p);
+            for (double q = std::floor(p0) + 1.0; q < p1 - 1e-12; q += 1.0) {
+                const int idx = base + static_cast<int>(q);
+                if (idx < base || idx >= base + n) continue;
+                arc.verts.push_back(dirInterface[idx].a);
+                arc.points.push_back(orig->vertices[dirInterface[idx].a]);
+            }
+            arc.points.push_back(nodes[arc.to].p);
+
+            arc.ifFrom = base + std::min(n - 1, static_cast<int>(std::floor(p0)));
+            arc.ifTo = base + std::max(0, std::min(n - 1, static_cast<int>(std::ceil(p1)) - 1));
+            arc.faceFrom = dirInterface[arc.ifFrom].face;
+            arc.faceTo = dirInterface[arc.ifTo].face;
+
+            // Which coordinate it holds constant, straight from Stage 5's
+            // propagated direction rather than re-read off the geometry.
+            arc.family = Align::None;
+            for (const auto &fc : lab->featureChains()) {
+                if (fc.branch == static_cast<int>(b)) { arc.family = fc.label; break; }
+            }
+            for (size_t i = 1; i < arc.points.size(); ++i) {
+                arc.modelLength += normP(arc.points[i] - arc.points[i - 1]);
+            }
+            arc.degenerate = arc.modelLength <= mergeTol;
+            arcs.push_back(std::move(arc));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// classifyMaterials()
+//
+// Which material each patch is in, and whether it is all one.
+//
+// The point of the whole multi-material extension is that a patch lies inside
+// one material, so this is the property worth measuring rather than assuming.
+// It is measured by locating points of the patch in the triangulation: the
+// midpoint of each of its arcs, stepped a short way into the patch along the
+// inward normal, which lands inside the patch for any arc that is not itself
+// degenerate. A patch whose samples disagree is a patch an element of the final
+// mesh could straddle, and it is counted.
+// ---------------------------------------------------------------------------
+void Arrangement::classifyMaterials() {
+    if (orig->triangleMatId.size() != orig->triangles.size()) return;
+    const double step = 1e-3 * modelExtent;
+
+    for (int fi : patches) {
+        Face &fc = faces[fi];
+        std::vector<int> found;
+        for (int h : fc.half) {
+            const Arc &ar = arcs[halves[h].arc];
+            if (ar.points.size() < 2 || ar.modelLength <= mergeTol) continue;
+            const size_t m = ar.points.size() / 2;
+            const size_t m0 = (m == 0) ? 0 : m - 1;
+            const Point a = ar.points[m0], b = ar.points[m0 + 1];
+            const Point d = normalizeP(b - a);
+            if (!(normP(d) > 0.0)) continue;
+            // The face lies to the left of its own half-edges, so the inward
+            // normal is the left normal of the direction of travel.
+            const double sgn = halves[h].forward ? 1.0 : -1.0;
+            const Point mid = (a + b) * 0.5;
+            const Point inward{-d[1] * sgn, d[0] * sgn};
+            const int t = orig->findTriangleContainingPoint(mid + inward * step);
+            if (t >= 0) found.push_back(orig->triangleMatId[t]);
+        }
+        if (found.empty()) continue;
+        fc.material = found.front();
+        for (int m : found) if (m != fc.material) fc.mixed = true;
+        if (fc.mixed) ++report.mixedPatches;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // collapseShortArcs()
 //
 // A sliver arc is not a layout edge and its two ends are one node; see
@@ -895,6 +1130,22 @@ void Arrangement::collapseShortArcs() {
 Point Arrangement::dirEdgeImage(int be) const {
     if (be < 0 || be >= static_cast<int>(dirBoundary.size())) return Point{1.0, 0.0};
     const DirEdge &de = dirBoundary[be];
+    const Triangle &t = orig->triangles[de.face];
+    const Triangle &ct = cut->triangles[de.face];
+    int la = -1, lb = -1;
+    for (int k = 0; k < 3; ++k) {
+        if (t[k] == de.a) la = k;
+        if (t[k] == de.b) lb = k;
+    }
+    if (la < 0 || lb < 0) return Point{1.0, 0.0};
+    return (*uv)[ct[lb]] - (*uv)[ct[la]];
+}
+
+// ---------------------------------------------------------------------------
+Point Arrangement::dirInterfaceImage(int ie) const {
+    if (ie < 0 || ie >= static_cast<int>(dirInterface.size())) return Point{1.0, 0.0};
+    const DirEdge &de = dirInterface[ie];
+    if (de.face < 0) return Point{1.0, 0.0};
     const Triangle &t = orig->triangles[de.face];
     const Triangle &ct = cut->triangles[de.face];
     int la = -1, lb = -1;
@@ -1062,6 +1313,9 @@ void Arrangement::buildAngles() {
                                 sep->point(st, true, Separatrices::Space::Image);
                 if (normP(d) > tiny) { iTo = d; ar.faceTo = st.face; break; }
             }
+        } else if (ar.kind == ArcKind::Interface) {
+            iFrom = dirInterfaceImage(ar.ifFrom);
+            iTo = dirInterfaceImage(ar.ifTo) * -1.0;
         } else {
             iFrom = dirEdgeImage(ar.bdFrom);
             iTo = dirEdgeImage(ar.bdTo) * -1.0;
@@ -1329,6 +1583,8 @@ void Arrangement::check() {
             case NodeKind::Crossing: ++report.crossingNodes; break;
             case NodeKind::BoundaryHit: ++report.boundaryHitNodes; break;
             case NodeKind::BoundaryCorner: ++report.boundaryCornerNodes; break;
+            case NodeKind::InterfaceNode: ++report.interfaceNodes; break;
+            case NodeKind::InterfaceHit: ++report.interfaceHitNodes; break;
             default: ++report.danglingNodes; break;
         }
         if (n.kind == NodeKind::Cone) {
@@ -1340,6 +1596,7 @@ void Arrangement::check() {
     report.arcs = static_cast<int>(arcs.size());
     for (const Arc &a : arcs) {
         if (a.kind == ArcKind::Separatrix) ++report.separatrixArcs;
+        else if (a.kind == ArcKind::Interface) ++report.interfaceArcs;
         else ++report.boundaryArcs;
         if (a.degenerate) ++report.degenerateArcs;
         if (a.dangling) ++report.danglingArcs;

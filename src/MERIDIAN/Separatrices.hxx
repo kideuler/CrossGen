@@ -356,6 +356,29 @@ public:
         // has, which does not converge slowly but drives det J to zero.
         double nearMissWindow = 1e-3;
 
+        // Vertices of S that are to emit separatrices although Stage 1 put no
+        // cone on them: the nodes of the material interface network.
+        //
+        // They are not cones and they are singular points of the layout all the
+        // same. A node where an interface turns a quarter has one quadrilateral
+        // on the inside of the corner and three on the outside; the three need
+        // two layout edges between them, those edges leave the node, and
+        // nothing else in the pipeline emits them. Left out, the region outside
+        // the corner comes back as one face with five corners and a reflex, and
+        // Stage 9 cannot fit it and Stage 10 cannot mesh it.
+        //
+        // The rays that would run *along* the interface are not emitted: the
+        // interface is already an arc of the layout and a separatrix on top of
+        // it is a second copy of the same edge. suppressAlongFeatures does
+        // that, and the count comes out right by itself -- a node with sectors
+        // q_1..q_m emits sum (q_s - 1) = (4 - I) - m rays, which is what the
+        // index prescribes less the branches meeting there.
+        std::vector<int> extraEmitters;
+        bool suppressAlongFeatures = true;
+        // How near a ray has to be to a sector boundary, in radians of fan
+        // angle, to count as running along it.
+        double featureRayTolerance = 1e-3;
+
         // How near the end of a boundary cone's fan a ray has to be before it
         // counts as running along dS rather than into the interior, in radians.
         // After Stage 6 the boundary is axis-aligned to the constraint
@@ -372,6 +395,10 @@ public:
 
         int emitted = 0;
         int prescribed = 0;         // sum of 4 - I (interior), 1 - I (boundary)
+        // Emitters added from the interface network, and rays not emitted from
+        // them because the interface itself is already that layout edge.
+        int interfaceEmitters = 0;
+        int suppressedAlongFeatures = 0;
 
         int endedAtCone = 0;
         int endedAtBoundary = 0;
@@ -559,6 +586,9 @@ private:
     // seam pair they belong to and the side they are on.
     std::unordered_map<EdgeKey, int, EdgeKeyHash> cutEdgeIndex;
     std::unordered_map<EdgeKey, int, EdgeKeyHash> seamSide;  // 2*pair + (0 plus, 1 minus)
+    // Per edge of Omega: its parent in S separates two materials, so a ray
+    // running along it is the interface and not a separatrix.
+    std::vector<char> parentIsFeature;
     std::vector<char> parentOnBoundary;      // per Omega edge
     std::vector<char> vertexOnRealBoundary;  // per Omega vertex
 

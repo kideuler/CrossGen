@@ -31,6 +31,15 @@ MERIDIAN::~MERIDIAN() = default;
 // ---------------------------------------------------------------------------
 void MERIDIAN::runField() {
     field = std::make_unique<SIPG>(mesh, options.sipgMaxSteps, options.sipgGamma);
+    // On a multi-material domain the interfaces are Dirichlet data for the field
+    // in exactly the way dS is. This is why runField() runs after Stage 0b and
+    // not before it: an interface is a curve the layout has to keep, so the
+    // field has to be tangent to it, and a field that is not carries none of the
+    // cones the regions either side of it need. Empty on a single-material mesh.
+    if (interfaces && interfaces->multiMaterial() && options.alignFieldToInterfaces) {
+        field->setAlignedInteriorEdges(interfaces->interfaceEdges());
+        status.fieldAlignedToInterfaces = true;
+    }
     field->initialize();
 
     const double nTris = static_cast<double>(mesh->triangles.size());
@@ -49,6 +58,28 @@ void MERIDIAN::runField() {
 
 bool MERIDIAN::run() {
     status = Status();
+    size_t balanceMessagesSeen = 0;
+
+    // --- Stage 0b: the material interface network -------------------------
+    // Before the field, because it says nothing about the field and everything
+    // about the domain: which curves the layout has to keep, where they meet,
+    // and what the layout has to do where they do. On a single-material mesh it
+    // finds nothing and costs one pass over the edges.
+    if (options.materialInterfaces) {
+        Interfaces::Options iopts;
+        iopts.kinkAngle = options.interfaceKinkAngle;
+        iopts.loopSplits = options.interfaceLoopSplits;
+        interfaces = std::make_unique<Interfaces>(mesh, iopts);
+        const Interfaces::Report &fr = interfaces->getReport();
+        status.materials = fr.materials;
+        status.interfaceEdges = fr.interfaceEdges;
+        status.interfaceBranches = fr.branches;
+        status.interfaceNodes = fr.nodes;
+        status.interfaceIllPosedNodes = fr.illPosedNodes;
+        status.interfaceWorstSector = fr.worstSectorResidual;
+        for (const std::string &m : fr.messages) status.messages.push_back("Stage 0b: " + m);
+        balanceMessagesSeen = fr.messages.size();
+    }
 
     // --- Stage 0: cross field ---------------------------------------------
     runField();
@@ -56,6 +87,45 @@ bool MERIDIAN::run() {
     // --- Stage 1: cone singularities, Sec. 3.1 ----------------------------
     cones = std::make_unique<ConeSingularities>(*field);
     cones->setBoundaryIndexRange(options.minBoundaryIndex, options.maxBoundaryIndex);
+
+    // The interface network's own cone indices, which the field cannot read
+    // because it does not know the interfaces are there. Applied before the
+    // Gauss-Bonnet check, so that the rebalance below distributes whatever is
+    // left over across the boundary cones it is still free to move.
+    if (interfaces && interfaces->multiMaterial() && options.prescribeInterfaceCones) {
+        cones->prescribe(interfaces->prescription());
+        status.interfaceConesPrescribed = interfaces->getReport().prescribedCones;
+        status.interfacePrescriptionShift = cones->prescriptionShift();
+        if (status.interfacePrescriptionShift > 0) {
+            std::ostringstream oss;
+            oss << "The interface network moved " << status.interfacePrescriptionShift
+                << " index unit(s) from where the cross field put them: the field is "
+                << "boundary-aligned and has no boundary condition on an interface, so "
+                << "at a junction or a landing it reads whatever propagated in.";
+            status.messages.push_back("Stage 1: " + oss.str());
+        }
+    }
+
+    // The pairs the aligned field puts on a curved interface, which no region
+    // asked for. Before the Gauss-Bonnet check because a pair sums to zero and
+    // cannot change it, and before Stage 2, which would otherwise cut to each
+    // of them.
+    if (interfaces && interfaces->multiMaterial() && options.alignFieldToInterfaces &&
+        options.cancelInterfaceDipoles) {
+        const int nV = static_cast<int>(mesh->vertices.size());
+        std::vector<int> region(nV, -1);
+        for (int v = 0; v < nV; ++v) region[v] = interfaces->regionAt(v);
+        status.coneDipoleUnits = cones->cancelDipoles(region);
+        if (status.coneDipoleUnits > 0) {
+            std::ostringstream oss;
+            oss << "Cancelled " << status.coneDipoleUnits
+                << " +1/-1 cone pair(s) the field put inside a single material region: "
+                << "an aligned field carries one on the concave side of every strongly "
+                << "curved stretch of interface, and a pair inside one region is in no "
+                << "region's Gauss-Bonnet count.";
+            status.messages.push_back("Stage 1: " + oss.str());
+        }
+    }
 
     ConeSingularities::GaussBonnetReport gb = cones->gaussBonnet();
     if (!gb.admissible && options.autoRebalance) {
@@ -80,6 +150,26 @@ bool MERIDIAN::run() {
             "Stopping before Ricci flow: sum I(v) != 4 chi(S), so the flat cone metric "
             "asked for does not exist.");
         return false;
+    }
+
+    // Stage 0b, second pass: the material regions and their own Gauss-Bonnet
+    // count. It needs Stage 1's cones on dS -- they are half the count -- which
+    // is why it runs here and not with the rest of Stage 0b.
+    if (interfaces && interfaces->multiMaterial()) {
+        interfaces->balance(cones->getIndices());
+        const Interfaces::Report &fr = interfaces->getReport();
+        status.interfaceNodes = fr.nodes;
+        status.interfaceBranches = fr.branches;
+        status.interfaceIllPosedNodes = fr.illPosedNodes;
+        status.interfaceWorstSector = fr.worstSectorResidual;
+        status.regions = fr.regions;
+        status.regionsBalanced = fr.regionsBalanced;
+        status.regionQuartersMoved = fr.quartersMoved;
+        status.regionCornersInserted = fr.cornersInserted;
+        status.worstRegionDeficit = fr.worstRegionDeficit;
+        for (size_t i = balanceMessagesSeen; i < fr.messages.size(); ++i) {
+            status.messages.push_back("Stage 0b: " + fr.messages[i]);
+        }
     }
 
     // --- Stage 2: cutting graph, Sec. 3.2.2 -------------------------------
@@ -139,11 +229,15 @@ bool MERIDIAN::run() {
     lopts.seedSelfReturns = options.seedSelfReturns;
     lopts.seedAllConnections = options.seedAllConnections;
     lopts.maxTraceSteps = options.separatrixMaxSteps;
-    labels = std::make_unique<SubdomainLabels>(*immersion, lopts);
+    lopts.interfaceCorners = options.interfaceCorners;
+    lopts.propagateInterfaceLabels = options.propagateInterfaceLabels;
+    labels = std::make_unique<SubdomainLabels>(*immersion, lopts, interfaces.get());
     const SubdomainLabels::Report &lr = labels->getReport();
     status.boundaryEdgesU = lr.boundaryEdgesU;
     status.boundaryEdgesV = lr.boundaryEdgesV;
     status.featureChains = lr.featureChains;
+    status.interfaceCorners = lr.interfaceCorners;
+    status.interfaceLabelsCorrected = lr.featureLabelsCorrected;
     status.topoPaths = lr.topoPaths;
     status.topoSelfReturns = lr.topoSelfReturns;
     status.topoExtraPerPair = lr.topoExtraPerPair;
@@ -165,6 +259,7 @@ bool MERIDIAN::run() {
     eopts.innerIterations = options.innerIterations;
     eopts.alternateReference = options.alternateReference;
     eopts.relabel = options.relabelBetweenSteps;
+    eopts.lagInterfaceScales = options.lagInterfaceScales;
     layout = std::make_unique<LayoutEnergy>(*immersion, *labels, eopts);
     status.layoutRan = layout->run();
     const LayoutEnergy::Report &er = layout->getReport();
@@ -172,6 +267,10 @@ bool MERIDIAN::run() {
     status.layoutConstrained = er.constraintsMet;
     status.outerStepsTaken = er.outerSteps;
     status.layoutValid = er.valid;
+    status.interfaceResidual = er.maxInterfaceResidual;
+    status.interfaceCornerChanges = er.interfaceCornerChanges;
+    status.interfacesAligned = er.interfaceCornerChanges == 0 &&
+                               er.maxInterfaceResidual < 1e-3;
     size_t layoutMessagesSeen = 0;
     auto drainLayoutMessages = [&]() {
         const auto &msgs = layout->getReport().messages;
@@ -191,6 +290,11 @@ bool MERIDIAN::run() {
     sopts.coneSnapRings = options.separatrixSnapRings;
     sopts.detectCycles = options.separatrixDetectCycles;
     sopts.nearMissWindow = options.repairGapLimit;
+    // The interface network's nodes emit too -- the ones that are singular
+    // points of the layout. See Interfaces::emitterNodes.
+    if (interfaces && interfaces->multiMaterial()) {
+        sopts.extraEmitters = interfaces->emitterNodes();
+    }
 
     RepairOptions ropts;
     // With the seeding switched off, E5 has no constraints at all and the run
@@ -300,6 +404,7 @@ bool MERIDIAN::run() {
     qopts.minIntervals = options.quadMinIntervals;
     qopts.maxIntervals = options.quadMaxIntervals;
     qopts.useSplines = options.quadUseSplines;
+    qopts.interfacesOnTracedArcs = options.quadInterfacesOnTracedArcs;
     qopts.smoothingPasses = options.quadSmoothingPasses;
     qopts.smoothingThreshold = options.quadSmoothingThreshold;
     try {

@@ -23,7 +23,12 @@ SubdomainLabels::SubdomainLabels(const Immersion &immersion)
     : SubdomainLabels(immersion, Options()) {}
 
 SubdomainLabels::SubdomainLabels(const Immersion &immersion, const Options &opts)
-    : imm(&immersion), options(opts) {
+    : SubdomainLabels(immersion, opts, nullptr) {}
+
+SubdomainLabels::SubdomainLabels(const Immersion &immersion, const Options &opts,
+                                 const Interfaces *interfaces)
+    : imm(&immersion), itf(interfaces), options(opts) {
+    if (itf && !itf->multiMaterial()) itf = nullptr;
     buildSeamTables();
 
     report.seamArcs = static_cast<int>(imm->getArcs().size());
@@ -35,6 +40,7 @@ SubdomainLabels::SubdomainLabels(const Immersion &immersion, const Options &opts
     buildBoundary(uv);
     buildBoundaryChains(uv);
     buildFeatures(uv);
+    buildInterfaceCorners();
     labelFeatures(uv);
     if (options.seedTopoConstraints) seedTopoPaths(uv);
 }
@@ -215,8 +221,11 @@ void SubdomainLabels::buildFeatures(const std::vector<Point> &uv) {
     const Mesh &cm = imm->getCutMesh();
     if (om.triangleMatId.size() != om.triangles.size()) return;
 
-    // The feature edges of Omega.
+    // The feature edges of Omega, and which branch of the network each came
+    // from. An interface edge contributes both of its Omega children when it
+    // runs along an arc of G, and both inherit the branch.
     std::unordered_set<int> featEdges;
+    std::unordered_map<int, int> edgeBranch;   // Omega edge -> branch, or -1
     for (int e = 0; e < static_cast<int>(om.edges.size()); ++e) {
         const int f0 = om.edgeTriangles[e][0];
         const int f1 = om.edgeTriangles[e][1];
@@ -224,16 +233,32 @@ void SubdomainLabels::buildFeatures(const std::vector<Point> &uv) {
         if (om.triangleMatId[f0] == om.triangleMatId[f1]) continue;
 
         const int a = om.edges[e][0], b = om.edges[e][1];
+        const int br = itf ? itf->branchOfEdge(e) : -1;
         for (int f : {f0, f1}) {
             const int la = localOf(om.triangles[f], a);
             const int lb = localOf(om.triangles[f], b);
             if (la < 0 || lb < 0) continue;
             auto it = cutEdgeIndex.find(EdgeKey(cm.triangles[f][la], cm.triangles[f][lb]));
-            if (it != cutEdgeIndex.end()) featEdges.insert(it->second);
+            if (it != cutEdgeIndex.end()) {
+                featEdges.insert(it->second);
+                edgeBranch[it->second] = br;
+            }
         }
     }
     report.featureEdges = static_cast<int>(featEdges.size());
     if (featEdges.empty()) return;
+
+    // Where a chain has to end because the layout turns there: the nodes of the
+    // interface network, and the cones, which are the two kinds of point a
+    // layout edge is allowed to stop at. Both are read in Omega, so a node the
+    // cutting graph split into several children stops every one of them.
+    const std::vector<int> &c2o = imm->getCut().getCutVertexToOriginal();
+    const std::vector<int> &vertCone = imm->getCutVertexCone();
+    std::vector<char> stopVert(cm.vertices.size(), 0);
+    for (size_t v = 0; v < cm.vertices.size(); ++v) {
+        if (v < vertCone.size() && vertCone[v] >= 0) stopVert[v] = 1;
+        if (itf && v < c2o.size() && c2o[v] >= 0 && itf->nodeAt(c2o[v]) >= 0) stopVert[v] = 1;
+    }
 
     // Chain them: nodes where the feature graph is not a simple path, and
     // corners where the image direction turns, both end a chain.
@@ -275,18 +300,32 @@ void SubdomainLabels::buildFeatures(const std::vector<Point> &uv) {
         // instead makes each piece a curve that a coordinate line can plausibly
         // follow, which is what the paper's own feature chains -- creases and
         // trim curves between cone-marked corners -- already are.
+        const int seedBranch = edgeBranch.count(seed) ? edgeBranch[seed] : -1;
         for (int side = 0; side < 2; ++side) {
             int cur = seed;
             int v = (side == 0) ? cm.edges[seed][0] : cm.edges[seed][1];
             double turned = 0.0;
             while (at[v].size() == 2) {
+                if (stopVert[v]) break;
                 int next = -1;
                 for (int c : at[v]) if (c != cur) next = c;
                 if (next < 0 || used.count(next)) break;
-                const double t = turnAt(v, cur, next);
-                if (std::fabs(t) > options.featureCornerAngle) break;
-                turned += t;
-                if (std::fabs(turned) > options.featureCornerAngle) break;
+                // With a network in hand a chain is a *branch*, and it runs
+                // from node to node however much it curves on the way. The
+                // accumulated-turn split below is what has to be done without
+                // one: it is a guess at where the corners are, and on an
+                // interface it guesses wrong in the expensive direction,
+                // cutting a smooth quarter-circle into two chains and asking
+                // E3 to hold each of them on a different isoline, which puts a
+                // corner of the layout in the middle of a smooth interface.
+                if (!itf) {
+                    const double t = turnAt(v, cur, next);
+                    if (std::fabs(t) > options.featureCornerAngle) break;
+                    turned += t;
+                    if (std::fabs(turned) > options.featureCornerAngle) break;
+                } else {
+                    if (edgeBranch.count(next) && edgeBranch[next] != seedBranch) break;
+                }
                 used.insert(next);
                 if (side == 0) chainEdges.insert(chainEdges.begin(), next);
                 else chainEdges.push_back(next);
@@ -318,9 +357,225 @@ void SubdomainLabels::buildFeatures(const std::vector<Point> &uv) {
                 prev = nxt;
             }
         }
+        fc.branch = seedBranch;
         fChains.push_back(std::move(fc));
     }
     report.featureChains = static_cast<int>(fChains.size());
+}
+
+// ---------------------------------------------------------------------------
+// buildInterfaceCorners()   --  what E6 is summed over
+//
+// One entry per sector of the interface network: the two curves that bound it
+// and the whole number of quarter turns the layout has to put between them,
+// which Stage 0b already worked out from the geometry.
+//
+// The two tangents are taken at the same child of the node in Omega -- the
+// faces either side of each ray say which child, and taking the face on the
+// side the sector is on picks the right one whenever the cutting graph does not
+// run through the sector itself. Where it does there is no common child and the
+// sector is dropped: a tangent at one child and a tangent at another are not in
+// the same frame, and forcing a quarter turn between them would be asking for
+// the transition Q4 already holds.
+//
+// A node on dS contributes its two boundary edges as rays as well. That is not
+// bookkeeping: an interface meeting the boundary has to meet it at a whole
+// number of quarter turns, and without the boundary rays nothing says so --
+// E2 puts dS on a coordinate line and E3 puts the interface on one, but which
+// one, and which way round, is exactly what the sector count fixes.
+// ---------------------------------------------------------------------------
+void SubdomainLabels::buildInterfaceCorners() {
+    iCorners.clear();
+    report.interfaceCorners = report.interfaceCornersSpanningCut = 0;
+    if (!itf || !options.interfaceCorners) return;
+
+    const Mesh &om = imm->getOriginalMesh();
+    const Mesh &cm = imm->getCutMesh();
+    const std::vector<double> &len = imm->getCutEdgeLengths();
+
+    // The child of original vertex `v` seen from face `f`.
+    auto childIn = [&](int v, int f) -> int {
+        if (f < 0) return -1;
+        const int l = localOf(om.triangles[f], v);
+        return (l < 0) ? -1 : cm.triangles[f][l];
+    };
+    auto flatLength = [&](int a, int b) -> double {
+        auto it = cutEdgeIndex.find(EdgeKey(a, b));
+        return (it == cutEdgeIndex.end()) ? 0.0 : len[it->second];
+    };
+
+    const std::vector<Interfaces::Node> &nds = itf->nodes();
+    for (size_t n = 0; n < nds.size(); ++n) {
+        const Interfaces::Node &nd = nds[n];
+        if (nd.rays.size() < 2 || nd.quarters.size() + 1 < nd.rays.size()) continue;
+
+        // Consecutive pairs only, never the wrap-around sector of an interior
+        // node. Composing every sector of a node closes the loop with
+        // R_(sum q) = R_(4 - I), which is the identity only when the node
+        // carries no cone; at one that does, adding the last sector would be
+        // asserting that the cone is not there.
+        for (size_t k = 0; k + 1 < nd.rays.size(); ++k) {
+            const Interfaces::Ray &ra = nd.rays[k];
+            const Interfaces::Ray &rb = nd.rays[k + 1];
+            const int fa = ra.faceCCW;      // the face on the sector's side of a
+            const int fb = rb.faceCW;       // ... and on the sector's side of b
+            const int va = childIn(nd.vertex, fa);
+            const int vb = childIn(nd.vertex, fb);
+            const int wa = childIn(ra.neighbour, fa);
+            const int wb = childIn(rb.neighbour, fb);
+            if (va < 0 || vb < 0 || wa < 0 || wb < 0) continue;
+            if (va != vb) { ++report.interfaceCornersSpanningCut; continue; }
+
+            InterfaceCorner ic;
+            ic.node = static_cast<int>(n);
+            ic.vertex = va;
+            ic.a = wa;
+            ic.b = wb;
+            ic.la = flatLength(va, wa);
+            ic.lb = flatLength(vb, wb);
+            ic.sa = ic.la;
+            ic.sb = ic.lb;
+            ic.quarters = nd.quarters[k];
+            ic.onBoundary = nd.onBoundary;
+            ic.aIsBoundary = (ra.branch < 0);
+            ic.bIsBoundary = (rb.branch < 0);
+            ic.sector = nd.sector[k];
+            if (!(ic.la > 0.0) || !(ic.lb > 0.0)) continue;
+            iCorners.push_back(ic);
+        }
+    }
+    report.interfaceCorners = static_cast<int>(iCorners.size());
+}
+
+// ---------------------------------------------------------------------------
+// propagateDirections()
+//
+// Which of {+u, +v, -u, -v} each branch of the network runs along.
+//
+// It is one propagation and not a vote, because the node quantisation already
+// fixes every branch relative to every other one it can reach: ray k+1 leaves
+// q_k quarter turns counter-clockwise of ray k, and the two ends of a branch
+// point opposite ways. What is left free is one direction per connected
+// component of the network, and that is the only thing read off the map.
+//
+// Doing it the other way -- a label per chain from its own flux, which is what
+// Sec. 3.3 prescribes for an isolated feature -- is not merely less accurate.
+// At the triple junction of geom003 the sectors are one, one and two quarters,
+// so the three branches must be labelled u, v, u; psi_R's flux reads all three
+// as u, and E3 is then asked for a map holding u constant on three curves
+// leaving one point in three different directions, which has no solution at any
+// penalty. The continuation does not diverge, it converges to a compromise in
+// which none of the three is met.
+// ---------------------------------------------------------------------------
+std::vector<int> SubdomainLabels::propagateDirections(const std::vector<Point> &uv) {
+    if (!itf) return {};
+    const std::vector<Interfaces::Node> &nds = itf->nodes();
+    const std::vector<Interfaces::Branch> &brs = itf->branches();
+    if (brs.empty()) return {};
+
+    // Global ray numbering, and the two rays of each branch.
+    std::vector<int> rayBase(nds.size() + 1, 0);
+    for (size_t n = 0; n < nds.size(); ++n) rayBase[n + 1] = rayBase[n] +
+                                            static_cast<int>(nds[n].rays.size());
+    const int nRays = rayBase.back();
+    std::vector<std::vector<int>> branchRays(brs.size());
+    for (size_t n = 0; n < nds.size(); ++n) {
+        for (size_t k = 0; k < nds[n].rays.size(); ++k) {
+            const int b = nds[n].rays[k].branch;
+            if (b >= 0) branchRays[b].push_back(rayBase[n] + static_cast<int>(k));
+        }
+    }
+
+    // The image displacement of each branch, node0 to node1, summed over the
+    // chains that carry it. A chain's own orientation is unknown, so it is
+    // compared against the branch's on the model, where both are known.
+    const Mesh &om = imm->getOriginalMesh();
+    const std::vector<int> &c2o = imm->getCut().getCutVertexToOriginal();
+    std::vector<Point> flux(brs.size(), Point{0.0, 0.0});
+    std::vector<double> weight(brs.size(), 0.0);
+    for (const FeatureChain &fc : fChains) {
+        if (fc.branch < 0 || fc.verts.size() < 2) continue;
+        const Interfaces::Branch &br = brs[fc.branch];
+        const Point mBranch = om.vertices[br.verts.back()] - om.vertices[br.verts.front()];
+        const int o0 = c2o[fc.verts.front()], o1 = c2o[fc.verts.back()];
+        if (o0 < 0 || o1 < 0) continue;
+        const Point mChain = om.vertices[o1] - om.vertices[o0];
+        const double sign = (dotP(mChain, mBranch) >= 0.0) ? 1.0 : -1.0;
+        flux[fc.branch] = flux[fc.branch] + (uv[fc.verts.back()] - uv[fc.verts.front()]) * sign;
+        weight[fc.branch] += fc.length;
+    }
+
+    std::vector<int> rayDir(nRays, -1);
+    std::vector<char> seen(nRays, 0);
+
+    // Seed order: the longest branch first, so each component is anchored on
+    // the piece whose flux says the most.
+    std::vector<int> order(brs.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = static_cast<int>(i);
+    std::sort(order.begin(), order.end(),
+              [&](int a, int b) { return weight[a] > weight[b]; });
+
+    std::vector<int> stack;
+    for (int b0 : order) {
+        if (branchRays[b0].empty() || seen[branchRays[b0].front()]) continue;
+
+        int best = 0;
+        double bestDot = -std::numeric_limits<double>::infinity();
+        for (int d = 0; d < 4; ++d) {
+            const double v = dotP(flux[b0], axis(d));
+            if (v > bestDot) { bestDot = v; best = d; }
+        }
+        rayDir[branchRays[b0].front()] = best;
+        stack.assign(1, branchRays[b0].front());
+        seen[branchRays[b0].front()] = 1;
+
+        while (!stack.empty()) {
+            const int r = stack.back();
+            stack.pop_back();
+            // Which node this ray belongs to.
+            size_t n = 0;
+            while (n + 1 < nds.size() && rayBase[n + 1] <= r) ++n;
+            const int k = r - rayBase[n];
+            const Interfaces::Node &nd = nds[n];
+
+            auto push = [&](int to, int d) {
+                if (to < 0 || seen[to]) return;
+                seen[to] = 1;
+                rayDir[to] = ((d % 4) + 4) % 4;
+                stack.push_back(to);
+            };
+            // Along the node's fan: ray k+1 is q_k quarters counter-clockwise.
+            if (k + 1 < static_cast<int>(nd.rays.size()) &&
+                k < static_cast<int>(nd.quarters.size())) {
+                push(r + 1, rayDir[r] + nd.quarters[k]);
+            }
+            if (k > 0 && k - 1 < static_cast<int>(nd.quarters.size())) {
+                push(r - 1, rayDir[r] - nd.quarters[k - 1]);
+            }
+            // Across a branch: the far end points the other way.
+            const int b = nd.rays[k].branch;
+            if (b >= 0) {
+                for (int other : branchRays[b]) if (other != r) push(other, rayDir[r] + 2);
+            }
+        }
+    }
+
+    // Back to one direction per branch: the way it leaves node0.
+    branchDir.assign(brs.size(), -1);
+    for (size_t b = 0; b < brs.size(); ++b) {
+        if (branchRays[b].empty()) continue;
+        // branchRays holds them in node order, and node0 is the smaller node
+        // only by accident, so find the ray that actually sits at node0.
+        for (int r : branchRays[b]) {
+            size_t n = 0;
+            while (n + 1 < nds.size() && rayBase[n + 1] <= r) ++n;
+            if (static_cast<int>(n) == brs[b].node0) { branchDir[b] = rayDir[r]; break; }
+        }
+        if (branchDir[b] < 0 && rayDir[branchRays[b].front()] >= 0) {
+            branchDir[b] = rayDir[branchRays[b].front()];
+        }
+    }
+    return branchDir;
 }
 
 // ---------------------------------------------------------------------------
@@ -333,6 +588,12 @@ void SubdomainLabels::buildFeatures(const std::vector<Point> &uv) {
 // ---------------------------------------------------------------------------
 void SubdomainLabels::labelFeatures(const std::vector<Point> &uv) {
     report.featureChainsU = report.featureChainsV = 0;
+    report.featureChainsPropagated = 0;
+    report.featureLabelsCorrected = 0;
+
+    const bool propagate = itf && options.propagateInterfaceLabels;
+    if (propagate) propagateDirections(uv);
+
     for (FeatureChain &fc : fChains) {
         if (fc.verts.size() < 2) { fc.label = Align::None; continue; }
         const Point d = uv[fc.verts.back()] - uv[fc.verts.front()];
@@ -350,8 +611,42 @@ void SubdomainLabels::labelFeatures(const std::vector<Point> &uv) {
             fc.fluxU = tvU;
             fc.fluxV = tvV;
         }
-        fc.label = (fc.fluxU <= fc.fluxV) ? Align::U : Align::V;
+        const Align byFlux = (fc.fluxU <= fc.fluxV) ? Align::U : Align::V;
+
+        // The propagated direction wins where there is one. It is the direction
+        // of *travel*, so the coordinate held constant is the other one: a
+        // branch running along +-u holds v.
+        fc.dirKnown = false;
+        if (propagate && fc.branch >= 0 && fc.branch < static_cast<int>(branchDir.size()) &&
+            branchDir[fc.branch] >= 0) {
+            fc.dir = branchDir[fc.branch];
+            fc.dirKnown = true;
+            fc.label = (fc.dir % 2 == 0) ? Align::V : Align::U;
+            ++report.featureChainsPropagated;
+            if (fc.label != byFlux) ++report.featureLabelsCorrected;
+        } else {
+            fc.label = byFlux;
+        }
         (fc.label == Align::U ? report.featureChainsU : report.featureChainsV) += 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// refreshInterfaceScales()
+// ---------------------------------------------------------------------------
+void SubdomainLabels::refreshInterfaceScales(const std::vector<Point> &uv) {
+    for (InterfaceCorner &ic : iCorners) {
+        if (ic.vertex < 0 || ic.a < 0 || ic.b < 0) continue;
+        if (ic.vertex >= static_cast<int>(uv.size()) || ic.a >= static_cast<int>(uv.size()) ||
+            ic.b >= static_cast<int>(uv.size())) {
+            continue;
+        }
+        const double na = normP(uv[ic.a] - uv[ic.vertex]);
+        const double nb = normP(uv[ic.b] - uv[ic.vertex]);
+        // A tangent the map has collapsed says nothing about a direction, so
+        // the flat length stands in rather than a division by nothing.
+        ic.sa = (na > 0.0) ? na : ic.la;
+        ic.sb = (nb > 0.0) ? nb : ic.lb;
     }
 }
 
@@ -437,6 +732,12 @@ Separatrices::Options SubdomainLabels::seedTracerOptions(const std::vector<Point
     const double tol = options.nearMissTolerance * spacing;
 
     Separatrices::Options so;
+    // The same emitter set Stage 7 will use, so that the curves the seeding
+    // sees and the curves Q5 is checked on are the same curves. A seeder with
+    // its own idea of which points emit finds a different set, and the
+    // difference shows up two stages later as a separatrix with no constraint
+    // behind it.
+    if (itf) so.extraEmitters = itf->emitterNodes();
     so.coneSnapTolerance = tol / extent;
     so.coneSnapRings = (meanEdge > 0.0)
         ? std::max(2, std::min(32, static_cast<int>(std::ceil(tol / meanEdge)) + 1))

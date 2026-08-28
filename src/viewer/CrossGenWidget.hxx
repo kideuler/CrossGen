@@ -18,6 +18,7 @@
 #include "MERIDIAN/MERIDIAN.hxx"
 #include "MERIDIAN/ConeSingularities.hxx"
 #include "MERIDIAN/Immersion.hxx"
+#include "MERIDIAN/Interfaces.hxx"
 #include "MERIDIAN/LayoutEnergy.hxx"
 #include "MERIDIAN/RicciFlow.hxx"
 #include "MERIDIAN/Separatrices.hxx"
@@ -309,6 +310,12 @@ private:
     // the left half of the split screen, and the whole of the Frames phase.
     void renderUMBERField();
 
+    // Stage 0b: the material interface network, read off the triangle tags.
+    // It needs nothing but the mesh -- no field, no cones -- so it runs as soon
+    // as MERIDIAN mode is chosen, and its picture is under every phase from the
+    // first. On a single-material mesh it finds nothing and says so once.
+    void runMERIDIANInterfaces();
+
     // Stage 1 of Shepherd et al.: read the cone indices off the SIPG field,
     // check Eq. (4), and rebalance the boundary cones if it does not hold.
     // Cheap; unlike the two below it needs no announcement.
@@ -485,6 +492,10 @@ private:
     // holds a reference to the one before -- ConeCut and RicciFlow both read
     // cones_, and ConeCut checks it was measured on this very mesh -- so cones_
     // is never rebuilt without clearing the two below it first.
+    // Stage 0b. SubdomainLabels holds a bare pointer to this, so it is declared
+    // before every stage that can be handed one and therefore destroyed after
+    // them.
+    std::optional<Interfaces>        interfaces_;
     std::optional<ConeSingularities> cones_;
     std::optional<ConeCut>           coneCut_;
     std::optional<RicciFlow>         ricci_;
@@ -578,6 +589,7 @@ private:
     // which for the cones means re-running the SIPG solve sixty times a second.
     // The Ricci solve is additionally announced a frame early, so the notice is
     // on screen while the GUI thread is inside the Newton loop.
+    bool interfacesAttempted_  = false;
     bool conesAttempted_       = false;
     bool cutAttempted_         = false;
     bool ricciAnnounced_       = false;
@@ -589,6 +601,20 @@ private:
     bool patchesAnnounced_      = false;
     bool patchesAttempted_      = false;
     bool meshAttempted_         = false;
+
+    // Stage 0b runs in two halves -- the network before Stage 1, the region
+    // balance after it, because the balance needs Stage 1's cones on dS -- and
+    // both append to the one message list, so this is how far it has been
+    // drained into the console.
+    size_t interfaceMessagesSeen_ = 0;
+
+    // What the interface network's two pictures are showing. The network itself
+    // is on whenever there is one: it is the input the multi-material path is
+    // about, and every stage after it is to be judged against it. The material
+    // fill is off, because it competes with the scalar ramps of Stages 3 and 4
+    // and because on a single-material model it says nothing at all.
+    bool showInterfaces_    = true;
+    bool showMaterialFill_  = false;
 
     // Stage 10 settings, surviving a reset the way the connectivity ones do so
     // that the dialog opens on whatever was last tried. The defaults are

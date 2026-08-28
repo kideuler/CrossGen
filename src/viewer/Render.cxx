@@ -1687,6 +1687,126 @@ void drawPolylineOnMesh(const Mesh &m, const std::vector<int> &path) {
 
 } // namespace
 
+// ── Stage 0b: the material interfaces ────────────────────────────────────────
+
+namespace {
+
+// One colour per kind of node, in the order Interfaces::NodeKind declares them.
+// The kinds are not degrees of the same thing -- a junction is a property of
+// three materials meeting, a kink of one interface bending, a balance corner of
+// a region's Gauss-Bonnet count -- so they are given colours that do not read
+// as a scale.
+void interfaceNodeColor(Interfaces::NodeKind kind, float &r, float &g, float &b) {
+    switch (kind) {
+        case Interfaces::NodeKind::Junction:  r = 0.97f; g = 0.97f; b = 0.97f; break;
+        case Interfaces::NodeKind::Landing:   r = 0.25f; g = 0.85f; b = 0.35f; break;
+        case Interfaces::NodeKind::Kink:      r = 0.98f; g = 0.60f; b = 0.10f; break;
+        case Interfaces::NodeKind::LoopSplit: r = 0.72f; g = 0.35f; b = 0.95f; break;
+        case Interfaces::NodeKind::Balance:   r = 0.20f; g = 0.85f; b = 0.90f; break;
+        default:                              r = 0.95f; g = 0.15f; b = 0.15f; break;
+    }
+}
+
+} // namespace
+
+void drawMaterialFill(const Mesh &m, float alpha) {
+    if (m.triangleMatId.size() != m.triangles.size()) return;
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glBegin(GL_TRIANGLES);
+    for (std::size_t t = 0; t < m.triangles.size(); ++t) {
+        float r, g, b;
+        materialColor(m.triangleMatId[t], r, g, b);
+        glColor4f(r, g, b, alpha);
+        const auto &tri = m.triangles[t];
+        for (int k = 0; k < 3; ++k) {
+            const Point &p = m.vertices[tri[k]];
+            glVertex2d(p[0], p[1]);
+        }
+    }
+    glEnd();
+    glDisable(GL_BLEND);
+}
+
+void drawInterfaceNetwork(const Interfaces &itf, double nodeRadius, float lineWidth) {
+    if (!itf.multiMaterial()) return;
+    const Mesh &m = itf.getMesh();
+
+    // The branches, in the white the wireframe already gives an interface edge,
+    // so the network and the edges it is made of read as one thing. A closed
+    // branch -- an inclusion the loop splitting left whole -- is drawn in the
+    // same colour: what makes it different is that it carries no node, which
+    // the picture shows by there being none on it.
+    glColor3f(0.97f, 0.97f, 0.99f);
+    glLineWidth(lineWidth);
+    for (const Interfaces::Branch &br : itf.branches()) drawPolylineOnMesh(m, br.verts);
+    glLineWidth(1.0f);
+
+    if (!(nodeRadius > 0.0)) return;
+    for (const Interfaces::Node &n : itf.nodes()) {
+        if (n.vertex < 0 || n.vertex >= static_cast<int>(m.vertices.size())) continue;
+        const Point &p = m.vertices[n.vertex];
+        // The halo is drawn under the disk, so an ill-posed node is a ring
+        // rather than a different colour: the kind still has to be readable.
+        if (!n.wellPosed) drawDisk3D(p, 1.6 * nodeRadius, 0.35f, 0.10f, 0.10f);
+        float r, g, b;
+        interfaceNodeColor(n.kind, r, g, b);
+        drawDisk3D(p, nodeRadius, r, g, b);
+    }
+}
+
+void drawInterfaceLegend(int fbw, int fbh, bool separatrixLegendShown) {
+    struct Row { Interfaces::NodeKind kind; const char *label; };
+    static const Row kRows[] = {
+        { Interfaces::NodeKind::Junction,  "junction (3+ branches)" },
+        { Interfaces::NodeKind::Landing,   "landing on dS"          },
+        { Interfaces::NodeKind::Kink,      "kink"                   },
+        { Interfaces::NodeKind::LoopSplit, "loop split"             },
+        { Interfaces::NodeKind::Balance,   "balance corner"         },
+        { Interfaces::NodeKind::Dangling,  "dangling (tag error)"   },
+    };
+    const int kRowCount = static_cast<int>(sizeof(kRows) / sizeof(kRows[0]));
+
+    const float x0 = 20.0f;
+    const float sw = 16.0f;
+    const float lineH = 22.0f;
+    // Above the cone legend, and above the separatrix legend when that one is
+    // between them.
+    float y0 = static_cast<float>(fbh) - (separatrixLegendShown ? 466.0f : 334.0f);
+
+    glMatrixMode(GL_PROJECTION);
+    glPushMatrix();
+    glLoadIdentity();
+    glOrtho(0, fbw, fbh, 0, -1, 1); // top-left origin
+    glMatrixMode(GL_MODELVIEW);
+    glPushMatrix();
+    glLoadIdentity();
+
+    glBegin(GL_QUADS);
+    for (int i = 0; i < kRowCount; ++i) {
+        float r, g, b;
+        interfaceNodeColor(kRows[i].kind, r, g, b);
+        glColor3f(r, g, b);
+        const float y = y0 + i * lineH;
+        glVertex2f(x0, y);
+        glVertex2f(x0 + sw, y);
+        glVertex2f(x0 + sw, y + sw);
+        glVertex2f(x0, y + sw);
+    }
+    glEnd();
+
+    glMatrixMode(GL_PROJECTION);
+    glPopMatrix();
+    glMatrixMode(GL_MODELVIEW);
+    glPopMatrix();
+
+    for (int i = 0; i < kRowCount; ++i) {
+        drawTextOverlay(fbw, fbh, kRows[i].label, x0 + sw + 8.0f, y0 + i * lineH + 2.0f,
+                        0.8f, 0.8f, 0.8f);
+    }
+}
+
 void drawCones(const Mesh &m, const ConeSingularities &cones, double radius) {
     if (!(radius > 0.0)) return;
     for (const auto &c : cones.getCones()) {
@@ -2178,6 +2298,40 @@ void drawLayoutUV(const Immersion &imm, const SubdomainLabels *labels,
     glEnd();
     glLineWidth(1.0f);
 
+    // The feature chains -- on a multi-material model, the interfaces -- in the
+    // image, which is where E3 and E6 are read off. Q3's rule applies to them
+    // in the same form as to dS: a chain labelled u should come out vertical
+    // and one labelled v horizontal, and a chain that is neither is where the
+    // E3 residual is. At a node of the network the picture says something E3
+    // cannot: the angle between two chains meeting there should be a whole
+    // number of right angles, and E6 is the term that puts it there.
+    //
+    // Drawn in the label colours with a white core, because that is what the
+    // model panel draws an interface in: the two halves have to be the same
+    // curve to the eye.
+    if (labels) {
+        for (int pass = 0; pass < 2; ++pass) {
+            glLineWidth(pass == 0 ? 4.5f : 1.5f);
+            for (const auto &fc : labels->featureChains()) {
+                if (fc.verts.size() < 2) continue;
+                if (pass == 0) {
+                    if (fc.label == SubdomainLabels::Align::U)      glColor3f(0.35f, 0.55f, 0.95f);
+                    else if (fc.label == SubdomainLabels::Align::V) glColor3f(0.20f, 0.85f, 0.40f);
+                    else                                            glColor3f(0.70f, 0.70f, 0.72f);
+                } else {
+                    glColor3f(0.97f, 0.97f, 0.99f);
+                }
+                glBegin(GL_LINE_STRIP);
+                for (const int v : fc.verts) {
+                    if (!ok(v)) continue;
+                    glVertex2d(uv[v][0], uv[v][1]);
+                }
+                glEnd();
+            }
+        }
+        glLineWidth(1.0f);
+    }
+
     // The cones, at every child the cut left them with, in the index colours
     // the model panel uses -- so a cone can be found in both halves at once.
     if (coneRadius > 0.0) {
@@ -2360,7 +2514,8 @@ void drawLayoutPatches(const Arrangement &arr, const SplineFit *fit,
     }
 }
 
-void drawQuadMesh(const QuadMesh &qm, float lineWidth, float blockLineWidth) {
+void drawQuadMesh(const QuadMesh &qm, float lineWidth, float blockLineWidth,
+                  bool materialFill) {
     const std::vector<Point> &V = qm.vertices();
     const std::vector<std::array<int, 4>> &Q = qm.quads();
     if (V.empty() || Q.empty()) return;
@@ -2376,7 +2531,26 @@ void drawQuadMesh(const QuadMesh &qm, float lineWidth, float blockLineWidth) {
         return 0.5 * a;
     };
 
-    // The folds, filled, underneath everything else.
+    // The materials, filled, under everything -- including under the folds, so
+    // a folded element in the middle of a region still reads as red.
+    const std::vector<int> &mat = qm.quadMaterials();
+    if (materialFill && mat.size() == Q.size()) {
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glBegin(GL_QUADS);
+        for (std::size_t i = 0; i < Q.size(); ++i) {
+            const auto &q = Q[i];
+            if (!ok(q[0]) || !ok(q[1]) || !ok(q[2]) || !ok(q[3])) continue;
+            float r, g, b;
+            materialColor(mat[i], r, g, b);
+            glColor4f(r, g, b, 0.30f);
+            for (int k = 0; k < 4; ++k) glVertex2d(V[q[k]][0], V[q[k]][1]);
+        }
+        glEnd();
+        glDisable(GL_BLEND);
+    }
+
+    // The folds, filled, over the material tint and under everything else.
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glColor4f(0.92f, 0.22f, 0.22f, 0.55f);

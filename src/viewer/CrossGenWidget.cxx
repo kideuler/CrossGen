@@ -386,6 +386,33 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
         }
         break;
 
+    case Qt::Key_I:
+        // The interface network, on or off. It is drawn over every MERIDIAN
+        // phase, which is what makes it useful and also what makes a key to
+        // hide it necessary: at the mesh phase it lies on top of the elements
+        // it is there to be compared against.
+        if (mode_ == Mode::MERIDIAN && interfaces_.has_value() &&
+            interfaces_->multiMaterial()) {
+            showInterfaces_ = !showInterfaces_;
+            console_.log(showInterfaces_ ? "[Interfaces] network shown"
+                                         : "[Interfaces] network hidden");
+            update();
+        }
+        break;
+
+    case Qt::Key_M:
+        // The materials as a fill rather than as the colour of a wireframe
+        // edge. Off by default because it competes with the conformal factor
+        // and the flat metric for the same triangles.
+        if (mode_ == Mode::MERIDIAN && interfaces_.has_value() &&
+            interfaces_->multiMaterial()) {
+            showMaterialFill_ = !showMaterialFill_;
+            console_.log(showMaterialFill_ ? "[Interfaces] triangles filled by material"
+                                           : "[Interfaces] material fill off");
+            update();
+        }
+        break;
+
     case Qt::Key_P:
         // The right half of the MERIDIAN layout phase carries two maps of the
         // same domain -- Stage 4's psi_R and Stage 6's Psi -- and the whole of
@@ -582,6 +609,10 @@ void CrossGenWidget::doReset() {
     ricci_.reset();
     coneCut_.reset();
     cones_.reset();
+    // Last of the MERIDIAN stages to go: SubdomainLabels holds a bare pointer
+    // to it.
+    interfaces_.reset();
+    interfaceMessagesSeen_ = 0;
     flatMetric_ = viewer::FlatMetric{};
     coneFans_.clear();
     ricciU_.resize(0);
@@ -612,6 +643,7 @@ void CrossGenWidget::doReset() {
     polysquareAnnounced_  = false;
     polysquareAttempted_  = false;
     blocksAttempted_      = false;
+    interfacesAttempted_  = false;
     conesAttempted_       = false;
     cutAttempted_         = false;
     ricciAnnounced_       = false;
@@ -1272,7 +1304,100 @@ void CrossGenWidget::runChordCollapse() {
                  "press 'c' to try other settings");
 }
 
-// ── MERIDIAN: Shepherd, Gu and Hughes (2022), Stages 1-3 ─────────────────────
+// ── MERIDIAN: Shepherd, Gu and Hughes (2022), Stages 0b-3 ────────────────────
+
+// Stage 0b, the material interface network. Everything it reads is already on
+// the mesh -- which triangle carries which material tag -- so it runs before the
+// field and before the cones, and on a single-material model it is one pass over
+// the edges that finds nothing.
+//
+// What it produces is not a picture but a set of demands on the stages after it:
+// a cone index at every node of the network for Stage 1, a sector constraint at
+// each of them for Stage 6, an emitter for Stage 7 and an arc for Stage 8. The
+// console is where those demands are visible before their consequences are, so
+// the report is printed in full rather than summarised.
+void CrossGenWidget::runMERIDIANInterfaces() {
+    interfacesAttempted_ = true;
+    interfaceMessagesSeen_ = 0;
+    if (!mesh_) return;
+
+    auto t0 = Clock::now();
+    try {
+        interfaces_.emplace(mesh_);
+    } catch (const std::exception &e) {
+        interfaces_.reset();
+        console_.log(std::string("[Interfaces] FAILED: ") + e.what());
+        std::cerr << "[Viewer] Interfaces failed: " << e.what() << "\n";
+        return;
+    }
+    auto t1 = Clock::now();
+
+    const Interfaces::Report &fr = interfaces_->getReport();
+    if (!interfaces_->multiMaterial()) {
+        // Said once, and not as a warning: the single-material pipeline is
+        // exactly what it was, and this is the line that says why nothing else
+        // about interfaces appears below.
+        console_.log("[Interfaces] Stage 0b: one material, so there are no interfaces "
+                     "and the pipeline is the single-material one throughout");
+        return;
+    }
+
+    {
+        std::ostringstream oss;
+        oss << "[Interfaces] Stage 0b: " << fr.materials << " material(s), "
+            << fr.interfaceEdges << " interface edge(s) in " << fr.branches
+            << " branch(es)";
+        if (fr.closedLoops > 0) oss << " (" << fr.closedLoops << " closed loop(s))";
+        oss << ", " << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Interfaces] " << fr.nodes << " node(s): " << fr.junctions << " junction, "
+            << fr.landings << " on dS, " << fr.kinks << " kink, " << fr.loopSplits
+            << " loop split";
+        if (fr.dangling > 0) oss << ", " << fr.dangling << " dangling";
+        console_.log(oss.str());
+    }
+    {
+        // The residual is the whole of what "ill-posed" means here, so it is
+        // reported as an angle and not as a flag: a junction 28 degrees off the
+        // quarter turns is a property of the domain, and the corpus has several
+        // on purpose.
+        std::ostringstream oss;
+        oss << "[Interfaces] sectors: " << fr.illPosedNodes << " of " << fr.nodes
+            << " node(s) more than 10 degrees from whole quarter turns, worst "
+            << std::fixed << std::setprecision(1)
+            << (fr.worstSectorResidual * 180.0 / M_PI) << " deg";
+        if (fr.worstSectorNode >= 0 &&
+            fr.worstSectorNode < static_cast<int>(interfaces_->nodes().size())) {
+            oss << " at vertex " << interfaces_->nodes()[fr.worstSectorNode].vertex;
+        }
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Interfaces] " << fr.prescribedCones
+            << " cone(s) prescribed from the geometry, summing to " << std::showpos
+            << fr.prescribedIndexSum << std::noshowpos
+            << "; Stage 1 will be told them rather than reading them off the field";
+        console_.log(oss.str());
+    }
+    if (fr.dangling > 0 || fr.nonManifoldVertices > 0) {
+        std::ostringstream oss;
+        oss << "[Interfaces] " << fr.dangling << " dangling branch(es) and "
+            << fr.nonManifoldVertices
+            << " vertex/-ices where the network is neither a path nor a node -- these are "
+            << "tag errors in the input, not something a later stage can repair";
+        console_.log(oss.str());
+    }
+    for (; interfaceMessagesSeen_ < fr.messages.size(); ++interfaceMessagesSeen_)
+        console_.log("[Interfaces] " + fr.messages[interfaceMessagesSeen_]);
+
+    console_.log("[Interfaces] white = an interface branch; the disks are its nodes, "
+                 "coloured by kind (see the key). Press 'i' to hide them, 'm' to fill "
+                 "the triangles by material");
+}
 
 // Stage 1, Sec. 3.1. Interior indices are the SIPG field's winding numbers,
 // boundary ones come from the field's rotation across each boundary star
@@ -1313,6 +1438,41 @@ void CrossGenWidget::runMERIDIANCones() {
         std::cerr << "[Viewer] ConeSingularities failed: " << e.what() << "\n";
         return;
     }
+    // The interface network's own indices, before Eq. (4) is checked: they are
+    // fixed by the geometry and rebalance() may not move them, so the check and
+    // the rebalance below have to see them already in place.
+    if (interfaces_.has_value() && interfaces_->multiMaterial()) {
+        cones_->prescribe(interfaces_->prescription());
+        std::ostringstream oss;
+        oss << "[Cones] " << interfaces_->getReport().prescribedCones
+            << " index/-ices taken from the interface network, "
+            << cones_->prescriptionShift()
+            << " unit(s) away from what the field read there -- the field is "
+               "boundary-aligned and has no boundary condition on an interface, so at a "
+               "junction or a landing it reports whatever propagated in";
+        console_.log(oss.str());
+    }
+
+    // The pairs the aligned field puts on a curved interface, which no region
+    // asked for: a smoothest field hard-aligned to a strongly curved feature
+    // carries a +1/-1 dipole on the concave side. Before Eq. (4) is checked
+    // (a pair sums to zero and cannot change it) and before Stage 2, which
+    // would otherwise cut to each of them. A pair spanning two regions -- the
+    // one a region boundary genuinely needs -- is left alone; only a pair that
+    // landed inside a single region's own count is cancelled.
+    if (interfaces_.has_value() && interfaces_->multiMaterial()) {
+        const int nV = static_cast<int>(mesh_->vertices.size());
+        std::vector<int> region(nV, -1);
+        for (int v = 0; v < nV; ++v) region[v] = interfaces_->regionAt(v);
+        const int cancelled = cones_->cancelDipoles(region);
+        if (cancelled > 0) {
+            std::ostringstream oss;
+            oss << "[Cones] cancelled " << cancelled << " +1/-1 cone pair(s) the field put "
+                   "inside a single material region";
+            console_.log(oss.str());
+        }
+    }
+
     auto gb = cones_->gaussBonnet();
     if (!gb.admissible) {
         const int moved = cones_->rebalance();
@@ -1356,6 +1516,44 @@ void CrossGenWidget::runMERIDIANCones() {
     if (!gb.admissible) {
         console_.log("[Cones] the flat cone metric asked for does not exist; Ricci flow "
                      "will refuse to start");
+    }
+
+    // The second half of Stage 0b: each material region's own Gauss-Bonnet
+    // count. It runs here because the cones on dS are half of that count and
+    // they are not known until Stage 1 has placed them. Where a region is short
+    // a quarter turn, this is what puts one somewhere it can go -- and without
+    // it E3 and E6 spend the whole continuation asking for a map that does not
+    // exist.
+    if (interfaces_.has_value() && interfaces_->multiMaterial()) {
+        interfaces_->balance(cones_->getIndices());
+        const Interfaces::Report &fr = interfaces_->getReport();
+        std::ostringstream oss;
+        oss << "[Interfaces] regions: " << fr.regionsBalanced << " of " << fr.regions
+            << " satisfy sum I + sum (2 - q) = 4 chi";
+        if (fr.quartersMoved > 0 || fr.cornersInserted > 0) {
+            oss << ", after moving " << fr.quartersMoved << " quarter turn(s) across a node "
+                << "and inserting " << fr.cornersInserted << " corner(s) on a smooth "
+                << "interface";
+        }
+        if (fr.regionsBalanced < fr.regions)
+            oss << "; the worst is " << fr.worstRegionDeficit << " quarter(s) out";
+        console_.log(oss.str());
+        if (fr.cornersInserted > 0) {
+            // The counts the picture now shows: inserting a corner splits the
+            // branch it went on, so the network drawn from here on is not the
+            // one reported above.
+            std::ostringstream oss2;
+            oss2 << "[Interfaces] the network is now " << fr.branches << " branch(es) and "
+                 << fr.nodes << " node(s)";
+            console_.log(oss2.str());
+        }
+        for (; interfaceMessagesSeen_ < fr.messages.size(); ++interfaceMessagesSeen_)
+            console_.log("[Interfaces] " + fr.messages[interfaceMessagesSeen_]);
+        if (fr.regionsBalanced < fr.regions) {
+            console_.log("[Interfaces] a region that cannot be a whole number of "
+                         "quadrilaterals is a contradiction and not a slack constraint; "
+                         "the remedy is upstream, in where Stage 1 put the boundary cones");
+        }
     }
 }
 
@@ -1589,6 +1787,39 @@ bool CrossGenWidget::promptMERIDIANConnectivity(const Immersion &imm,
         "either way -- the deduplication is on the pair of ends, not the pair of\n"
         "cones.");
 
+    // ── Stage 0b: what the material interfaces are held to ───────────────────
+    //
+    // Only shown on a multi-material model, where they are the two switches that
+    // decide how much of the interface network the layout is actually made to
+    // respect. Both are on, and both are here for the same reason the tolerances
+    // above are: what each of them buys is a question about the model, and the
+    // only way to settle it is to turn one off and look.
+    const bool multiMat = interfaces_.has_value() && interfaces_->multiMaterial();
+
+    auto *e6Box = new QCheckBox("hold the sector at each interface node (E6)", &dlg);
+    e6Box->setChecked(meridianConn_.labels.interfaceCorners);
+    e6Box->setToolTip(
+        "Sec. 3.3's E3 already asks that each interface be a coordinate line, and\n"
+        "it is a statement about one curve at a time. What it cannot say is what\n"
+        "the map does where two of them meet: a junction whose sectors are one,\n"
+        "one and two quarter turns is a condition on a *pair* of tangents, and\n"
+        "nothing in E1-E5 asks for it.\n\n"
+        "Off is the pipeline as it was before Stage 0b existed, and is what to\n"
+        "compare against: the interfaces stay straight and the corners between\n"
+        "them turn wherever the rest of the energy finds cheapest.");
+
+    auto *propagateBox = new QCheckBox("label interface chains from the node quantisation", &dlg);
+    propagateBox->setChecked(meridianConn_.labels.propagateInterfaceLabels);
+    propagateBox->setToolTip(
+        "Whether an interface chain is Gamma_u or Gamma_v is decided by walking\n"
+        "the network from its nodes, quarter turn by quarter turn, rather than by\n"
+        "reading the flux of psi_R along the chain.\n\n"
+        "The flux is a measurement of a map that is not yet a layout, and at a\n"
+        "triple point it can label all three branches u -- which asks E3 for a map\n"
+        "holding u constant on three curves leaving one point in three directions.\n"
+        "There is no such map, and the continuation spends every outer step\n"
+        "failing to reach it.");
+
     // ── Stage 7: what counts as arriving ─────────────────────────────────────
     auto *snapBox = new QDoubleSpinBox(&dlg);
     snapBox->setRange(1e-9, 1e-2);
@@ -1754,15 +1985,17 @@ bool CrossGenWidget::promptMERIDIANConnectivity(const Immersion &imm,
 
     auto *restore = new QPushButton("Restore recommended", &dlg);
     QObject::connect(restore, &QPushButton::clicked, &dlg,
-                     [&, nearMissBox, selfReturnBox, allConnBox, snapBox, ringsBox, stepsBox,
-                      cycleBox, repairBox, repairMaxBox, repairGapBox, repairBoostBox,
-                      repairOuterBox]() {
+                     [&, nearMissBox, selfReturnBox, allConnBox, e6Box, propagateBox,
+                      snapBox, ringsBox, stepsBox, cycleBox, repairBox, repairMaxBox,
+                      repairGapBox, repairBoostBox, repairOuterBox]() {
         const SubdomainLabels::Options l;
         const Separatrices::Options t;
         const MERIDIAN::Options m;
         nearMissBox->setValue(l.nearMissTolerance);
         selfReturnBox->setChecked(l.seedSelfReturns);
         allConnBox->setChecked(l.seedAllConnections);
+        e6Box->setChecked(l.interfaceCorners);
+        propagateBox->setChecked(l.propagateInterfaceLabels);
         snapBox->setValue(t.coneSnapTolerance);
         ringsBox->setValue(t.coneSnapRings);
         stepsBox->setValue(t.maxSteps);
@@ -1795,6 +2028,12 @@ bool CrossGenWidget::promptMERIDIANConnectivity(const Immersion &imm,
     form->addRow("near-miss tolerance (of cone spacing)", nearMissBox);
     form->addRow(selfReturnBox);
     form->addRow(allConnBox);
+
+    if (multiMat) {
+        form->addRow(section("Stage 0b — the material interfaces"));
+        form->addRow(e6Box);
+        form->addRow(propagateBox);
+    }
 
     form->addRow(section("Stage 7 — tracing the separatrices of Psi"));
     form->addRow("snap tolerance (of image extent)", snapBox);
@@ -1831,6 +2070,8 @@ bool CrossGenWidget::promptMERIDIANConnectivity(const Immersion &imm,
     meridianConn_.labels.nearMissTolerance = nearMissBox->value();
     meridianConn_.labels.seedSelfReturns = selfReturnBox->isChecked();
     meridianConn_.labels.seedAllConnections = allConnBox->isChecked();
+    meridianConn_.labels.interfaceCorners = e6Box->isChecked();
+    meridianConn_.labels.propagateInterfaceLabels = propagateBox->isChecked();
     meridianConn_.labels.maxTraceSteps = stepsBox->value();
     meridianConn_.trace.coneSnapTolerance = snapBox->value();
     meridianConn_.trace.coneSnapRings = ringsBox->value();
@@ -1931,7 +2172,8 @@ void CrossGenWidget::runMERIDIANLayout() {
     // ── Stage 5: subdomain labelling ─────────────────────────────────────────
     t0 = Clock::now();
     try {
-        meridianLabels_.emplace(*immersion_, meridianConn_.labels);
+        meridianLabels_.emplace(*immersion_, meridianConn_.labels,
+                                interfaces_.has_value() ? &*interfaces_ : nullptr);
     } catch (const std::exception &e) {
         meridianLabels_.reset();
         console_.log(std::string("[Labels] FAILED: ") + e.what());
@@ -1970,6 +2212,22 @@ void CrossGenWidget::runMERIDIANLayout() {
             << meridianConn_.labels.nearMissTolerance << " of the mean cone spacing = "
             << std::scientific << std::setprecision(2) << sr.seedSnapTolerance
             << " in image units, searched over " << sr.seedSnapRings << " ring(s)";
+        console_.log(oss.str());
+    }
+    if (sr.interfaceCorners > 0 || sr.featureChainsPropagated > 0) {
+        // What Stage 6 will be holding the interfaces to. The corrected count
+        // is the one worth watching: a chain the flux of psi_R would have
+        // labelled the other way is one where the node quantisation and the map
+        // disagree, and E3 alone would have taken the map's word for it.
+        std::ostringstream oss;
+        oss << "[Labels] interfaces: " << sr.featureChainsPropagated
+            << " chain(s) labelled from the node quantisation ("
+            << sr.featureLabelsCorrected << " against what their flux said), "
+            << sr.interfaceCorners << " sector(s) handed to E6";
+        if (sr.interfaceCornersSpanningCut > 0) {
+            oss << ", " << sr.interfaceCornersSpanningCut
+                << " dropped where the cutting graph runs through the sector";
+        }
         console_.log(oss.str());
     }
     for (const std::string &m : sr.messages) console_.log("[Labels] " + m);
@@ -2016,6 +2274,20 @@ void CrossGenWidget::runMERIDIANLayout() {
         if (er.coneValenceChanges > 0) oss << ", " << er.coneValenceChanges << " changed valence";
         console_.log(oss.str());
     }
+    if (er.interfaceCorners > 0) {
+        std::ostringstream oss;
+        oss << "[Layout] E6: the worst interface sector is " << std::scientific
+            << std::setprecision(2) << er.maxInterfaceResidual
+            << " rad from the quarter turns the model has there";
+        if (er.interfaceCornerChanges > 0) {
+            oss << "; " << er.interfaceCornerChanges
+                << " turned a different whole number of quarters, which is a layout the "
+                << "material regions do not have";
+        }
+        oss << " " << (er.interfaceCornerChanges == 0 && er.maxInterfaceResidual < 1e-3
+                           ? "[PASS]" : "[FAIL]");
+        console_.log(oss.str());
+    }
     {
         std::ostringstream oss;
         oss << "[Layout] Psi " << (ok ? "satisfies Q1-Q5: a quadrilateral layout in the sense "
@@ -2026,7 +2298,8 @@ void CrossGenWidget::runMERIDIANLayout() {
     }
     for (const std::string &m : er.messages) console_.log("[Layout] " + m);
     console_.log("[Layout] right panel = Psi; press 'p' for psi_R, the map it started from. "
-                 "Blue = Gamma_u, green = Gamma_v, amber/magenta = the two banks of each seam");
+                 "Blue = Gamma_u, green = Gamma_v, amber/magenta = the two banks of each seam, "
+                 "white-cored = a feature chain (on a multi-material model, an interface)");
 }
 
 // Stage 7, Sec. 4. The separatrices are what Q5 is actually about -- every
@@ -2055,6 +2328,21 @@ void CrossGenWidget::runMERIDIANSeparatrices() {
 
     Separatrices::Options topts = meridianConn_.trace;
     topts.nearMissWindow = meridianConn_.repairGapLimit;
+    // The nodes of the interface network emit as well as the cones -- but only
+    // the ones with spare sector capacity. A node with a sector three quarters
+    // wide needs two layout edges into it that no cone emits, and without them
+    // the region outside the corner comes back as one face with five corners
+    // that Stage 9 cannot fit and Stage 10 cannot mesh. A node with no spare
+    // sector (every quarter already accounted for) has no ray to receive a
+    // curve, so it must not be a termination target either -- the same rule
+    // Stage 5's own seeding uses (Interfaces::emitterNodes()), shared here so
+    // Stage 5 and Stage 7 never disagree about which nodes are live. The rays
+    // that would run *along* an interface are suppressed by the tracer itself:
+    // the interface is already an arc of the layout.
+    if (interfaces_.has_value() && interfaces_->multiMaterial()) {
+        const std::vector<int> emitters = interfaces_->emitterNodes();
+        topts.extraEmitters.insert(topts.extraEmitters.end(), emitters.begin(), emitters.end());
+    }
 
     MERIDIAN::RepairResult rep;
     try {
@@ -2226,6 +2514,19 @@ void CrossGenWidget::runMERIDIANPatches() {
             << " on dS, " << ar.boundaryCornerNodes << " corner) and " << ar.arcs
             << " arc(s) (" << ar.separatrixArcs << " traced, " << ar.boundaryArcs
             << " of dS), " << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+    }
+    if (ar.interfaceArcs > 0 || ar.interfaceNodes > 0) {
+        // mixedPatches is the property the whole multi-material path exists to
+        // produce, so it is reported whether it is zero or not: a patch whose
+        // interior is not all one material is one every element of which will
+        // straddle the interface.
+        std::ostringstream oss;
+        oss << "[Patches] interfaces: " << ar.interfaceArcs << " arc(s) and "
+            << ar.interfaceNodes << " node(s) of the network in the arrangement, "
+            << ar.interfaceHitNodes << " separatrix/-ces landed on one; "
+            << ar.mixedPatches << " patch(es) of mixed material "
+            << (ar.mixedPatches == 0 ? "[PASS]" : "[FAIL]");
         console_.log(oss.str());
     }
     {
@@ -2503,6 +2804,16 @@ void CrossGenWidget::runMERIDIANMesh() {
             << (qr.conforming ? "conforming [PASS]" : "not conforming [FAIL]");
         console_.log(oss.str());
     }
+    if (qr.materials > 1) {
+        std::ostringstream oss;
+        oss << "[Mesh] materials: " << qr.materials << " over " << qr.interfaceEdges
+            << " element edge(s) on an interface, " << qr.mixedQuads
+            << " element(s) straddling one "
+            << (qr.materialsPure ? "[PASS]" : "[FAIL]");
+        if (qr.unlocatedQuads > 0)
+            oss << " (" << qr.unlocatedQuads << " element(s) located off the triangulation)";
+        console_.log(oss.str());
+    }
     for (const std::string &m : qr.messages) console_.log("[Mesh] " + m);
     {
         std::ostringstream oss;
@@ -2543,7 +2854,8 @@ void CrossGenWidget::rerunMERIDIANConnectivity() {
 
     auto t0 = Clock::now();
     try {
-        meridianLabels_.emplace(*immersion_, meridianConn_.labels);
+        meridianLabels_.emplace(*immersion_, meridianConn_.labels,
+                                interfaces_.has_value() ? &*interfaces_ : nullptr);
     } catch (const std::exception &e) {
         meridianLabels_.reset();
         console_.log(std::string("[Labels] FAILED: ") + e.what());
@@ -2918,6 +3230,14 @@ void CrossGenWidget::runComputations() {
     if (sipgStageWantsField() && !sipgField_.has_value()) {
         auto t0 = Clock::now();
         sipgField_.emplace(mesh_);
+        // On a multi-material domain the interfaces are Dirichlet data for the
+        // field in exactly the way dS is: a curve the layout has to keep needs
+        // the field tangent to it, or neither region either side gets the
+        // interior cones its own Gauss-Bonnet count demands. Must be set before
+        // initialize(), which does the first assembly.
+        if (mode_ == Mode::MERIDIAN && interfaces_.has_value() && interfaces_->multiMaterial()) {
+            sipgField_->setAlignedInteriorEdges(interfaces_->interfaceEdges());
+        }
         sipgField_->initialize();
         auto t1 = Clock::now();
         console_.log("[SIPG] Initialized: " +
@@ -2982,6 +3302,15 @@ void CrossGenWidget::runComputations() {
     if (mode_ == Mode::UMBER && umberPhase_ >= UMBERPhase::Blocks &&
         polysquare_.has_value() && !blocksAttempted_) {
         runBlocks();
+    }
+
+    // ── MERIDIAN: Stage 0b, the material interfaces ──────────────────────────
+    //
+    // At the first phase, not the cone one: it reads the tags and nothing else,
+    // and the picture of what the layout will have to keep is worth having in
+    // front of the field rather than after it.
+    if (mode_ == Mode::MERIDIAN && !interfacesAttempted_) {
+        runMERIDIANInterfaces();
     }
 
     // ── MERIDIAN: Stage 1, the cones and Eq. (4) ─────────────────────────────
@@ -3626,6 +3955,10 @@ void CrossGenWidget::renderMERIDIANModel() {
         viewer::drawScalarField(*mesh_, ricciU_, ricciUAbsMax_);
         viewer::drawMeshOverlay(*mesh_, 0.85f, 0.85f, 0.85f, 0.22f, 1.0f);
     } else {
+        // The material fill goes under the wireframe, so the edges the tags
+        // separate stay readable over it.
+        if (showMaterialFill_ && interfaces_.has_value() && interfaces_->multiMaterial())
+            viewer::drawMaterialFill(*mesh_, 0.28f);
         viewer::drawMesh(*mesh_);
     }
 
@@ -3639,6 +3972,12 @@ void CrossGenWidget::renderMERIDIANModel() {
     if (meridianPhase_ >= MERIDIANPhase::Cut && coneCut_.has_value())
         viewer::drawCuttingGraph(*coneCut_, showMetric ? 2.0f : 3.5f);
     viewer::drawBoundaryEdges(*mesh_);
+
+    // The interface network over all of it and under the cones. It is an input
+    // rather than a result, so it is drawn at every phase: what each stage is
+    // to be judged on is whether its own picture still respects these curves.
+    if (showInterfaces_ && interfaces_.has_value())
+        viewer::drawInterfaceNetwork(*interfaces_, 0.4 * avgEdge_, showMetric ? 2.0f : 3.0f);
 
     if (cones_.has_value())
         viewer::drawCones(*mesh_, *cones_, 0.5 * avgEdge_);
@@ -4080,7 +4419,12 @@ void CrossGenWidget::renderNormal() {
             // The SIPG stages, drawn as SIPG mode draws them: the field whose
             // holonomy Sec. 3.1 is about to turn into cone indices, and the
             // interior singularities it already found.
+            if (showMaterialFill_ && interfaces_.has_value() && interfaces_->multiMaterial())
+                viewer::drawMaterialFill(*mesh_, 0.28f);
             viewer::drawMesh(*mesh_);
+            // Stage 0b needs neither, so its network is already there to see.
+            if (showInterfaces_ && interfaces_.has_value())
+                viewer::drawInterfaceNetwork(*interfaces_, 0.4 * avgEdge_, 3.0f);
             if (meridianPhase_ >= MERIDIANPhase::CrossField && sipgField_.has_value()) {
                 viewer::drawTriangleCrossField(*mesh_, *sipgField_, scale_);
                 const double ballRadius = 0.5 * avgEdge_;
@@ -4104,12 +4448,22 @@ void CrossGenWidget::renderNormal() {
                 // sourced copy of them over the first. A face Stage 10 could
                 // not mesh has no wall here, which is the point: the blank is
                 // where the mesh is not.
-                viewer::drawQuadMesh(*quadMesh_, 1.0f, 2.5f);
+                viewer::drawQuadMesh(*quadMesh_, 1.0f, 2.5f,
+                                     showMaterialFill_ && interfaces_.has_value() &&
+                                         interfaces_->multiMaterial());
             } else if (meridianPhase_ >= MERIDIANPhase::Patches && arrangement_.has_value()) {
                 viewer::drawLayoutPatches(*arrangement_,
                                           splines_.has_value() ? &*splines_ : nullptr,
                                           0.30 * avgEdge_, 3.0f);
             }
+            // Over the finished picture, and this is where it earns its place:
+            // an element or a patch side that crosses one of these curves
+            // rather than running along it is exactly the defect the whole
+            // multi-material path exists to prevent, and nothing else in the
+            // frame shows it.
+            if (showInterfaces_ && meridianPhase_ >= MERIDIANPhase::Patches &&
+                interfaces_.has_value())
+                viewer::drawInterfaceNetwork(*interfaces_, 0.25 * avgEdge_, 2.0f);
         }
     } else if (mode_ == Mode::MedialAxis) {
         viewer::drawAxis(view_);
@@ -4214,6 +4568,16 @@ void CrossGenWidget::renderNormal() {
                                       "quasi-eigenfunction");
     }
 
+    // MERIDIAN: the node colours of the interface network, above the cone
+    // legend, whenever the network is on screen.
+    const bool sepLegendShown = (mode_ == Mode::MERIDIAN && cones_.has_value() &&
+                                 meridianPhase_ == MERIDIANPhase::Separatrices &&
+                                 separatrices_.has_value());
+    if (mode_ == Mode::MERIDIAN && showInterfaces_ && interfaces_.has_value() &&
+        interfaces_->multiMaterial()) {
+        viewer::drawInterfaceLegend(fbw(), fbh(), sepLegendShown);
+    }
+
     // MERIDIAN: the cone colours everywhere they are drawn, and whichever ramp
     // the current phase is using under them.
     if (mode_ == Mode::MERIDIAN && cones_.has_value()) {
@@ -4232,7 +4596,15 @@ void CrossGenWidget::renderNormal() {
         }
     }
 
-    // Overlay text
+    // Overlay text. On a multi-material model the two display toggles are
+    // appended to whatever the phase's own help says, since they apply at every
+    // MERIDIAN phase and to none of the other modes.
+    const std::string meridianKeys =
+        (mode_ == Mode::MERIDIAN && interfaces_.has_value() && interfaces_->multiMaterial())
+            ? std::string("press 'i' to show/hide the interface network\n"
+                          "press 'm' to fill the triangles by material\n")
+            : std::string();
+
     if (mode_ == Mode::Unselected) {
         renderOverlay("press '1' for PolyVector mode\npress '2' for MBO mode\n"
                       "press '3' for Medial Axis mode\npress '4' for SIPG mode\n"
@@ -4245,20 +4617,23 @@ void CrossGenWidget::renderNormal() {
                       "press 'r' to restart\npress 'q' to quit");
     } else if (mode_ == Mode::MERIDIAN && meridianPhase_ == MERIDIANPhase::Layout &&
                meridianLayout_.has_value()) {
-        renderOverlay("press 'p' to swap psi_R / Psi\npress 'r' to restart\npress 'q' to quit");
+        renderOverlay((meridianKeys + "press 'p' to swap psi_R / Psi\n"
+                                      "press 'r' to restart\npress 'q' to quit").c_str());
     } else if (mode_ == Mode::MERIDIAN && meridianPhase_ == MERIDIANPhase::Mesh) {
-        renderOverlay("press 'c' to mesh again at another target edge length\n"
-                      "press 'n' to change the connectivity settings and trace again\n"
-                      "press 'r' to restart\npress 'q' to quit");
+        renderOverlay((meridianKeys +
+                       "press 'c' to mesh again at another target edge length\n"
+                       "press 'n' to change the connectivity settings and trace again\n"
+                       "press 'r' to restart\npress 'q' to quit").c_str());
     } else if (mode_ == Mode::MERIDIAN && meridianPhase_ == MERIDIANPhase::Patches) {
-        renderOverlay("press 'c' to mesh the patches (Stage 10)\n"
-                      "press 'n' to change the connectivity settings and trace again\n"
-                      "press 'r' to restart\npress 'q' to quit");
+        renderOverlay((meridianKeys + "press 'c' to mesh the patches (Stage 10)\n"
+                       "press 'n' to change the connectivity settings and trace again\n"
+                       "press 'r' to restart\npress 'q' to quit").c_str());
     } else if (mode_ == Mode::UMBER && umberPhase_ == UMBERPhase::Simplified) {
         renderOverlay("press 'c' to change the collapse settings\n"
                       "press 'r' to restart\npress 'q' to quit");
     } else {
-        renderOverlay("press 'c' to continue\npress 'r' to restart\npress 'q' to quit");
+        renderOverlay((meridianKeys + "press 'c' to continue\npress 'r' to restart\n"
+                                      "press 'q' to quit").c_str());
     }
 }
 

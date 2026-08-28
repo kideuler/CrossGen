@@ -13,6 +13,7 @@
 #include "MERIDIAN/ConeCut.hxx"
 #include "MERIDIAN/ConeSingularities.hxx"
 #include "MERIDIAN/Immersion.hxx"
+#include "MERIDIAN/Interfaces.hxx"
 #include "MERIDIAN/RicciFlow.hxx"
 #include "MERIDIAN/Separatrices.hxx"
 #include "MERIDIAN/QuadMesh.hxx"
@@ -229,6 +230,49 @@ void drawQuadLayoutArcs(const QuadLayout &layout, float lineWidth, float r, floa
 // head-on, and blue for a T-junction.
 void drawQuadLayoutNodes(const QuadLayout &layout, double radius);
 
+// ── MERIDIAN Stage 0b: the material interface network ────────────────────────
+//
+// On a multi-material model the interfaces are an input, not a result: they are
+// the curves the tags already put on the triangulation, and the whole of the
+// multi-material path is the pipeline being made to keep them. So they are
+// drawn from the first MERIDIAN phase, before there is a field or a cone or a
+// layout to draw them against, and they stay under every phase after it.
+//
+// Two pictures, because they answer two different questions.
+
+// The triangles filled by material, translucently, so the regions read as
+// regions rather than as a wireframe that happens to change colour. This is the
+// domain the layout has to be compatible with, and on a model whose tags are
+// wrong it is the picture that says so before anything else has run. Uniform on
+// a single-material mesh, which is why the viewer only turns it on when there
+// is more than one material.
+void drawMaterialFill(const Mesh &m, float alpha);
+
+// The network itself: every branch as the polyline of mesh edges it is, and
+// every node as a disk coloured by what kind of node it is.
+//
+//   white     a junction -- three or more branches meet inside S
+//   green     a landing -- a branch reaches dS
+//   orange    a kink -- the interface turns by more than the threshold, and the
+//             layout has to turn with it or an element straddles the corner
+//   violet    a loop split -- a closed interface carries no node of its own, so
+//             it is cut into arcs that the faces inside it can have corners at
+//   cyan      a corner Stage 0b's balance() put on a smooth interface to make
+//             the region's own Gauss-Bonnet count come out
+//   red       a dangling branch: one interface edge ending nowhere, which is a
+//             tag error and not a feature
+//
+// A node whose sectors are more than Options::wellPosedAngle from whole quarter
+// turns carries a dark halo. That is not an error either -- an oblique junction
+// is a property of the domain, and the corpus has several on purpose -- but it
+// is where the layout has the most turning to absorb, so it is worth being able
+// to find by eye.
+void drawInterfaceNetwork(const Interfaces &itf, double nodeRadius, float lineWidth);
+
+// Screen-space key for those node colours. `separatrixLegendShown` lifts it
+// clear of the separatrix legend when both are on screen.
+void drawInterfaceLegend(int fbw, int fbh, bool separatrixLegendShown);
+
 // ── MERIDIAN: cones, the cutting graph, and the flat cone metric ─────────────
 //
 // Shepherd, Gu and Hughes (2022), Secs. 3.1 and 3.2. Everything here is drawn
@@ -348,6 +392,11 @@ void drawConeFans(const std::vector<ConeFan> &fans);
 //   amber/magenta the two banks of each arc of G. Q4 says they are the same
 //                 curve up to R_k, so they are drawn apart: an arc whose two
 //                 banks are not congruent has not met E4.
+//   white-cored   the feature chains, which on a multi-material model are the
+//   blue / green  material interfaces. Same rule as dS -- a chain labelled u is
+//                 vertical, one labelled v horizontal -- and the angle between
+//                 two of them at a node of the network is what E6 holds at a
+//                 whole number of right angles.
 //   cone disks    the same index colours drawCones() uses on the model, at
 //                 every child of the cone in Omega. An interior cone that the
 //                 cut opened appears once per child.
@@ -434,6 +483,12 @@ void drawLayoutPatches(const Arrangement &arr, const SplineFit *fit,
 // second, heavier pass, which is what makes the structure legible: the interior
 // of a block is a regular grid, and where two of them meet the rows either
 // match or they do not.
-void drawQuadMesh(const QuadMesh &qm, float lineWidth, float blockLineWidth);
+// `materialFill` tints every element with the material of the region its
+// centroid landed in, which is the one way to see the property the
+// multi-material path exists for: an element that straddles an interface is one
+// no analysis code can integrate, and with the network drawn over the fill a
+// straddling element is a cell the interface runs through rather than along.
+void drawQuadMesh(const QuadMesh &qm, float lineWidth, float blockLineWidth,
+                  bool materialFill = false);
 
 } // namespace viewer

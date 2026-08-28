@@ -10,6 +10,7 @@
 #include "MERIDIAN/ConeCut.hxx"
 #include "MERIDIAN/ConeSingularities.hxx"
 #include "MERIDIAN/Immersion.hxx"
+#include "MERIDIAN/Interfaces.hxx"
 #include "MERIDIAN/LayoutEnergy.hxx"
 #include "MERIDIAN/QuadMesh.hxx"
 #include "MERIDIAN/RicciFlow.hxx"
@@ -34,6 +35,18 @@ class SIPG;
 // Dirichlet barrier of Sec. 3.3 can prevent a flipped triangle but never undo
 // one. Ricci flow is where that starting map comes from, and getting to it
 // takes three stages:
+//
+//   Stage 0b             The material interface network, on a mesh whose
+//                        triangles carry more than one material tag. The
+//                        paper's features are trim curves and creases and it
+//                        takes them as an input to Stage 0; here they are the
+//                        boundaries between the physical surfaces of the .geo,
+//                        and the graph they form -- its junctions, its landings
+//                        on dS, its corners, and the quarter turns the layout
+//                        must make in every sector at each of them -- is what
+//                        Stages 1, 5, 6, 7 and 8 are then written against.
+//                        Nothing on a single-material mesh.
+//                        -> Interfaces
 //
 //   Stage 1  Sec. 3.1    Cone singularities. Cross field in, integer indices
 //                        out, checked against the discrete Gauss-Bonnet
@@ -117,6 +130,48 @@ class SIPG;
 // comes from -- which is why run() reports Stage 4's flipped-face count rather
 // than only its own convergence.
 //
+// ### Multi-material domains
+//
+// A material interface is a feature in exactly the paper's sense -- a curve of
+// the input the output has to keep -- and E3 of Sec. 3.3 is already written for
+// features. That is not enough, and the reason is that E3 is a statement about
+// one curve at a time while everything that makes a *network* of curves part of
+// a layout lives between them. Four things had to be added, and each of them
+// fails visibly without the others:
+//
+//   Stage 0b   the network itself, and the quarter turns the layout must make
+//              in each sector at each of its nodes. Two conditions: the local
+//              one at a node, which is arithmetic on the incident directions,
+//              and the global one on each material region, which is the
+//              discrete Gauss-Bonnet count of Eq. (4) restricted to it. The
+//              second is not optional and is not a tolerance: a quarter disk
+//              inside a square whose interface meets the boundary at right
+//              angles at both ends has three quarter turns on its boundary and
+//              needs four, and until the fourth is put somewhere E3 and E6 are
+//              asking for a map that does not exist.
+//
+//   Stage 1    the cone index at every node of that network, prescribed from
+//              the geometry rather than read off the field. The field is
+//              boundary-aligned and has no boundary condition on an interface,
+//              so at a junction it reports whatever propagated in from
+//              elsewhere.
+//
+//   Stage 6    E6, the sector condition imposed on Psi. See LayoutEnergy.
+//
+//   Stages 7   the interfaces as arcs of the layout, and the layout edges that
+//   and 8      leave a node whose sector is more than one quadrilateral wide.
+//              An interface is a layout edge whether or not a separatrix
+//              happens to lie on it, so Stage 8 takes the branches directly;
+//              and a node with a three-quarter sector emits two curves into it
+//              that no cone emits, so Stage 7 emits from the network's nodes as
+//              well as from P, suppressing the rays that would merely lie along
+//              the interface a second time.
+//
+// What comes out is a mesh whose every element lies inside one material and
+// whose two sides of every interface share their nodes, which is what an
+// analysis code on a multi-material domain needs and what a layout ignoring the
+// tags cannot give it.
+//
 // What comes out at the end is a set of bicubic patches meeting C0 across their
 // shared boundary curves and C2 inside, together with everything they were
 // derived from: Psi, the separatrices, the arrangement, and a conforming
@@ -137,6 +192,44 @@ public:
         // TestSIPG.
         double sipgGamma = 10.0;
         int sipgMaxSteps = 500;
+
+        // Stage 0b: the material interface network. No effect on a
+        // single-material mesh, where there are no interfaces to find, so this
+        // is on by default and the single-material pipeline is unchanged.
+        bool materialInterfaces = true;
+        // Where an interface turns sharply enough that the layout has to turn
+        // with it, and how many arcs a closed interface loop is cut into.
+        double interfaceKinkAngle = M_PI / 4.0;
+        int interfaceLoopSplits = 4;
+        // Align the Stage 0 cross field to the interfaces as well as to dS.
+        //
+        // Without this the field has no boundary condition on an interface and
+        // runs straight through it, so the cones each material region needs in
+        // its *interior* are never read off at all -- and Stage 0b then has to
+        // put the missing turn somewhere, which means a corner in the middle of
+        // an interface that does not turn. See Interfaces::balance and
+        // SIPG::setAlignedInteriorEdges. Off is the behaviour before this,
+        // which is what the --no-field-interfaces flag measures against.
+        bool alignFieldToInterfaces = true;
+        // Annihilate the +1/-1 cone pairs an interface-aligned field puts on the
+        // concave side of a strongly curved interface. Both members are in one
+        // material region, so the pair is in no region's Gauss-Bonnet count and
+        // is a property of the smoothest field rather than of the layout. See
+        // ConeSingularities::cancelDipoles; the --no-cancel-dipoles flag is
+        // what measures it.
+        bool cancelInterfaceDipoles = true;
+        // Hand Stage 1 the cone index the interface geometry fixes at every
+        // node of that network, overriding what the cross field read there.
+        // See ConeSingularities::prescribe for why the field cannot supply it.
+        bool prescribeInterfaceCones = true;
+        // Stage 6's E6, the sector condition at those nodes. Off leaves the
+        // interfaces to E3 alone, which is what the pipeline did before this
+        // stage existed and is what the --no-e6 flag is for measuring against.
+        bool interfaceCorners = true;
+        bool propagateInterfaceLabels = true;
+        // See LayoutEnergy::Options::lagInterfaceScales; off, and the numbers
+        // that say why are there.
+        bool lagInterfaceScales = false;
 
         // Stage 1
         bool autoRebalance = true;   // restore Eq. (4) by moving boundary cones
@@ -226,6 +319,8 @@ public:
         // polylines instead, which tells a meshing artefact apart from a
         // fitting one. See QuadMesh::Options::useSplines.
         bool quadUseSplines = true;
+        // See QuadMesh::Options::interfacesOnTracedArcs.
+        bool quadInterfacesOnTracedArcs = true;
         // Winslow sweeps over the interior of each block, the boundary held.
         // Zero leaves the transfinite grid alone. See QuadMesh::smooth().
         int quadSmoothingPasses = 500;
@@ -274,6 +369,25 @@ public:
     struct Status {
         int mboSteps = 0;
         bool fieldConverged = false;
+        // Whether the interfaces were Dirichlet data for the field, Stage 0.
+        bool fieldAlignedToInterfaces = false;
+        // Index units cancelDipoles() annihilated, Stage 1.
+        int coneDipoleUnits = 0;
+
+        // Stage 0b
+        int materials = 1;
+        int interfaceEdges = 0;
+        int interfaceBranches = 0;
+        int interfaceNodes = 0;
+        int interfaceIllPosedNodes = 0;
+        double interfaceWorstSector = 0.0;   // radians
+        int interfaceConesPrescribed = 0;
+        int interfacePrescriptionShift = 0;  // index units the field was out by
+        int regions = 0;                     // connected pieces of one material
+        int regionsBalanced = 0;             // of those, satisfying their own Eq. (4)
+        int regionQuartersMoved = 0;
+        int regionCornersInserted = 0;
+        int worstRegionDeficit = 0;
 
         bool conesAdmissible = false;
         int interiorCones = 0;
@@ -299,6 +413,13 @@ public:
         int topoPaths = 0;
         int topoSelfReturns = 0;    // paths back to the cone they left, Fig. 9
         int topoExtraPerPair = 0;   // second and later curves of one cone pair
+
+        // Stage 5/6, the interface terms
+        int interfaceCorners = 0;
+        int interfaceLabelsCorrected = 0;
+        double interfaceResidual = 0.0;      // radians
+        int interfaceCornerChanges = 0;
+        bool interfacesAligned = false;
 
         // Stage 6
         bool layoutRan = false;
@@ -426,6 +547,7 @@ public:
     bool run();
 
     const SIPG& getField() const { return *field; }
+    const Interfaces& getInterfaces() const { return *interfaces; }
     const ConeSingularities& getCones() const { return *cones; }
     const ConeCut& getCut() const { return *cutter; }
     const RicciFlow& getRicci() const { return *ricci; }
@@ -438,6 +560,7 @@ public:
     const QuadMesh& getQuadMesh() const { return *quads; }
 
     // Null until the stage that builds them has run.
+    bool hasInterfaces() const { return interfaces != nullptr; }
     bool hasCones() const { return cones != nullptr; }
     bool hasCut() const { return cutter != nullptr; }
     bool hasRicci() const { return ricci != nullptr; }
@@ -462,6 +585,7 @@ private:
     Status status;
 
     std::unique_ptr<SIPG> field;
+    std::unique_ptr<Interfaces> interfaces;
     std::unique_ptr<ConeSingularities> cones;
     std::unique_ptr<ConeCut> cutter;
     std::unique_ptr<RicciFlow> ricci;
