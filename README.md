@@ -17,5 +17,6 @@ A purely 2D implementation of Cross-fields along with block decomposition
 - [X] Go back and try to fix tracing and simplification
 - [X] See if we can do a chord collapse operation for complex polysquares
 - [x] Try medial axis again.
-- [ ] Change mesh cutting a little so singularities do not lie on the same cut. Should conditions better.
-- [ ] Tracing.
+- [X] Change mesh cutting a little so singularities do not lie on the same cut. Should conditions better.
+- [X] Tracing.
+- [ ] Multi-materials in MERIDIAN through alignment to feature lines in energy.
