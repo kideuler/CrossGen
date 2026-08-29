@@ -241,6 +241,10 @@ public:
         // the letter of Sec. 3.2.2 and leaves G a tree with junctions in it.
         // See ConeCut::Options::conesToBoundary.
         bool coneCutsToBoundary = true;
+        // How dearly the cutting graph avoids the material interface network.
+        // See ConeCut::Options::interfaceAvoidance; 0 routes as if the network
+        // were not there, which is what Stage 2 did before it knew.
+        double coneCutInterfaceAvoidance = 1.0;
 
         // Stage 3
         double ricciTolerance = 1e-8;
@@ -395,6 +399,13 @@ public:
 
         bool cutIsDisk = false;
         bool allConesOnBoundary = false;
+        // Stage 2 against the interface network: arcs of G lying along an
+        // interface, vertices of G on the network at all, and how many of those
+        // are nodes. Zero on a single-material mesh, and zero on a
+        // multi-material one whose cones all have an interface-free route to dS.
+        int cutInterfaceEdges = 0;
+        int cutInterfaceVertices = 0;
+        int cutInterfaceNodes = 0;
 
         bool ricciConverged = false;
 

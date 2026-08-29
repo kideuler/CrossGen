@@ -173,12 +173,20 @@ bool MERIDIAN::run() {
     }
 
     // --- Stage 2: cutting graph, Sec. 3.2.2 -------------------------------
+    // The interface network goes in with it. Stage 2 is where the layout's two
+    // sets of curves first meet: G is free to be routed anywhere and the
+    // interfaces are not free at all, so it is G that gives way. See ConeCut's
+    // class comment for what a cut that does not costs E3 and E6.
     ConeCut::Options cutOpts;
     cutOpts.conesToBoundary = options.coneCutsToBoundary;
-    cutter = std::make_unique<ConeCut>(mesh, *cones, cutOpts);
+    cutOpts.interfaceAvoidance = options.coneCutInterfaceAvoidance;
+    cutter = std::make_unique<ConeCut>(mesh, *cones, cutOpts, interfaces.get());
     const ConeCut::Report &cr = cutter->getReport();
     status.cutIsDisk = cr.isDisk;
     status.allConesOnBoundary = cr.allConesOnBoundary;
+    status.cutInterfaceEdges = cr.interfaceEdgesOnCut;
+    status.cutInterfaceVertices = cr.interfaceVertsOnCut;
+    status.cutInterfaceNodes = cr.interfaceNodesOnCut;
     for (const std::string &m : cr.messages) status.messages.push_back("Stage 2: " + m);
 
     // --- Stage 3: discrete Ricci flow, Sec. 3.2.1 -------------------------

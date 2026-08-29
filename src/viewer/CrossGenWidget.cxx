@@ -1565,7 +1565,11 @@ void CrossGenWidget::runMERIDIANCut() {
 
     auto t0 = Clock::now();
     try {
-        coneCut_.emplace(mesh_, *cones_);
+        // The interface network goes in with the cones: on a multi-material
+        // mesh the cut has to be routed around it, or the seam lands on a
+        // curve the layout is meant to keep. See ConeCut's class comment.
+        coneCut_.emplace(mesh_, *cones_, ConeCut::Options(),
+                         interfaces_.has_value() ? &*interfaces_ : nullptr);
     } catch (const std::exception &e) {
         coneCut_.reset();
         console_.log(std::string("[Cut] FAILED: ") + e.what());

@@ -207,6 +207,8 @@ void usage(const char *argv0) {
               << "  --no-flips         disable weighted-Delaunay flipping\n"
               << "  --no-rebalance     do not repair Eq. (4) automatically\n"
               << "  --cut-to-graph     cone cuts may stop on an earlier cut, not only dS\n"
+              << "  --cut-through-interfaces  route the cutting graph as if the material\n"
+              << "                     interfaces were not there (Stage 2 before it knew)\n"
               << "  --cut <file.obj>   write the cut disk Omega\n"
               << "  --no-interfaces    ignore the material tags: no Stage 0b, no E6\n"
               << "  --no-field-interfaces  leave the Stage 0 field aligned to dS alone\n"
@@ -303,6 +305,7 @@ int main(int argc, char **argv) {
         else if (a == "--no-flips")                opts.delaunayFlips = false;
         else if (a == "--no-rebalance")            opts.autoRebalance = false;
         else if (a == "--cut-to-graph")            opts.coneCutsToBoundary = false;
+        else if (a == "--cut-through-interfaces")  opts.coneCutInterfaceAvoidance = 0.0;
         else if (a == "--cut" && i + 1 < argc)     cutOut = argv[++i];
         else if (a == "--no-interfaces")           opts.materialInterfaces = false;
         else if (a == "--no-field-interfaces")     opts.alignFieldToInterfaces = false;
@@ -587,7 +590,41 @@ int main(int argc, char **argv) {
               << (opts.coneCutsToBoundary ? "  (expected 0: every arc runs to dS)" : "")
               << "\n";
 
+    // What the cut has in common with the material interface network. Nothing
+    // is what E3 and E6 need of it; see ConeCut's class comment.
+    if (st.materials > 1) {
+        std::cout << "  Interface network: " << cr.interfaceVertsOnCut
+                  << " vertex/vertices of G on it (" << cr.interfaceNodesOnCut
+                  << " node(s)), " << cr.interfaceEdgesOnCut << " arc(s) along it";
+        if (cr.conesOnInterfaceNodes > 0) {
+            std::cout << "; " << cr.conesOnInterfaceNodes
+                      << " cone(s) sit on a node and must leave from one";
+        }
+        std::cout << "\n";
+        const Mesh &om = cut.getOriginalMesh();
+        for (const auto &cp : cut.getConePaths()) {
+            if (cp.interfaceVerts == 0) continue;
+            const Point &a = om.vertices[cp.cone];
+            std::cout << "     cone " << cp.cone << " (" << std::fixed << std::setprecision(4)
+                      << a[0] << ", " << a[1] << ")" << std::defaultfloat << " I = " << cp.index
+                      << ": " << cp.interfaceVerts << " interface vertex/vertices ("
+                      << cp.interfaceNodes << " node(s))"
+                      << (cp.startsOnNode ? ", the cone itself among them" : "")
+                      << " on a " << cp.path.size() << "-vertex arc\n";
+        }
+    }
+
     verdict(cr.isDisk, "Omega = S - G is a topological disk");
+    if (st.materials > 1) {
+        // A verdict on the half of it that is always reachable. Running an arc
+        // *along* an interface is never forced -- a single transversal crossing
+        // is cheaper than two vertices of a branch under any triangulation --
+        // and it is the contact that costs E3 a whole chain, so it is a
+        // failure. Crossing is the other half, and a cone inside an inclusion
+        // has no interface-free route to dS at all, so that one is counted on
+        // the line above and warned about below rather than failed.
+        verdict(cr.interfaceEdgesOnCut == 0, "No arc of G runs along a material interface");
+    }
     verdict(cr.allConesOnBoundary, "P is contained in G union dS (all cones on the boundary)");
     // Not a verdict: Sec. 3.2.2 prefers cuts that stop at a cone but does not
     // require it, and Fig. 7 is a cone split into three children.

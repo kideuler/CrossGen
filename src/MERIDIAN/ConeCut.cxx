@@ -47,13 +47,19 @@ struct DSU {
 } // namespace
 
 ConeCut::ConeCut(std::shared_ptr<Mesh> mesh, const ConeSingularities &cones,
-                 const Options &options)
+                 const Options &options, const Interfaces *interfaces)
     : orig(std::move(mesh)), opts(options) {
     if (!orig) throw std::runtime_error("ConeCut: null mesh");
     if (orig->triangles.empty()) throw std::runtime_error("ConeCut: empty mesh");
     if (orig.get() != &cones.getMesh()) {
         throw std::runtime_error("ConeCut: the cone set was measured on a different mesh");
     }
+    if (interfaces && orig.get() != &interfaces->getMesh()) {
+        throw std::runtime_error("ConeCut: the interface network was found on a different mesh");
+    }
+
+    // --- What the routing must keep away from, before it routes anything ---
+    buildVertexPenalty(interfaces);
 
     // --- The voids, by Wang et al. Sec. 4.1 -------------------------------
     harmonic = std::make_unique<HarmonicCut>(orig);
@@ -68,7 +74,53 @@ ConeCut::ConeCut(std::shared_ptr<Mesh> mesh, const ConeSingularities &cones,
     routeConePaths(cones);
 
     buildExplicitCutMesh();
-    check(cones);
+    check(cones, interfaces);
+}
+
+// ---------------------------------------------------------------------------
+// buildVertexPenalty()
+//
+// The cost of *arriving* at a vertex, added to the edge length that got there.
+// It is zero everywhere except on the material interface network, and the
+// network's value is chosen so that the penalty is a lexicographic order and
+// not a weighting: one unit is the total length of every edge in the mesh,
+// which no simple path can exceed, so a route touching one fewer vertex of the
+// network is cheaper than any route touching one more however much shorter that
+// one is, and among routes with the same contact the ordinary shortest path
+// wins on the remainder.
+//
+// A node of the network is charged twice a plain vertex of a branch, so a
+// crossing that has to happen somewhere happens in the middle of a branch. That
+// ordering is measured and not argued, and the argument points the other way:
+// Stage 5 ends a feature chain at every node it meets, so a cut crossing there
+// splits no chain at all, where one crossing a branch in its interior splits it
+// in two. Charging a node less was tried on geom009 -- all four crossings moved
+// onto the loop-split nodes of the ellipse, and the twelve feature chains
+// became eight with no split among them -- and it is worse in every number that
+// follows: half of E6's sectors go with the nodes (four of eight dropped where
+// the graph runs through the sector), and E3's residual rises from 7.8e-06 to
+// 4.3e-05. A sector dropped from E6 is a turn nothing asserts any more; a split
+// chain is a constraint E3 merely struggles with. The looser-looking damage is
+// the more expensive one.
+// ---------------------------------------------------------------------------
+void ConeCut::buildVertexPenalty(const Interfaces *interfaces) {
+    vertexPenalty.clear();
+    if (!interfaces || !interfaces->multiMaterial()) return;
+    if (!(opts.interfaceAvoidance > 0.0)) return;
+
+    double totalLength = 0.0;
+    for (const auto &e : orig->edges) totalLength += edgeLength(*orig, e[0], e[1]);
+    const double unit = opts.interfaceAvoidance * (totalLength + 1.0);
+
+    const int nV = static_cast<int>(orig->vertices.size());
+    vertexPenalty.assign(nV, 0.0);
+    bool any = false;
+    for (int v = 0; v < nV; ++v) {
+        if (interfaces->degreeAt(v) <= 0 && interfaces->nodeAt(v) < 0) continue;
+        vertexPenalty[v] = (interfaces->nodeAt(v) >= 0) ? 2.0 * unit : unit;
+        any = true;
+    }
+    if (!any) vertexPenalty.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -111,7 +163,7 @@ std::vector<int> ConeCut::shortestPathToSet(int source,
             for (int c = 0; c < 3; ++c) {
                 const int to = tri[c];
                 if (to == u) continue;
-                const double w = edgeLength(*orig, u, to);
+                const double w = edgeLength(*orig, u, to) + penaltyAt(to);
                 if (dist[to] > d + w) {
                     dist[to] = d + w;
                     prev[to] = u;
@@ -154,6 +206,12 @@ std::vector<int> ConeCut::shortestPathToSet(int source,
 // decides who gets the direct route rather than only how much edge length is
 // spent. It is left as it was, nearest-first, because on that corpus no cone
 // ever needed the fallback below and so nothing chooses between orderings.
+//
+// Orthogonal to both rules is the arrival penalty of buildVertexPenalty(),
+// which is on the *metric* rather than on the target or forbidden sets: it does
+// not change where an arc may stop, only which of the routes there it takes.
+// With a material interface network in hand it makes every route that avoids
+// the network cheaper than every route that does not, so the cut goes round.
 //
 // Blocking is why the strict route can fail at all. In the continuum a slit
 // from an interior point to dS never disconnects a disk, so a route around an
@@ -225,7 +283,7 @@ void ConeCut::routeConePaths(const ConeSingularities &cones) {
                 for (int c = 0; c < 3; ++c) {
                     const int to = tri[c];
                     if (to == u) continue;
-                    const double w = d + edgeLength(*orig, u, to);
+                    const double w = d + edgeLength(*orig, u, to) + penaltyAt(to);
                     if (toGraph[to] > w) { toGraph[to] = w; pq.push({w, to}); }
                 }
             }
@@ -382,7 +440,7 @@ void ConeCut::buildExplicitCutMesh() {
 // than inferred from the number of arcs laid, because an arc that failed to
 // find a route leaves the mesh looking almost right.
 // ---------------------------------------------------------------------------
-void ConeCut::check(const ConeSingularities &cones) {
+void ConeCut::check(const ConeSingularities &cones, const Interfaces *interfaces) {
     const int V = static_cast<int>(cut.vertices.size());
     const int F = static_cast<int>(cut.triangles.size());
     const int E = static_cast<int>(cut.edges.size());
@@ -482,6 +540,59 @@ void ConeCut::check(const ConeSingularities &cones) {
         for (const EdgeKey &e : cutEdges) { ++degree[e.a]; ++degree[e.b]; }
         for (const auto &kv : degree) {
             if (kv.second >= 3 && !orig->isBoundaryVertex[kv.first]) ++report.interiorJunctions;
+        }
+    }
+
+    // What G still has in common with the interface network. Read off the graph
+    // rather than off the routing, because a void arc is routed by HarmonicCut,
+    // which knows nothing about the network and is not penalised away from it.
+    if (interfaces && interfaces->multiMaterial()) {
+        std::unordered_set<int> touched;
+        for (const EdgeKey &e : cutEdges) {
+            for (int v : {e.a, e.b}) {
+                if (interfaces->degreeAt(v) > 0 || interfaces->nodeAt(v) >= 0) touched.insert(v);
+            }
+        }
+        for (int v : touched) {
+            ++report.interfaceVertsOnCut;
+            if (interfaces->nodeAt(v) >= 0) ++report.interfaceNodesOnCut;
+        }
+        for (int e = 0; e < static_cast<int>(orig->edges.size()); ++e) {
+            if (!interfaces->isInterfaceEdge(e)) continue;
+            if (cutEdges.count(EdgeKey(orig->edges[e][0], orig->edges[e][1]))) {
+                ++report.interfaceEdgesOnCut;
+            }
+        }
+        for (ConePath &cp : conePaths) {
+            for (size_t k = 0; k < cp.path.size(); ++k) {
+                const int v = cp.path[k];
+                if (interfaces->degreeAt(v) <= 0 && interfaces->nodeAt(v) < 0) continue;
+                ++cp.interfaceVerts;
+                if (interfaces->nodeAt(v) >= 0) ++cp.interfaceNodes;
+                if (k == 0) cp.startsOnNode = true;
+            }
+            if (cp.startsOnNode) ++report.conesOnInterfaceNodes;
+            if (cp.interfaceVerts > (cp.startsOnNode ? 1 : 0)) ++report.conesTouchingInterface;
+        }
+
+        if (report.interfaceEdgesOnCut > 0) {
+            std::ostringstream oss;
+            oss << report.interfaceEdgesOnCut << " arc(s) of the cutting graph run along a "
+                << "material interface, which makes that stretch of it a seam: its two sides "
+                << "become two chains of Omega a quarter turn apart, and E3 is asked to hold "
+                << "both of them on the same coordinate line.";
+            report.messages.push_back(oss.str());
+        }
+        const int crossings = report.interfaceVertsOnCut - report.conesOnInterfaceNodes;
+        if (crossings > 0 && report.interfaceEdgesOnCut == 0) {
+            std::ostringstream oss;
+            oss << report.conesTouchingInterface << " of " << report.conesRouted
+                << " cone arc(s) cross the material interface network, at " << crossings
+                << " vertex/vertices in all (" << report.interfaceNodesOnCut
+                << " of them node(s)): no interface-free route to dS was available, which is "
+                << "what an inclusion leaves a cone inside it. Each crossing splits a feature "
+                << "chain, and each node splits a sector out of E6.";
+            report.messages.push_back(oss.str());
         }
     }
 
