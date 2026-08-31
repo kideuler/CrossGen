@@ -2670,24 +2670,64 @@ void drawQuadMesh(const QuadMesh &qm, float lineWidth, float blockLineWidth,
     // Every edge once. An interior edge is shared by two quads and would
     // otherwise be laid down twice, which on a translucent line reads as a
     // darker line and makes the grid look like it has a pattern in it.
-    std::vector<std::pair<int, int>> edges;
+    //
+    // On a multi-material mesh the edge carries the material with it, exactly
+    // as the triangulation's wireframe does: an edge inside one material takes
+    // that material's colour, an edge between two takes white. That makes the
+    // interface network readable in the quads without needing the fill on.
+    const bool haveMat = mat.size() == Q.size();
+    bool multiMat = false;
+    if (haveMat)
+        for (std::size_t i = 1; i < mat.size() && !multiMat; ++i)
+            multiMat = mat[i] != mat[0];
+
+    // -1 marks "not yet seen"; -2 marks "seen with two different materials".
+    std::vector<std::pair<std::pair<int, int>, int>> edges;
     edges.reserve(Q.size() * 4);
-    for (const auto &q : Q) {
+    for (std::size_t i = 0; i < Q.size(); ++i) {
+        const auto &q = Q[i];
         for (int k = 0; k < 4; ++k) {
             int a = q[k], b = q[(k + 1) & 3];
             if (!ok(a) || !ok(b) || a == b) continue;
-            edges.emplace_back(std::min(a, b), std::max(a, b));
+            edges.emplace_back(std::make_pair(std::min(a, b), std::max(a, b)),
+                               haveMat ? mat[i] : 0);
         }
     }
     std::sort(edges.begin(), edges.end());
-    edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
+    // Collapse the duplicates, folding the two incident materials together.
+    std::size_t out = 0;
+    for (std::size_t i = 0; i < edges.size();) {
+        std::size_t j = i;
+        int m = edges[i].second;
+        while (j < edges.size() && edges[j].first == edges[i].first) {
+            if (edges[j].second != m) m = -2;
+            ++j;
+        }
+        edges[out++] = { edges[i].first, m };
+        i = j;
+    }
+    edges.resize(out);
 
-    glColor3f(0.78f, 0.80f, 0.84f);
     glLineWidth(lineWidth);
     glBegin(GL_LINES);
-    for (const auto &e : edges) {
-        glVertex2d(V[e.first][0],  V[e.first][1]);
-        glVertex2d(V[e.second][0], V[e.second][1]);
+    if (multiMat) {
+        for (const auto &e : edges) {
+            float r, g, b;
+            if (e.second == -2) {
+                r = g = b = 1.0f;  // interface edge
+            } else {
+                materialColor(e.second, r, g, b);
+            }
+            glColor3f(r, g, b);
+            glVertex2d(V[e.first.first][0],   V[e.first.first][1]);
+            glVertex2d(V[e.first.second][0],  V[e.first.second][1]);
+        }
+    } else {
+        glColor3f(0.78f, 0.80f, 0.84f);
+        for (const auto &e : edges) {
+            glVertex2d(V[e.first.first][0],   V[e.first.first][1]);
+            glVertex2d(V[e.first.second][0],  V[e.first.second][1]);
+        }
     }
     glEnd();
     glLineWidth(1.0f);
