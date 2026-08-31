@@ -745,6 +745,8 @@ bool TORSION::run() {
     SplineFit::Options sfopts;
     sfopts.segments = options.splineSegments;
     sfopts.samples = options.splineSamples;
+    sfopts.fitBoundaryArcs = options.fitBoundaryArcs;
+    sfopts.fitInterfaceArcs = options.fitInterfaceArcs;
     try {
         splines = std::make_unique<SplineFit>(*arrangement, sfopts);
     } catch (const std::exception &e) {
@@ -767,7 +769,7 @@ bool TORSION::run() {
     qopts.minIntervals = options.quadMinIntervals;
     qopts.maxIntervals = options.quadMaxIntervals;
     qopts.useSplines = options.quadUseSplines;
-    qopts.interfacesOnTracedArcs = options.quadInterfacesOnTracedArcs;
+    qopts.featuresOnTracedArcs = options.quadFeaturesOnTracedArcs;
     qopts.smoothingPasses = options.quadSmoothingPasses;
     qopts.smoothingThreshold = options.quadSmoothingThreshold;
     try {

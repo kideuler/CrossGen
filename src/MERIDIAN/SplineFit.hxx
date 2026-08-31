@@ -51,6 +51,51 @@
 // the watertightness rule above, checked rather than assumed in
 // Report::maxSeamGap.
 //
+// ### Which arcs are fitted, and which are carried exactly
+//
+// Not every arc of the arrangement is the same kind of object, and only one
+// kind is the fit's to approximate.
+//
+// A separatrix is a curve *the pipeline chose*. Nothing outside this code knows
+// where it is, it is smooth by construction, and replacing it with three cubics
+// is a modelling decision the fit is entitled to make.
+//
+// A boundary arc and an interface arc are curves *the input gave*. A boundary
+// arc is a run of edges of dS and an interface arc a run of edges of the
+// material network, so each one is already an exact polyline through mesh
+// vertices -- the true geometry, in the only form the mesh has it. A
+// least-squares cubic through such a run does not approximate a smooth curve;
+// it rounds off the features the model was drawn to have. On the ICF hohlraum
+// the outer wall runs straight for a while and then turns into a fillet inside
+// one arc, and three cubics cut the corner by 1.1e-2 of the model -- a fifth of
+// an element -- while the separatrices of the same model are fitted to 6.4e-4.
+// The interfaces are worse: 2.2e-2, which is what put elements astride a
+// material boundary.
+//
+// So by default only separatrices are fitted. A boundary or interface arc is
+// carried as its polyline (Curve::exact), evaluate() walks that polyline, and
+// the least-squares control points are still computed -- but they are now only
+// the net the Coons blend needs, not the curve. Options::fitBoundaryArcs and
+// Options::fitInterfaceArcs put either kind back under the fit, which is what
+// tells a fitting artefact from a meshing one.
+//
+// A patch with an exact side is no longer a pure bicubic. The net would leave
+// its boundary rows on the fitted curves, so evaluate(Patch) adds the
+// transfinite correction that pulls each exact side back onto its polyline:
+//
+//     S(s,t) += (1-t) d_0(s) + t d_2(s) + (1-s) d_3(t) + s d_1(t)
+//
+// with d_k = (exact side k) - (its control-net curve). The usual bilinear
+// corner term is absent because it is identically zero: fitOne() pins both end
+// control points to the arc's end nodes, so every d_k vanishes at both of its
+// ends. The result is exact on the boundary of the patch, C0 across it -- two
+// patches sharing an exact arc both land on the same polyline -- and a smooth
+// blend inside. What it costs is that such a patch is a Coons surface over
+// piecewise-linear sides rather than a tensor-product bicubic, so the control
+// net alone no longer reproduces it. Stage 10 samples through evaluate(), so
+// this is invisible to the mesh; a consumer that wants the net alone should
+// turn the two options on and accept the deviation.
+//
 // ### The pullback
 //
 // Sec. 5 begins by pulling each traced arc back to R^3 through its barycentric
@@ -83,7 +128,19 @@ public:
     struct Curve {
         int arc = -1;
         std::vector<Point> ctrl;
-        double maxDeviation = 0.0;   // of the traced polyline from the fit
+
+        // Set on an arc that is carried as its traced polyline rather than
+        // approximated: evaluate() walks `poly`, and `ctrl` is then only the
+        // control net the Coons blend is built from. See the header.
+        bool exact = false;
+        std::vector<Point> poly;     // the traced polyline, when exact
+        std::vector<double> cum;     // its normalised cumulative chord length
+
+        // Of the traced polyline from the control-net curve. On a fitted arc
+        // that is the geometric error of the reconstruction. On an exact arc
+        // the curve *is* the polyline and this is instead the size of the
+        // transfinite correction evaluate(Patch) applies along that side.
+        double maxDeviation = 0.0;
         double rmsDeviation = 0.0;
         double length = 0.0;         // of the traced polyline
         int samples = 0;
@@ -97,6 +154,10 @@ public:
         std::array<int, 4> side{{-1, -1, -1, -1}};      // its four arcs
         std::array<bool, 4> forward{{true, true, true, true}};
         std::array<int, 4> corner{{-1, -1, -1, -1}};    // its four nodes
+        // Which sides are carried exactly, and so which of them evaluate()
+        // has to correct the net back onto.
+        std::array<bool, 4> exactSide{{false, false, false, false}};
+        bool corrected = false;                         // any of them
         std::vector<Point> net;
 
         double area = 0.0;         // of the surface, from a sampled grid
@@ -124,6 +185,13 @@ public:
         // cell, and by writeSurfaceOBJ() when it is not given one.
         int samples = 8;
 
+        // Put the arcs the *input* gave -- the runs of edges along dS and
+        // along the material interface network -- back under the least-squares
+        // fit, instead of carrying them exactly. Off by default; the header
+        // says why, and the numbers there are what turning either one on costs.
+        bool fitBoundaryArcs = false;
+        bool fitInterfaceArcs = false;
+
         // Fit and report the arcs even where Stage 8 could not close the
         // layout. The curves are useful on their own -- they are the layout
         // drawn on the model -- and refusing to produce them because some face
@@ -133,7 +201,10 @@ public:
 
     struct Report {
         int arcs = 0;
-        int curves = 0;
+        int curves = 0;              // arcs that came out with a curve at all
+        int fittedArcs = 0;          // ... by least squares
+        int exactArcs = 0;           // ... by carrying the polyline
+        int correctedPatches = 0;    // patches with at least one exact side
         int underdetermined = 0;
         int controlPointsPerArc = 0;
 
@@ -143,12 +214,20 @@ public:
         int foldedPatches = 0;      // a sampled cell came out reversed
 
         // How far the fitted curve is from the polyline it was fitted to, over
-        // every arc, as a fraction of the diagonal of S. This is the geometric
-        // error of the reconstruction and the number Sec. 5's "least-squares
-        // fit a cubic B-spline" is answerable for.
+        // the arcs that were *fitted*, as a fraction of the diagonal of S. This
+        // is the geometric error of the reconstruction and the number Sec. 5's
+        // "least-squares fit a cubic B-spline" is answerable for. An exact arc
+        // contributes nothing to it because it has no such error.
         double maxDeviation = 0.0;
         double rmsDeviation = 0.0;
         int worstArc = -1;
+
+        // The same measurement on the exact arcs, where it is not an error of
+        // the model but the size of the correction evaluate(Patch) applies to
+        // keep the net's boundary row on the polyline. It says how far the
+        // control net alone would have been from the input.
+        double maxNetDeviation = 0.0;
+        int worstNetArc = -1;
 
         // The watertightness rule, measured rather than assumed: the largest
         // distance between the control points two patches carry for the arc
@@ -159,6 +238,24 @@ public:
         // Corner interpolation: how far a patch's corner control point is from
         // the node of the arrangement it belongs to.
         double maxCornerGap = 0.0;
+
+        // The same rule read off the surface rather than off the net, which is
+        // what a patch with an exact side makes a separate question: how far
+        // evaluate(Patch) along a side is from evaluate(Curve) on the arc that
+        // side is. It says every patch sits on its own arcs, and therefore that
+        // two patches sharing one meet along it -- the sampled statement of
+        // maxSeamGap, on the geometry Stage 10 actually reads.
+        //
+        // Unlike maxSeamGap this one is *not* exactly zero, and cannot be. A
+        // side traversed backwards is evaluated by reversing its control points,
+        // which reproduces the reversed curve only because the uniform knot
+        // vector is symmetric -- and it is not, in binary: 1 - (1/3) and (2/3)
+        // are a double apart. So the mirrored basis functions differ in the last
+        // bit and the two evaluations of one arc land an ulp apart. It is 2e-16
+        // of the model on the corpus, with or without an exact side, and
+        // boundaryTolerance is what separates that floor from a real gap.
+        double maxBoundaryGap = 0.0;
+        static constexpr double boundaryTolerance = 1e-12;
 
         double patchArea = 0.0;
         double faceArea = 0.0;      // the same patches as arrangement faces
@@ -207,6 +304,12 @@ private:
     void check();
 
     Curve fitOne(const std::vector<Point> &poly) const;
+    // The plain B-spline over a curve's control points, with no regard for
+    // whether the curve is carried exactly. evaluate() is this on a fitted arc
+    // and the polyline on an exact one; the difference between the two is what
+    // sideCorrection() hands to the Coons blend.
+    Point evaluateNet(const Curve &c, double u) const;
+    Point sideCorrection(const Patch &p, int side, double w) const;
     static void basisFuns(int span, double u, const std::vector<double> &U, double *N);
     int findSpan(double u) const;
 

@@ -387,6 +387,8 @@ bool MERIDIAN::run() {
     SplineFit::Options fopts;
     fopts.segments = options.splineSegments;
     fopts.samples = options.splineSamples;
+    fopts.fitBoundaryArcs = options.fitBoundaryArcs;
+    fopts.fitInterfaceArcs = options.fitInterfaceArcs;
     try {
         splines = std::make_unique<SplineFit>(*arrangement, fopts);
     } catch (const std::exception &e) {
@@ -412,7 +414,7 @@ bool MERIDIAN::run() {
     qopts.minIntervals = options.quadMinIntervals;
     qopts.maxIntervals = options.quadMaxIntervals;
     qopts.useSplines = options.quadUseSplines;
-    qopts.interfacesOnTracedArcs = options.quadInterfacesOnTracedArcs;
+    qopts.featuresOnTracedArcs = options.quadFeaturesOnTracedArcs;
     qopts.smoothingPasses = options.quadSmoothingPasses;
     qopts.smoothingThreshold = options.quadSmoothingThreshold;
     try {

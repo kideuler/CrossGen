@@ -130,7 +130,7 @@ void SplineFit::basisFuns(int span, double u, const std::vector<double> &U, doub
     }
 }
 
-Point SplineFit::evaluate(const Curve &c, double u) const {
+Point SplineFit::evaluateNet(const Curve &c, double u) const {
     if (c.ctrl.empty()) return Point{0.0, 0.0};
     u = std::max(0.0, std::min(1.0, u));
     const int span = findSpan(u);
@@ -139,6 +139,46 @@ Point SplineFit::evaluate(const Curve &c, double u) const {
     Point out{0.0, 0.0};
     for (int k = 0; k <= 3; ++k) out = out + c.ctrl[span - 3 + k] * N[k];
     return out;
+}
+
+// An exact arc is walked along its own normalised chord length, which is the
+// parameterisation the fit was taken in as well. Using the same one for both is
+// what keeps the difference between them -- the correction the Coons blend gets
+// -- as small as the two curves actually are apart, rather than inflating it
+// with a reparameterisation.
+Point SplineFit::evaluate(const Curve &c, double u) const {
+    if (!c.exact || c.poly.size() < 2) return evaluateNet(c, u);
+    u = std::max(0.0, std::min(1.0, u));
+    if (u <= 0.0) return c.poly.front();
+    if (u >= 1.0) return c.poly.back();
+    const size_t k = static_cast<size_t>(
+        std::lower_bound(c.cum.begin(), c.cum.end(), u) - c.cum.begin());
+    if (k == 0) return c.poly.front();
+    if (k >= c.poly.size()) return c.poly.back();
+    const double seg = c.cum[k] - c.cum[k - 1];
+    const double w = seg > 0.0 ? (u - c.cum[k - 1]) / seg : 0.0;
+    return c.poly[k - 1] + (c.poly[k] - c.poly[k - 1]) * w;
+}
+
+// ---------------------------------------------------------------------------
+// sideCorrection()
+//
+// What side `k` of a patch has to be moved by, at patch-frame parameter `w`, to
+// put it back on the polyline it was carried from. Zero on a fitted side, and
+// zero at both ends of an exact one because fitOne() pinned the end control
+// points to the arc's end nodes.
+//
+// The mapping is the inverse of the one buildPatches() used to orient the four
+// control polygons: sides 0 and 1 run with the (s, t) frame and sides 2 and 3
+// against it, and either may additionally be traversed against the arc's own
+// direction.
+// ---------------------------------------------------------------------------
+Point SplineFit::sideCorrection(const Patch &p, int k, double w) const {
+    if (!p.exactSide[k]) return Point{0.0, 0.0};
+    const Curve &c = fitted[p.side[k]];
+    double u = (k < 2) ? w : 1.0 - w;
+    if (!p.forward[k]) u = 1.0 - u;
+    return evaluate(c, u) - evaluateNet(c, u);
 }
 
 Point SplineFit::evaluate(const Patch &p, double s, double t) const {
@@ -155,6 +195,12 @@ Point SplineFit::evaluate(const Patch &p, double s, double t) const {
         for (int a = 0; a <= 3; ++a) {
             out = out + p.net[(ti - 3 + b) * n + (si - 3 + a)] * (Ns[a] * Nt[b]);
         }
+    }
+    // The transfinite correction of the header. No bilinear corner term: every
+    // d_k is zero at both of its ends, so the term it would subtract is zero.
+    if (p.corrected) {
+        out = out + sideCorrection(p, 0, s) * (1.0 - t) + sideCorrection(p, 2, s) * t +
+              sideCorrection(p, 3, t) * (1.0 - s) + sideCorrection(p, 1, t) * s;
     }
     return out;
 }
@@ -299,6 +345,16 @@ SplineFit::Curve SplineFit::fitOne(const std::vector<Point> &poly) const {
     return c;
 }
 
+// ---------------------------------------------------------------------------
+// fitArcs()
+//
+// Every arc gets its control points, because every arc is a side of some patch
+// and the Coons net has to be built from something. What differs is whether
+// those control points are also the *curve*: on a separatrix they are, and on
+// an arc that came from the input they are not -- the polyline is kept and
+// evaluate() returns it. See the header for why the two kinds are not the same
+// kind of object.
+// ---------------------------------------------------------------------------
 void SplineFit::fitArcs() {
     const std::vector<Arrangement::Arc> &list = arr->getArcs();
     report.arcs = static_cast<int>(list.size());
@@ -312,6 +368,37 @@ void SplineFit::fitArcs() {
         fitted[a].arc = static_cast<int>(a);
         ++report.curves;
         if (fitted[a].underdetermined) ++report.underdetermined;
+
+        const Arrangement::ArcKind kind = list[a].kind;
+        const bool exact =
+            (kind == Arrangement::ArcKind::Boundary && !options.fitBoundaryArcs) ||
+            (kind == Arrangement::ArcKind::Interface && !options.fitInterfaceArcs);
+        if (exact) {
+            Curve &c = fitted[a];
+            c.exact = true;
+            c.poly = list[a].points;
+            c.cum.assign(c.poly.size(), 0.0);
+            for (size_t i = 1; i < c.poly.size(); ++i) {
+                c.cum[i] = c.cum[i - 1] + normP(c.poly[i] - c.poly[i - 1]);
+            }
+            const double total = c.cum.back();
+            if (total > 0.0) {
+                for (double &x : c.cum) x /= total;
+            } else {
+                for (size_t i = 0; i < c.cum.size(); ++i) {
+                    c.cum[i] = static_cast<double>(i) / (c.cum.size() - 1.0);
+                }
+            }
+            c.cum.back() = 1.0;
+            ++report.exactArcs;
+            if (c.maxDeviation > report.maxNetDeviation) {
+                report.maxNetDeviation = c.maxDeviation;
+                report.worstNetArc = static_cast<int>(a);
+            }
+            continue;
+        }
+
+        ++report.fittedArcs;
         if (fitted[a].maxDeviation > report.maxDeviation) {
             report.maxDeviation = fitted[a].maxDeviation;
             report.worstArc = static_cast<int>(a);
@@ -321,6 +408,7 @@ void SplineFit::fitArcs() {
     }
     report.rmsDeviation = count > 0 ? std::sqrt(sum / count) / modelExtent : 0.0;
     report.maxDeviation /= modelExtent;
+    report.maxNetDeviation /= modelExtent;
 }
 
 // ---------------------------------------------------------------------------
@@ -363,7 +451,10 @@ void SplineFit::buildPatches() {
             p.forward[k] = sides[k].forward;
             const Arrangement::Arc &ar = arr->getArcs()[sides[k].arc];
             p.corner[k] = sides[k].forward ? ar.from : ar.to;
+            p.exactSide[k] = fitted[sides[k].arc].exact;
+            if (p.exactSide[k]) p.corrected = true;
         }
+        if (p.corrected) ++report.correctedPatches;
 
         // The four sides as control polygons, each running the way the (s, t)
         // frame wants it.
@@ -500,7 +591,30 @@ void SplineFit::check() {
     }
     if (!std::isfinite(report.minCellRatio)) report.minCellRatio = 0.0;
 
-    report.watertight = report.maxSeamGap == 0.0 && report.maxCornerGap == 0.0;
+    // Does each patch actually lie on its four arcs? For a pure bicubic that is
+    // the construction and nothing more can be said; with the transfinite
+    // correction in play it is a claim about arithmetic, so it is sampled.
+    const int ms = std::max(8, options.samples * 4);
+    for (const Patch &p : nets) {
+        for (int k = 0; k < 4; ++k) {
+            const Curve &c = fitted[p.side[k]];
+            if (c.ctrl.empty()) continue;
+            for (int i = 0; i <= ms; ++i) {
+                const double w = static_cast<double>(i) / ms;
+                double u = (k < 2) ? w : 1.0 - w;
+                if (!p.forward[k]) u = 1.0 - u;
+                const Point on = (k == 0) ? evaluate(p, w, 0.0)
+                               : (k == 1) ? evaluate(p, 1.0, w)
+                               : (k == 2) ? evaluate(p, w, 1.0)
+                                          : evaluate(p, 0.0, w);
+                report.maxBoundaryGap = std::max(report.maxBoundaryGap,
+                                                 normP(on - evaluate(c, u)) / modelExtent);
+            }
+        }
+    }
+
+    report.watertight = report.maxSeamGap == 0.0 && report.maxCornerGap == 0.0 &&
+                        report.maxBoundaryGap <= Report::boundaryTolerance;
 
     std::ostringstream oss;
     if (report.skipped > 0) {
@@ -528,8 +642,10 @@ void SplineFit::check() {
     }
     if (!report.watertight) {
         oss << "Two patches disagree about a shared arc by " << report.maxSeamGap
-            << " of the model, or a corner is " << report.maxCornerGap << " off its node. "
-            << "Both should be exactly zero.";
+            << " of the model, a corner is " << report.maxCornerGap << " off its node, or a "
+            << "patch leaves its own arc by " << report.maxBoundaryGap
+            << ". The first two should be exactly zero and the third within "
+            << Report::boundaryTolerance << ".";
         report.messages.push_back(oss.str());
         oss.str("");
     }
@@ -546,6 +662,17 @@ bool SplineFit::writeCurvesOBJ(const std::string &filename, int samples) const {
     int base = 1;
     for (const Curve &c : fitted) {
         if (c.ctrl.empty()) continue;
+        // An exact arc is written as the polyline it is, not as that polyline
+        // resampled: resampling it at `samples` stations would cut its corners
+        // for exactly the reason the fit was taken off it.
+        if (c.exact && c.poly.size() >= 2) {
+            for (const Point &q : c.poly) out << "v " << q[0] << " " << q[1] << " 0\n";
+            out << "l";
+            for (size_t i = 0; i < c.poly.size(); ++i) out << " " << (base + static_cast<int>(i));
+            out << "\n";
+            base += static_cast<int>(c.poly.size());
+            continue;
+        }
         for (int i = 0; i <= samples; ++i) {
             const Point p = evaluate(c, static_cast<double>(i) / samples);
             out << "v " << p[0] << " " << p[1] << " 0\n";

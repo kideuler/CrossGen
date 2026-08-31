@@ -169,23 +169,31 @@ public:
         // tells a meshing artefact apart from a fitting one.
         bool useSplines = true;
 
-        // Place the nodes of a *material interface* arc on the traced curve
-        // even when everything else is placed on the Stage 9 fit.
+        // Place the nodes of a *feature* arc -- one on dS, or on the material
+        // interface network -- on the traced polyline even when everything else
+        // is placed on the Stage 9 fit.
         //
         // The two kinds of arc are not the same kind of object. A separatrix is
         // a curve the pipeline chose, and approximating it with three cubics is
-        // a modelling decision the fit is entitled to make. An interface is a
-        // curve the input gave, an element that crosses it carries two
-        // materials, and three cubics are not always enough: geom011's
-        // interface is a cosine whose radius of curvature is about three
-        // element lengths, the fit misses it by 4.8e-2 of the model -- a whole
-        // element -- and 31 of its 984 elements come out with the interface
-        // running through them. Meshed on the traced arc instead, none do.
+        // a modelling decision the fit is entitled to make. A feature is a curve
+        // the input gave: dS is where the model ends, an element that crosses an
+        // interface carries two materials, and three cubics are not always
+        // enough. geom011's interface is a cosine whose radius of curvature is
+        // about three element lengths, the fit misses it by 4.8e-2 of the model
+        // -- a whole element -- and 31 of its 984 elements come out with the
+        // interface running through them. Meshed on the traced arc instead, none
+        // do. The ICF hohlraum makes the same point on dS: a wall that runs
+        // straight and then turns into a fillet inside one arc is cut by 1.1e-2.
         //
-        // It costs nothing anywhere else: on an interface the fit follows, the
-        // two curves agree to the fit's deviation, which is 1e-15 on the
-        // straight-interface models in the corpus.
-        bool interfacesOnTracedArcs = true;
+        // It costs nothing anywhere else: on a feature the fit follows, the two
+        // curves agree to the fit's deviation, which is 1e-15 on the
+        // straight-sided models in the corpus.
+        //
+        // Since SplineFit now carries those arcs exactly by default, this is
+        // normally the same curve either way; it stays because it is what keeps
+        // the node placement on the input when the arcs *are* put back under the
+        // fit (SplineFit::Options::fitBoundaryArcs).
+        bool featuresOnTracedArcs = true;
 
         // Stations per direction used to measure a patch's isoparametric line
         // lengths, which are the data the interval assignment is chosen from.

@@ -221,8 +221,8 @@ void usage(const char *argv0) {
               << "                     than by the node quantisation\n"
               << "  --lag-e6           re-read E6's tangent lengths from the map between\n"
               << "                     outer steps (off; it costs more than it buys)\n"
-              << "  --fit-interfaces   mesh the interfaces on their spline fits like every\n"
-              << "                     other arc, rather than on the traced curves\n"
+              << "  --fit-features     mesh dS and the interfaces on their spline fits like\n"
+              << "                     every other arc, rather than on the traced curves\n"
               << "  --kink <deg>       interface corner threshold        (default 45)\n"
               << "  --loop-splits <n>  arcs a closed interface is cut into (default 4)\n"
               << "  --nodes <n>        list at most n interface nodes    (default 12)\n"
@@ -264,6 +264,9 @@ void usage(const char *argv0) {
               << "  --faces <file.obj> write the layout faces as polylines\n"
               << "  --no-splines       skip Stage 9 (spline reconstruction)\n"
               << "  --segments <n>     cubic segments per arc              (default 3)\n"
+              << "  --spline-boundary  fit the arcs on dS instead of carrying them as the\n"
+              << "                     polylines of mesh edges they are\n"
+              << "  --spline-interfaces  the same for the material interface network\n"
               << "  --samples <n>      patch sampling grid                 (default 8)\n"
               << "  --fit <file.obj>   write the fitted arc curves\n"
               << "  --net <file.obj>   write the patch control nets\n"
@@ -314,7 +317,7 @@ int main(int argc, char **argv) {
         else if (a == "--no-prescribe")            opts.prescribeInterfaceCones = false;
         else if (a == "--no-propagate")            opts.propagateInterfaceLabels = false;
         else if (a == "--lag-e6")                  opts.lagInterfaceScales = true;
-        else if (a == "--fit-interfaces")          opts.quadInterfacesOnTracedArcs = false;
+        else if (a == "--fit-features")            opts.quadFeaturesOnTracedArcs = false;
         else if (a == "--kink" && i + 1 < argc)
             opts.interfaceKinkAngle = std::stod(argv[++i]) * M_PI / 180.0;
         else if (a == "--loop-splits" && i + 1 < argc)
@@ -356,6 +359,8 @@ int main(int argc, char **argv) {
         else if (a == "--faces" && i + 1 < argc)   facesOut = argv[++i];
         else if (a == "--no-splines")              opts.runSplines = false;
         else if (a == "--segments" && i + 1 < argc) opts.splineSegments = std::stoi(argv[++i]);
+        else if (a == "--spline-boundary")         opts.fitBoundaryArcs = true;
+        else if (a == "--spline-interfaces")       opts.fitInterfaceArcs = true;
         else if (a == "--samples" && i + 1 < argc) opts.splineSamples = std::stoi(argv[++i]);
         else if (a == "--fit" && i + 1 < argc)     fitOut = argv[++i];
         else if (a == "--net" && i + 1 < argc)     netOut = argv[++i];
@@ -1183,14 +1188,24 @@ int main(int argc, char **argv) {
     const SplineFit &fit = pipeline.getSplines();
     const SplineFit::Report &sf = fit.getReport();
 
-    std::cout << "  Fitted " << sf.curves << " of " << sf.arcs << " arc(s) to cubic B-splines: "
-              << sf.controlPointsPerArc << " control points each, "
+    std::cout << "  Fitted " << sf.fittedArcs << " of " << sf.arcs << " arc(s) to cubic "
+              << "B-splines: " << sf.controlPointsPerArc << " control points each, "
               << fit.getOptions().segments << " Bezier segment(s)\n";
     std::cout << "  Deviation from the traced curves: " << std::scientific
               << std::setprecision(3) << sf.maxDeviation << " worst, " << sf.rmsDeviation
               << " rms, of the model" << std::defaultfloat;
     if (sf.worstArc >= 0) std::cout << " (arc " << sf.worstArc << ")";
     std::cout << "\n";
+    if (sf.exactArcs > 0) {
+        std::cout << "  Carried exactly, as the polylines the mesh has them as: "
+                  << sf.exactArcs << " arc(s) on dS or an interface; "
+                  << sf.correctedPatches << " patch(es) blend one\n";
+        std::cout << "  Their control nets alone would have been out by " << std::scientific
+                  << std::setprecision(3) << sf.maxNetDeviation << " of the model"
+                  << std::defaultfloat;
+        if (sf.worstNetArc >= 0) std::cout << " (arc " << sf.worstNetArc << ")";
+        std::cout << ", which is what the transfinite correction takes out\n";
+    }
     std::cout << "  Patches: " << sf.patches << " of " << sf.faces << " face(s), "
               << sf.controlPointsPerArc << " x " << sf.controlPointsPerArc
               << " control points each";
@@ -1199,7 +1214,9 @@ int main(int argc, char **argv) {
     std::cout << "  Watertightness: " << sf.sharedArcs
               << " arc(s) shared by two patches, control points apart by "
               << std::scientific << std::setprecision(3) << sf.maxSeamGap
-              << ", corners off their node by " << sf.maxCornerGap << std::defaultfloat << "\n";
+              << ", corners off their node by " << sf.maxCornerGap
+              << ", patch boundaries off their arc by " << sf.maxBoundaryGap
+              << std::defaultfloat << "\n";
     std::cout << "  Worst sampled cell is " << std::fixed << std::setprecision(4)
               << sf.minCellRatio << " of the mean; " << sf.foldedPatches
               << " folded patch(es)" << std::defaultfloat << "\n";
@@ -1207,9 +1224,11 @@ int main(int argc, char **argv) {
               << " against " << sf.faceArea << " for the same faces of the arrangement"
               << std::defaultfloat << "\n";
 
-    verdict(sf.curves == sf.arcs, "Every arc was fitted");
+    verdict(sf.curves == sf.arcs, "Every arc came out with a curve");
     verdict(sf.underdetermined == 0, "Every arc had more sample points than control points");
     verdict(sf.skipped == 0, "Every patch of the layout became a Coons patch");
+    verdict(sf.maxBoundaryGap <= SplineFit::Report::boundaryTolerance,
+            "Every patch lies on the four arcs it was built from");
     verdict(sf.watertight, "Watertight: both patches on an arc carry the same control points");
     verdict(sf.foldedPatches == 0, "No patch folds");
     for (const std::string &m : sf.messages) std::cout << "  " << kWarn << " " << m << "\n";

@@ -210,13 +210,18 @@ public:
         bool runSplines = true;
         int splineSegments = 3;
         int splineSamples = 8;
+        // See SplineFit::Options::fitBoundaryArcs: off, dS and the material
+        // interface network are carried as the polylines the mesh has them as
+        // rather than approximated.
+        bool fitBoundaryArcs = false;
+        bool fitInterfaceArcs = false;
 
         bool runQuadMesh = true;
         double quadTargetEdge = 0.05;
         int quadMinIntervals = 1;
         int quadMaxIntervals = 0;
         bool quadUseSplines = true;
-        bool quadInterfacesOnTracedArcs = true;
+        bool quadFeaturesOnTracedArcs = true;
         int quadSmoothingPasses = 500;
         double quadSmoothingThreshold = 0.0;
 

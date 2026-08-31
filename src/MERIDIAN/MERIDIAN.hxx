@@ -309,6 +309,11 @@ public:
         bool runSplines = true;
         int splineSegments = 3;
         int splineSamples = 8;
+        // Fit the arcs the input gave -- dS and the material interface network
+        // -- instead of carrying them as the polylines the mesh has them as.
+        // See SplineFit::Options::fitBoundaryArcs.
+        bool fitBoundaryArcs = false;
+        bool fitInterfaceArcs = false;
 
         // Stage 10: the quadrilateral mesh on those patches. The target edge
         // length is absolute, in the units of the model; the corpus is
@@ -323,8 +328,8 @@ public:
         // polylines instead, which tells a meshing artefact apart from a
         // fitting one. See QuadMesh::Options::useSplines.
         bool quadUseSplines = true;
-        // See QuadMesh::Options::interfacesOnTracedArcs.
-        bool quadInterfacesOnTracedArcs = true;
+        // See QuadMesh::Options::featuresOnTracedArcs.
+        bool quadFeaturesOnTracedArcs = true;
         // Winslow sweeps over the interior of each block, the boundary held.
         // Zero leaves the transfinite grid alone. See QuadMesh::smooth().
         int quadSmoothingPasses = 500;

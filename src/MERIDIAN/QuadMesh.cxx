@@ -92,10 +92,10 @@ QuadMesh::QuadMesh(const SplineFit &f, const Options &opts)
 // ---------------------------------------------------------------------------
 Point QuadMesh::evaluateArc(int arc, double u) const {
     u = std::max(0.0, std::min(1.0, u));
-    const bool onInterface =
+    const bool onFeature =
         arc >= 0 && arc < static_cast<int>(arr->getArcs().size()) &&
-        arr->getArcs()[arc].kind == Arrangement::ArcKind::Interface;
-    if (options.useSplines && !(onInterface && options.interfacesOnTracedArcs) &&
+        arr->getArcs()[arc].kind != Arrangement::ArcKind::Separatrix;
+    if (options.useSplines && !(onFeature && options.featuresOnTracedArcs) &&
         arc < static_cast<int>(fit->curves().size()) &&
         !fit->curves()[arc].ctrl.empty()) {
         return fit->evaluate(fit->curves()[arc], u);
