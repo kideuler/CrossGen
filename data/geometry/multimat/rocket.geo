@@ -189,3 +189,4 @@ Plane Surface(5) = {6};
 Curve Loop(7) = {37, 38, 39, 34, -35, -33};
 //+
 Plane Surface(6) = {7};
+Physical Surface(5) = {6};
