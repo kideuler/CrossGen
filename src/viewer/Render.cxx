@@ -1868,6 +1868,110 @@ void drawConeLegend(int fbw, int fbh) {
     }
 }
 
+// ── TORSION Stage 3F: the combed frames ──────────────────────────────────────
+
+namespace {
+
+// The palette a_t is cycled through. Eight entries, chosen to be
+// distinguishable next to each other rather than to form a ramp: a_t is an
+// integer label and not a magnitude, and a ramp would invite reading a
+// difference of three as bigger than a difference of one when what matters is
+// only whether two neighbouring faces share it.
+void branchColor(int a, float &r, float &g, float &b) {
+    static const float kPal[8][3] = {
+        {0.20f, 0.65f, 0.95f},  // blue
+        {0.95f, 0.60f, 0.15f},  // orange
+        {0.35f, 0.80f, 0.40f},  // green
+        {0.90f, 0.35f, 0.55f},  // pink
+        {0.75f, 0.70f, 0.20f},  // olive
+        {0.55f, 0.45f, 0.90f},  // violet
+        {0.25f, 0.80f, 0.78f},  // teal
+        {0.85f, 0.30f, 0.25f},  // red
+    };
+    const int k = ((a % 8) + 8) % 8;
+    r = kPal[k][0]; g = kPal[k][1]; b = kPal[k][2];
+}
+
+} // namespace
+
+void drawCombedFrames(const Mesh &m, const FieldFrames &ff, double scale) {
+    const std::vector<double> &th = ff.combedAngle();
+    const std::vector<int> &a = ff.branch();
+    if (th.size() != m.triangles.size() || a.size() != th.size()) return;
+
+    glLineWidth(2.5f);
+    for (int t = 0; t < static_cast<int>(m.triangles.size()); ++t) {
+        const Triangle &tri = m.triangles[t];
+        const Point &p0 = m.vertices[tri[0]];
+        const Point &p1 = m.vertices[tri[1]];
+        const Point &p2 = m.vertices[tri[2]];
+        const Point c = {(p0[0] + p1[0] + p2[0]) / 3.0,
+                         (p0[1] + p1[1] + p2[1]) / 3.0};
+
+        float r, g, b;
+        branchColor(a[t], r, g, b);
+
+        // X_t full length, Y_t at two thirds and dimmed. The two rows of J*_t
+        // are not interchangeable -- the integration fits grad u to X and
+        // grad v to Y -- so the picture has to say which is which, and a cross
+        // of four equal arms cannot.
+        const Point x{std::cos(th[t]), std::sin(th[t])};
+        const Point y{-std::sin(th[t]), std::cos(th[t])};
+        drawArrow(c, x, scale, r, g, b);
+        drawArrow(c, y, scale * 0.66, 0.45f * r + 0.15f, 0.45f * g + 0.15f,
+                  0.45f * b + 0.15f);
+    }
+}
+
+void drawCombedFrameLegend(int fbw, int fbh, const FieldFrames &ff) {
+    const std::vector<int> &a = ff.branch();
+    int lo = 0, hi = 0;
+    for (int v : a) { lo = std::min(lo, v); hi = std::max(hi, v); }
+    // More than eight distinct branches and the palette repeats, so the swatch
+    // strip would be claiming a distinction it cannot draw; the range is still
+    // worth saying, and the picture is still worth reading for where the steps
+    // are rather than for which value each patch has.
+    const int rows = std::min(hi - lo + 1, 8);
+
+    const float x0 = 20.0f;
+    const float sw = 16.0f;
+    const float lineH = 22.0f;
+    float y0 = static_cast<float>(fbh) - 190.0f - rows * lineH;
+
+    glMatrixMode(GL_PROJECTION);
+    glPushMatrix();
+    glLoadIdentity();
+    glOrtho(0, fbw, fbh, 0, -1, 1);
+    glMatrixMode(GL_MODELVIEW);
+    glPushMatrix();
+    glLoadIdentity();
+
+    glBegin(GL_QUADS);
+    for (int i = 0; i < rows; ++i) {
+        float r, g, b;
+        branchColor(lo + i, r, g, b);
+        glColor3f(r, g, b);
+        const float y = y0 + i * lineH;
+        glVertex2f(x0, y);
+        glVertex2f(x0 + sw, y);
+        glVertex2f(x0 + sw, y + sw);
+        glVertex2f(x0, y + sw);
+    }
+    glEnd();
+
+    glMatrixMode(GL_PROJECTION);
+    glPopMatrix();
+    glMatrixMode(GL_MODELVIEW);
+    glPopMatrix();
+
+    for (int i = 0; i < rows; ++i) {
+        std::string label = "a = " + std::to_string(lo + i);
+        if (i == 0) label += "   (branch of the comb)";
+        drawTextOverlay(fbw, fbh, label.c_str(), x0 + sw + 8.0f,
+                        y0 + i * lineH + 2.0f, 0.8f, 0.8f, 0.8f);
+    }
+}
+
 void drawCuttingGraph(const ConeCut &cut, float lineWidth) {
     const Mesh &m = cut.getOriginalMesh();
 

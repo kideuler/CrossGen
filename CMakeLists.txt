@@ -81,6 +81,14 @@ add_library(PolyVector SHARED
     src/MERIDIAN/SplineFit.cxx
     src/MERIDIAN/QuadMesh.hxx
     src/MERIDIAN/QuadMesh.cxx
+    src/TORSION/FieldFrames.hxx
+    src/TORSION/FieldFrames.cxx
+    src/TORSION/TutteEmbedding.hxx
+    src/TORSION/TutteEmbedding.cxx
+    src/TORSION/FieldIntegration.hxx
+    src/TORSION/FieldIntegration.cxx
+    src/TORSION/TORSION.hxx
+    src/TORSION/TORSION.cxx
     src/UMBER/Polysquare.hxx
     src/UMBER/Polysquare.cxx
     src/UMBER/MotorcycleGraph.hxx
@@ -168,6 +176,14 @@ target_link_libraries(TestUMBER PRIVATE PolyVector)
 add_executable(TestMERIDIAN src/utils/TestMERIDIAN.cxx)
 target_link_libraries(TestMERIDIAN PRIVATE PolyVector)
 
+# Test TORSION, Pipeline B of docs/cf_flow_pipeline.md: the same Stages 1-10 as
+# MERIDIAN with psi_0 built by integrating the SIPG cross field instead of by
+# unfolding a Ricci metric. --selftest exercises the four new pieces -- the
+# combing and its matchings, the Tutte embedding, the constrained integration
+# and Reference::Field -- on meshes whose answers are known in closed form.
+add_executable(TestTORSION src/utils/TestTORSION.cxx)
+target_link_libraries(TestTORSION PRIVATE PolyVector)
+
 # copy all meshes to build directory for easy access, keeping the material
 # subdirectory layout (singlemat/, multimat/, ...) intact
 file(GLOB_RECURSE MESH_FILES RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}/data/meshes"
@@ -246,6 +262,23 @@ add_custom_target(meridian
     VERBATIM
 )
 
+# Custom target to run TestTORSION on all meshes
+set(TORSION_COMMANDS "")
+foreach(MESH_FILE ${MESH_OBJ_FILES})
+    get_filename_component(MESH_NAME ${MESH_FILE} NAME)
+    list(APPEND TORSION_COMMANDS
+        COMMAND ${CMAKE_COMMAND} -E echo "Processing ${MESH_NAME}..."
+        COMMAND $<TARGET_FILE:TestTORSION> ${MESH_FILE} || ${CMAKE_COMMAND} -E true
+    )
+endforeach()
+
+add_custom_target(torsion
+    ${TORSION_COMMANDS}
+    DEPENDS TestTORSION
+    COMMENT "Running TestTORSION on all meshes in data/meshes"
+    VERBATIM
+)
+
 # Enable testing
 enable_testing()
 
@@ -294,6 +327,46 @@ foreach(MERIDIAN_CASE singlemat/geom001 singlemat/geom003 singlemat/geom012 mult
     add_test(NAME MERIDIAN_Layout_${MERIDIAN_CASE_NAME}
              COMMAND TestMERIDIAN ${CMAKE_CURRENT_SOURCE_DIR}/data/meshes/${MERIDIAN_CASE}.obj)
 endforeach()
+
+# The four pieces Pipeline B adds -- the combing and its matchings, the
+# constrained integration, the Tutte embedding, and the field reference -- on
+# inputs whose answers are known in closed form before the code runs. A square
+# whose boundary is axis aligned has a *constant* cross field: every matching is
+# zero, the integration's answer is exactly x -> x/h, and Reference::Field must
+# report det J = 1 on every triangle. A circle has none of that and is there for
+# the branch selection and the seam transitions to have something to do.
+add_test(NAME TORSION_SelfTest COMMAND TestTORSION --selftest)
+
+# End-to-end on the same four models MERIDIAN_Layout uses, with psi_0 integrated
+# from the cross field instead of unfolded from a Ricci metric. Asserts Q1-Q5 on
+# the map that comes out, exactly as the MERIDIAN cases do; what is *not*
+# asserted is the arrangement, because the two routes differ there for a reason
+# that is structural rather than numerical -- see FieldFrames::Report::
+# boundaryTurnMismatches.
+foreach(TORSION_CASE singlemat/geom001 singlemat/geom003 singlemat/geom012 multimat/geom001)
+    string(REPLACE "/" "_" TORSION_CASE_NAME ${TORSION_CASE})
+    add_test(NAME TORSION_Layout_${TORSION_CASE_NAME}
+             COMMAND TestTORSION ${CMAKE_CURRENT_SOURCE_DIR}/data/meshes/${TORSION_CASE}.obj)
+    # Longer than the MERIDIAN cases need. The continuation of Stage 6 stops
+    # early when every property of Definition 2.1 holds, and on a
+    # field-integrated map it often does not get to: the boundary corners
+    # FieldFrames predicts sit at vertices Stage 1 called regular, so Q2 has a
+    # residual the penalties cannot spend away and the full schedule runs.
+    set_tests_properties(TORSION_Layout_${TORSION_CASE_NAME} PROPERTIES TIMEOUT 2400)
+endforeach()
+
+# Sec. 4 of docs/cf_flow_pipeline.md asks for the field reference to be tested
+# standalone, from psi_R, before any integration exists to be blamed for its
+# failures. This is that test, over all four references at once, and its
+# verdicts are the finding it produced: Reference::Field is Reference::Euclidean
+# to machine precision, because the frame is a scaled rotation and the symmetric
+# Dirichlet energy cannot see a rotation on the right of J. geom003 is the model
+# Sec. 10 names for it -- the disk whose cone fan the Euclidean reference
+# shreds.
+add_test(NAME TORSION_ReferenceMetrics
+         COMMAND TestTORSION --ref-test
+                 ${CMAKE_CURRENT_SOURCE_DIR}/data/meshes/singlemat/geom003.obj)
+set_tests_properties(TORSION_ReferenceMetrics PROPERTIES TIMEOUT 2400)
 # Optional Qt6 OpenGL viewer (replaces the old GLFW-based viewer)
 option(BUILD_OPENGL_VIEWER "Build the Qt6 OpenGL mesh/field viewer" OFF)
 if (BUILD_OPENGL_VIEWER)

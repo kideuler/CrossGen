@@ -31,6 +31,7 @@
 #include "tracing/QuadLayout.hxx"
 #include "UMBER/MotorcycleGraph.hxx"
 #include "UMBER/Polysquare.hxx"
+#include "TORSION/FieldFrames.hxx"
 
 namespace viewer {
 
@@ -370,6 +371,29 @@ void computeConeFanBounds(const std::vector<ConeFan> &fans,
                           double &cx, double &cy, double &baseW, double &baseH);
 
 void drawConeFans(const std::vector<ConeFan> &fans);
+
+// ── TORSION: the combed field (Stage 3F) ─────────────────────────────────────
+//
+// The cross field again, but as one branch of it rather than as four
+// indistinguishable arms: theta_hat_t = theta_t + (pi/2) a_t, drawn as the
+// frame J*_t it defines -- X_t in warm colour, Y_t in cool -- so that the
+// picture shows which arm the comb chose and not merely where the cross points.
+//
+// The colour is the integer a_t, cycled through a fixed palette. That is the
+// whole of what the stage is judged on and it is judged by eye: a_t is constant
+// over a patch and steps only where an arc of G is crossed, because Omega is a
+// disk and the branch is path-independent on it. A step in the middle of a
+// patch is the combing defect Report::combingDefects counts, seen at the place
+// it happened rather than as a number.
+//
+// Faces outside Omega -- the ones the cut removed nothing of but the comb was
+// never asked about -- carry a_t = 0 like the seed and are drawn as such; the
+// count that says whether any such face exists is Report::unreachedFaces, and
+// it is zero on every model the cut left a disk.
+void drawCombedFrames(const Mesh &m, const FieldFrames &ff, double scale);
+
+// Screen-space key for the branch palette above, under the cone legend.
+void drawCombedFrameLegend(int fbw, int fbh, const FieldFrames &ff);
 
 // ── MERIDIAN: the layout Psi on Omega ────────────────────────────────────────
 //

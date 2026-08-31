@@ -46,6 +46,10 @@
 #include "UMBER/ChordCollapse.hxx"
 #include "UMBER/MotorcycleGraph.hxx"
 #include "UMBER/UMBER.hxx"
+#include "TORSION/FieldFrames.hxx"
+#include "TORSION/TORSION.hxx"
+#include "TORSION/FieldIntegration.hxx"
+#include "TORSION/TutteEmbedding.hxx"
 
 // ── Enumerations mirroring the original viewer state machine ──────────────────
 
@@ -54,7 +58,7 @@ enum class Mode {
     PolyVector  = 1,
     MBO         = 2,
     MedialAxis  = 3,
-    SIPG        = 4,
+    TORSION     = 4,
     OASIS       = 5,
     UMBER       = 6,
     MERIDIAN    = 7,
@@ -86,14 +90,6 @@ enum class MBOPhase {
     Quantized   = 9,
 };
 
-enum class SIPGPhase {
-    MeshOnly   = 1,
-    CrossField = 2,
-    Stepping   = 3,
-    CutSeams   = 4,
-    UVMesh     = 5,
-};
-
 // UMBER borrows the first three SIPG stages verbatim -- its input *is* a
 // converged SIPG cross field -- and then adds the two solves of the paper:
 // the frame field of Sec. 4.2 and the polysquare of Sec. 4.3. Neither is
@@ -121,10 +117,23 @@ enum class UMBERPhase {
     Simplified = 7,
 };
 
-// MERIDIAN is Stages 1-7 of Shepherd, Gu and Hughes (2022), and it borrows the
-// same first three stages as SIPG and UMBER modes because its input is the same
-// converged cross field -- Sec. 3.1 reads the cone indices off a field's
-// holonomy, and here that field is the SIPG one.
+// The phase sequence shared by the two quadrilateral-layout pipelines, MERIDIAN
+// (mode 7) and TORSION (mode 4). They are Stages 1 to 10 of Shepherd, Gu and
+// Hughes (2022) either way, they take the same input -- a converged SIPG cross
+// field, whose holonomy Sec. 3.1 reads the cone indices off -- and they differ
+// in exactly two of the eleven phases, which is why they share one enum:
+//
+//                MERIDIAN                       TORSION
+//   Flow         Stage 3, discrete Ricci flow   Stage 3F, comb the field and
+//                                               read the matchings
+//   Metric       the flat cone metric it        Stages 4F and 4R, integrate the
+//                produced                       field and untangle what it
+//                                               inverted -- psi_0
+//
+// Everything before them (the interfaces, the field, the cones, the cut) and
+// everything after them (the labelling, the continuation, the separatrices, the
+// arrangement, the splines, the mesh) is one body of code driven by one phase
+// variable, and the mode is only asked about where those two rows differ.
 //
 // The stages after it are the pipeline proper, and each is chosen to show
 // the thing that stage is judged on rather than just what it computed:
@@ -140,19 +149,35 @@ enum class UMBERPhase {
 //              void arcs from HarmonicCut, the cone arcs from Sec. 3.2.2 -- and
 //              behave differently at their ends.
 //
-//   RicciFlow  the conformal factor u of Eq. (8), the actual unknown of the
-//              flow, drawn as a scalar field. On a planar model the interior
-//              starts flat and all the curvature sits on the boundary, so what
-//              u shows is the transport: the factor swells around the cones
-//              that had to absorb it.
+//   Flow       In MERIDIAN, the conformal factor u of Eq. (8), the actual
+//              unknown of the flow, drawn as a scalar field. On a planar model
+//              the interior starts flat and all the curvature sits on the
+//              boundary, so what u shows is the transport: the factor swells
+//              around the cones that had to absorb it.
 //
-//   Metric     what the flow produced. Split screen, because the flat cone
-//              metric is a set of edge lengths rather than a set of positions
-//              and neither half alone says what it is: on the left the model
-//              with every edge coloured by how far the flow stretched it, on
-//              the right each cone's one-ring unfolded *in that metric*, which
-//              is the only place the cone angles themselves can be seen. See
-//              viewer::ConeFan.
+//              In TORSION, Stage 3F: the field combed to one branch over Omega,
+//              drawn as the frame J*_t it defines on every triangle, coloured
+//              by the integer a_f the comb assigned. The picture is the thing
+//              the stage is judged on -- a_f constant over a patch and stepping
+//              only across an arc of G is what "one branch over a disk" looks
+//              like, and a step anywhere else is the combing defect the report
+//              counts.
+//
+//   Metric     In MERIDIAN, what the flow produced. Split screen, because the
+//              flat cone metric is a set of edge lengths rather than a set of
+//              positions and neither half alone says what it is: on the left
+//              the model with every edge coloured by how far the flow stretched
+//              it, on the right each cone's one-ring unfolded *in that metric*,
+//              which is the only place the cone angles themselves can be seen.
+//              See viewer::ConeFan.
+//
+//              In TORSION, Stages 4F and 4R: psi_0 itself. Split screen for a
+//              different reason -- the integration produces a map straight away
+//              rather than a metric, so the right half is that map, and what it
+//              is being judged on is whether it inverted anything. Red faces
+//              there are the whole cost of the substitution. 'p' swaps the
+//              least-squares map for the untangled one, which is the only way
+//              to see what Stage 4R did.
 //
 //   Layout     Stages 4, 5 and 6 together -- the metric immersion psi_R, the
 //              subdomain labelling, and the penalty continuation that turns the
@@ -161,10 +186,11 @@ enum class UMBERPhase {
 //              last's starting point: psi_R and Psi are the same triangulation
 //              in the same plane, and what Stage 6 did is the difference
 //              between them, which is only visible if the continuation is run
-//              before anything is drawn. Split screen, like SIPG mode's UVMesh
-//              phase -- the model on the left and the parameter domain on the
-//              right -- because this is the first stage that produces a map,
-//              and a map is a thing with two ends.
+//              before anything is drawn. Split screen -- the model on the left
+//              and the parameter domain on the right -- because a map is a
+//              thing with two ends. On the field route it is not the first
+//              stage to produce one: the Metric phase already did, and this
+//              phase is where that map becomes a layout.
 //
 //   Separatrices  Stage 7, Sec. 4. The integral curves out of the cones,
 //              marched over Psi and continued across the cutting graph. Split
@@ -200,13 +226,13 @@ enum class UMBERPhase {
 //              arrangement of curves that did not close is not a layout, and
 //              drawing one as though it were is the one thing this picture
 //              must not do.
-enum class MERIDIANPhase {
+enum class PipelinePhase {
     MeshOnly     = 1,
     CrossField   = 2,
     Stepping     = 3,
     Cones        = 4,
     Cut          = 5,
-    RicciFlow    = 6,
+    Flow         = 6,
     Metric       = 7,
     Layout       = 8,
     Separatrices = 9,
@@ -325,6 +351,26 @@ private:
     // disk they cut S into.
     void runMERIDIANCut();
 
+    // TORSION Stage 3F (docs/cf_flow_pipeline.md Sec. 5), which sits in the
+    // phase Pipeline A runs the flow in: comb the SIPG field to one branch over
+    // Omega, read the matchings off it, and audit the indices they imply
+    // against the ones the field itself read. Cheap -- one BFS and one pass
+    // over the vertices -- so unlike the flow it needs no announcement.
+    void runTORSIONFrames();
+
+    // TORSION Stages 4F, 4R and 4 (Secs. 6, 7.2 and 6.2), in the phase Pipeline
+    // A shows the flat metric in, and for the same reason the two phases are
+    // one on that side: the integration produces a *map*, so what would have
+    // been "the metric the flow reached" is here "the map the field integrates
+    // to", and the immersion that wraps it is the same object either route
+    // ends at. Blocking, and announced a frame ahead.
+    void runTORSIONIntegration();
+
+    // Stage 4R alone. Returns the untangled map, or an empty vector when there
+    // was nothing locally injective to start from -- in which case psi_0 stands
+    // as the solve left it and Stage 4's gate is what stops the pipeline.
+    std::vector<Point> runTORSIONUntangle();
+
     // Stage 3: the Newton solve on Eq. (10), then the two things drawn from it
     // -- the conformal factor as a scalar field and the unfolded cone fans.
     // Blocking, like runUMBER, and announced a frame ahead for the same reason.
@@ -406,10 +452,19 @@ private:
     void applyHalfOrtho(int x, int vpW, const viewer::ViewState &vs) const;
     void drawSplitDivider(int halfW) const;
 
-    // SIPG mode and UMBER mode share their first three stages, so the guards
-    // that drive the SIPG solve ask about the stage rather than the mode.
+    // UMBER mode and both layout pipelines share their first three stages, so
+    // the guards that drive the SIPG solve ask about the stage rather than the
+    // mode.
     bool sipgStageWantsField() const;
     bool sipgStageIsStepping() const;
+
+    // Whether the current mode is one of the two quadrilateral-layout
+    // pipelines. Nine of the eleven phases are shared between them and are
+    // guarded by this rather than by either mode; the mode itself is only asked
+    // about at Flow and Metric, and where a picture belongs to one route alone.
+    bool inPipeline() const {
+        return mode_ == Mode::MERIDIAN || mode_ == Mode::TORSION;
+    }
 
     // Nodes of the simplified layout that are T-junctions the quantization
     // failed to resolve. A T-junction is found structurally -- three
@@ -444,8 +499,6 @@ private:
     std::optional<MIQSolver>   miqSolver_;
     std::optional<CrossField>  crossField_;
     std::optional<SIPG>        sipgField_;
-    std::optional<CutMesh>     sipgCutMesh_;
-    std::optional<UVGParam>    sipgUVParam_;
     std::shared_ptr<SeparatrixTrace> separatrixTrace_;
     // Holds a pointer to the trace above, so it must not outlive it: both are
     // cleared together in reset().
@@ -509,6 +562,31 @@ private:
     // not the pinned vertex's value.
     Eigen::VectorXd                  ricciU_;
     double                           ricciUAbsMax_ = 1.0;
+    // TORSION's Stages 3F and 4F/4R, filling the same two phases Pipeline A
+    // fills with the flow and the metric it produced.
+    //
+    // scaffold_ is an Immersion over a throwaway map, built only for the arcs
+    // of G, their (e+, e-) pairing and their quarter turns -- all three come off
+    // ConeCut and the frames rather than off the map -- so it is what the
+    // integration's constraint rows are written against. It holds references to
+    // coneCut_ and cones_ like every other Immersion here, so it is declared
+    // after them and cleared before them.
+    // The indices the cross field itself read, snapshotted before Stage 1's
+    // prescribe() and rebalance() move any of them on purpose. Sec. 5.1's audit
+    // is run against this rather than against the set as it stands, so that it
+    // reports a disagreement between the matchings and the field and not the
+    // pipeline doing its job.
+    std::vector<int>                 fieldIndex_;
+    std::optional<FieldFrames>       frames_;
+    std::optional<Immersion>         scaffold_;
+    std::optional<FieldIntegration>  integration_;
+    std::optional<TutteEmbedding>    tutte_;
+    // psi_0 as the least-squares solve returned it, kept alongside the map that
+    // survived Stage 4R so that what the substitution actually cost is on
+    // screen rather than only in the report. 'p' swaps the two at the Metric
+    // phase, exactly as it swaps psi_R for Psi at the Layout one.
+    std::vector<Point>               integratedMap_;
+    bool                             showIntegrated_ = false;
     // Stages 4 to 6. Each holds a reference to the one before it -- Immersion
     // to the cut, the flow and the cones, SubdomainLabels to the immersion,
     // LayoutEnergy to both -- so they are destroyed in the reverse order and
@@ -540,11 +618,10 @@ private:
     Mode           mode_     = Mode::Unselected;
     Phase          phase_    = Phase::MeshOnly;
     MBOPhase       mboPhase_ = MBOPhase::MeshOnly;
-    SIPGPhase      sipgPhase_ = SIPGPhase::MeshOnly;
     MedialAxisPhase maPhase_ = MedialAxisPhase::MeshOnly;
     OASISPhase     oasisPhase_ = OASISPhase::MeshOnly;
     UMBERPhase     umberPhase_ = UMBERPhase::MeshOnly;
-    MERIDIANPhase  meridianPhase_ = MERIDIANPhase::MeshOnly;
+    PipelinePhase  pipePhase_ = PipelinePhase::MeshOnly;
 
     // OASIS parameters and derived display range.
     double oasisLambda_  = 0.0;   // set by the dialog on first use
@@ -594,6 +671,13 @@ private:
     bool cutAttempted_         = false;
     bool ricciAnnounced_       = false;
     bool ricciAttempted_       = false;
+    // The same discipline for Pipeline B's two. The combing is cheap and needs
+    // no announcement; the integration is a sparse saddle solve followed, when
+    // it inverted anything, by a whole continuation of its own, so it is
+    // announced a frame ahead like the Ricci solve.
+    bool framesAttempted_      = false;
+    bool integrationAnnounced_ = false;
+    bool integrationAttempted_ = false;
     bool layoutAnnounced_      = false;
     bool layoutAttempted_      = false;
     bool separatricesAnnounced_ = false;

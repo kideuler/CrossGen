@@ -166,6 +166,27 @@ public:
         int degenerateArcs = 0;
         int boundaryArcEdges = 0;   // G edges that lie in dS and cannot be paired
 
+        // Field route only (the second constructor).
+        //
+        // frameKConflicts counts edges of one arc whose frames disagree with
+        // the rest of it about the arc's quarter turn. Zero on a correctly
+        // combed field: the jump across an arc of G is what the branch
+        // selection fixed, and it is the same at every edge of the arc. A
+        // non-zero count is the BFS having leaked across G, not the field being
+        // rough, and it is the same failure the combing's own loop check
+        // reports from the other side.
+        //
+        // maxFrameKResidual is how far theta_hat_- - theta_hat_+ was from the
+        // multiple of pi/2 it was rounded to, over every seam edge. It is *not*
+        // an error: two triangles that share an edge differ by a quarter turn
+        // plus the field's own smooth variation across that edge, and that
+        // variation is bounded by pi/4 and is generally not small near a cone.
+        // It is reported because a value approaching pi/4 is a seam edge where
+        // the rounding to a quarter turn was nearly a coin toss, which is worth
+        // knowing before Q4 is read off the arc it belongs to.
+        int frameKConflicts = 0;
+        double maxFrameKResidual = 0.0;
+
         // Sec. 3.2.2's closing assumption: the immersion is rotated so that at
         // least one boundary edge is exactly axis aligned.
         double globalRotation = 0.0;
@@ -197,6 +218,46 @@ public:
     // was driven to. The constructor checks and throws rather than producing a
     // layout of a metric that belongs to something else.
     Immersion(const ConeCut &cut, const RicciFlow &ricci, const ConeSingularities &cones);
+
+    // Pipeline B's seam (docs/cf_flow_pipeline.md Sec. 6.2): psi from
+    // *integrating a cross field* rather than from unfolding a metric.
+    //
+    // Everything this class does apart from buildLengths() and layout() is
+    // metric-independent -- the arcs of G, their (e+, e-) pairing, the cone
+    // children and the axis alignment all come off ConeCut alone -- so a field
+    // route needs none of it rewritten. It supplies the two things the
+    // unfolding would otherwise have produced and the rest runs verbatim:
+    //
+    //   psi         one planar point per vertex of Omega, from the constrained
+    //               least-squares integration of the field;
+    //   flatLen     one length per edge of the *input* mesh, from the field
+    //               metric g_t = (J*_t)^T J*_t. Stages 5 and 6 weight their
+    //               boundary integrals by it and it is what fitTransitions()
+    //               measures arc lengths in, so it has to be filled whether or
+    //               not any metric was ever flowed to.
+    //
+    // `faceAngle` is the combed angle theta_hat of the field, one per face of
+    // the input mesh, and it is optional. Given it, the transition of each arc
+    // is *read off the frames* -- R_k = J*_+ (J*_-)^-1, exact from the matchings
+    // and needing neither a fit nor a rounding -- and the least-squares fit that
+    // fitTransitions() does anyway is kept as a check on the branch selection
+    // rather than as the source of k. Report::maxSnapError is then how far the
+    // geometry disagrees with the matchings, which is a strictly better use for
+    // the number. Left empty, k is fitted and snapped exactly as in the Ricci
+    // route.
+    //
+    // check() is run in full, and reports in full; what it does *not* do here
+    // is fail the map for maxMetricResidual. An integrated map realises the
+    // field metric only to the extent the field is integrable, so that residual
+    // is a measurement of the non-integrability and not a broken unfolding.
+    // Q1 -- flippedFaces -- is the gate that matters, and it is unchanged.
+    Immersion(const ConeCut &cut, const ConeSingularities &cones,
+              const std::vector<Point> &psi,
+              const std::vector<double> &flatEdgeLengths,
+              const std::vector<double> &faceAngle = std::vector<double>());
+
+    // Whether this immersion came from the field constructor above.
+    bool isFromField() const { return fromField; }
 
     // psi_R, one planar point per vertex of Omega.
     const std::vector<Point>& getUV() const { return uv; }
@@ -243,6 +304,8 @@ public:
 
 private:
     void buildLengths(const RicciFlow &ricci);
+    // The same second indexing, from a flatLen supplied from outside.
+    void buildCutLengths();
     void layout();                 // the unfolding
     void normaliseOrientation();   // make every image triangle positively oriented
     void buildArcs();              // maximal chains of G between its nodes
@@ -265,6 +328,12 @@ private:
     std::vector<double> flatLen;   // per edge of the input mesh
     std::vector<double> cutLen;    // per edge of Omega
     std::vector<Point> uv;
+
+    // The field route's two extras: the combed angle per face of S, empty in
+    // the Ricci route, and the flag that tells check() the map is not meant to
+    // be an isometry of flatLen.
+    std::vector<double> faceAngle;
+    bool fromField = false;
 
     std::vector<Arc> arcs;
     std::vector<std::array<int, 4>> seamPairs;

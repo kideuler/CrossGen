@@ -72,17 +72,6 @@ MBOPhase nextMBOPhase(MBOPhase p) {
     return MBOPhase::Quantized;
 }
 
-SIPGPhase nextSIPGPhase(SIPGPhase p) {
-    switch (p) {
-        case SIPGPhase::MeshOnly:   return SIPGPhase::CrossField;
-        case SIPGPhase::CrossField: return SIPGPhase::Stepping;
-        case SIPGPhase::Stepping:   return SIPGPhase::CutSeams;
-        case SIPGPhase::CutSeams:   return SIPGPhase::UVMesh;
-        case SIPGPhase::UVMesh:     return SIPGPhase::UVMesh;
-    }
-    return SIPGPhase::UVMesh;
-}
-
 UMBERPhase nextUMBERPhase(UMBERPhase p) {
     switch (p) {
         case UMBERPhase::MeshOnly:   return UMBERPhase::CrossField;
@@ -96,21 +85,21 @@ UMBERPhase nextUMBERPhase(UMBERPhase p) {
     return UMBERPhase::Simplified;
 }
 
-MERIDIANPhase nextMERIDIANPhase(MERIDIANPhase p) {
+PipelinePhase nextPipelinePhase(PipelinePhase p) {
     switch (p) {
-        case MERIDIANPhase::MeshOnly:   return MERIDIANPhase::CrossField;
-        case MERIDIANPhase::CrossField: return MERIDIANPhase::Stepping;
-        case MERIDIANPhase::Stepping:   return MERIDIANPhase::Cones;
-        case MERIDIANPhase::Cones:      return MERIDIANPhase::Cut;
-        case MERIDIANPhase::Cut:        return MERIDIANPhase::RicciFlow;
-        case MERIDIANPhase::RicciFlow:  return MERIDIANPhase::Metric;
-        case MERIDIANPhase::Metric:     return MERIDIANPhase::Layout;
-        case MERIDIANPhase::Layout:     return MERIDIANPhase::Separatrices;
-        case MERIDIANPhase::Separatrices: return MERIDIANPhase::Patches;
-        case MERIDIANPhase::Patches:    return MERIDIANPhase::Mesh;
-        case MERIDIANPhase::Mesh:       return MERIDIANPhase::Mesh;
+        case PipelinePhase::MeshOnly:   return PipelinePhase::CrossField;
+        case PipelinePhase::CrossField: return PipelinePhase::Stepping;
+        case PipelinePhase::Stepping:   return PipelinePhase::Cones;
+        case PipelinePhase::Cones:      return PipelinePhase::Cut;
+        case PipelinePhase::Cut:        return PipelinePhase::Flow;
+        case PipelinePhase::Flow:  return PipelinePhase::Metric;
+        case PipelinePhase::Metric:     return PipelinePhase::Layout;
+        case PipelinePhase::Layout:     return PipelinePhase::Separatrices;
+        case PipelinePhase::Separatrices: return PipelinePhase::Patches;
+        case PipelinePhase::Patches:    return PipelinePhase::Mesh;
+        case PipelinePhase::Mesh:       return PipelinePhase::Mesh;
     }
-    return MERIDIANPhase::Mesh;
+    return PipelinePhase::Mesh;
 }
 
 MedialAxisPhase nextMedialAxisPhase(MedialAxisPhase p) {
@@ -152,17 +141,6 @@ const char *mboPhaseName(MBOPhase p) {
     return "?";
 }
 
-const char *sipgPhaseName(SIPGPhase p) {
-    switch (p) {
-        case SIPGPhase::MeshOnly:   return "1) mesh";
-        case SIPGPhase::CrossField: return "2) SIPG crossfield";
-        case SIPGPhase::Stepping:   return "3) SIPG stepping";
-        case SIPGPhase::CutSeams:   return "4) cut seams (combed)";
-        case SIPGPhase::UVMesh:     return "5) UV mesh (UVGParam)";
-    }
-    return "?";
-}
-
 const char *umberPhaseName(UMBERPhase p) {
     switch (p) {
         case UMBERPhase::MeshOnly:   return "1) mesh";
@@ -176,19 +154,27 @@ const char *umberPhaseName(UMBERPhase p) {
     return "?";
 }
 
-const char *meridianPhaseName(MERIDIANPhase p) {
+// The two pipelines differ in exactly two of the eleven rows, so the name is a
+// function of the phase and the mode rather than of the phase alone. Every
+// other row is the same stage of the same paper reached by the same code.
+const char *pipelinePhaseName(PipelinePhase p, Mode m) {
+    const bool field = (m == Mode::TORSION);
     switch (p) {
-        case MERIDIANPhase::MeshOnly:   return "1) mesh";
-        case MERIDIANPhase::CrossField: return "2) SIPG crossfield";
-        case MERIDIANPhase::Stepping:   return "3) SIPG stepping";
-        case MERIDIANPhase::Cones:      return "4) cone singularities (Sec. 3.1)";
-        case MERIDIANPhase::Cut:        return "5) cutting graph (Sec. 3.2.2)";
-        case MERIDIANPhase::RicciFlow:  return "6) discrete Ricci flow (Sec. 3.2.1)";
-        case MERIDIANPhase::Metric:     return "7) flat cone metric";
-        case MERIDIANPhase::Layout:     return "8) layout Psi (Secs. 3.2.2, 3.3)";
-        case MERIDIANPhase::Separatrices: return "9) separatrices (Sec. 4, Q5)";
-        case MERIDIANPhase::Patches:    return "10) arrangement and splines (Secs. 4, 5)";
-        case MERIDIANPhase::Mesh:       return "11) quadrilateral mesh (Sec. 5)";
+        case PipelinePhase::MeshOnly:   return "1) mesh";
+        case PipelinePhase::CrossField: return "2) SIPG crossfield";
+        case PipelinePhase::Stepping:   return "3) SIPG stepping";
+        case PipelinePhase::Cones:      return "4) cone singularities (Sec. 3.1)";
+        case PipelinePhase::Cut:        return "5) cutting graph (Sec. 3.2.2)";
+        case PipelinePhase::Flow:
+            return field ? "6) combed field and matchings (Stage 3F)"
+                         : "6) discrete Ricci flow (Sec. 3.2.1)";
+        case PipelinePhase::Metric:
+            return field ? "7) psi_0 by integration (Stages 4F, 4R)"
+                         : "7) flat cone metric";
+        case PipelinePhase::Layout:     return "8) layout Psi (Secs. 3.2.2, 3.3)";
+        case PipelinePhase::Separatrices: return "9) separatrices (Sec. 4, Q5)";
+        case PipelinePhase::Patches:    return "10) arrangement and splines (Secs. 4, 5)";
+        case PipelinePhase::Mesh:       return "11) quadrilateral mesh (Sec. 5)";
     }
     return "?";
 }
@@ -220,7 +206,7 @@ const char *modeName(Mode m) {
         case Mode::PolyVector: return "PolyVector";
         case Mode::MBO:        return "MBO";
         case Mode::MedialAxis: return "Medial Axis";
-        case Mode::SIPG:       return "SIPG";
+        case Mode::TORSION:    return "TORSION";
         case Mode::OASIS:      return "OASIS";
         case Mode::UMBER:      return "UMBER";
         case Mode::MERIDIAN:   return "MERIDIAN";
@@ -231,7 +217,7 @@ const char *modeName(Mode m) {
 // The line every mode-selection prompt prints, kept in one place so adding a
 // mode does not mean chasing three copies of it.
 const char *kModeMenu =
-    "press '1' for PolyVector, '2' for MBO, '3' for Medial Axis, '4' for SIPG, "
+    "press '1' for PolyVector, '2' for MBO, '3' for Medial Axis, '4' for TORSION, "
     "'5' for OASIS, '6' for UMBER, '7' for MERIDIAN";
 
 } // anonymous namespace
@@ -374,24 +360,24 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
         // there re-opens the mesh dialog. Which pairs of cones are meant to be
         // joined is still a judgement about the model that only trying a number
         // settles, so it keeps a key of its own.
-        if (mode_ == Mode::MERIDIAN && meridianPhase_ >= MERIDIANPhase::Patches &&
+        if (inPipeline() && pipePhase_ >= PipelinePhase::Patches &&
             immersion_.has_value() && separatricesAttempted_) {
             if (promptMERIDIANConnectivity(*immersion_, psiR_)) {
                 rerunMERIDIANConnectivity();
                 // Stages 8 and 9 are gone with the trace, and so is the mesh
                 // that stood on them; step back to the phase that rebuilds
                 // them rather than drawing over a stale one.
-                meridianPhase_ = MERIDIANPhase::Patches;
+                pipePhase_ = PipelinePhase::Patches;
             }
         }
         break;
 
     case Qt::Key_I:
-        // The interface network, on or off. It is drawn over every MERIDIAN
-        // phase, which is what makes it useful and also what makes a key to
-        // hide it necessary: at the mesh phase it lies on top of the elements
-        // it is there to be compared against.
-        if (mode_ == Mode::MERIDIAN && interfaces_.has_value() &&
+        // The interface network, on or off. It is drawn over every phase of
+        // either pipeline, which is what makes it useful and also what makes a
+        // key to hide it necessary: at the mesh phase it lies on top of the
+        // elements it is there to be compared against.
+        if (inPipeline() && interfaces_.has_value() &&
             interfaces_->multiMaterial()) {
             showInterfaces_ = !showInterfaces_;
             console_.log(showInterfaces_ ? "[Interfaces] network shown"
@@ -404,7 +390,7 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
         // The materials as a fill rather than as the colour of a wireframe
         // edge. Off by default because it competes with the conformal factor
         // and the flat metric for the same triangles.
-        if (mode_ == Mode::MERIDIAN && interfaces_.has_value() &&
+        if (inPipeline() && interfaces_.has_value() &&
             interfaces_->multiMaterial()) {
             showMaterialFill_ = !showMaterialFill_;
             console_.log(showMaterialFill_ ? "[Interfaces] triangles filled by material"
@@ -414,11 +400,35 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
         break;
 
     case Qt::Key_P:
-        // The right half of the MERIDIAN layout phase carries two maps of the
-        // same domain -- Stage 4's psi_R and Stage 6's Psi -- and the whole of
-        // what Sec. 3.3 does is the difference between them, which is only
-        // visible by swapping one for the other in place.
-        if (mode_ == Mode::MERIDIAN && meridianPhase_ == MERIDIANPhase::Layout &&
+        // Both phases that carry two maps of the same domain in the right half
+        // put the swap on this key, and for the same reason: what the stage did
+        // is the difference between them, and a difference between two pictures
+        // is only visible by putting one where the other was.
+        //
+        // At TORSION's Metric phase the pair is Stage 4F's least-squares map
+        // and what Stage 4R made of it. The whole cost of substituting an
+        // integration for a flow is the red faces on the first of them, so
+        // hiding that behind the repaired map would hide the one measurement
+        // the phase exists to show.
+        if (mode_ == Mode::TORSION && pipePhase_ == PipelinePhase::Metric &&
+            immersion_.has_value() && !integratedMap_.empty()) {
+            showIntegrated_ = !showIntegrated_;
+            const std::vector<Point> &uv =
+                showIntegrated_ ? integratedMap_ : immersion_->getUV();
+            viewer::computeLayoutBounds(uv, uvView_.cx, uvView_.cy,
+                                        uvView_.baseW, uvView_.baseH);
+            uvView_.zoom = 1.0;
+            console_.log(showIntegrated_
+                             ? "[psi_0] right panel: the Stage 4F least-squares map, "
+                               "red where it inverted"
+                             : "[psi_0] right panel: psi_0 as Stage 4 accepted it");
+            update();
+            break;
+        }
+        // The right half of the layout phase carries Stage 4's psi_R and Stage
+        // 6's Psi, and the whole of what Sec. 3.3 does is the difference
+        // between them.
+        if (inPipeline() && pipePhase_ == PipelinePhase::Layout &&
             meridianLayout_.has_value() && !psiR_.empty()) {
             showPsiR_ = !showPsiR_;
             const std::vector<Point> &uv = showPsiR_ ? psiR_ : meridianLayout_->getUV();
@@ -457,9 +467,9 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
 
     case Qt::Key_4:
         if (mode_ == Mode::Unselected && phase_ == Phase::MeshOnly) {
-            mode_ = Mode::SIPG;
+            mode_ = Mode::TORSION;
             std::cerr << "[Viewer] Selected mode: " << modeName(mode_) << " (press 'c' to advance)\n";
-            console_.log("Selected mode: SIPG");
+            console_.log("Selected mode: TORSION (psi_0 by integrating the cross field)");
         }
         break;
 
@@ -571,8 +581,6 @@ void CrossGenWidget::doReset() {
     miqSolver_.reset();
     crossField_.reset();
     sipgField_.reset();
-    sipgCutMesh_.reset();
-    sipgUVParam_.reset();
     separatrixTrace_.reset();
     quadLayout_.reset();
     simplified_.reset();
@@ -594,9 +602,10 @@ void CrossGenWidget::doReset() {
     blocks_.reset();
     umberCorners_.clear();
     umberInternal_.clear();
-    // Each MERIDIAN stage holds on to the ones before it, so they go in
-    // reverse: the layout on the labels and the immersion, the immersion on the
-    // cut, the flow and the cones, and both the flow and the cut on the cones.
+    // Each stage of either pipeline holds on to the ones before it, so they go
+    // in reverse: the layout on the labels and the immersion, the immersion on
+    // the cut, the flow and the cones, and both the flow and the cut on the
+    // cones.
     quadMesh_.reset();
     splines_.reset();
     arrangement_.reset();
@@ -607,9 +616,18 @@ void CrossGenWidget::doReset() {
     psiR_.clear();
     showPsiR_ = false;
     ricci_.reset();
+    // Pipeline B's three, and the scaffold Immersion that also points at the
+    // cut and the cones.
+    integration_.reset();
+    tutte_.reset();
+    scaffold_.reset();
+    frames_.reset();
+    integratedMap_.clear();
+    showIntegrated_ = false;
+    fieldIndex_.clear();
     coneCut_.reset();
     cones_.reset();
-    // Last of the MERIDIAN stages to go: SubdomainLabels holds a bare pointer
+    // Last of the pipeline stages to go: SubdomainLabels holds a bare pointer
     // to it.
     interfaces_.reset();
     interfaceMessagesSeen_ = 0;
@@ -621,11 +639,10 @@ void CrossGenWidget::doReset() {
     mode_     = Mode::Unselected;
     phase_    = Phase::MeshOnly;
     mboPhase_ = MBOPhase::MeshOnly;
-    sipgPhase_ = SIPGPhase::MeshOnly;
     maPhase_  = MedialAxisPhase::MeshOnly;
     oasisPhase_ = OASISPhase::MeshOnly;
     umberPhase_ = UMBERPhase::MeshOnly;
-    meridianPhase_ = MERIDIANPhase::MeshOnly;
+    pipePhase_ = PipelinePhase::MeshOnly;
     // oasisLambda_ deliberately survives a reset so it can be reused as the
     // dialog's default on the next run.
 
@@ -648,6 +665,9 @@ void CrossGenWidget::doReset() {
     cutAttempted_         = false;
     ricciAnnounced_       = false;
     ricciAttempted_       = false;
+    framesAttempted_      = false;
+    integrationAnnounced_ = false;
+    integrationAttempted_ = false;
     layoutAnnounced_      = false;
     layoutAttempted_      = false;
     separatricesAnnounced_ = false;
@@ -1438,6 +1458,13 @@ void CrossGenWidget::runMERIDIANCones() {
         std::cerr << "[Viewer] ConeSingularities failed: " << e.what() << "\n";
         return;
     }
+    // The snapshot Sec. 5.1's audit is run against, taken here because this is
+    // the last moment at which the indices are the ones the *field* read.
+    // Unused by MERIDIAN and cheap, so it is taken in both modes rather than
+    // conditionally: what it costs is one vector and what it buys is that the
+    // cone stage stays one piece of code.
+    fieldIndex_ = cones_->getIndices();
+
     // The interface network's own indices, before Eq. (4) is checked: they are
     // fixed by the geometry and rebalance() may not move them, so the check and
     // the rebalance below have to see them already in place.
@@ -1693,6 +1720,362 @@ void CrossGenWidget::runRicciFlow() {
             << " input edge(s) replaced by flipping (grey underneath, green on top)";
         console_.log(oss.str());
     }
+}
+
+// ── TORSION Stage 3F, Sec. 5: the combed field ───────────────────────────────
+//
+// The phase Pipeline A runs the flow in, doing the same job by other means:
+// turning the field into the structure the layout will have. SIPG stores
+// u_k[t] = exp(4 i theta_t) in the global frame, so on a planar model parallel
+// transport is identically zero, the matching across an interior edge is the
+// integer p_fg the two representatives differ by, and combing is a BFS over the
+// faces of Omega carrying an integer a_f.
+//
+// Cheap -- one BFS and one pass over the vertices -- so unlike the Ricci solve
+// it needs no announcement. What it produces that nothing downstream can do
+// without is the branch: the quarter turn across each arc of G is read off the
+// frames either side of it, which is what makes C2 hold by construction instead
+// of by a fit and a rounding.
+void CrossGenWidget::runTORSIONFrames() {
+    framesAttempted_ = true;
+    if (!sipgField_.has_value() || !coneCut_.has_value() || !cones_.has_value()) return;
+
+    FieldFrames::Options fopts;
+    fopts.referenceIndex = fieldIndex_;
+
+    auto t0 = Clock::now();
+    try {
+        frames_.emplace(*sipgField_, *coneCut_, *cones_, fopts);
+    } catch (const std::exception &e) {
+        frames_.reset();
+        console_.log(std::string("[Frames] FAILED: ") + e.what());
+        std::cerr << "[Viewer] FieldFrames failed: " << e.what() << "\n";
+        return;
+    }
+    auto t1 = Clock::now();
+
+    const FieldFrames::Report &fr = frames_->getReport();
+    {
+        std::ostringstream oss;
+        oss << "[Frames] combed " << fr.combedFaces << "/" << fr.faces
+            << " face(s) of Omega from face " << fr.seedFace << " ("
+            << fr.unreachedFaces << " unreached), " << fr.combingDefects
+            << " loop defect(s) " << (fr.combingDefects == 0 ? "[PASS]" : "[FAIL]") << ", "
+            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+        std::cerr << "[Viewer] " << oss.str() << "\n";
+    }
+    {
+        // The roughness of the field, which is what predicts where Stage 4F
+        // will invert triangles: delta is the field's own variation across a
+        // dual edge once the quarter turn is taken out, and it is bounded by
+        // pi/4 by construction, so a value near it is a face where the two
+        // representatives were nearly a coin toss apart.
+        std::ostringstream oss;
+        oss << "[Frames] worst |delta| across a dual edge " << std::fixed
+            << std::setprecision(3) << fr.maxFrameJump << " rad of the pi/4 = 0.785 the "
+            << "matching leaves; this is where Stage 4F's flips will be";
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Frames] Sec. 5.1: I from the matchings agrees with the field at all but "
+            << fr.indexMismatches << " interior vertex/-ices "
+            << (fr.indexMismatches == 0 ? "[PASS]" : "[FAIL]") << "; sum I = " << fr.indexSum
+            << " against 4 chi = " << fr.indexTarget << " "
+            << (fr.admissible ? "[PASS]" : "[FAIL]");
+        if (fr.highIndexCones > 0) oss << ", " << fr.highIndexCones << " with |I| > 2";
+        console_.log(oss.str());
+    }
+    if (fr.boundaryTurnMismatches > 0) {
+        // The one place a field-integrated layout is asked for two different
+        // things at one point, and it is not a bug in anything here: Pipeline A
+        // gives Stage 6 a geodesic boundary because Stage 1 prescribes zero
+        // curvature at every non-cone boundary vertex and the flow drives it
+        // there. The field has no such stage -- it follows a curving boundary
+        // and quantises it into a staircase -- so every step of that staircase
+        // away from a cone is a corner the arrangement will find and Q2 will
+        // report. It is why the two routes' arrangements differ.
+        std::ostringstream oss;
+        oss << "[Frames] the frame turns at " << fr.boundaryTurns << " vertex/-ices of dS, "
+            << fr.boundaryTurnMismatches << " of them disagreeing with the cone set (worst "
+            << "at vertex " << fr.worstBoundaryTurnVertex << ", rounding residual "
+            << std::fixed << std::setprecision(3) << fr.maxBoundaryTurnResidual
+            << " rad) -- these are the corners Q2 will find at vertices Stage 1 called "
+               "regular";
+        console_.log(oss.str());
+    }
+    if (fr.leftHandedFrames > 0 || fr.sizingFallbacks > 0) {
+        std::ostringstream oss;
+        oss << "[Frames] " << fr.leftHandedFrames << " frame(s) with det J* <= 0 and "
+            << fr.sizingFallbacks << " face(s) whose h_t was not positive -- both make "
+               "Stage 6's flip cap meaningless where they occur";
+        console_.log(oss.str());
+    }
+    for (const std::string &m : fr.messages) console_.log("[Frames] " + m);
+
+    console_.log(std::string("[Frames] the branch ") +
+                 (fr.valid ? "is single valued over Omega [PASS]"
+                           : "is not single valued over Omega [FAIL]") +
+                 "; colour = a_f, and a step in a_f anywhere but across an arc of G is a "
+                 "leak in the comb");
+}
+
+// ── TORSION Stage 4R, Sec. 7.2: the untangling ───────────────────────────────
+//
+// A Tutte embedding, which is bijective by theorem and bad in every other
+// respect, followed by Stage 6's own energy with E1 fitting the field's target
+// Jacobian under the barrier and a single mu on E4. It is not a second solver:
+// fitting a map to a per-triangle target under a barrier is well posed even
+// when the target is unrealisable, which is exactly the situation a
+// non-integrable field puts it in.
+//
+// The reference is the metric the *least-squares map* induces, not the frame.
+// The frame is a scaled rotation, so E1 against it is E1 against the model's
+// Euclidean geometry -- see LayoutEnergy.hxx for the algebra -- and that
+// reference has no cones, which is the failure this whole route has to avoid.
+std::vector<Point> CrossGenWidget::runTORSIONUntangle() {
+    if (!coneCut_.has_value() || !cones_.has_value() || !frames_.has_value()) return {};
+    const Mesh &omega = coneCut_->getCutMesh();
+
+    TutteEmbedding::Options topts;
+    tutte_.emplace(omega, topts);
+    const TutteEmbedding::Report &tr = tutte_->getReport();
+    for (const std::string &m : tr.messages) console_.log("[Untangle] " + m);
+    if (!tr.valid) {
+        console_.log("[Untangle] nothing locally injective to start from, so Sec. 7.2 was "
+                     "not run; psi_0 stands as the integration returned it");
+        return {};
+    }
+
+    // A second Immersion over the Tutte map, for the arcs and the seam pairing
+    // the energy needs. The combed angles go in again, so the quarter turns it
+    // holds are the matchings' and not a Procrustes fit of a Tutte map, which
+    // would be meaningless.
+    std::unique_ptr<Immersion> start;
+    try {
+        start = std::make_unique<Immersion>(*coneCut_, *cones_, tutte_->getUV(),
+                                            frames_->fieldEdgeLengths(),
+                                            frames_->combedAngle());
+    } catch (const std::exception &e) {
+        console_.log(std::string("[Untangle] could not wrap the Tutte map: ") + e.what());
+        return {};
+    }
+
+    // No boundary labelling worth having on a Tutte map and no connectivity to
+    // seed from it; with lambda_2, lambda_3 and lambda_5 at zero none of it
+    // would be read in any case, and not building it saves a separatrix trace
+    // of a map that means nothing.
+    SubdomainLabels::Options lopts;
+    lopts.seedTopoConstraints = false;
+    lopts.interfaceCorners = false;
+    SubdomainLabels startLabels(*start, lopts);
+
+    LayoutEnergy::Options eopts;
+    eopts.reference = LayoutEnergy::Reference::Induced;
+    eopts.referenceLengths = TORSION::inducedLengths(*mesh_, *coneCut_, integratedMap_);
+    // mu is E4's penalty and nothing else is switched on, so it is set through
+    // lambdaFactor rather than through lambdaInit: run() floors lambda_4 at
+    // lambda_1, and that floor would swallow a starting mu below 1.
+    const TORSION::Options defaults;
+    eopts.lambdaInit = 1.0;
+    eopts.lambdaFactor[4] = defaults.untangleSeamWeight;
+    eopts.lambdaGrowth = defaults.lambdaGrowth;
+    eopts.outerSteps = defaults.untangleOuterSteps;
+    eopts.innerIterations = defaults.untangleInnerIterations;
+    eopts.alternateReference = false;
+    eopts.relabel = false;
+    // E1 and E4 only. Everything else is a statement about a layout and this
+    // pass is not producing one -- it is producing something injective with the
+    // field's directions in it, for Stage 6 to make a layout out of.
+    eopts.lambdaFactor[2] = 0.0;
+    eopts.lambdaFactor[3] = 0.0;
+    eopts.lambdaFactor[5] = 0.0;
+    eopts.lambdaFactor[6] = 0.0;
+
+    auto t0 = Clock::now();
+    LayoutEnergy fit(*start, startLabels, eopts);
+    fit.run();
+    auto t1 = Clock::now();
+
+    const LayoutEnergy::Report &fr = fit.getReport();
+    {
+        std::ostringstream oss;
+        oss << "[Untangle] from the Tutte map, " << fr.outerSteps
+            << " outer step(s) of target-Jacobian fitting under the barrier: "
+            << fr.invertedTriangles << " inverted face(s) left "
+            << (fr.invertedTriangles == 0 ? "[PASS]" : "[FAIL]") << ", seam "
+            << std::scientific << std::setprecision(2) << fr.maxSeamResidual
+            << " of the extent, "
+            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+        std::cerr << "[Viewer] " << oss.str() << "\n";
+    }
+    if (fr.invertedTriangles > 0) {
+        console_.log("[Untangle] the line search's flip cap was defeated, normally by a "
+                     "reference triangle that was already degenerate. Sec. 7.3's knobs, in "
+                     "order: field smoothness near the cones, refinement where the "
+                     "per-triangle fit residual is largest, a lower h there");
+    }
+    for (const std::string &m : fr.messages) console_.log("[Untangle] " + m);
+    return fit.getUV();
+}
+
+// ── TORSION Stages 4F, 4R and 4, Secs. 6, 7.2 and 6.2: psi_0 ─────────────────
+//
+// The phase Pipeline A shows the flat metric in, and the reason it is one phase
+// there is the reason it is one here read backwards. On that side the metric is
+// a set of edge lengths and needs unfolding before there is anything to look
+// at; on this side the solve produces a *map* immediately, and what the phase
+// is judged on is not what the map looks like but whether it inverted anything.
+// The red faces on the left panel's right half are the entire cost of
+// substituting an integration for a flow, which is why 'p' keeps the
+// least-squares map reachable after Stage 4R has replaced it.
+//
+// Blocking: one sparse saddle solve, and when it inverted something, a whole
+// continuation after it.
+void CrossGenWidget::runTORSIONIntegration() {
+    integrationAttempted_ = true;
+    if (!frames_.has_value() || !coneCut_.has_value() || !cones_.has_value()) return;
+
+    const FieldFrames::Report &ffr = frames_->getReport();
+    if (ffr.unreachedFaces > 0 || ffr.combingDefects > 0) {
+        console_.log("[psi_0] stopping before the integration: the branch of the field over "
+                     "Omega is not single valued, so the seam transitions it would be "
+                     "constrained by are not defined");
+        return;
+    }
+
+    // The scaffold exists for one reason: the constraint rows need the arcs of
+    // G, their (e+, e-) pairing and their quarter turns, and all three are
+    // Immersion::buildArcs()' work. It is handed Omega's own coordinates as a
+    // placeholder map, which nothing read from it depends on.
+    try {
+        scaffold_.emplace(*coneCut_, *cones_, coneCut_->getCutMesh().vertices,
+                          frames_->fieldEdgeLengths(), frames_->combedAngle());
+    } catch (const std::exception &e) {
+        scaffold_.reset();
+        console_.log(std::string("[psi_0] could not build the seam pairing: ") + e.what());
+        return;
+    }
+
+    auto t0 = Clock::now();
+    try {
+        integration_.emplace(*coneCut_, *frames_, *scaffold_, FieldIntegration::Options());
+    } catch (const std::exception &e) {
+        integration_.reset();
+        console_.log(std::string("[psi_0] FAILED: ") + e.what());
+        std::cerr << "[Viewer] FieldIntegration failed: " << e.what() << "\n";
+        return;
+    }
+    auto t1 = Clock::now();
+
+    const FieldIntegration::Report &ir = integration_->getReport();
+    {
+        std::ostringstream oss;
+        oss << "[psi_0] Stage 4F: " << ir.constraintRows << " constraint row(s) over "
+            << ir.seamPairs << " seam pair(s), " << (ir.solvedWithLDLT ? "LDL^T" : "LU fallback")
+            << ", seam " << std::scientific << std::setprecision(2) << ir.maxSeamResidual
+            << " of the extent, "
+            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+        std::cerr << "[Viewer] " << oss.str() << "\n";
+    }
+    if (!ir.solved) {
+        console_.log("[psi_0] the field could not be integrated on Omega");
+        return;
+    }
+    {
+        // The non-integrability, which is the thing being measured here. A
+        // discrete cross field generically has curl X != 0, so the closest map
+        // in L^2 inverts triangles; where the per-face fit residual is large is
+        // where they are.
+        std::ostringstream oss;
+        oss << "[psi_0] fit residual mean " << std::fixed << std::setprecision(4)
+            << ir.meanFitResidual << ", worst " << ir.maxFitResidual << " at face "
+            << ir.worstFitFace << " (0 = the field realised exactly, 1 = a gradient the "
+               "size of the target pointing the wrong way)";
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[psi_0] Stage 4F inverted " << ir.flippedFaces << " face(s), "
+            << std::fixed << std::setprecision(2)
+            << (ir.totalArea > 0.0 ? 100.0 * ir.flippedArea / ir.totalArea : 0.0)
+            << "% of the area, " << ir.flipsAdjacentToCone << " of them in the one ring of "
+            << "a cone; nearest flip " << std::scientific << std::setprecision(2)
+            << ir.nearestFlipToCone << " of the diagonal from one";
+        console_.log(oss.str());
+    }
+    for (const std::string &m : ir.messages) console_.log("[psi_0] " + m);
+
+    integratedMap_ = integration_->getUV();
+    showIntegrated_ = false;
+
+    // ── Stage 4R ─────────────────────────────────────────────────────────────
+    std::vector<Point> psi0 = integratedMap_;
+    if (ir.flippedFaces > 0) {
+        std::vector<Point> repaired = runTORSIONUntangle();
+        if (!repaired.empty()) psi0 = std::move(repaired);
+    } else {
+        console_.log("[psi_0] the integration inverted nothing, so Sec. 7.2's untangling "
+                     "was not needed. That happens on gently curved, well-aligned models "
+                     "and is not to be assumed");
+    }
+
+    // ── Stage 4: the immersion both routes end at ────────────────────────────
+    try {
+        immersion_.emplace(*coneCut_, *cones_, psi0, frames_->fieldEdgeLengths(),
+                           frames_->combedAngle());
+    } catch (const std::exception &e) {
+        immersion_.reset();
+        console_.log(std::string("[psi_0] Stage 4 could not accept psi_0: ") + e.what());
+        return;
+    }
+
+    const Immersion::Report &imr = immersion_->getReport();
+    {
+        std::ostringstream oss;
+        oss << "[psi_0] " << imr.arcs << " arc(s), " << imr.seamEdgePairs
+            << " seam pair(s), " << imr.frameKConflicts
+            << " arc(s) whose frames disagree about their own quarter turn "
+            << (imr.frameKConflicts == 0 ? "[PASS]" : "[FAIL]");
+        console_.log(oss.str());
+    }
+    {
+        // Q4 read as a check rather than as a rounding, which is what the field
+        // route buys: k came off the matchings, so this number is how far the
+        // geometry disagrees with them instead of how much it had to be snapped.
+        std::ostringstream oss;
+        oss << "[psi_0] Q4 the geometry is " << std::scientific << std::setprecision(2)
+            << imr.maxSnapError << " rad from the quarter turns the matchings prescribe; "
+            << "the field metric is realised to " << imr.maxMetricResidual
+            << " relative, which is the non-integrability per edge and not an error";
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[psi_0] Q1 " << (imr.flippedFaces == 0 ? "[PASS]" : "[FAIL]") << " ("
+            << imr.flippedFaces << " flipped face(s))";
+        console_.log(oss.str());
+        std::cerr << "[Viewer] " << oss.str() << "\n";
+    }
+    for (const std::string &m : imr.messages) console_.log("[psi_0] " + m);
+
+    if (imr.flippedFaces > 0) {
+        console_.log("[psi_0] Q1 does not hold, and Sec. 3.3's barrier can only preserve it, "
+                     "never repair it, so the continuation will not be run. This is the cost "
+                     "of the substitution: Sec. 7.3 is the list of what to try");
+    }
+
+    viewer::computeLayoutBounds(immersion_->getUV(), uvView_.cx, uvView_.cy,
+                                uvView_.baseW, uvView_.baseH);
+    uvView_.zoom = 1.0;
+    uvView_.fbw  = view_.fbw;
+    uvView_.fbh  = view_.fbh;
+
+    console_.log("[psi_0] right panel = psi_0 as Stage 4 accepted it; press 'p' for the "
+                 "Stage 4F least-squares map it came from, red where that inverted");
 }
 
 // Stages 4, 5 and 6 in one go, Secs. 3.2.2 and 3.3. They are one viewer phase
@@ -2092,7 +2475,7 @@ bool CrossGenWidget::promptMERIDIANConnectivity(const Immersion &imm,
 
 void CrossGenWidget::runMERIDIANLayout() {
     layoutAttempted_ = true;
-    if (!coneCut_.has_value() || !ricci_.has_value() || !cones_.has_value()) return;
+    if (!coneCut_.has_value() || !cones_.has_value()) return;
 
     // Fit the right panel to whichever map is about to be shown there.
     auto fitPanel = [this](const std::vector<Point> &uv) {
@@ -2104,8 +2487,37 @@ void CrossGenWidget::runMERIDIANLayout() {
         uvView_.fbh  = view_.fbh;
     };
 
-    // ── Stage 4: the metric immersion psi_R ──────────────────────────────────
+    // ── Stage 4: the immersion psi_0 ─────────────────────────────────────────
+    //
+    // The one place the two routes part company, and the only one in this
+    // function. Pipeline A unfolds the flat cone metric here, triangle by
+    // triangle; Pipeline B has no metric to unfold and built its immersion at
+    // the phase before, out of the map the integration produced. Everything
+    // below reads immersion_ and cannot tell which of the two filled it, which
+    // is the whole point of Sec. 6.2 calling the Immersion the hub.
     auto t0 = Clock::now();
+    auto t1 = t0;
+
+    if (mode_ == Mode::TORSION) {
+        if (!immersion_.has_value()) return;
+        // The same gate the Ricci route applies below, applied to the map the
+        // integration produced: the barrier of Sec. 3.3 preserves Q1 and cannot
+        // repair it, so a psi_0 with a flipped face is not something to start a
+        // continuation from. Stage 4R is what stands in front of this, and when
+        // it did not manage it the phase before said so.
+        if (immersion_->getReport().flippedFaces > 0) {
+            console_.log("[Layout] psi_0 does not satisfy Q1, so the continuation of "
+                         "Sec. 3.3 was not run; see the Stage 4F and 4R reports at the "
+                         "phase before");
+            return;
+        }
+        psiR_ = immersion_->getUV();
+        showPsiR_ = false;
+        fitPanel(psiR_);
+    } else {
+    if (!ricci_.has_value()) return;
+
+    t0 = Clock::now();
     try {
         immersion_.emplace(*coneCut_, *ricci_, *cones_);
     } catch (const std::exception &e) {
@@ -2114,7 +2526,7 @@ void CrossGenWidget::runMERIDIANLayout() {
         std::cerr << "[Viewer] Immersion failed: " << e.what() << "\n";
         return;
     }
-    auto t1 = Clock::now();
+    t1 = Clock::now();
 
     const Immersion::Report &ir = immersion_->getReport();
     psiR_ = immersion_->getUV();
@@ -2162,6 +2574,7 @@ void CrossGenWidget::runMERIDIANLayout() {
                      "can only preserve it, never repair it, so it was not run");
         return;
     }
+    }  // end of the Ricci route's Stage 4
 
     // The connectivity settings are asked for here rather than on the way into
     // the mode: every number in them is a fraction of something psi_R measures
@@ -2237,10 +2650,34 @@ void CrossGenWidget::runMERIDIANLayout() {
     for (const std::string &m : sr.messages) console_.log("[Labels] " + m);
 
     // ── Stage 6: the layout-inducing energies ────────────────────────────────
+    //
+    // C4, and the second and last place the routes differ. E1 measures J
+    // against a reference metric, and a field-integrated map has no flat metric
+    // to be measured against; leaving it Euclidean is the failure
+    // LayoutEnergy.hxx documents on geom003, where a reference with no cones
+    // and Q2 are contradictory statements about the same vertex. What psi_0
+    // does have is the metric it induces itself -- the integration's seam
+    // constraints are exact rotations, so its image angle sum at each cone is
+    // already 2 pi - (pi/2) I before the continuation starts -- and that is a
+    // flat cone metric with the right cones, got without a flow.
+    LayoutEnergy::Options eopts;
+    if (mode_ == Mode::TORSION) {
+        eopts.reference = LayoutEnergy::Reference::Induced;
+        eopts.referenceLengths =
+            TORSION::inducedLengths(*mesh_, *coneCut_, immersion_->getUV());
+        // Sec. 9's closing note: the field is already aligned to dS and to the
+        // interfaces, so E2 and E3 start small and over-penalising them early
+        // only fights E1; E4 starts higher because the untangling introduced
+        // seam error, and Q4 is not free to trade away.
+        eopts.lambdaFactor[2] = TORSION::Options().lambdaAlignmentFactor;
+        eopts.lambdaFactor[3] = TORSION::Options().lambdaAlignmentFactor;
+        eopts.lambdaFactor[4] = TORSION::Options().lambdaSeamFactor;
+    }
+
     t0 = Clock::now();
     bool ok = false;
     try {
-        meridianLayout_.emplace(*immersion_, *meridianLabels_);
+        meridianLayout_.emplace(*immersion_, *meridianLabels_, eopts);
         ok = meridianLayout_->run();
     } catch (const std::exception &e) {
         meridianLayout_.reset();
@@ -2920,11 +3357,6 @@ void CrossGenWidget::advancePhase() {
         maPhase_ = nextMedialAxisPhase(maPhase_);
         if (maPhase_ != old)
             std::cerr << "[Viewer] Medial Axis Phase " << medialAxisPhaseName(maPhase_) << "\n";
-    } else if (mode_ == Mode::SIPG) {
-        SIPGPhase old = sipgPhase_;
-        sipgPhase_ = nextSIPGPhase(sipgPhase_);
-        if (sipgPhase_ != old)
-            std::cerr << "[Viewer] SIPG Phase " << sipgPhaseName(sipgPhase_) << "\n";
     } else if (mode_ == Mode::UMBER) {
         UMBERPhase old = umberPhase_;
         umberPhase_ = nextUMBERPhase(umberPhase_);
@@ -2943,11 +3375,12 @@ void CrossGenWidget::advancePhase() {
             if (blockLayout_.has_value() && promptChordCollapseParameters())
                 runChordCollapse();
         }
-    } else if (mode_ == Mode::MERIDIAN) {
-        MERIDIANPhase old = meridianPhase_;
-        meridianPhase_ = nextMERIDIANPhase(meridianPhase_);
-        if (meridianPhase_ != old)
-            std::cerr << "[Viewer] MERIDIAN Phase " << meridianPhaseName(meridianPhase_) << "\n";
+    } else if (inPipeline()) {
+        PipelinePhase old = pipePhase_;
+        pipePhase_ = nextPipelinePhase(pipePhase_);
+        if (pipePhase_ != old)
+            std::cerr << "[Viewer] " << modeName(mode_) << " Phase "
+                      << pipelinePhaseName(pipePhase_, mode_) << "\n";
 
         // Mesh is the last phase and it stays that way: 'c' at it re-opens the
         // Stage 10 dialog, so a target edge length can be tried, looked at, and
@@ -2956,31 +3389,34 @@ void CrossGenWidget::advancePhase() {
         // at the Patches phase, moved to 'n' -- the two are both judgements
         // about the model and both need re-opening, and one key cannot carry
         // them both.
-        if (old == MERIDIANPhase::Patches && meridianPhase_ == MERIDIANPhase::Mesh) {
+        if (old == PipelinePhase::Patches && pipePhase_ == PipelinePhase::Mesh) {
             // Stages 8 and 9 are built by the frame after the one that asked
             // for them, so they may not be there yet on the frame that
             // advanced. Build them now rather than opening a dialog on a
             // pipeline that has not run.
             if (!patchesAttempted_) runMERIDIANPatches();
         }
-        if (meridianPhase_ == MERIDIANPhase::Mesh && splines_.has_value()) {
+        if (pipePhase_ == PipelinePhase::Mesh && splines_.has_value()) {
             if (promptMERIDIANMesh()) runMERIDIANMesh();
         }
     }
 }
 
-// ── stages shared with SIPG mode ─────────────────────────────────────────────
+// ── the SIPG solve, which three modes share ──────────────────────────────────
+//
+// UMBER's input is a converged SIPG field, and so is either pipeline's: Sec.
+// 3.1 reads the cone indices off a field's holonomy, and TORSION goes on to
+// integrate the very same field. So the guards ask about the stage rather than
+// the mode.
 
 bool CrossGenWidget::sipgStageWantsField() const {
-    return (mode_ == Mode::SIPG     && sipgPhase_     >= SIPGPhase::CrossField) ||
-           (mode_ == Mode::UMBER    && umberPhase_    >= UMBERPhase::CrossField) ||
-           (mode_ == Mode::MERIDIAN && meridianPhase_ >= MERIDIANPhase::CrossField);
+    return (mode_ == Mode::UMBER && umberPhase_ >= UMBERPhase::CrossField) ||
+           (inPipeline() && pipePhase_ >= PipelinePhase::CrossField);
 }
 
 bool CrossGenWidget::sipgStageIsStepping() const {
-    return (mode_ == Mode::SIPG     && sipgPhase_     == SIPGPhase::Stepping) ||
-           (mode_ == Mode::UMBER    && umberPhase_    == UMBERPhase::Stepping) ||
-           (mode_ == Mode::MERIDIAN && meridianPhase_ == MERIDIANPhase::Stepping);
+    return (mode_ == Mode::UMBER && umberPhase_ == UMBERPhase::Stepping) ||
+           (inPipeline() && pipePhase_ == PipelinePhase::Stepping);
 }
 
 std::vector<int> CrossGenWidget::hangingTJunctions() const {
@@ -3239,7 +3675,10 @@ void CrossGenWidget::runComputations() {
         // the field tangent to it, or neither region either side gets the
         // interior cones its own Gauss-Bonnet count demands. Must be set before
         // initialize(), which does the first assembly.
-        if (mode_ == Mode::MERIDIAN && interfaces_.has_value() && interfaces_->multiMaterial()) {
+        // TORSION needs this more than MERIDIAN does rather than less: it
+        // integrates the field, so an interface the field ran straight through
+        // is an interface the *map* runs straight through.
+        if (inPipeline() && interfaces_.has_value() && interfaces_->multiMaterial()) {
             sipgField_->setAlignedInteriorEdges(interfaces_->interfaceEdges());
         }
         sipgField_->initialize();
@@ -3308,29 +3747,29 @@ void CrossGenWidget::runComputations() {
         runBlocks();
     }
 
-    // ── MERIDIAN: Stage 0b, the material interfaces ──────────────────────────
+    // ── Both pipelines: Stage 0b, the material interfaces ────────────────────
     //
     // At the first phase, not the cone one: it reads the tags and nothing else,
     // and the picture of what the layout will have to keep is worth having in
     // front of the field rather than after it.
-    if (mode_ == Mode::MERIDIAN && !interfacesAttempted_) {
+    if (inPipeline() && !interfacesAttempted_) {
         runMERIDIANInterfaces();
     }
 
-    // ── MERIDIAN: Stage 1, the cones and Eq. (4) ─────────────────────────────
-    if (mode_ == Mode::MERIDIAN && meridianPhase_ >= MERIDIANPhase::Cones &&
+    // ── Both pipelines: Stage 1, the cones and Eq. (4) ───────────────────────
+    if (inPipeline() && pipePhase_ >= PipelinePhase::Cones &&
         sipgField_.has_value() && !conesAttempted_) {
         runMERIDIANCones();
     }
 
-    // ── MERIDIAN: Stage 2, the cutting graph ─────────────────────────────────
-    if (mode_ == Mode::MERIDIAN && meridianPhase_ >= MERIDIANPhase::Cut &&
+    // ── Both pipelines: Stage 2, the cutting graph ───────────────────────────
+    if (inPipeline() && pipePhase_ >= PipelinePhase::Cut &&
         cones_.has_value() && !cutAttempted_) {
         runMERIDIANCut();
     }
 
     // ── MERIDIAN: Stage 3, discrete Ricci flow ───────────────────────────────
-    if (mode_ == Mode::MERIDIAN && meridianPhase_ >= MERIDIANPhase::RicciFlow &&
+    if (mode_ == Mode::MERIDIAN && pipePhase_ >= PipelinePhase::Flow &&
         cones_.has_value() && !ricciAttempted_) {
         if (!ricciAnnounced_) {
             // runComputations() runs at the top of paintGL, so returning here
@@ -3342,20 +3781,54 @@ void CrossGenWidget::runComputations() {
         }
     }
 
-    // ── MERIDIAN: Stages 4 to 6, psi_R through Psi ───────────────────────────
-    if (mode_ == Mode::MERIDIAN && meridianPhase_ >= MERIDIANPhase::Layout &&
-        ricci_.has_value() && !flatMetric_.edges.empty() && !layoutAttempted_) {
+    // ── TORSION: Stage 3F, the combed field and its matchings ────────────────
+    //
+    // The same phase, and the same place in the argument: this is where the
+    // pipeline stops working with the model's own geometry and starts working
+    // with the structure the layout is going to have. Pipeline A gets that
+    // structure from a flow; this gets it from the field it already has.
+    if (mode_ == Mode::TORSION && pipePhase_ >= PipelinePhase::Flow &&
+        coneCut_.has_value() && !framesAttempted_) {
+        runTORSIONFrames();
+    }
+
+    // ── TORSION: Stages 4F, 4R and 4, psi_0 ──────────────────────────────────
+    if (mode_ == Mode::TORSION && pipePhase_ >= PipelinePhase::Metric &&
+        frames_.has_value() && !integrationAttempted_) {
+        if (!integrationAnnounced_) {
+            console_.log("[psi_0] integrating the field on Omega and untangling what it "
+                         "inverted, this blocks...");
+            integrationAnnounced_ = true;
+        } else {
+            runTORSIONIntegration();
+        }
+    }
+
+    // ── Both pipelines: Stages 4 to 6, psi_0 through Psi ─────────────────────
+    //
+    // What has to be there before this runs differs by route -- Pipeline A
+    // needs the flow and the metric it produced, because Stage 4 is the
+    // unfolding of that metric and happens here; Pipeline B needs the immersion
+    // itself, because its Stage 4 already happened at the phase before -- so
+    // the guard is the one thing the two have in common at this point, which is
+    // that the map psi_0 exists.
+    if (inPipeline() && pipePhase_ >= PipelinePhase::Layout && !layoutAttempted_ &&
+        ((mode_ == Mode::MERIDIAN && ricci_.has_value() && !flatMetric_.edges.empty()) ||
+         (mode_ == Mode::TORSION && immersion_.has_value()))) {
         if (!layoutAnnounced_) {
-            console_.log("[Layout] unfolding psi_R and running the Eq. (13) continuation, "
-                         "this blocks...");
+            console_.log(mode_ == Mode::TORSION
+                             ? "[Layout] labelling the subdomains and running the Eq. (13) "
+                               "continuation on psi_0, this blocks..."
+                             : "[Layout] unfolding psi_R and running the Eq. (13) "
+                               "continuation, this blocks...");
             layoutAnnounced_ = true;
         } else {
             runMERIDIANLayout();
         }
     }
 
-    // ── MERIDIAN: Stage 7, the separatrices of Psi ───────────────────────────
-    if (mode_ == Mode::MERIDIAN && meridianPhase_ >= MERIDIANPhase::Separatrices &&
+    // ── Both pipelines: Stage 7, the separatrices of Psi ─────────────────────
+    if (inPipeline() && pipePhase_ >= PipelinePhase::Separatrices &&
         meridianLayout_.has_value() && !separatricesAttempted_) {
         if (!separatricesAnnounced_) {
             console_.log("[Separatrices] tracing the integral curves out of every cone, "
@@ -3366,7 +3839,7 @@ void CrossGenWidget::runComputations() {
         }
     }
 
-    // ── MERIDIAN: Stages 8 and 9, the arrangement and the patches ────────────
+    // ── Both pipelines: Stages 8 and 9, the arrangement and the patches ─────
     //
     // Only on a clean trace. Stage 8 builds a planar subdivision out of the
     // curves and Stage 9 fits a surface to its faces; run either on a bundle
@@ -3374,7 +3847,7 @@ void CrossGenWidget::runComputations() {
     // not there. What Stage 7 already reported is exactly the precondition --
     // Q5 on every curve, and Psi still a layout after the repair -- so it is
     // read rather than re-derived.
-    if (mode_ == Mode::MERIDIAN && meridianPhase_ >= MERIDIANPhase::Patches &&
+    if (inPipeline() && pipePhase_ >= PipelinePhase::Patches &&
         separatrices_.has_value() && !patchesAttempted_) {
         if (!patchesAnnounced_) {
             console_.log("[Patches] building the arrangement and fitting the splines, "
@@ -3385,47 +3858,6 @@ void CrossGenWidget::runComputations() {
         }
     }
 
-
-    // ── SIPG: Cut seams from converged SIPG field ─────────────────────────────
-    if (mode_ == Mode::SIPG && sipgPhase_ >= SIPGPhase::CutSeams &&
-        sipgField_.has_value() && !sipgCutMesh_.has_value()) {
-        auto t0 = Clock::now();
-        sipgCutMesh_.emplace(*sipgField_);
-        auto t1 = Clock::now();
-        std::ostringstream oss;
-        oss << "[SIPG CutSeams] " << sipgCutMesh_->getCutEdges().size() << " cut edges: "
-            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
-        console_.log(oss.str());
-
-        const auto &rep = sipgCutMesh_->sanityCheck();
-        console_.log(std::string("[SIPG CutSeams] ") +
-                     (rep.looksLikeDisk ? "disk \033[32m[PASS]\033[0m"
-                                        : "not a disk \033[31m[FAIL]\033[0m"));
-    }
-
-    // ── SIPG: UVGParam parametrization ───────────────────────────────────────
-    if (mode_ == Mode::SIPG && sipgPhase_ >= SIPGPhase::UVMesh &&
-        sipgCutMesh_.has_value() && !sipgUVParam_.has_value()) {
-        auto t0 = Clock::now();
-        try {
-            sipgUVParam_.emplace(*sipgCutMesh_);
-        } catch (const std::exception &e) {
-            console_.log(std::string("[UVGParam] ERROR: ") + e.what());
-        }
-        if (sipgUVParam_.has_value()) {
-            auto t1 = Clock::now();
-            std::ostringstream oss;
-            oss << "[UVGParam] Solved: "
-                << sipgUVParam_->getU().size() << " vertices: "
-                << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
-            console_.log(oss.str());
-
-            viewer::computeUVGParamBounds(*sipgUVParam_, uvView_.cx, uvView_.cy, uvView_.baseW, uvView_.baseH);
-            uvView_.zoom = 1.0;
-            uvView_.fbw  = view_.fbw;
-            uvView_.fbh  = view_.fbh;
-        }
-    }
 
     // ── Medial Axis: Delaunay re-triangulation ────────────────────────────────
     if (mode_ == Mode::MedialAxis && maPhase_ >= MedialAxisPhase::DelaunayMesh && !delaunayMesh_) {
@@ -3840,7 +4272,6 @@ void CrossGenWidget::renderTraceAnimation() {
 // what decides where a drag or a scroll lands.
 bool CrossGenWidget::inUVSplitScreen() const {
     return (mode_ == Mode::PolyVector && phase_ == Phase::UVMesh && miqSolver_.has_value()) ||
-           (mode_ == Mode::SIPG && sipgPhase_ == SIPGPhase::UVMesh && sipgUVParam_.has_value()) ||
            // The chord collapse phase takes the whole window back: what it has
            // to show is the structure before against the structure after, and
            // both of those live in the model.
@@ -3849,14 +4280,19 @@ bool CrossGenWidget::inUVSplitScreen() const {
            // The gallery of unfolded cone fans is not a parameter domain, but
            // it is a second world with its own scale in the right half of the
            // window, which is all this predicate is really asking.
-           (mode_ == Mode::MERIDIAN && meridianPhase_ == MERIDIANPhase::Metric &&
+           (mode_ == Mode::MERIDIAN && pipePhase_ == PipelinePhase::Metric &&
             !coneFans_.empty()) ||
+           // TORSION's Metric phase is a parameter domain in the ordinary
+           // sense, because its Stage 4 already happened: the right half is
+           // psi_0 itself rather than a gallery standing in for a metric.
+           (mode_ == Mode::TORSION && pipePhase_ == PipelinePhase::Metric &&
+            immersion_.has_value()) ||
            // Stages 4 to 6 do have a parameter domain in the ordinary sense:
            // psi_R and Psi are maps of Omega into the plane.
-           (mode_ == Mode::MERIDIAN && meridianPhase_ == MERIDIANPhase::Layout &&
+           (inPipeline() && pipePhase_ == PipelinePhase::Layout &&
             immersion_.has_value()) ||
            // Stage 7 draws the same domain again, with the curves on it.
-           (mode_ == Mode::MERIDIAN && meridianPhase_ == MERIDIANPhase::Separatrices &&
+           (inPipeline() && pipePhase_ == PipelinePhase::Separatrices &&
             immersion_.has_value());
 }
 
@@ -3924,19 +4360,26 @@ void CrossGenWidget::renderUMBERField() {
     }
 }
 
-// The model at whichever MERIDIAN stage is current: the mesh (or the flat
-// metric drawn over it), the cutting graph once it exists, and the cones on
-// top. Shared by the last four phases and by the left half of the split screen,
-// so that the cones stay in the same place and the same colours throughout.
+// The model at whichever pipeline stage is current: the mesh (or the flat
+// metric drawn over it, or the combed frames), the cutting graph once it
+// exists, and the cones on top. Shared by the last four phases, by both
+// pipelines and by the left half of the split screen, so that the cones stay in
+// the same place and the same colours throughout.
 void CrossGenWidget::renderMERIDIANModel() {
     // The stretch ramp is dropped again at the separatrix phase: what that one
     // is about is the curves, and a wireframe in the diverging ramp underneath
     // competes with them for exactly the colours they are drawn in.
-    const bool showMetric = (meridianPhase_ >= MERIDIANPhase::Metric &&
-                             meridianPhase_ != MERIDIANPhase::Separatrices &&
-                             meridianPhase_ != MERIDIANPhase::Patches &&
+    const bool showMetric = (pipePhase_ >= PipelinePhase::Metric &&
+                             pipePhase_ != PipelinePhase::Separatrices &&
+                             pipePhase_ != PipelinePhase::Patches &&
                              !flatMetric_.edges.empty());
-    const bool showU = (meridianPhase_ == MERIDIANPhase::RicciFlow && ricciU_.size() > 0);
+    const bool showU = (pipePhase_ == PipelinePhase::Flow && ricciU_.size() > 0);
+    // Pipeline B's Flow phase. The combed frames are drawn over a plain
+    // wireframe rather than over a filled field, because what is being looked
+    // at is where a_f *steps*, and that is a comparison between two adjacent
+    // triangles which a fill under them would flood.
+    const bool showFrames = (mode_ == Mode::TORSION &&
+                             pipePhase_ == PipelinePhase::Flow && frames_.has_value());
 
     // At the patch and mesh phases nothing of the model underneath is drawn at
     // all -- not the wireframe, not dS, not the cones. The block decomposition
@@ -3945,7 +4388,7 @@ void CrossGenWidget::renderMERIDIANModel() {
     // that was the point of the phase to get past. It is worse at the mesh
     // phase than at the patch one, where the quadrilaterals are near the size
     // of the triangles beneath them and the two grids read as one.
-    if (meridianPhase_ >= MERIDIANPhase::Patches) return;
+    if (pipePhase_ >= PipelinePhase::Patches) return;
 
     if (showMetric) {
         // The metric replaces the wireframe rather than covering it: every edge
@@ -3970,10 +4413,17 @@ void CrossGenWidget::renderMERIDIANModel() {
     // holonomy, and a cone sitting where the field turns is the whole argument
     // for putting one there. It goes once the cutting graph arrives, which
     // would otherwise be lost among the arrows.
-    if (meridianPhase_ == MERIDIANPhase::Cones && sipgField_.has_value())
+    if (pipePhase_ == PipelinePhase::Cones && sipgField_.has_value())
         viewer::drawTriangleCrossField(*mesh_, *sipgField_, scale_);
 
-    if (meridianPhase_ >= MERIDIANPhase::Cut && coneCut_.has_value())
+    // ... and comes back one phase later on the field route, as one branch of
+    // itself rather than as four indistinguishable arms. The cutting graph is
+    // drawn over it on purpose here: the arcs of G are exactly where a_f is
+    // allowed to step, so the two pictures only mean anything together.
+    if (showFrames)
+        viewer::drawCombedFrames(*mesh_, *frames_, scale_);
+
+    if (pipePhase_ >= PipelinePhase::Cut && coneCut_.has_value())
         viewer::drawCuttingGraph(*coneCut_, showMetric ? 2.0f : 3.5f);
     viewer::drawBoundaryEdges(*mesh_);
 
@@ -4033,81 +4483,6 @@ void CrossGenWidget::renderNormal() {
         }
 
         drawSplitDivider(halfW);
-    } else if (mode_ == Mode::SIPG) {
-        if (sipgPhase_ == SIPGPhase::UVMesh && sipgUVParam_.has_value()) {
-            // ── Split-screen: left = mesh with cut seams, right = UVGParam ────
-            int w = fbw(), h = fbh();
-            int halfW = w / 2;
-
-            // Left panel: mesh with combed field + cut seams
-            applyHalfOrtho(0, halfW, view_);
-            {
-                viewer::ViewState leftVs = view_;
-                leftVs.fbw = halfW;
-                leftVs.fbh = h;
-                viewer::drawAxis(leftVs);
-            }
-            viewer::drawMesh(*mesh_);
-            if (sipgCutMesh_.has_value()) {
-                viewer::drawUField(*mesh_, sipgCutMesh_->getUField(), scale_);
-                viewer::drawVField(*mesh_, sipgCutMesh_->getVField(), scale_);
-                if (!sipgCutMesh_->getSingularityPathCutEdges().empty())
-                    viewer::drawEdgeSetOnMesh(*mesh_, sipgCutMesh_->getCutEdges(), 1.0f, 0.75f, 0.1f, 4.0f);
-                else
-                    viewer::drawEdgeSetOnMesh(*mesh_, sipgCutMesh_->getCutEdges(), 1.0f, 0.2f, 0.9f, 3.5f);
-            }
-            if (sipgField_.has_value()) {
-                double ballRadius = 0.5 * avgEdge_;
-                for (const auto &[vertIdx, crossIndex] : sipgField_->singularVertices) {
-                    if (vertIdx < 0 || vertIdx >= static_cast<int>(mesh_->vertices.size())) continue;
-                    const Point &c = mesh_->vertices[vertIdx];
-                    if (crossIndex > 0)
-                        viewer::drawDisk3D(c, ballRadius, 0.2f, 0.2f, 0.95f);
-                    else
-                        viewer::drawDisk3D(c, ballRadius, 0.95f, 0.2f, 0.2f);
-                }
-            }
-
-            // Right panel: UVGParam
-            applyHalfOrtho(halfW, w - halfW, uvView_);
-            viewer::drawUVGParam(*sipgUVParam_);
-            viewer::drawFlippedUVTriangles(*sipgUVParam_);
-            if (sipgField_.has_value()) {
-                double uvRadius = 0.5 * avgEdge_;
-                viewer::drawSingularitiesOnUVG(*sipgUVParam_, sipgField_->singularVertices, uvRadius);
-            }
-
-            drawSplitDivider(halfW);
-        } else {
-        viewer::drawAxis(view_);
-        viewer::drawMesh(*mesh_);
-        if (sipgPhase_ >= SIPGPhase::CrossField && sipgField_.has_value()) {
-            if (sipgPhase_ < SIPGPhase::CutSeams || !sipgCutMesh_.has_value()) {
-                viewer::drawTriangleCrossField(*mesh_, *sipgField_, scale_);
-            }
-            double ballRadius = 0.5 * avgEdge_;
-            for (const auto &[vertIdx, crossIndex] : sipgField_->singularVertices) {
-                if (vertIdx < 0 || vertIdx >= static_cast<int>(mesh_->vertices.size())) continue;
-                const Point &c = mesh_->vertices[vertIdx];
-                if (crossIndex > 0)
-                    viewer::drawDisk3D(c, ballRadius, 0.2f, 0.2f, 0.95f);
-                else
-                    viewer::drawDisk3D(c, ballRadius, 0.95f, 0.2f, 0.2f);
-            }
-        }
-        if (sipgPhase_ >= SIPGPhase::CutSeams && sipgCutMesh_.has_value()) {
-            // Draw combed u and v fields
-            viewer::drawUField(*mesh_, sipgCutMesh_->getUField(), scale_);
-            viewer::drawVField(*mesh_, sipgCutMesh_->getVField(), scale_);
-            // Draw cut edges (singularity paths highlighted differently)
-            if (!sipgCutMesh_->getSingularityPathCutEdges().empty())
-                viewer::drawEdgeSetOnMesh(*mesh_, sipgCutMesh_->getCutEdges(), 1.0f, 0.75f, 0.1f, 4.0f);
-            else
-                viewer::drawEdgeSetOnMesh(*mesh_, sipgCutMesh_->getCutEdges(), 1.0f, 0.2f, 0.9f, 3.5f);
-            // Draw natural boundary edges in red
-            viewer::drawEdgeSetOnMesh(*mesh_, sipgCutMesh_->getNaturalBoundaryEdges(), 1.0f, 0.1f, 0.1f, 3.5f);
-        }
-        } // end else (non-UVMesh SIPG phases)
     } else if (mode_ == Mode::MBO) {
         viewer::drawAxis(view_);
         // The quantized grid is the payoff of this whole mode, and the
@@ -4312,8 +4687,8 @@ void CrossGenWidget::renderNormal() {
         viewer::drawAxis(view_);
         if (umberPhase_ < UMBERPhase::Frames || !umber_.has_value()) {
             viewer::drawMesh(*mesh_);
-            // The SIPG stages, drawn as SIPG mode draws them: the input field
-            // and the singularities Sec. 4.2 is about to move.
+            // The three SIPG stages UMBER shares with both layout pipelines:
+            // the input field and the singularities Sec. 4.2 is about to move.
             if (umberPhase_ >= UMBERPhase::CrossField && sipgField_.has_value()) {
                 viewer::drawTriangleCrossField(*mesh_, *sipgField_, scale_);
                 double ballRadius = 0.5 * avgEdge_;
@@ -4335,21 +4710,20 @@ void CrossGenWidget::renderNormal() {
             // failed to leave the interior.
             renderUMBERField();
         }
-    } else if (mode_ == Mode::MERIDIAN &&
-               (meridianPhase_ == MERIDIANPhase::Layout ||
-                meridianPhase_ == MERIDIANPhase::Separatrices) &&
+    } else if (inPipeline() &&
+               (pipePhase_ == PipelinePhase::Layout ||
+                pipePhase_ == PipelinePhase::Separatrices) &&
                immersion_.has_value()) {
         // ── Split-screen: left = the model, right = Omega in the plane ───────
         //
-        // The same arrangement SIPG mode's UVMesh phase uses, and for the same
-        // reason: this is the first MERIDIAN stage that produces a map, and a
-        // map is only readable against the thing it is a map of. The right half
+        // A map is only readable against the thing it is a map of, so it gets
+        // half the window and the model keeps the other. The right half
         // is Psi once the continuation has run and psi_R before it -- or after
         // it, on 'p', which is the only way to see what Stage 6 actually did.
         // At the separatrix phase the map is not a choice: the curves were
         // marched over Psi, and drawing them over psi_R would be drawing them
         // over a map they are not the integral curves of.
-        const bool wantPsiR = showPsiR_ && meridianPhase_ == MERIDIANPhase::Layout;
+        const bool wantPsiR = showPsiR_ && pipePhase_ == PipelinePhase::Layout;
         const std::vector<Point> &uv =
             (meridianLayout_.has_value() && !wantPsiR) ? meridianLayout_->getUV() : psiR_;
 
@@ -4391,7 +4765,45 @@ void CrossGenWidget::renderNormal() {
         }
 
         drawSplitDivider(halfW);
-    } else if (mode_ == Mode::MERIDIAN && meridianPhase_ == MERIDIANPhase::Metric &&
+    } else if (mode_ == Mode::TORSION && pipePhase_ == PipelinePhase::Metric &&
+               immersion_.has_value()) {
+        // ── Split-screen: left = the model, right = psi_0 ────────────────────
+        //
+        // The same two halves the Layout phase gets, one phase earlier, because
+        // on this route Stage 4 has already happened: there is no metric
+        // standing between the field and a map. What the right half is being
+        // judged on is not what it looks like but whether it inverted anything,
+        // which drawLayoutUV fills in red -- and on 'p' it is the Stage 4F
+        // least-squares map instead, where those red faces are the entire cost
+        // of substituting an integration for a flow.
+        //
+        // No labels are passed, because Stage 5 has not run: the boundary comes
+        // out grey rather than in Gamma_u / Gamma_v, which is honest about
+        // there being no labelling yet to colour it by.
+        const std::vector<Point> &uv =
+            (showIntegrated_ && !integratedMap_.empty()) ? integratedMap_
+                                                         : immersion_->getUV();
+
+        const int w = fbw();
+        const int halfW = w / 2;
+
+        applyHalfOrtho(0, halfW, view_);
+        {
+            viewer::ViewState leftVs = view_;
+            leftVs.fbw = halfW;
+            leftVs.fbh = fbh();
+            viewer::drawAxis(leftVs);
+        }
+        renderMERIDIANModel();
+
+        applyHalfOrtho(halfW, w - halfW, uvView_);
+        {
+            const double diag = std::hypot(uvView_.baseW, uvView_.baseH);
+            viewer::drawLayoutUV(*immersion_, nullptr, uv, 0.010 * diag * uvView_.zoom);
+        }
+
+        drawSplitDivider(halfW);
+    } else if (mode_ == Mode::MERIDIAN && pipePhase_ == PipelinePhase::Metric &&
                !coneFans_.empty()) {
         // ── Split-screen: left = the flat metric on the model, right = the
         //    cone angles it was driven to ─────────────────────────────────────
@@ -4417,10 +4829,10 @@ void CrossGenWidget::renderNormal() {
         viewer::drawConeFans(coneFans_);
 
         drawSplitDivider(halfW);
-    } else if (mode_ == Mode::MERIDIAN) {
+    } else if (inPipeline()) {
         viewer::drawAxis(view_);
-        if (meridianPhase_ < MERIDIANPhase::Cones || !cones_.has_value()) {
-            // The SIPG stages, drawn as SIPG mode draws them: the field whose
+        if (pipePhase_ < PipelinePhase::Cones || !cones_.has_value()) {
+            // The three SIPG stages both pipelines start from: the field whose
             // holonomy Sec. 3.1 is about to turn into cone indices, and the
             // interior singularities it already found.
             if (showMaterialFill_ && interfaces_.has_value() && interfaces_->multiMaterial())
@@ -4429,7 +4841,7 @@ void CrossGenWidget::renderNormal() {
             // Stage 0b needs neither, so its network is already there to see.
             if (showInterfaces_ && interfaces_.has_value())
                 viewer::drawInterfaceNetwork(*interfaces_, 0.4 * avgEdge_, 3.0f);
-            if (meridianPhase_ >= MERIDIANPhase::CrossField && sipgField_.has_value()) {
+            if (pipePhase_ >= PipelinePhase::CrossField && sipgField_.has_value()) {
                 viewer::drawTriangleCrossField(*mesh_, *sipgField_, scale_);
                 const double ballRadius = 0.5 * avgEdge_;
                 for (const auto &[vertIdx, crossIndex] : sipgField_->singularVertices) {
@@ -4446,7 +4858,7 @@ void CrossGenWidget::renderNormal() {
             // The blocks over the model, once Stages 8 and 9 have produced
             // any: this is the whole of what the phase is for, and it is
             // drawn last so no wireframe edge crosses a patch side.
-            if (meridianPhase_ == MERIDIANPhase::Mesh && quadMesh_.has_value()) {
+            if (pipePhase_ == PipelinePhase::Mesh && quadMesh_.has_value()) {
                 // Stage 10 draws its own block walls off the blocks it built,
                 // so drawLayoutPatches would only lay a second, differently
                 // sourced copy of them over the first. A face Stage 10 could
@@ -4455,7 +4867,7 @@ void CrossGenWidget::renderNormal() {
                 viewer::drawQuadMesh(*quadMesh_, 1.0f, 2.5f,
                                      showMaterialFill_ && interfaces_.has_value() &&
                                          interfaces_->multiMaterial());
-            } else if (meridianPhase_ >= MERIDIANPhase::Patches && arrangement_.has_value()) {
+            } else if (pipePhase_ >= PipelinePhase::Patches && arrangement_.has_value()) {
                 viewer::drawLayoutPatches(*arrangement_,
                                           splines_.has_value() ? &*splines_ : nullptr,
                                           0.30 * avgEdge_, 3.0f);
@@ -4465,7 +4877,7 @@ void CrossGenWidget::renderNormal() {
             // rather than running along it is exactly the defect the whole
             // multi-material path exists to prevent, and nothing else in the
             // frame shows it.
-            if (showInterfaces_ && meridianPhase_ >= MERIDIANPhase::Patches &&
+            if (showInterfaces_ && pipePhase_ >= PipelinePhase::Patches &&
                 interfaces_.has_value())
                 viewer::drawInterfaceNetwork(*interfaces_, 0.25 * avgEdge_, 2.0f);
         }
@@ -4572,28 +4984,32 @@ void CrossGenWidget::renderNormal() {
                                       "quasi-eigenfunction");
     }
 
-    // MERIDIAN: the node colours of the interface network, above the cone
-    // legend, whenever the network is on screen.
-    const bool sepLegendShown = (mode_ == Mode::MERIDIAN && cones_.has_value() &&
-                                 meridianPhase_ == MERIDIANPhase::Separatrices &&
+    // Either pipeline: the node colours of the interface network, above the
+    // cone legend, whenever the network is on screen.
+    const bool sepLegendShown = (inPipeline() && cones_.has_value() &&
+                                 pipePhase_ == PipelinePhase::Separatrices &&
                                  separatrices_.has_value());
-    if (mode_ == Mode::MERIDIAN && showInterfaces_ && interfaces_.has_value() &&
+    if (inPipeline() && showInterfaces_ && interfaces_.has_value() &&
         interfaces_->multiMaterial()) {
         viewer::drawInterfaceLegend(fbw(), fbh(), sepLegendShown);
     }
 
-    // MERIDIAN: the cone colours everywhere they are drawn, and whichever ramp
-    // the current phase is using under them.
-    if (mode_ == Mode::MERIDIAN && cones_.has_value()) {
+    // Either pipeline: the cone colours everywhere they are drawn, and
+    // whichever ramp -- or, on the field route, whichever palette -- the
+    // current phase is using under them.
+    if (inPipeline() && cones_.has_value()) {
         viewer::drawConeLegend(fbw(), fbh());
-        if (meridianPhase_ == MERIDIANPhase::Separatrices && separatrices_.has_value()) {
+        if (pipePhase_ == PipelinePhase::Separatrices && separatrices_.has_value()) {
             viewer::drawSeparatrixLegend(fbw(), fbh());
-        } else if (meridianPhase_ == MERIDIANPhase::RicciFlow && ricciU_.size() > 0) {
+        } else if (mode_ == Mode::TORSION && pipePhase_ == PipelinePhase::Flow &&
+                   frames_.has_value()) {
+            viewer::drawCombedFrameLegend(fbw(), fbh(), *frames_);
+        } else if (pipePhase_ == PipelinePhase::Flow && ricciU_.size() > 0) {
             viewer::drawScalarFieldLegend(fbw(), fbh(), -ricciUAbsMax_, ricciUAbsMax_,
                                           "conformal factor u, mean removed");
-        } else if (meridianPhase_ >= MERIDIANPhase::Metric &&
-                   meridianPhase_ != MERIDIANPhase::Separatrices &&
-                   meridianPhase_ != MERIDIANPhase::Patches &&
+        } else if (pipePhase_ >= PipelinePhase::Metric &&
+                   pipePhase_ != PipelinePhase::Separatrices &&
+                   pipePhase_ != PipelinePhase::Patches &&
                    !flatMetric_.edges.empty()) {
             viewer::drawScalarFieldLegend(fbw(), fbh(), -flatMetric_.absMax, flatMetric_.absMax,
                                           "log(l_flat / l_input), mean removed");
@@ -4602,16 +5018,16 @@ void CrossGenWidget::renderNormal() {
 
     // Overlay text. On a multi-material model the two display toggles are
     // appended to whatever the phase's own help says, since they apply at every
-    // MERIDIAN phase and to none of the other modes.
+    // phase of either pipeline and to none of the other modes.
     const std::string meridianKeys =
-        (mode_ == Mode::MERIDIAN && interfaces_.has_value() && interfaces_->multiMaterial())
+        (inPipeline() && interfaces_.has_value() && interfaces_->multiMaterial())
             ? std::string("press 'i' to show/hide the interface network\n"
                           "press 'm' to fill the triangles by material\n")
             : std::string();
 
     if (mode_ == Mode::Unselected) {
         renderOverlay("press '1' for PolyVector mode\npress '2' for MBO mode\n"
-                      "press '3' for Medial Axis mode\npress '4' for SIPG mode\n"
+                      "press '3' for Medial Axis mode\npress '4' for TORSION mode\n"
                       "press '5' for OASIS mode\npress '6' for UMBER mode\n"
                       "press '7' for MERIDIAN mode\n"
                       "right-drag to pan, scroll to zoom\n"
@@ -4619,16 +5035,20 @@ void CrossGenWidget::renderNormal() {
     } else if (mode_ == Mode::OASIS) {
         renderOverlay("press 'c' to change lambda / orientation\n"
                       "press 'r' to restart\npress 'q' to quit");
-    } else if (mode_ == Mode::MERIDIAN && meridianPhase_ == MERIDIANPhase::Layout &&
+    } else if (mode_ == Mode::TORSION && pipePhase_ == PipelinePhase::Metric &&
+               immersion_.has_value() && !integratedMap_.empty()) {
+        renderOverlay((meridianKeys + "press 'p' to swap psi_0 / the Stage 4F map\n"
+                                      "press 'r' to restart\npress 'q' to quit").c_str());
+    } else if (inPipeline() && pipePhase_ == PipelinePhase::Layout &&
                meridianLayout_.has_value()) {
         renderOverlay((meridianKeys + "press 'p' to swap psi_R / Psi\n"
                                       "press 'r' to restart\npress 'q' to quit").c_str());
-    } else if (mode_ == Mode::MERIDIAN && meridianPhase_ == MERIDIANPhase::Mesh) {
+    } else if (inPipeline() && pipePhase_ == PipelinePhase::Mesh) {
         renderOverlay((meridianKeys +
                        "press 'c' to mesh again at another target edge length\n"
                        "press 'n' to change the connectivity settings and trace again\n"
                        "press 'r' to restart\npress 'q' to quit").c_str());
-    } else if (mode_ == Mode::MERIDIAN && meridianPhase_ == MERIDIANPhase::Patches) {
+    } else if (inPipeline() && pipePhase_ == PipelinePhase::Patches) {
         renderOverlay((meridianKeys + "press 'c' to mesh the patches (Stage 10)\n"
                        "press 'n' to change the connectivity settings and trace again\n"
                        "press 'r' to restart\npress 'q' to quit").c_str());

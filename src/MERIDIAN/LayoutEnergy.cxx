@@ -151,13 +151,85 @@ void LayoutEnergy::buildReference(Reference ref) {
     refM.assign(nT, {0.0, 0.0, 0.0, 0.0});
     refArea.assign(nT, 0.0);
 
+    // Reference::Field composes the model's own geometry with the field frame:
+    // refM = (J*_t E_t)^-1, E_t = [p1 - p0, p2 - p0] the triangle's real edge
+    // matrix. J = D refM is then the identity exactly when the map's Jacobian
+    // is J*_t, which is the statement E1 is wanted to make. The reference area
+    // scales by det J*_t, as it must for E1's integral to stay an integral over
+    // the reference.
+    //
+    // Note that this is not the Euclidean reference with something added to it.
+    // The Euclidean branch below lays its triangle down from three side lengths
+    // in a canonical position, so the J it produces is the true Jacobian times
+    // an arbitrary rotation -- harmless for ||J||_F, which is rotation
+    // invariant, and fatal here, because J*_t is stated in the *global* frame
+    // and a per-triangle rotation on the right would compare it against a
+    // differently rotated one on every face.
+    if (ref == Reference::Induced &&
+        options.referenceLengths.size() != om.edges.size()) {
+        report.messages.push_back(
+            "Reference::Induced was asked for without one length per edge of the input mesh; "
+            "falling back to the Euclidean reference, whose planar version has no cones.");
+    }
+
+    if (ref == Reference::Field) {
+        int leftHanded = 0;
+        const bool haveFrames = options.fieldFrames.size() == static_cast<size_t>(nT);
+        if (!haveFrames) {
+            report.messages.push_back(
+                "Reference::Field was asked for without one J* per triangle; falling back to "
+                "the Euclidean reference, whose planar version has no cones at all.");
+        }
+        for (int t = 0; haveFrames && t < nT; ++t) {
+            const Triangle &tri = cm->triangles[t];
+            const Point e1 = cm->vertices[tri[1]] - cm->vertices[tri[0]];
+            const Point e2 = cm->vertices[tri[2]] - cm->vertices[tri[0]];
+            const std::array<double, 4> &Js = options.fieldFrames[t];
+            const double detJs = Js[0] * Js[3] - Js[1] * Js[2];
+
+            // A = J* E, row-major.
+            const double a00 = Js[0] * e1[0] + Js[1] * e1[1];
+            const double a01 = Js[0] * e2[0] + Js[1] * e2[1];
+            const double a10 = Js[2] * e1[0] + Js[3] * e1[1];
+            const double a11 = Js[2] * e2[0] + Js[3] * e2[1];
+            const double det = a00 * a11 - a01 * a10;
+
+            if (!(detJs > 0.0) || !(det > 0.0) || !std::isfinite(det)) {
+                ++leftHanded;
+                continue;   // left to the Euclidean fallback in the loop below
+            }
+            refM[t][0] =  a11 / det;
+            refM[t][1] = -a01 / det;
+            refM[t][2] = -a10 / det;
+            refM[t][3] =  a00 / det;
+            refArea[t] = 0.5 * det;
+        }
+        report.leftHandedFrames = leftHanded;
+        if (haveFrames && leftHanded == 0) return;
+        if (leftHanded > 0) {
+            std::ostringstream oss;
+            oss << leftHanded << " triangle(s) were handed a frame with det J* <= 0. A combed "
+                << "field hands back a left-handed frame wherever a matching is wrong, and "
+                << "until that is fixed the flip cap's identity \"det J > 0 iff the image "
+                << "triangle is not inverted\" is void on them; they were given the Euclidean "
+                << "reference so that the run continues.";
+            report.messages.push_back(oss.str());
+        }
+    }
+
     int degenerate = 0;
     for (int t = 0; t < nT; ++t) {
+        // Field triangles already filled above; only the left-handed ones and
+        // the no-frames fallback drop through here.
+        if (ref == Reference::Field && refArea[t] > 0.0) continue;
         double l01, l12, l20;
-        if (ref == Reference::Ricci) {
-            l01 = flat[om.triangleEdges[t][0]];
-            l12 = flat[om.triangleEdges[t][1]];
-            l20 = flat[om.triangleEdges[t][2]];
+        const bool induced = ref == Reference::Induced &&
+                             options.referenceLengths.size() == om.edges.size();
+        if (ref == Reference::Ricci || induced) {
+            const std::vector<double> &src = induced ? options.referenceLengths : flat;
+            l01 = src[om.triangleEdges[t][0]];
+            l12 = src[om.triangleEdges[t][1]];
+            l20 = src[om.triangleEdges[t][2]];
         } else {
             const Triangle &tri = cm->triangles[t];
             l01 = normP(cm->vertices[tri[1]] - cm->vertices[tri[0]]);
@@ -977,8 +1049,8 @@ bool LayoutEnergy::constraintsUnder(double tol) const {
 // and never let the continuation settle.
 // ---------------------------------------------------------------------------
 bool LayoutEnergy::run() {
-    lambda[1] = options.lambda1;
-    for (int j = 2; j <= 6; ++j) lambda[j] = options.lambdaInit;
+    lambda[1] = options.lambda1 * options.lambdaFactor[1];
+    for (int j = 2; j <= 6; ++j) lambda[j] = options.lambdaInit * options.lambdaFactor[j];
     // E4 is the one constraint psi_R already satisfies exactly, so its penalty
     // has a different job from the others: not to *reach* Q4 over the course of
     // the continuation but to hold it while E2, E3 and E5 drag the map around.
@@ -989,7 +1061,7 @@ bool LayoutEnergy::run() {
     // the l_e^-1 weighting of Eq. (17) makes that *largest* on the short seam
     // edges, which are the ones at the cones. So E4 starts level with the
     // distortion term and grows from there.
-    lambda[4] = std::max(options.lambdaInit, options.lambda1);
+    lambda[4] = std::max(options.lambdaInit, options.lambda1) * options.lambdaFactor[4];
 
     measure(true);
     report.energyStart = energy(x);

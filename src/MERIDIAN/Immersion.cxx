@@ -85,6 +85,75 @@ Immersion::Immersion(const ConeCut &cut, const RicciFlow &ricci, const ConeSingu
 }
 
 // ---------------------------------------------------------------------------
+// The field constructor -- docs/cf_flow_pipeline.md Sec. 6.2
+//
+// buildLengths() and layout() are the only two things the Ricci route does that
+// a field route has already done for itself, so they are the only two skipped.
+// The cone bookkeeping above them and the four stages below them are common to
+// both, and they are common *by construction*: every one of them reads ConeCut
+// and nothing else about the metric.
+//
+// normaliseOrientation() is skipped as well, and deliberately. It exists
+// because the unfolding's seed triangle fixes the handedness of the whole
+// immersion to whatever that one face's winding happened to be, which is an
+// artefact of the unfolding. An integrated map has no seed: its handedness is
+// the field's, det J*_t > 0 everywhere, and a negative total area here would be
+// a real fold and not a convention to be reflected away. Reflecting it would
+// hide exactly the failure Q1 is here to catch.
+// ---------------------------------------------------------------------------
+Immersion::Immersion(const ConeCut &cut, const ConeSingularities &conesIn,
+                     const std::vector<Point> &psi,
+                     const std::vector<double> &flatEdgeLengths,
+                     const std::vector<double> &faceAngleIn)
+    : cutter(&cut), cones(&conesIn), orig(cut.getOriginalMeshPtr()),
+      cutMesh(cut.getCutMesh()) {
+    if (!orig) throw std::runtime_error("Immersion: the cut has no source mesh");
+    if (&conesIn.getMesh() != orig.get()) {
+        throw std::runtime_error("Immersion: the cones were measured on a different mesh");
+    }
+    if (cutMesh.triangles.size() != orig->triangles.size()) {
+        throw std::runtime_error("Immersion: Omega does not have one face per face of S");
+    }
+    if (psi.size() != cutMesh.vertices.size()) {
+        throw std::runtime_error("Immersion: the integrated map has one point per vertex of "
+                                 "Omega, and this one does not");
+    }
+    if (flatEdgeLengths.size() != orig->edges.size()) {
+        throw std::runtime_error("Immersion: the field metric has one length per edge of S, "
+                                 "and this one does not");
+    }
+    if (!faceAngleIn.empty() && faceAngleIn.size() != orig->triangles.size()) {
+        throw std::runtime_error("Immersion: the combed field angle has one value per face of "
+                                 "S, and this one does not");
+    }
+
+    fromField = true;
+    faceAngle = faceAngleIn;
+
+    const auto &o2c = cutter->getOriginalToCutVertices();
+    cutVertCone.assign(cutMesh.vertices.size(), -1);
+    for (const auto &c : cones->getCones()) {
+        const int slot = static_cast<int>(coneVertex.size());
+        coneVertex.push_back(c.vertex);
+        coneIndex.push_back(c.index);
+        coneChildren.push_back(o2c[c.vertex]);
+        for (int cv : o2c[c.vertex]) cutVertCone[cv] = slot;
+    }
+
+    flatLen = flatEdgeLengths;
+    buildCutLengths();
+    uv = psi;
+    report.cutVertices = static_cast<int>(cutMesh.vertices.size());
+    report.placedVertices = report.cutVertices;
+    report.unplacedVertices = 0;
+
+    buildArcs();
+    fitTransitions();
+    alignToAxes();
+    check();
+}
+
+// ---------------------------------------------------------------------------
 // buildLengths()
 //
 // The flat metric arrives as one length per edge of the *input* mesh; Omega
@@ -105,6 +174,17 @@ void Immersion::buildLengths(const RicciFlow &ricci) {
         report.messages.push_back(oss.str());
     }
 
+    buildCutLengths();
+}
+
+// ---------------------------------------------------------------------------
+// buildCutLengths()
+//
+// flatLen re-indexed by the edges of Omega. Split out of buildLengths() because
+// the field constructor is handed flatLen ready-made -- from the field metric
+// rather than from the flow -- and still needs this half of it.
+// ---------------------------------------------------------------------------
+void Immersion::buildCutLengths() {
     std::unordered_map<EdgeKey, int, EdgeKeyHash> origEdgeIndex;
     origEdgeIndex.reserve(orig->edges.size() * 2);
     for (int e = 0; e < static_cast<int>(orig->edges.size()); ++e) {
@@ -403,6 +483,18 @@ void Immersion::fitTransitions() {
         std::vector<double> pairLen;
         bool broken = false;
 
+        // The field route's exact transition. Reading it off the frames rather
+        // than fitting it is what makes C2 hold by construction: with the same
+        // dx on both sides of the seam, dpsi+ = J*_+ dx and dpsi- = J*_- dx, so
+        // the rotation taking the minus side to the plus side is
+        // J*_+ (J*_-)^-1 = R(theta_hat_- - theta_hat_+), and the combing has
+        // already made that a whole number of quarter turns. Which face is
+        // which is settled here and nowhere else -- fPlus is the one traversing
+        // the arc in the direction of travel -- so this is where the frames are
+        // read, and the "+"/"-" of the transition cannot drift away from the
+        // "+"/"-" of the pairing.
+        int frameK = -1;
+
         for (size_t t = 0; t + 1 < path.size(); ++t) {
             const int a = path[t], b = path[t + 1];
             auto ie = origEdgeIndex.find(EdgeKey(a, b));
@@ -423,6 +515,16 @@ void Immersion::fitTransitions() {
             if (directedIn(fA, a, b))      { fPlus = fA; fMinus = fB; }
             else if (directedIn(fB, a, b)) { fPlus = fB; fMinus = fA; }
             else { broken = true; break; }   // inconsistent winding across the edge
+
+            if (!faceAngle.empty()) {
+                const double turns = (faceAngle[fMinus] - faceAngle[fPlus]) / M_PI_2;
+                const long rounded = std::lround(turns);
+                report.maxFrameKResidual = std::max(report.maxFrameKResidual,
+                                                    std::fabs(turns - static_cast<double>(rounded)) * M_PI_2);
+                const int kk = static_cast<int>(((rounded % 4) + 4) % 4);
+                if (frameK < 0) frameK = kk;
+                else if (frameK != kk) ++report.frameKConflicts;
+            }
 
             const int pa = cutMesh.triangles[fPlus][localOf(fPlus, a)];
             const int pb = cutMesh.triangles[fPlus][localOf(fPlus, b)];
@@ -490,8 +592,13 @@ void Immersion::fitTransitions() {
         }
         arc.theta = std::atan2(sc, sd);
 
+        // The fit is always taken. Where the frames supplied a k it is the fit
+        // that gives way, and snapError stops being a rounding step and becomes
+        // a check on the branch selection: how far the geometry of the map is
+        // from the quarter turn the matchings say the arc carries.
         int k = static_cast<int>(std::lround(arc.theta / M_PI_2));
         k = ((k % 4) + 4) % 4;
+        if (frameK >= 0) k = frameK;
         arc.k = k;
         arc.snapError = std::fabs(wrap_pi(arc.theta - k * M_PI_2));
 
@@ -720,14 +827,35 @@ void Immersion::check() {
     }
     if (report.maxMetricResidual > 1e-6) {
         std::ostringstream oss;
-        oss << "The unfolding is off the flat metric by up to "
-            << report.maxMetricResidual << " relative.";
+        if (fromField) {
+            // Not a failure and not the same statement. The unfolding realises
+            // its metric or it has gone wrong; an integrated map realises the
+            // field metric only as far as the field is integrable, and this is
+            // that gap measured per edge. It is the number Sec. 7.3 of
+            // docs/cf_flow_pipeline.md sends refinement after.
+            oss << "The integrated map is off the field metric by up to "
+                << report.maxMetricResidual << " relative; that is the "
+                << "non-integrability of the field, edge by edge, and not a "
+                << "broken layout.";
+        } else {
+            oss << "The unfolding is off the flat metric by up to "
+                << report.maxMetricResidual << " relative.";
+        }
+        report.messages.push_back(oss.str());
+    }
+    if (report.frameKConflicts > 0) {
+        std::ostringstream oss;
+        oss << report.frameKConflicts << " seam edge(s) disagree with the rest of their arc "
+            << "about its quarter turn (worst frame residual " << report.maxFrameKResidual
+            << " rad). The combing leaked across G somewhere; the arc membership test is "
+            << "what to look at, not the field.";
         report.messages.push_back(oss.str());
     }
 
     report.valid = report.unplacedVertices == 0 && report.flippedFaces == 0 &&
-                   report.degenerateFaces == 0 && report.maxMetricResidual < 1e-6 &&
-                   report.degenerateArcs == 0;
+                   report.degenerateFaces == 0 && report.degenerateArcs == 0 &&
+                   (fromField ? report.frameKConflicts == 0
+                              : report.maxMetricResidual < 1e-6);
 }
 
 // ---------------------------------------------------------------------------

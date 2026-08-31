@@ -216,8 +216,79 @@
 // placement -- and run() says so by name rather than reporting a number.
 class LayoutEnergy {
 public:
-    // Which metric J is measured against. Sec. 3.3's final paragraph.
-    enum class Reference { Ricci = 0, Euclidean = 1 };
+    // Which metric J is measured against. Sec. 3.3's final paragraph, plus one
+    // the paper does not have.
+    //
+    // Field is Pipeline B's answer to C4 (docs/cf_flow_pipeline.md Secs. 2.1
+    // and 4). A field-integrated map has no flat metric to be measured against,
+    // and the note above says at length what happens if it settles for the
+    // Euclidean one instead: on a planar input that reference has no cones, so
+    // "J is a rotation" and Q2 contradict each other and E1 pays for Q2 by
+    // shredding the cone one-rings. The cross field's own frame does have the
+    // cones -- its holonomy around one *is* (pi/2) I -- so measuring J against
+    //
+    //     J*_t = [ X_t | Y_t ]^T,   X_t = (1/h_t)( cos th_t,  sin th_t)
+    //                               Y_t = (1/h_t)(-sin th_t,  cos th_t)
+    //
+    // restores the agreement. E1 then reads "how far is the map from the frame
+    // the field asked for at this triangle", which is the same question the
+    // Ricci reference asks and is the one an integrated map is the answer to.
+    //
+    // The reference is composed with the model's own geometry rather than
+    // replacing it: refM = (J*_t E_t)^-1 with E_t the triangle's real edge
+    // matrix, so J = I exactly when the map's Jacobian is J*_t. h_t is the
+    // target edge length and is where a sizing field goes -- it is Pipeline B's
+    // analogue of the global scaling of the Ricci metric, and unlike that one
+    // it can vary per face.
+    //
+    // ### Measured: Field does not answer C4, and cannot
+    //
+    // The construction above is the plan's own (Sec. 4 of
+    // docs/cf_flow_pipeline.md) and Sec. 11's risk register asks for it to be
+    // tested standalone before anything is built on it. It was, by
+    // TestTORSION --ref-test, and it fails:
+    //
+    //     det J: Field vs Euclidean differ by at most 9.3e-16 relative
+    //
+    // -- on geom003, Reference::Field and Reference::Euclidean are the same
+    // function to machine precision. The reason is one line of algebra. The
+    // frame is a *scaled rotation*, J*_t = R(-theta_t)/h, so
+    //
+    //     J_field = J_true (J*_t)^-1 = h J_true R(theta_t)
+    //
+    // and that is a rotation applied on the **right** of J. ||J||_F does not
+    // see a rotation on the right, and neither does ||J^-1||_F, so
+    //
+    //     ||J_field||^2 + ||J_field^-1||^2
+    //         = h^2 ||J_true||^2 + h^-2 ||J_true^-1||^2
+    //
+    // with theta_t gone from both terms; and the reference area scales by
+    // det J* = 1/h^2, which at h = 1 leaves the two energies not merely similar
+    // but identical. Reference::Field therefore inherits the geom003 failure
+    // documented above word for word: Q2 at the non-cone boundary vertices goes
+    // to pi, Stage 10 inverts four elements it cannot smooth out, and the mesh
+    // drops from 1001 quadrilaterals to 656.
+    //
+    // The cone structure the field carries lives entirely in that rotation, and
+    // E1 is blind to it. The lesson generalises past this codebase: a reference
+    // metric has to differ from the Euclidean one in the *shape* of its
+    // triangles, and an orientation cannot carry a cone into a
+    // rotation-invariant energy.
+    //
+    // ### Induced, which does answer it
+    //
+    // Reference::Induced builds the reference from three side lengths in
+    // exactly the way Reference::Ricci does, from lengths the caller supplies
+    // in Options::referenceLengths. Pipeline B fills them with the lengths psi_0
+    // itself induces, |psi_0(i) - psi_0(j)|, and that metric has the cone
+    // structure for a reason that costs nothing to arrange: the seam
+    // constraints of the integration are exact rotations, so psi_0's image
+    // angle sum at a cone is already 2 pi - (pi/2) I to eight digits before
+    // Stage 6 runs. It is a flat cone metric with the right cones, obtained
+    // without a flow, and E1 measured against it starts at its own minimum --
+    // J a rotation on every triangle -- which is exactly where the Ricci route
+    // starts.
+    enum class Reference { Ricci = 0, Euclidean = 1, Field = 2, Induced = 3 };
 
     struct Options {
         double lambda1 = 1.0;        // fixed; it is the injectivity barrier
@@ -245,6 +316,37 @@ public:
         int maxBacktracks = 50;
 
         Reference reference = Reference::Ricci;
+
+        // Reference::Field's J*_t, one 2x2 stored row-major per triangle, in
+        // the face order of the mesh. Required by, and only read by, that
+        // reference. det J*_t must be positive on every triangle -- the flip
+        // cap's identity "det J > 0 iff the image triangle is not inverted"
+        // rests on the reference being positively oriented -- and a triangle
+        // where it is not is counted in Report::leftHandedFrames and given the
+        // Euclidean reference instead, so that the run continues and the
+        // diagnosis is by name rather than by a run that quietly stops
+        // descending.
+        std::vector<std::array<double, 4>> fieldFrames;
+
+        // Reference::Induced's metric: one length per edge of the *input* mesh,
+        // in the indexing Immersion::getFlatEdgeLengths() uses. Required by,
+        // and only read by, that reference; supplied with the wrong length the
+        // Euclidean reference is used instead and the fallback is reported.
+        std::vector<double> referenceLengths;
+
+        // Per-energy multipliers on the penalties, index 1..6, applied to the
+        // starting lambda and therefore surviving every growth step (a factor
+        // of zero switches an energy off for the whole continuation).
+        //
+        // The continuation of Sec. 3.3 wants all five raised together and these
+        // are all 1 for it. Sec. 7.2 of docs/cf_flow_pipeline.md wants
+        // something else and wants it out of the same solver: the untangling
+        // pass that repairs a field-integrated map is exactly this energy with
+        // E1 against Reference::Field and a single mu on E4, started from a
+        // Tutte embedding -- no boundary alignment, no features, no
+        // connectivity, because none of those are what that pass is for. It is
+        // one minimisation with four terms switched off, not a second solver.
+        double lambdaFactor[7] = {1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
 
         // Off: on a planar input the Euclidean reference has no cones, so it
         // fights Q2 rather than offering a second local minimum. See "Why the
@@ -283,6 +385,11 @@ public:
         int factorisationFallbacks = 0;
         int relabels = 0;
         int referenceSwitches = 0;
+        // Reference::Field only: triangles whose supplied J*_t had a
+        // non-positive determinant. A combed field hands back a left-handed
+        // frame wherever a matching is wrong, so this is a statement about the
+        // combing and not about the map.
+        int leftHandedFrames = 0;
 
         double lambdaFinal[5] = {0.0, 0.0, 0.0, 0.0, 0.0};   // lambda_2 .. lambda_6
         double energyStart = 0.0, energyEnd = 0.0;
