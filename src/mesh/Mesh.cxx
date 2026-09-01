@@ -2,6 +2,7 @@
 #include "Mesh.hxx"
 #include "VertexTriangleCSR.hxx"
 
+static bool fitCircleKasa(const std::vector<Point> &pts, Point &center, double &radius);
 
 // Helper struct for hashing an undirected edge (min,max)
 struct EdgeKey {
@@ -151,7 +152,199 @@ Mesh::Mesh(const std::vector<Point> &verts, const std::vector<Triangle> &tris,
 	
 	// Build CSR mapping of vertex -> incident triangles (CCW order)
 	vertexTriangles = VertexTriangleCSR::buildFromMesh(*this);
+
+	computeMaterialCircles();
 }
+
+// Algebraic (Kasa) least-squares circle fit through `pts`. Minimizes
+// sum (x^2+y^2 - D*x - E*y - F)^2, whose stationary point is linear in
+// (D,E,F) -- solved here as a plain 3x3 system rather than pulling in Eigen
+// for a header only Mesh already avoids depending on it. Returns false (and
+// leaves center/radius untouched) if the system is singular, which happens
+// when the points are collinear or fewer than 3 are given.
+static bool fitCircleKasa(const std::vector<Point> &pts, Point &center, double &radius) {
+	if (pts.size() < 3) return false;
+
+	double Sx = 0, Sy = 0, Sxx = 0, Syy = 0, Sxy = 0, Sxz = 0, Syz = 0, Sz = 0;
+	const double n = static_cast<double>(pts.size());
+	for (const auto &p : pts) {
+		double x = p[0], y = p[1];
+		double z = x * x + y * y;
+		Sx += x; Sy += y; Sxx += x * x; Syy += y * y; Sxy += x * y;
+		Sxz += x * z; Syz += y * z; Sz += z;
+	}
+
+	// Normal-equation matrix [[Sxx,Sxy,Sx],[Sxy,Syy,Sy],[Sx,Sy,n]] * (D,E,F) = (Sxz,Syz,Sz)
+	double a00 = Sxx, a01 = Sxy, a02 = Sx;
+	double a10 = Sxy, a11 = Syy, a12 = Sy;
+	double a20 = Sx,  a21 = Sy,  a22 = n;
+
+	auto det3 = [](double m00, double m01, double m02,
+	               double m10, double m11, double m12,
+	               double m20, double m21, double m22) {
+		return m00 * (m11 * m22 - m12 * m21)
+		     - m01 * (m10 * m22 - m12 * m20)
+		     + m02 * (m10 * m21 - m11 * m20);
+	};
+
+	double det = det3(a00, a01, a02, a10, a11, a12, a20, a21, a22);
+	if (std::fabs(det) < 1e-12) return false;
+
+	// Cramer's rule: replace each column in turn with the RHS (Sxz, Syz, Sz).
+	double D = det3(Sxz, a01, a02, Syz, a11, a12, Sz, a21, a22) / det;
+	double E = det3(a00, Sxz, a02, a10, Syz, a12, a20, Sz, a22) / det;
+	double F = det3(a00, a01, Sxz, a10, a11, Syz, a20, a21, Sz) / det;
+
+	center = Point{D / 2.0, E / 2.0};
+	double r2 = F + center[0] * center[0] + center[1] * center[1];
+	if (r2 <= 0.0) return false;
+	radius = std::sqrt(r2);
+	return true;
+}
+
+// Fills materialComponents, triangleComponent and materialCircle.
+//
+// The boundary of a region -- a component or a whole material -- is every edge
+// with the region on exactly one side: a mesh boundary edge whose lone
+// triangle is inside, or an interior edge whose two triangles straddle the
+// region. That predicate degenerates to dS for a single-material mesh (there
+// triangleMatId is uniform, so only mesh-boundary edges qualify) and gives the
+// material's own boundary -- including the interface arcs it shares with a
+// neighbour -- for a multi-material one, so one code path covers both.
+void Mesh::computeMaterialCircles(double tol, double maxChordFrac) {
+	materialComponents.clear();
+	triangleComponent.assign(triangles.size(), -1);
+	materialCircle.clear();
+	if (triangles.empty()) return;
+
+	// -- Connected components of same-material triangles -------------------
+	//
+	// Flood fill over triangleAdjacency, refusing to cross an edge whose two
+	// triangles carry different material ids. What comes out of a
+	// single-material mesh is one component per connected piece of it, which
+	// for the corpus is the whole mesh.
+	const int NT = static_cast<int>(triangles.size());
+	std::vector<int> stack;
+	for (int seed = 0; seed < NT; ++seed) {
+		if (triangleComponent[seed] >= 0) continue;
+		int comp = static_cast<int>(materialComponents.size());
+		materialComponents.emplace_back();
+		materialComponents[comp].matId = triangleMatId[seed];
+
+		stack.clear();
+		stack.push_back(seed);
+		triangleComponent[seed] = comp;
+		while (!stack.empty()) {
+			int t = stack.back();
+			stack.pop_back();
+			materialComponents[comp].triangles.push_back(t);
+			for (int e = 0; e < 3; ++e) {
+				int tn = triangleAdjacency[t][e];
+				if (tn < 0) continue;
+				if (triangleComponent[tn] >= 0) continue;
+				if (triangleMatId[tn] != triangleMatId[t]) continue;
+				triangleComponent[tn] = comp;
+				stack.push_back(tn);
+			}
+		}
+		std::sort(materialComponents[comp].triangles.begin(),
+		          materialComponents[comp].triangles.end());
+	}
+
+	// -- Boundary vertex sets, per component and per material --------------
+	//
+	// Collected together with the longest boundary edge of each region, which
+	// is the chord test's input: a circle cut into many short chords is a
+	// discretised circle, a circle cut into four long ones is a square whose
+	// corners happen to be concyclic.
+	struct Accum {
+		std::unordered_set<int> verts;
+		double maxEdgeLen = 0.0;
+	};
+	std::vector<Accum> compAcc(materialComponents.size());
+	std::unordered_map<int, Accum> matAcc;
+
+	for (int e = 0; e < static_cast<int>(edges.size()); ++e) {
+		int t0 = edgeTriangles[e][0];
+		int t1 = edgeTriangles[e][1];
+		if (t0 < 0) continue;
+
+		int v0 = edges[e][0], v1 = edges[e][1];
+		double len = normP(vertices[v1] - vertices[v0]);
+
+		auto add = [&](Accum &acc) {
+			acc.verts.insert(v0);
+			acc.verts.insert(v1);
+			acc.maxEdgeLen = std::max(acc.maxEdgeLen, len);
+		};
+
+		int c0 = triangleComponent[t0];
+		int c1 = (t1 >= 0) ? triangleComponent[t1] : -1;
+		if (c0 != c1) {
+			add(compAcc[c0]);
+			if (c1 >= 0) add(compAcc[c1]);
+		}
+
+		int m0 = triangleMatId[t0];
+		int m1 = (t1 >= 0) ? triangleMatId[t1] : -1;
+		if (t1 < 0 || m1 != m0) {
+			add(matAcc[m0]);
+			if (t1 >= 0) add(matAcc[m1]);
+		}
+	}
+
+	// Fit one region's boundary and apply the two acceptance tests.
+	auto fitAccum = [&](const Accum &acc) {
+		CircleFit fit;
+		std::vector<Point> pts;
+		pts.reserve(acc.verts.size());
+		for (int v : acc.verts) pts.push_back(vertices[v]);
+
+		if (!fitCircleKasa(pts, fit.center, fit.radius) || fit.radius <= 1e-14) return fit;
+
+		double maxDev = 0.0;
+		for (const auto &p : pts) {
+			maxDev = std::max(maxDev, std::fabs(normP(p - fit.center) - fit.radius));
+		}
+		fit.maxRelDev    = maxDev / fit.radius;
+		fit.maxChordFrac = acc.maxEdgeLen / fit.radius;
+		fit.isCircle     = (fit.maxRelDev <= tol) && (fit.maxChordFrac <= maxChordFrac);
+		return fit;
+	};
+
+	for (const auto &[matId, acc] : matAcc) materialCircle[matId] = fitAccum(acc);
+
+	for (std::size_t c = 0; c < materialComponents.size(); ++c) {
+		MaterialComponent &mc = materialComponents[c];
+		mc.circle = fitAccum(compAcc[c]);
+		mc.centerTriangle = -1;
+		if (!mc.circle.isCircle) continue;
+
+		// Locate the center by scanning the component's own triangles rather
+		// than by walking the mesh: findTriangleContainingPoint walks toward
+		// the target across whatever it meets, which on a domain with holes
+		// can stall, and it has no notion of staying inside the component. A
+		// component that is a disk is small, so the scan is cheap and cannot
+		// answer with a triangle belonging to something else.
+		for (int t : mc.triangles) {
+			const Triangle &tri = triangles[t];
+			const Point &a = vertices[tri[0]];
+			const Point &bb = vertices[tri[1]];
+			const Point &cc = vertices[tri[2]];
+			double denom = cross2(bb - a, cc - a);
+			if (std::fabs(denom) < 1e-30) continue;
+			Point ap = mc.circle.center - a;
+			double l1 = cross2(ap, cc - a) / denom;
+			double l2 = cross2(bb - a, ap) / denom;
+			double l0 = 1.0 - l1 - l2;
+			if (l0 >= -1e-10 && l1 >= -1e-10 && l2 >= -1e-10) {
+				mc.centerTriangle = t;
+				break;
+			}
+		}
+	}
+}
+
 
 Mesh::Mesh(const std::string &filename) {
 	std::ifstream in(filename);

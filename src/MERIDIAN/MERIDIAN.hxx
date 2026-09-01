@@ -201,6 +201,59 @@ public:
         // with it, and how many arcs a closed interface loop is cut into.
         double interfaceKinkAngle = M_PI / 4.0;
         int interfaceLoopSplits = 4;
+        // Leave a disk's rim unsplit: its own cones already cross it four
+        // times, and a node anywhere else on it emits a layout edge nothing
+        // receives. See Interfaces::Options::splitCircleLoops.
+        bool splitCircleLoops = false;
+        // Take the block structure of a circular inclusion from a template
+        // instead of asking Stage 6 for one.
+        //
+        // The O-grid is the only block structure a disk has: a square core and
+        // four ring blocks, four +1 cones at the corners of the core and four
+        // -1 cones answering them out in the matrix. It is not a choice, it is
+        // what the topology of a disk in a plane leaves, and the cross field
+        // finds it unaided -- one inclusion comes out of Stage 1 with exactly
+        // those eight cones, four at 0.58 of the radius and four at 1.44 of
+        // it. Asking Stage 6 for it is what does not work: eight cones per
+        // disk is 80 on data/meshes/multimat/bubbles, and the continuation
+        // walls out at about 40 interior cones whatever the geometry.
+        //
+        // Since the answer is known there is no reason to solve for it. What
+        // the layout is asked for instead is the *exterior* -- the box with
+        // holes -- and the disk is handed to it as a single patch:
+        //
+        //   * the rim is cut into four arcs, as any closed interface loop is,
+        //     and each of the four nodes is given one quarter turn on the
+        //     inside and three on the outside. Eq. (4) restricted to the disk
+        //     is then 4 . 1 = 4 = 4 chi and restricted to the matrix is
+        //     4 - 4n = 4 chi, so *neither region needs an interior cone at
+        //     all*. Stage 0b's balance() already knows how to move a quarter
+        //     across a node and its own comment names this case; all this does
+        //     is take the eight cones away so that the move is the one it
+        //     finds.
+        //
+        //   * Stage 10 then meshes that patch as an O-grid rather than as a
+        //     transfinite grid, which is the step the whole arrangement is
+        //     for. A disk carried as one patch has its four corners at smooth
+        //     points of the rim, and a structured grid on it puts a 180 degree
+        //     element corner at each of them. The template does not: the four
+        //     rim arcs become the outer ring, the core square is inset, and
+        //     the rim nodes come out with two elements inside and three
+        //     outside. The counts match without arithmetic, because the disk
+        //     is a quadrilateral patch and Stage 10's chords already force its
+        //     opposite sides to agree.
+        //
+        // Only a component Mesh::computeMaterialCircles accepted as a circle
+        // takes this path, and only when the cones it is carrying cancel --
+        // see diskConeRadius. Everything else is laid out exactly as before.
+        bool diskTemplates = false;
+        // How far out, in radii of the disk, the cones cleared with it are
+        // looked for. The pair a disk carries straddles its rim, so both
+        // members have to go or Eq. (4) stops holding; the outer member sits
+        // at about 1.4 radii on the corpus and 2 leaves room without reaching
+        // the next inclusion. A disk whose cones do not sum to zero over that
+        // ball is left alone and reported.
+        double diskConeRadius = 2.0;
         // Align the Stage 0 cross field to the interfaces as well as to dS.
         //
         // Without this the field has no boundary condition on an interface and
@@ -382,6 +435,13 @@ public:
         bool fieldAlignedToInterfaces = false;
         // Index units cancelDipoles() annihilated, Stage 1.
         int coneDipoleUnits = 0;
+        // Stage 1, the disk templates: circular components whose cones were
+        // cleared because Stage 10 supplies their O-grid, how many cones went
+        // with them, and how many circles were left alone because what they
+        // carried did not cancel.
+        int diskTemplates = 0;
+        int diskConesCleared = 0;
+        int diskTemplatesRefused = 0;
 
         // Stage 0b
         int materials = 1;
@@ -473,6 +533,7 @@ public:
         int meshQuads = 0;
         int meshChords = 0;
         int meshUnmeshedPatches = 0;
+        int meshDiskTemplates = 0;   // patches meshed as an O-grid, Stage 10
         double meshMinScaledJacobian = 0.0;
         bool meshConforming = false;
         bool meshValid = false;
@@ -595,6 +656,13 @@ public:
 
 private:
     void runField();
+    // Stage 1: take the cross field's O-grid away from every circular
+    // inclusion whose cones cancel over a ball of Options::diskConeRadius
+    // radii, and record which components those were so that Stage 10 can put
+    // the template back. See Options::diskTemplates.
+    void clearDiskCones();
+    // Whether an interface edge lies on the rim of a circular inclusion.
+    bool onCircularRim(int edge) const;
 
     std::shared_ptr<Mesh> mesh;
     Options options;
@@ -612,6 +680,10 @@ private:
     std::unique_ptr<Arrangement> arrangement;
     std::unique_ptr<SplineFit> splines;
     std::unique_ptr<QuadMesh> quads;
+
+    // Material components Stage 10 meshes as an O-grid, and the four rim
+    // vertices of each. Empty unless Options::diskTemplates.
+    std::vector<int> diskComponents;
 };
 
 #endif // __MERIDIAN_HXX__

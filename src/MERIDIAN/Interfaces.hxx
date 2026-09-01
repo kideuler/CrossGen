@@ -185,6 +185,47 @@ public:
         bool splitLoops = true;
         int loopSplits = 4;
 
+        // Split a closed loop that bounds a *disk* as well. Off, and that is
+        // not an oversight.
+        //
+        // The reason a closed loop is split at all is that a closed curve
+        // through no singular point cannot be a union of layout edges: the
+        // face inside it would have no corners. A disk is the one inclusion
+        // for which that is already false before this stage runs. Its four
+        // corners come from the field: a cross field tangent to the rim has
+        // index +1 inside, which SIPG splits into four +1/4 cones and
+        // setPinDiskCenters puts on the diagonals, and the separatrix out of
+        // each of them crosses the rim. Four crossings, four arcs, corners
+        // where the layout actually turns -- which is exactly what splitting
+        // was for, arrived at from the field rather than from the tangent.
+        //
+        // Splitting anyway costs, and it costs more than a redundant node. A
+        // loop-split node reads as two straight-through sectors, so by
+        // emitterNodes() it emits one layout edge into each of the two regions
+        // it separates -- and on a disk neither of those edges has anything to
+        // meet. They cut the ring blocks the disk's own cones bound, so no
+        // patch has one arc a side, and out in the surrounding material the
+        // outbound one runs until it crosses something. Measured on
+        // data/geometry/multimat: one inclusion goes from 49 layout faces to
+        // 16, three from a layout Stage 6 cannot make injective (det J to 1e-4,
+        // E1 to 4e18, the continuation running past its outer-step budget) to
+        // one that converges in ten outer steps with det J at 0.33, every face
+        // a quadrilateral and 98.5% of the model meshed.
+        //
+        // Nor is putting the node *on* the diagonal a fix, though it looks
+        // like one: the node and the crossing are then the same point to
+        // within one rim segment, and Stage 8 gets a sliver between them
+        // instead of a node. Measured, that is worse than either.
+        //
+        // Only a loop bounding a component whose boundary
+        // Mesh::computeMaterialCircles accepted as a circle takes this path --
+        // two tests, how far the rim sits off the fitted circle and how long
+        // its longest edge is in radii, the second being what tells a
+        // discretised circle from a polygon inscribed in one. Every other
+        // closed interface in the corpus, and every inclusion that is not
+        // round, is split as before.
+        bool splitCircleLoops = false;
+
         // A node's sectors are called well-posed when every one of them is
         // within this of a whole number of quarter turns. Purely diagnostic.
         // 10 degrees: comfortably above the discretisation of a smooth
@@ -371,6 +412,9 @@ private:
     void findNodes();
     void buildBranches();
     void splitClosedLoops();
+    // The material component a closed interface loop bounds, when that
+    // component is a disk: -1 otherwise. See Options::splitCircleLoops.
+    int circularComponentOfLoop(const Branch &b) const;
     void measureNodes();
     void buildRegions();
     void measureRegions(const std::vector<int> &coneIndex);

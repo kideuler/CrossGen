@@ -113,6 +113,43 @@ struct MeshEdgeKeyHash {
     }
 };
 
+// Result of fitting a circle to one material's boundary (or interface, for a
+// multi-material mesh). `isCircle` is false whenever the fit failed outright
+// (fewer than 3 points, or the points collinear/degenerate) or the fitted
+// circle failed one of the two acceptance tests -- center/radius are
+// meaningless in that case and should not be used.
+//
+// Two tests, not one. `maxRelDev` is the obvious one, how far the boundary
+// vertices sit off the fitted circle. On its own it is not enough: the four
+// corners of a square are exactly concyclic and pass it perfectly, as does
+// any polygon inscribed in a circle. `maxChordFrac` is what rules those out
+// -- the longest boundary edge measured in radii. A boundary that really is
+// a discretised circle is cut into many short chords (a 24-gon gives 0.26),
+// while a square gives 1.41, so the two cases are nowhere near each other.
+struct CircleFit {
+    bool isCircle = false;
+    Point center{0.0, 0.0};
+    double radius = 0.0;
+    double maxRelDev = 0.0;    // max |dist(vertex, center) - radius| / radius
+    double maxChordFrac = 0.0; // longest boundary edge / radius
+};
+
+// One connected run of same-material triangles: a maximal set of triangles
+// carrying the same material id, any two of which are joined by a path of
+// edge-adjacent triangles that never crosses a material interface. This is
+// the granularity circle detection has to work at, not the material: in
+// data/geometry/multimat/bubbles.geo material 2 is a single id spread over
+// ten disjoint disks, and fitting one circle to all ten at once fits nothing.
+struct MaterialComponent {
+    int matId = 0;
+    std::vector<int> triangles;   // triangle indices in this component
+    CircleFit circle;             // fit to the component's own boundary
+    // Triangle containing circle.center, or -1 when the component is not a
+    // circle or the center somehow lands outside it. This is the triangle a
+    // solver pins to kill the disk's rotational degree of freedom.
+    int centerTriangle = -1;
+};
+
 class Mesh {
  public:
     std::vector<Point> vertices; // List of 2D points
@@ -137,6 +174,25 @@ class Mesh {
     // CSR mapping: vertex -> incident triangles in CCW order
     VertexTriangleCSR vertexTriangles;
 
+    // Connected components of same-material triangles, each with the circle
+    // fitted to its own boundary. Filled by every constructor that builds
+    // mesh topology; SIPG (or anyone else holding a Mesh) reads it straight
+    // off the mesh. This -- not materialCircle -- is what a caller wanting
+    // "which regions of this mesh are disks" should read.
+    std::vector<MaterialComponent> materialComponents;
+    // Triangle -> index into materialComponents. Same length as triangles.
+    std::vector<int> triangleComponent;
+
+    // Per-material circle fit: material id -> CircleFit of that material's
+    // boundary (its share of dS, plus any interface edges bordering another
+    // material). A single-material mesh (triangleMatId all equal) gets one
+    // entry, keyed by that material id, fit to the ordinary mesh boundary.
+    // Note this is the fit to the material taken WHOLE: a material spread
+    // over several disjoint regions gets one fit across all of them, which is
+    // a circle only if the material happens to be a single disk. Prefer
+    // materialComponents unless you specifically want the whole-material fit.
+    std::unordered_map<int, CircleFit> materialCircle;
+
     Mesh() = default;
 
     Mesh(const std::string &filename); // Load mesh from an .obj file
@@ -149,6 +205,22 @@ class Mesh {
          const std::vector<int> &matIds);
 
     int findTriangleContainingPoint(const Point &p) const; // Find the triangle index that contains point p, or -1 if not found
+
+    // (Re)builds materialComponents/triangleComponent and (re)fits both their
+    // circles and materialCircle from the current vertices/triangles/
+    // triangleMatId and edge topology. Called automatically once topology is
+    // built; exposed so a caller that mutates vertex positions after
+    // construction (e.g. a smoother) can refresh the fit.
+    //
+    // `tol` is the largest relative deviation (max |dist(vertex, center) -
+    // radius| / radius) a fit may have and still be accepted. Meshers put
+    // boundary nodes exactly on the geometric curve, so a genuine circle
+    // comes in at 1e-12 or so and this only has to stay clear of real
+    // non-circularity. `maxChordFrac` is the largest a single boundary edge
+    // may be, in radii, before the boundary is judged a polygon inscribed in
+    // the fitted circle rather than a discretisation of it; 0.5 admits any
+    // circle cut into 13 or more segments and rejects a square (1.41).
+    void computeMaterialCircles(double tol = 1e-3, double maxChordFrac = 0.5);
 };
 
 #endif // __MESH_HXX__

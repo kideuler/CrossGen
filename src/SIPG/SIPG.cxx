@@ -157,6 +157,45 @@ void SIPG::initialize() {
         pinToEdge(edgeIdx, mesh->edgeTriangles[edgeIdx][1]);
     }
 
+    // --- Disk centers ------------------------------------------------------
+    //
+    // One more Dirichlet triangle per disk, pinned to u = 1, which is what
+    // fixes the rotation the disk's symmetry otherwise leaves free -- see
+    // SIPG::setPinDiskCenters for why that value and where the cones then go.
+    // It is the same kind of pin as a boundary one, just prescribed by a point
+    // rather than read off an edge tangent, so it goes through the same
+    // bcWeightedSum/K/b path and gets eliminated with the rest in Step 6.
+    diskCenterTriangles.clear();
+    if (pinDiskCenters) {
+        for (const auto &comp : mesh->materialComponents) {
+            if (!comp.circle.isCircle) continue;
+            int tc = comp.centerTriangle;
+            if (tc < 0) continue;
+
+            // Already Dirichlet from dS or an interface. That only happens on a
+            // disk so coarse its center triangle touches its own boundary, and
+            // there the tangent data is the better constraint of the two.
+            if (bcWeightTotal.count(tc)) continue;
+
+            // Weight to match an edge pin's: gamma * |e| / h with |e| the
+            // triangle's longest edge and h = 2A/|e| its height on that edge.
+            const Triangle &tri = mesh->triangles[tc];
+            double eMax = 0.0;
+            for (int k = 0; k < 3; ++k) {
+                eMax = std::max(eMax, normP(mesh->vertices[tri[(k + 1) % 3]] - mesh->vertices[tri[k]]));
+            }
+            if (area[tc] < 1e-30 || eMax < 1e-14) continue;
+            double kappa = gamma * eMax * eMax / (2.0 * area[tc]);
+
+            const std::complex<double> gc(1.0, 0.0); // exp(4i*0): cross on the axes
+            stiffTrips.emplace_back(tc, tc, std::complex<double>(kappa, 0.0));
+            b[tc] += kappa * gc;
+            bcWeightedSum[tc] += kappa * gc;
+            bcWeightTotal[tc] += kappa;
+            diskCenterTriangles.push_back(tc);
+        }
+    }
+
     // Normalise each boundary triangle's BC to the unit circle.
     boundaryTriangleBC.clear();
     for (const auto &[ti, wsum] : bcWeightedSum) {

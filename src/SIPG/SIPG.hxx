@@ -56,6 +56,37 @@ public:
     // ConeSingularities::cancelDipoles.
     void setAlignedInteriorEdges(const std::vector<int> &edges);
 
+    // Kill the rotational degree of freedom of a disk.
+    //
+    // A disk is rotationally symmetric, so the boundary-aligned cross field on
+    // it is too: rotate the domain and the problem maps to itself, and the four
+    // +1/4 cones that Gauss-Bonnet asks for slide around with it. Nothing in
+    // the boundary data picks their angular position, so the MBO lands them
+    // wherever arithmetic noise puts them, and two runs of the same disk -- or
+    // the ten copies of one disk in data/geometry/multimat/bubbles.geo -- need
+    // not agree.
+    //
+    // Pinning the triangle at the center of the disk to u = exp(4i*theta) = 1
+    // removes it. Near the center the field is, to leading order, the
+    // extension of the boundary data z^4 perturbed off zero: u(z) = z^4 -
+    // eps^4 c, whose four simple zeros are the four cones, at radius eps and
+    // at angles arg(c)/4 + k*pi/2. The value at the center is u(0) = -eps^4 c,
+    // so fixing it fixes arg(c): u(0) = 1 gives c = -1 and puts the cones at
+    // pi/4 + k*pi/2, measured from the center. That is the canonical position
+    // -- the cones on the diagonals, the cross at the center axis-aligned --
+    // and it is reproducible across runs and across disks.
+    //
+    // On by default. The pin only ever applies to a component of the mesh
+    // whose boundary Mesh::computeMaterialCircles accepted as a circle, so a
+    // domain with no disk in it is unaffected, and a center triangle that is
+    // already Dirichlet from dS or an interface is left alone rather than
+    // fought over. Call before initialize().
+    void setPinDiskCenters(bool on) { pinDiskCenters = on; }
+
+    // The triangles pinned by the above, one per disk, in materialComponents
+    // order. Empty until initialize() has run.
+    const std::vector<int>& getDiskCenterTriangles() const { return diskCenterTriangles; }
+
     void step();
 
     void computeSingularities();
@@ -83,6 +114,9 @@ private:
     // Interior edges promoted to aligned (Dirichlet) edges, per edge of the
     // mesh. Empty when there are none, which is the single-material case.
     std::vector<char> edgeAligned;
+
+    bool pinDiskCenters = true;          // see setPinDiskCenters
+    std::vector<int> diskCenterTriangles; // triangles pinned to 1 by it
 
     // Hard Dirichlet BC per boundary triangle: triangle index -> prescribed exp(4i*theta)
     // Computed from the dominant boundary edge tangent in initialize(); applied after each step.

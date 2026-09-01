@@ -291,6 +291,35 @@ void Interfaces::buildBranches() {
 }
 
 // ---------------------------------------------------------------------------
+// circularComponentOfLoop()
+//
+// Whether a closed interface loop is the rim of a disk, which is what
+// Options::splitCircleLoops turns on. The judgement is not made here: the
+// loop's two sides name their material components and
+// Mesh::computeMaterialCircles has already fitted a circle to each
+// component's own boundary and applied its two acceptance tests.
+// ---------------------------------------------------------------------------
+int Interfaces::circularComponentOfLoop(const Branch &b) const {
+    if (b.edges.empty() || mesh->triangleComponent.empty()) return -1;
+    int best = -1;
+    for (int k = 0; k < 2; ++k) {
+        const int t = mesh->edgeTriangles[b.edges.front()][k];
+        if (t < 0 || t >= static_cast<int>(mesh->triangleComponent.size())) continue;
+        const int c = mesh->triangleComponent[t];
+        if (c < 0 || c >= static_cast<int>(mesh->materialComponents.size())) continue;
+        if (!mesh->materialComponents[c].circle.isCircle) continue;
+        // Both sides can fit a circle only when one of them is an annulus
+        // around the other; the inclusion is the smaller of the two and is the
+        // one this loop is the whole boundary of.
+        if (best < 0 || mesh->materialComponents[c].triangles.size() <
+                        mesh->materialComponents[best].triangles.size()) {
+            best = c;
+        }
+    }
+    return best;
+}
+
+// ---------------------------------------------------------------------------
 // splitClosedLoops()
 //
 // A closed interface loop carries no node, and a closed curve through no
@@ -308,6 +337,9 @@ void Interfaces::buildBranches() {
 // without having to know which four directions the layout will choose, and it
 // degrades gracefully on a non-convex loop, where the unwrapped angle still
 // totals 2 pi but is not monotone and the crossings are taken in order.
+//
+// A disk is the one loop this is not asked of, because it is the one loop that
+// already has corners before the stage runs: see Options::splitCircleLoops.
 // ---------------------------------------------------------------------------
 void Interfaces::splitClosedLoops() {
     bool any = false;
@@ -316,6 +348,12 @@ void Interfaces::splitClosedLoops() {
 
     for (const Branch &b : branchList) {
         if (!b.closed || b.verts.size() < static_cast<size_t>(options.loopSplits) + 1) continue;
+
+        // A disk's rim is already crossed four times by the separatrices of
+        // the cones its own rotational symmetry puts inside it, so it already
+        // has the corners splitting was for and a node here is one the layout
+        // has nothing to meet. See Options::splitCircleLoops.
+        if (!options.splitCircleLoops && circularComponentOfLoop(b) >= 0) continue;
 
         // Unwrapped tangent angle at each vertex of the loop.
         const size_t n = b.verts.size() - 1;      // verts.back() == verts.front()

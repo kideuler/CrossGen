@@ -20,3 +20,9 @@ A purely 2D implementation of Cross-fields along with block decomposition
 - [X] Change mesh cutting a little so singularities do not lie on the same cut. Should conditions better.
 - [X] Tracing.
 - [X] Multi-materials in MERIDIAN through alignment to feature lines in energy.
+- [X] SIPG integration through TORSION
+- [X] Disk material pinning rotational symmetry
+- [ ] Get Laghos to output to paraview.
+- [ ] Get bubble working correctly
+- [ ] Get tests ready.
+- [ ] Try to parallelize (for a little)

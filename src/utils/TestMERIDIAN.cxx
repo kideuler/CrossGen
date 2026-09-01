@@ -225,6 +225,9 @@ void usage(const char *argv0) {
               << "                     every other arc, rather than on the traced curves\n"
               << "  --kink <deg>       interface corner threshold        (default 45)\n"
               << "  --loop-splits <n>  arcs a closed interface is cut into (default 4)\n"
+              << "  --split-disks      cut a disk rim into arcs, as any other closed loop\n"
+              << "  --disk-templates   clear a circular inclusion's cones and mesh it as an O-grid\n"
+              << "  --disk-radius <r>  how far out, in radii, those cones are looked for\n"
               << "  --nodes <n>        list at most n interface nodes    (default 12)\n"
               << "  --interfaces <f.obj> write the interface network as polylines\n"
               << "  --cones <n>        list at most n cones          (default 20)\n"
@@ -320,6 +323,9 @@ int main(int argc, char **argv) {
         else if (a == "--fit-features")            opts.quadFeaturesOnTracedArcs = false;
         else if (a == "--kink" && i + 1 < argc)
             opts.interfaceKinkAngle = std::stod(argv[++i]) * M_PI / 180.0;
+        else if (a == "--split-disks")             opts.splitCircleLoops = true;
+        else if (a == "--disk-templates")          opts.diskTemplates = true;
+        else if (a == "--disk-radius" && i + 1 < argc) opts.diskConeRadius = std::stod(argv[++i]);
         else if (a == "--loop-splits" && i + 1 < argc)
             opts.interfaceLoopSplits = std::stoi(argv[++i]);
         else if (a == "--nodes" && i + 1 < argc)   interfaceListLimit = std::stoi(argv[++i]);
@@ -811,6 +817,15 @@ int main(int argc, char **argv) {
 
     verdict(sr.boundaryEdges > 0, "Every curve of dS carries a label");
     for (const std::string &m : sr.messages) std::cout << "  " << kWarn << " " << m << "\n";
+    // Stage 5 and 6 notes the *repair loop* logged through MERIDIAN::Status.
+    // Every other stage prints its own Report, but traceAndRepair has none of
+    // its own -- it writes through a callback -- so without this its rollbacks
+    // and its pruning happen silently.
+    for (const std::string &m : st.messages) {
+        if (m.rfind("Stage 5: ", 0) == 0 || m.rfind("Stage 6: ", 0) == 0) {
+            std::cout << "  " << kWarn << " " << m << "\n";
+        }
+    }
 
     if (!pipeline.hasLayout()) {
         heading("Result");
