@@ -226,8 +226,11 @@ void usage(const char *argv0) {
               << "  --kink <deg>       interface corner threshold        (default 45)\n"
               << "  --loop-splits <n>  arcs a closed interface is cut into (default 4)\n"
               << "  --split-disks      cut a disk rim into arcs, as any other closed loop\n"
-              << "  --disk-templates   clear a circular inclusion's cones and mesh it as an O-grid\n"
-              << "  --disk-radius <r>  how far out, in radii, those cones are looked for\n"
+              << "  --disk-templates   excise every circular inclusion (Stage 0c) and fill it\n"
+              << "                     back in with an O-grid template (Stage 11)\n"
+              << "  --disk-squareness <w>  how square the template's core is  (default 0.55)\n"
+              << "  --disk-ring <n>    rows of elements in the ring, 0 = auto  (default 0)\n"
+              << "  --disk-smooth <n>  smoothing sweeps over the template     (default 300)\n"
               << "  --nodes <n>        list at most n interface nodes    (default 12)\n"
               << "  --interfaces <f.obj> write the interface network as polylines\n"
               << "  --cones <n>        list at most n cones          (default 20)\n"
@@ -325,7 +328,12 @@ int main(int argc, char **argv) {
             opts.interfaceKinkAngle = std::stod(argv[++i]) * M_PI / 180.0;
         else if (a == "--split-disks")             opts.splitCircleLoops = true;
         else if (a == "--disk-templates")          opts.diskTemplates = true;
-        else if (a == "--disk-radius" && i + 1 < argc) opts.diskConeRadius = std::stod(argv[++i]);
+        else if (a == "--disk-squareness" && i + 1 < argc)
+            opts.diskCoreSquareness = std::stod(argv[++i]);
+        else if (a == "--disk-ring" && i + 1 < argc)
+            opts.diskRingDepth = std::stoi(argv[++i]);
+        else if (a == "--disk-smooth" && i + 1 < argc)
+            opts.diskSmoothingPasses = std::stoi(argv[++i]);
         else if (a == "--loop-splits" && i + 1 < argc)
             opts.interfaceLoopSplits = std::stoi(argv[++i]);
         else if (a == "--nodes" && i + 1 < argc)   interfaceListLimit = std::stoi(argv[++i]);
@@ -1383,24 +1391,84 @@ int main(int argc, char **argv) {
     }
     for (const std::string &m : qr.messages) std::cout << "  " << kWarn << " " << m << "\n";
 
+    // ---------------------------------------------------------------------
+    // Stage 11 -- the O-grid templates
+    // ---------------------------------------------------------------------
+    bool templatesOK = true;
+    if (pipeline.hasDiskTemplate()) {
+        heading("Stage 11  O-grid templates on the excised inclusions");
+        const DiskTemplate &dt = pipeline.getDiskTemplate();
+        const DiskTemplate::Report &dr = dt.getReport();
+        templatesOK = dr.valid;
+
+        std::cout << "  " << dr.filled << " of " << dr.inclusions
+                  << " inclusion(s) templated: " << dr.blocks << " block(s), "
+                  << dr.quads << " element(s), " << dr.vertices << " new vertex/vertices";
+        if (dr.smoothingSweeps > 0) {
+            std::cout << "; at most " << dr.smoothingSweeps << " smoothing sweep(s) on one";
+        }
+        std::cout << "\n";
+        if (dr.refusedOdd || dr.refusedShort || dr.refusedOpen) {
+            std::cout << "  Refused: " << dr.refusedOdd << " rim(s) with an odd edge count, "
+                      << dr.refusedShort << " too short, " << dr.refusedOpen
+                      << " that Stage 10 did not close\n";
+        }
+        std::cout << "  Merged mesh: " << dr.mergedVertices << " vertices, "
+                  << dr.mergedQuads << " quadrilateral(s); scaled Jacobian "
+                  << std::fixed << std::setprecision(4) << dr.minScaledJacobian
+                  << " worst, " << dr.meanScaledJacobian << " mean ("
+                  << dr.templateMinScaledJacobian << " worst on the templates)"
+                  << std::defaultfloat << "\n";
+        std::cout << "  Edge length in [" << std::fixed << std::setprecision(4) << dr.minEdge
+                  << ", " << dr.maxEdge << "]" << std::defaultfloat << "\n";
+        std::cout << "  Edges: " << dr.interiorEdges << " shared by two elements, "
+                  << dr.boundaryEdges << " on the boundary of the mesh\n";
+
+        verdict(dr.filled == dr.inclusions, "Every circular inclusion was templated");
+        verdict(dr.nonManifoldEdges == 0,
+                "Conforming: every edge is shared by two elements or bounds the mesh");
+        verdict(dr.cracks == 0, "Watertight: the templates share the rim rather than repeat it");
+        verdict(dr.invertedQuads == 0, "No element of the merged mesh is inverted");
+        for (const std::string &m : dr.messages) std::cout << "  " << kWarn << " " << m << "\n";
+    }
+
     if (!meshOut.empty()) {
-        if (qm.writeOBJ(meshOut)) std::cout << "  Wrote the quad mesh to " << meshOut << "\n";
+        const bool wrote = pipeline.hasDiskTemplate()
+                               ? pipeline.getDiskTemplate().writeOBJ(meshOut)
+                               : qm.writeOBJ(meshOut);
+        if (wrote) std::cout << "  Wrote the quad mesh to " << meshOut << "\n";
         else std::cout << "  " << kWarn << " Failed to write " << meshOut << "\n";
     }
     if (!meshVTUOut.empty()) {
-        if (qm.writeVTU(meshVTUOut)) std::cout << "  Wrote the quad mesh to " << meshVTUOut << "\n";
+        const bool wrote = pipeline.hasDiskTemplate()
+                               ? pipeline.getDiskTemplate().writeVTU(meshVTUOut)
+                               : qm.writeVTU(meshVTUOut);
+        if (wrote) std::cout << "  Wrote the quad mesh to " << meshVTUOut << "\n";
         else std::cout << "  " << kWarn << " Failed to write " << meshVTUOut << "\n";
     }
 
     // ---------------------------------------------------------------------
     heading("Result");
-    if (ok && tr.valid && arep.valid && sf.valid && qr.valid) {
+    if (ok && tr.valid && arep.valid && sf.valid && qr.valid && templatesOK) {
         std::cout << "  " << kPass << " " << sf.patches
                   << " watertight bicubic patch(es), C0 across their shared curves and C2 "
                   << "inside, from a layout satisfying Q1-Q5, meshed into " << qr.quads
-                  << " conforming quadrilateral(s) at a target edge length of " << qr.target
-                  << ".\n";
+                  << " conforming quadrilateral(s) at a target edge length of " << qr.target;
+        if (pipeline.hasDiskTemplate()) {
+            const DiskTemplate::Report &dr = pipeline.getDiskTemplate().getReport();
+            std::cout << ", plus " << dr.filled << " templated inclusion(s) for a merged "
+                      << "mesh of " << dr.mergedQuads << " element(s)";
+        }
+        std::cout << ".\n";
         return 0;
+    }
+    if (ok && tr.valid && arep.valid && sf.valid && qr.valid && !templatesOK) {
+        const DiskTemplate::Report &dr = pipeline.getDiskTemplate().getReport();
+        std::cout << "  " << kWarn << " The layout of the excised model is clean -- "
+                  << sf.patches << " watertight patch(es), " << qr.quads
+                  << " conforming element(s) -- but " << (dr.inclusions - dr.filled)
+                  << " of " << dr.inclusions << " inclusion(s) could not be templated.\n";
+        return 4;
     }
     if (ok && tr.valid && arep.valid && sf.valid) {
         std::cout << "  " << kWarn << " " << sf.patches

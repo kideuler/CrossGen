@@ -419,8 +419,47 @@ void TORSION::runField() {
 // -- Stages 0b, 1 and 2 stay as they are -- so the only thing worth doing here
 // is to keep it recognisably the same code.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// exciseDisks()  --  Stage 0c, MERIDIAN's unchanged
+//
+// Before everything, because everything downstream is indexed on the mesh this
+// leaves behind. See DiskTemplate.
+// ---------------------------------------------------------------------------
+void TORSION::exciseDisks() {
+    std::vector<std::string> msgs;
+    inclusions = DiskTemplate::detect(*mesh, msgs);
+    for (const std::string &m : msgs) status.messages.push_back("Stage 0c: " + m);
+    status.diskInclusions = static_cast<int>(inclusions.size());
+    if (inclusions.empty()) return;
+
+    std::shared_ptr<Mesh> excised = DiskTemplate::excise(*mesh, inclusions);
+    if (!excised || excised->triangles.empty()) {
+        inclusions.clear();
+        status.diskInclusions = 0;
+        status.messages.push_back(
+            "Stage 0c: excising the circular inclusions would leave no mesh behind, so "
+            "they are laid out like any other region.");
+        return;
+    }
+
+    for (const DiskTemplate::Inclusion &inc : inclusions) {
+        status.diskTrianglesExcised += static_cast<int>(inc.triangles.size());
+    }
+    inputMesh = mesh;
+    mesh = excised;
+
+    std::ostringstream oss;
+    oss << "Excised " << inclusions.size() << " circular inclusion(s), "
+        << status.diskTrianglesExcised << " of " << inputMesh->triangles.size()
+        << " triangle(s): the layout is asked for the matrix with holes and Stage 11 "
+        << "puts each O-grid back from a template.";
+    status.messages.push_back("Stage 0c: " + oss.str());
+}
+
 bool TORSION::runFront() {
     size_t balanceMessagesSeen = 0;
+
+    if (options.diskTemplates) exciseDisks();
 
     if (options.materialInterfaces) {
         Interfaces::Options iopts;
@@ -1561,6 +1600,11 @@ bool TORSION::run() {
     qopts.featuresOnTracedArcs = options.quadFeaturesOnTracedArcs;
     qopts.smoothingPasses = options.quadSmoothingPasses;
     qopts.smoothingThreshold = options.quadSmoothingThreshold;
+    // Each excised rim has to come out with an even number of edges or Stage 11
+    // has nothing it can fill it with. See QuadMesh::fixLoopParity.
+    const std::vector<std::vector<int>> rims =
+        DiskTemplate::rimArcs(*arrangement, inclusions);
+    for (const std::vector<int> &r : rims) if (!r.empty()) qopts.evenLoops.push_back(r);
     try {
         quads = std::make_unique<QuadMesh>(*splines, qopts);
     } catch (const std::exception &e) {
@@ -1576,7 +1620,32 @@ bool TORSION::run() {
     status.meshMinScaledJacobian = qr.minScaledJacobian;
     status.meshConforming = qr.conforming;
     status.meshValid = qr.valid;
+    status.meshOddLoops = qr.oddLoops;
+    status.meshParityChordsMoved = qr.parityChordsMoved;
+    status.meshOddLoopsLeft = qr.oddLoopsLeft;
     for (const std::string &m : qr.messages) status.messages.push_back("Stage 10: " + m);
+
+    // --- Stage 11: the O-grid templates -----------------------------------
+    if (inclusions.empty()) return status.layoutValid;
+    DiskTemplate::Options topts;
+    topts.coreSquareness = options.diskCoreSquareness;
+    topts.ringDepth = options.diskRingDepth;
+    topts.smoothingPasses = options.diskSmoothingPasses;
+    diskFill = std::make_unique<DiskTemplate>(
+        quads->vertices(), quads->quads(), quads->quadMaterials(),
+        DiskTemplate::rimVertexLoops(*arrangement, *quads, rims), inclusions, topts);
+    const DiskTemplate::Report &dr = diskFill->getReport();
+    status.diskTemplatesRan = true;
+    status.diskTemplatesFilled = dr.filled;
+    status.diskTemplateBlocks = dr.blocks;
+    status.diskTemplateQuads = dr.quads;
+    status.diskTemplatesRefused = dr.refusedOdd + dr.refusedShort + dr.refusedOpen;
+    status.diskTemplateMinScaledJacobian = dr.templateMinScaledJacobian;
+    status.mergedVertices = dr.mergedVertices;
+    status.mergedQuads = dr.mergedQuads;
+    status.mergedMinScaledJacobian = dr.minScaledJacobian;
+    status.diskTemplatesValid = dr.valid;
+    for (const std::string &m : dr.messages) status.messages.push_back("Stage 11: " + m);
 
     return status.layoutValid;
 }

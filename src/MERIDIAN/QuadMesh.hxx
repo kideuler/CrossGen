@@ -157,6 +157,25 @@ public:
         int minIntervals = 1;
         int maxIntervals = 0;
 
+        // Closed loops of arcs that must come out with an **even** number of
+        // edges in total. Empty unless something downstream needs one.
+        //
+        // The one thing that does is Stage 11: a rim it is asked to fill with
+        // quadrilaterals must have an even number of edges on it, because
+        // summing |boundary| over the faces of any quadrangulation of a disk
+        // gives 4F = 2E_interior + E_boundary. That is not a property a fill
+        // can be clever about -- an odd rim has no quadrangulation at all --
+        // and it is not a property the chord assignment produces by accident:
+        // on data/meshes/multimat/bubbles five of the ten inclusion rims come
+        // out odd at the default target.
+        //
+        // It is cheap to arrange, though, because the parity is a linear
+        // function over GF(2) of the per-chord counts: moving one chord by one
+        // edge flips the parity of every loop that chord crosses an odd number
+        // of times. See fixLoopParity, which solves that little system for the
+        // cheapest set of chords to move and reports what the move cost.
+        std::vector<std::vector<int>> evenLoops;
+
         // Points used to tabulate arc length along each fitted arc before the
         // nodes are placed on it by inverting that table. The fits are cubic
         // over three or four spans, so this is far finer than it needs to be
@@ -259,6 +278,17 @@ public:
         int clampedChords = 0;        // bound by the floor or the ceiling
         double meanIntervals = 0.0;
 
+        // Options::evenLoops: how many came out odd before the parity fix, how
+        // many chords it had to move to make them even, and how much that cost
+        // in the objective F the counts were chosen against. `oddLoopsLeft` is
+        // the ones it could not fix -- a loop whose every chord also crosses
+        // another odd loop an odd number of times, or one holding an arc no
+        // patch asked for.
+        int oddLoops = 0;
+        int parityChordsMoved = 0;
+        int oddLoopsLeft = 0;
+        double parityCost = 0.0;
+
         int blocks = 0;               // patches meshed
         int unmeshedPatches = 0;      // faces without four sides of one arc
         double unmeshedArea = 0.0;    // of those, as a fraction of S
@@ -358,6 +388,8 @@ public:
 
 private:
     void assignIntervals();
+    // Options::evenLoops, applied to the counts assignIntervals() chose.
+    void fixLoopParity(std::vector<std::vector<double>> &chordSpans);
     void meshArcs();
     void meshPatches();
     void smooth();

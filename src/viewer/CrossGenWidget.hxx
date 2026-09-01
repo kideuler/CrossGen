@@ -17,6 +17,7 @@
 #include "MERIDIAN/ConeCut.hxx"
 #include "MERIDIAN/MERIDIAN.hxx"
 #include "MERIDIAN/ConeSingularities.hxx"
+#include "MERIDIAN/DiskTemplate.hxx"
 #include "MERIDIAN/Immersion.hxx"
 #include "MERIDIAN/Interfaces.hxx"
 #include "MERIDIAN/LayoutEnergy.hxx"
@@ -446,6 +447,35 @@ private:
     // smoothed mesh is a different question and TestMERIDIAN asks it.
     void runMERIDIANMesh();
 
+    // Record why a stage produced nothing: to the console in full, to the
+    // terminal, and to `pipelineBlocked_` as the short form the overlay keeps
+    // on screen for as long as it is true. `what` is one clause, no prefix.
+    void blockPipeline(const std::string &stage, const std::string &what);
+
+    // Stage 0c, run the moment either pipeline is chosen and before anything
+    // else has been built on the mesh: find the circular inclusions and, if
+    // there are any and the dialog is accepted, replace mesh_ by the matrix
+    // with a hole where each of them was. Every stage after it is indexed on
+    // that mesh, which is why this cannot wait until the phase it belongs to --
+    // there is no such phase. See DiskTemplate.
+    //
+    // On a mesh with no circular inclusion -- every single-material model, and
+    // every multi-material one whose regions are not disks -- it finds nothing,
+    // says nothing and leaves the pipeline exactly as it was.
+    void runDiskExcision();
+
+    // The dialog that decides it, opened only when there is something to
+    // decide. Lists what was found, because "excise ten inclusions" is a
+    // statement about this model and the radii are how it is judged. Returns
+    // false if declined, and then the disks are laid out like any other region.
+    bool promptDiskExcision(const std::vector<DiskTemplate::Inclusion> &found);
+
+    // Stage 11: fill each excised rim with its O-grid. Runs straight after
+    // Stage 10 and off the same rim arcs, since Stage 10 needed them first to
+    // make the rims carry an even number of edges. A no-op when nothing was
+    // excised.
+    void runDiskTemplates(const std::vector<std::vector<int>> &rims);
+
     // Whether a parameter domain occupies the right half of the window.
     bool inUVSplitScreen() const;
 
@@ -613,6 +643,15 @@ private:
     std::optional<SplineFit>         splines_;
     // Stage 10, holding a reference to the fit, so it is cleared before it.
     std::optional<QuadMesh>          quadMesh_;
+    // Stages 0c and 11. The inclusions are found before any stage runs and
+    // outlive all of them -- Stage 10 wants their rims and Stage 11 wants their
+    // circles -- and inputMesh_ is the mesh as it was loaded, kept only so that
+    // what was taken out can be said in the report. diskFill_ holds copies of
+    // the arrays it was handed rather than a reference to quadMesh_, but it is
+    // meaningless without it and is cleared with it.
+    std::vector<DiskTemplate::Inclusion> inclusions_;
+    std::shared_ptr<Mesh>                inputMesh_;
+    std::optional<DiskTemplate>          diskFill_;
 
     // Guiding field for the OASIS orientation term. Held by shared_ptr because
     // OASIS keeps a reference to it for as long as it lives; separate from
@@ -690,6 +729,16 @@ private:
     bool patchesAnnounced_      = false;
     bool patchesAttempted_      = false;
     bool meshAttempted_         = false;
+    // Stage 0c is attempted once per run, at the moment the mode is chosen.
+    bool disksAttempted_        = false;
+
+    // Why the last phases have nothing to show, in one clause, or empty when
+    // nothing is wrong. Kept on screen rather than only in the console: the
+    // console holds eight lines and a stage that refuses prints its reason
+    // among a dozen others, so by the time the phase that is blank is on
+    // screen the reason has scrolled off it. Set by whichever stage refused or
+    // failed, cleared by the next one that runs.
+    std::string pipelineBlocked_;
 
     // Stage 0b runs in two halves -- the network before Stage 1, the region
     // balance after it, because the balance needs Stage 1's cones on dS -- and
@@ -715,6 +764,21 @@ private:
         bool   useSplines  = true;
     };
     MERIDIANMeshSettings meshSettings_;
+
+    // Stages 0c and 11, surviving a reset like every other judgement in this
+    // widget so that the next run opens on whatever was last tried. `excise` is
+    // what the Stage 0c dialog was last left at and is only ever asked about on
+    // a model that has circular inclusions at all; the other three are
+    // DiskTemplate::Options' own defaults and are offered in the Stage 10
+    // dialog, because Stage 11 is rerun with the mesh and trying a squareness
+    // means meshing again.
+    struct DiskTemplateSettings {
+        bool   excise      = true;
+        double squareness  = DiskTemplate::Options().coreSquareness;
+        int    ringDepth   = DiskTemplate::Options().ringDepth;
+        int    smoothing   = DiskTemplate::Options().smoothingPasses;
+    };
+    DiskTemplateSettings diskSettings_;
 
     // Chord collapse settings, surviving a reset the way oasisLambda_ does so
     // that the dialog opens on whatever was tried last.

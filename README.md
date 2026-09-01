@@ -22,7 +22,8 @@ A purely 2D implementation of Cross-fields along with block decomposition
 - [X] Multi-materials in MERIDIAN through alignment to feature lines in energy.
 - [X] SIPG integration through TORSION
 - [X] Disk material pinning rotational symmetry
+- [X] Templated circular inclusions: excise them (Stage 0c) and fill each with an O-grid (Stage 11).
 - [ ] Get Laghos to output to paraview.
-- [ ] Get bubble working correctly
+- [X] Get bubble working correctly (`--disk-templates --near-miss 0.04`, both pipelines)
 - [ ] Get tests ready.
 - [ ] Try to parallelize (for a little)

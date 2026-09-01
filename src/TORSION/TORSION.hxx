@@ -191,6 +191,14 @@ public:
         bool materialInterfaces = true;
         double interfaceKinkAngle = M_PI / 4.0;
         int interfaceLoopSplits = 4;
+        // Stages 0c and 11, identical to MERIDIAN's: excise every circular
+        // inclusion before the field runs and put its O-grid back from a
+        // template after Stage 10. See DiskTemplate for the reasoning and
+        // MERIDIAN::Options::diskTemplates for the short version.
+        bool diskTemplates = false;
+        double diskCoreSquareness = 0.55;
+        int diskRingDepth = 0;
+        int diskSmoothingPasses = 300;
         bool alignFieldToInterfaces = true;
         bool cancelInterfaceDipoles = true;
         bool prescribeInterfaceCones = true;
@@ -569,6 +577,22 @@ public:
         int meshQuads = 0;
         int meshChords = 0;
         int meshUnmeshedPatches = 0;
+        // Stages 0c and 11. See MERIDIAN::Status for what each one counts.
+        int diskInclusions = 0;
+        int diskTrianglesExcised = 0;
+        int meshOddLoops = 0;
+        int meshParityChordsMoved = 0;
+        int meshOddLoopsLeft = 0;
+        bool diskTemplatesRan = false;
+        int diskTemplatesFilled = 0;
+        int diskTemplateBlocks = 0;
+        int diskTemplateQuads = 0;
+        int diskTemplatesRefused = 0;
+        double diskTemplateMinScaledJacobian = 0.0;
+        int mergedVertices = 0;
+        int mergedQuads = 0;
+        double mergedMinScaledJacobian = 0.0;
+        bool diskTemplatesValid = false;
         double meshMinScaledJacobian = 0.0;
         bool meshConforming = false;
         bool meshValid = false;
@@ -616,6 +640,9 @@ public:
     const Arrangement& getArrangement() const { return *arrangement; }
     const SplineFit& getSplines() const { return *splines; }
     const QuadMesh& getQuadMesh() const { return *quads; }
+    const DiskTemplate& getDiskTemplate() const { return *diskFill; }
+    bool hasDiskTemplate() const { return diskFill != nullptr; }
+    const std::vector<DiskTemplate::Inclusion>& getInclusions() const { return inclusions; }
 
     bool hasInterfaces() const { return interfaces != nullptr; }
     bool hasCones() const { return cones != nullptr; }
@@ -649,11 +676,17 @@ public:
     static std::vector<double> inducedLengths(const Mesh &mesh, const ConeCut &cut,
                                               const std::vector<Point> &psi);
 
+    // The mesh the layout was computed on. With Options::diskTemplates this is
+    // the *excised* mesh; getInputMesh() is what came in. See MERIDIAN.
     const Mesh& getMesh() const { return *mesh; }
+    const Mesh& getInputMesh() const { return inputMesh ? *inputMesh : *mesh; }
     std::shared_ptr<Mesh> getMeshPtr() const { return mesh; }
 
 private:
     void runField();
+    // Stage 0c, MERIDIAN's unchanged: find the circular inclusions and take
+    // them out of `mesh`. See DiskTemplate.
+    void exciseDisks();
     // Stages 0b, 0, 1 and 2, which are MERIDIAN's unchanged. Returns false when
     // the cone set is inadmissible or the cut is not a disk, which are the two
     // things every route downstream depends on.
@@ -670,6 +703,8 @@ private:
     std::vector<Point> untangle();
 
     std::shared_ptr<Mesh> mesh;
+    // What run() was handed, kept only when Stage 0c replaced it.
+    std::shared_ptr<Mesh> inputMesh;
     Options options;
     Status status;
 
@@ -690,6 +725,11 @@ private:
     std::unique_ptr<Arrangement> arrangement;
     std::unique_ptr<SplineFit> splines;
     std::unique_ptr<QuadMesh> quads;
+    std::unique_ptr<DiskTemplate> diskFill;
+
+    // The circular inclusions Stage 0c took out. Empty unless
+    // Options::diskTemplates.
+    std::vector<DiskTemplate::Inclusion> inclusions;
 
     // The indices the cross field read, before Stage 1 moved any of them; the
     // set Sec. 5.1's audit is run against.

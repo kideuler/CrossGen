@@ -10,6 +10,7 @@
 #include <unordered_set>
 
 #include "MERIDIAN/Arrangement.hxx"
+#include "MERIDIAN/DiskTemplate.hxx"
 #include "MERIDIAN/ConeCut.hxx"
 #include "MERIDIAN/ConeSingularities.hxx"
 #include "MERIDIAN/Immersion.hxx"
@@ -514,5 +515,31 @@ void drawLayoutPatches(const Arrangement &arr, const SplineFit *fit,
 // straddling element is a cell the interface runs through rather than along.
 void drawQuadMesh(const QuadMesh &qm, float lineWidth, float blockLineWidth,
                   bool materialFill = false);
+
+// MERIDIAN Stage 11: the same picture of the merged mesh -- Stage 10's mesh of
+// the matrix with each excised inclusion filled back in from its O-grid
+// template.
+//
+// Drawn by the one routine above and not by a second one, because the whole
+// claim of the stage is that the join is not visible: the templates' elements
+// are elements of the same mesh, their edges are counted with the rest, and a
+// crack at a rim would show here as a boundary edge in the middle of the model
+// rather than as a differently coloured patch.
+//
+// `qm` may be null, and where it is non-null its blocks are drawn alongside the
+// templates' own. The template's vertex array extends Stage 10's rather than
+// replacing it, so a Stage 10 block indexes the merged mesh unchanged; the two
+// sets of walls together are the block structure of the whole mesh, and the
+// rims are where they meet.
+void drawQuadMesh(const DiskTemplate &dt, const QuadMesh *qm, float lineWidth,
+                  float blockLineWidth, bool materialFill = false);
+
+// The circular inclusions Stage 0c took out of the layout problem, as the
+// circles that were fitted to them: what the holes in the model *are*, drawn
+// where the triangles used to be. Under every phase, because from the field on
+// there is nothing else in the frame that says the holes were put there on
+// purpose rather than found in the input.
+void drawInclusionCircles(const std::vector<DiskTemplate::Inclusion> &inclusions,
+                          float lineWidth, int samples = 96);
 
 } // namespace viewer

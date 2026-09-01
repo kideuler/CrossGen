@@ -467,6 +467,15 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
 
     case Qt::Key_4:
         if (mode_ == Mode::Unselected && phase_ == Phase::MeshOnly) {
+            // Stage 0c first, and *before* mode_ is set. It replaces the mesh
+            // every stage of the pipeline is built on, and it opens a dialog to
+            // decide whether to: a modal dialog runs a nested event loop, that
+            // loop paints, and painting is what drives runComputations(). With
+            // the mode already set, Stage 0b would be built on the mesh as it
+            // stands -- the one about to be thrown away -- while the dialog is
+            // still open, and every stage after it would refuse to work with an
+            // interface network found on a different mesh.
+            runDiskExcision();
             mode_ = Mode::TORSION;
             std::cerr << "[Viewer] Selected mode: " << modeName(mode_) << " (press 'c' to advance)\n";
             console_.log("Selected mode: TORSION (psi_0 by integrating the cross field)");
@@ -498,6 +507,7 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
 
     case Qt::Key_7:
         if (mode_ == Mode::Unselected && phase_ == Phase::MeshOnly) {
+            runDiskExcision();   // before mode_, and for the reason given under '4'
             mode_ = Mode::MERIDIAN;
             std::cerr << "[Viewer] Selected mode: " << modeName(mode_) << " (press 'c' to advance)\n";
             console_.log("Selected mode: MERIDIAN (Shepherd, Gu and Hughes 2022, Stages 1-6)");
@@ -606,6 +616,13 @@ void CrossGenWidget::doReset() {
     // in reverse: the layout on the labels and the immersion, the immersion on
     // the cut, the flow and the cones, and both the flow and the cut on the
     // cones.
+    diskFill_.reset();
+    pipelineBlocked_.clear();
+    // Stage 0c replaced the mesh every later stage was written on, so the reset
+    // has to put the loaded one back before anything is built on it again.
+    if (inputMesh_) mesh_ = inputMesh_;
+    inputMesh_.reset();
+    inclusions_.clear();
     quadMesh_.reset();
     splines_.reset();
     arrangement_.reset();
@@ -675,6 +692,7 @@ void CrossGenWidget::doReset() {
     patchesAnnounced_      = false;
     patchesAttempted_      = false;
     meshAttempted_         = false;
+    disksAttempted_        = false;
 
     view_.cx    = 0.5 * (bounds_.minx + bounds_.maxx);
     view_.cy    = 0.5 * (bounds_.miny + bounds_.maxy);
@@ -1429,8 +1447,8 @@ void CrossGenWidget::runMERIDIANInterfaces() {
 // kernel is the constants, so the residual has to be orthogonal to them -- and
 // an inadmissible set does not converge slowly, it has no solution at all.
 void CrossGenWidget::runMERIDIANCones() {
+    if (!sipgField_.has_value()) return;   // called before the field: not an attempt
     conesAttempted_ = true;
-    if (!sipgField_.has_value()) return;
 
     // Cone indices are read off a *converged* field: an interior winding number
     // is an exact integer only once the field has stopped moving, and a
@@ -1587,8 +1605,8 @@ void CrossGenWidget::runMERIDIANCones() {
 // Stage 2, Sec. 3.2.2. HarmonicCut opens the voids and the cone arcs drag every
 // interior cone out to the boundary, leaving S - G a disk with P in G union dS.
 void CrossGenWidget::runMERIDIANCut() {
+    if (!cones_.has_value()) return;       // called before Stage 1: not an attempt
     cutAttempted_ = true;
-    if (!cones_.has_value()) return;
 
     auto t0 = Clock::now();
     try {
@@ -1599,8 +1617,10 @@ void CrossGenWidget::runMERIDIANCut() {
                          interfaces_.has_value() ? &*interfaces_ : nullptr);
     } catch (const std::exception &e) {
         coneCut_.reset();
-        console_.log(std::string("[Cut] FAILED: ") + e.what());
-        std::cerr << "[Viewer] ConeCut failed: " << e.what() << "\n";
+        // On the banner as well as in the console: everything from Stage 4 on
+        // is built on the cut, so this failure is what the four blank phases
+        // after it are, and the console will have scrolled past it by then.
+        blockPipeline("Stage 2 failed", e.what());
         return;
     }
     auto t1 = Clock::now();
@@ -1640,8 +1660,8 @@ void CrossGenWidget::runMERIDIANCut() {
 // derived here rather than per frame -- both are a walk over every edge or
 // every cone star.
 void CrossGenWidget::runRicciFlow() {
+    if (!cones_.has_value()) return;       // called before Stage 1: not an attempt
     ricciAttempted_ = true;
-    if (!cones_.has_value()) return;
 
     auto t0 = Clock::now();
     bool ok = false;
@@ -1737,8 +1757,8 @@ void CrossGenWidget::runRicciFlow() {
 // frames either side of it, which is what makes C2 hold by construction instead
 // of by a fit and a rounding.
 void CrossGenWidget::runTORSIONFrames() {
-    framesAttempted_ = true;
     if (!sipgField_.has_value() || !coneCut_.has_value() || !cones_.has_value()) return;
+    framesAttempted_ = true;
 
     // Sec. 4, and C4. The frame the plan first wrote down was (1/h) R(-theta),
     // which asks the map to be an isometry of the model everywhere and so is
@@ -1979,8 +1999,8 @@ std::vector<Point> CrossGenWidget::runTORSIONUntangle() {
 // Blocking: one sparse saddle solve, and when it inverted something, a whole
 // continuation after it.
 void CrossGenWidget::runTORSIONIntegration() {
-    integrationAttempted_ = true;
     if (!frames_.has_value() || !coneCut_.has_value() || !cones_.has_value()) return;
+    integrationAttempted_ = true;
 
     const FieldFrames::Report &ffr = frames_->getReport();
     if (ffr.unreachedFaces > 0 || ffr.combingDefects > 0) {
@@ -2524,8 +2544,17 @@ bool CrossGenWidget::promptMERIDIANConnectivity(const Immersion &imm,
 }
 
 void CrossGenWidget::runMERIDIANLayout() {
+    if (!coneCut_.has_value() || !cones_.has_value()) {
+        // Said once -- pipelineBlocked_ is only empty the first time through --
+        // because this is reached on every frame for as long as it is true.
+        if (pipelineBlocked_.empty())
+            blockPipeline("Stages 4-11 not run",
+                          "there is no cutting graph to unfold: Stage 2 did not produce "
+                          "one, and psi_R is an immersion of the disk it cuts");
+        return;
+    }
     layoutAttempted_ = true;
-    if (!coneCut_.has_value() || !cones_.has_value()) return;
+    pipelineBlocked_.clear();
 
     // Fit the right panel to whichever map is about to be shown there.
     auto fitPanel = [this](const std::vector<Point> &uv) {
@@ -2556,9 +2585,10 @@ void CrossGenWidget::runMERIDIANLayout() {
         // continuation from. Stage 4R is what stands in front of this, and when
         // it did not manage it the phase before said so.
         if (immersion_->getReport().flippedFaces > 0) {
-            console_.log("[Layout] psi_0 does not satisfy Q1, so the continuation of "
-                         "Sec. 3.3 was not run; see the Stage 4F and 4R reports at the "
-                         "phase before");
+            blockPipeline("Stages 5-11 not run",
+                          "psi_0 does not satisfy Q1, and Sec. 3.3's barrier can only "
+                          "preserve Q1, never repair it; see the Stage 4F and 4R reports "
+                          "at the phase before");
             return;
         }
         psiR_ = immersion_->getUV();
@@ -2620,8 +2650,11 @@ void CrossGenWidget::runMERIDIANLayout() {
     for (const std::string &m : ir.messages) console_.log("[Immersion] " + m);
 
     if (ir.flippedFaces > 0 || ir.unplacedVertices > 0) {
-        console_.log("[Immersion] psi_R does not satisfy Q1; the continuation of Sec. 3.3 "
-                     "can only preserve it, never repair it, so it was not run");
+        blockPipeline("Stages 5-11 not run",
+                      "psi_R does not satisfy Q1 (" + std::to_string(ir.flippedFaces) +
+                          " flipped face(s), " + std::to_string(ir.unplacedVertices) +
+                          " unplaced vertex/vertices); the continuation can only preserve "
+                          "Q1, never repair it");
         return;
     }
     }  // end of the Ricci route's Stage 4
@@ -2812,9 +2845,10 @@ void CrossGenWidget::runMERIDIANLayout() {
 // pair of cones whose connectivity constraint is missing, which is the
 // diagnosis Sec. 3.3 asks for when the layout is not yet a layout.
 void CrossGenWidget::runMERIDIANSeparatrices() {
-    separatricesAttempted_ = true;
     if (!immersion_.has_value() || !meridianLayout_.has_value() ||
         !meridianLabels_.has_value()) return;
+    separatricesAttempted_ = true;
+    pipelineBlocked_.clear();
 
     auto t0 = Clock::now();
 
@@ -2864,15 +2898,14 @@ void CrossGenWidget::runMERIDIANSeparatrices() {
                                        });
     } catch (const std::exception &e) {
         separatrices_.reset();
-        console_.log(std::string("[Separatrices] FAILED: ") + e.what());
-        std::cerr << "[Viewer] Separatrices failed: " << e.what() << "\n";
+        blockPipeline("Stages 7-11 not run", e.what());
         return;
     }
     auto t1 = Clock::now();
 
     if (!rep.separatrices) {
         separatrices_.reset();
-        console_.log("[Separatrices] the curves could not be traced");
+        blockPipeline("Stages 7-11 not run", "the curves could not be traced");
         return;
     }
     separatrices_.emplace(std::move(*rep.separatrices));
@@ -2959,18 +2992,50 @@ void CrossGenWidget::runMERIDIANSeparatrices() {
                  "a cone and went on, red ended nowhere");
 }
 
-// Whether Stage 7 came back with something a layout can be read off. Q5 on
-// every curve traced and Psi still satisfying Q1-Q5 after the repair: the two
-// verdicts the separatrix phase already printed. Stage 8's own validation is a
-// different question -- it asks whether the partition is four-sided everywhere
-// -- and it is allowed to fail and be reported. What is not allowed is to build
-// the partition out of curves that never closed.
+// Whether Stage 7 came back with something a layout can be read off: every
+// curve it traced terminated the way Q5 allows, and Psi is still injective.
+// Stage 8's own validation is a different question -- it asks whether the partition is
+// four-sided everywhere -- and it is allowed to fail and be reported. What is
+// not allowed is to build the partition out of curves that never closed, or on
+// a map that folded.
+//
+// LayoutEnergy::Report::valid is deliberately *not* the test, though it looks
+// like the obvious one. It is Q1, Q2 and `constraintsMet`, and that last is the
+// continuation's own residual on the Gamma_topo paths Stage 5 seeded -- a
+// statement about how far E5 got, not about the curves. Q5 itself is what Stage
+// 7 measures, on every separatrix there is rather than on the seeded subset,
+// and that is the verdict above. Requiring `valid` on top of it means a model
+// whose residual stops just short has its arrangement, its splines and its mesh
+// refused over a number that says nothing about whether the curves partition S:
+// data/meshes/multimat/bubbles with its inclusions excised is exactly that, Q5
+// passing on all 200 traced curves with the E5 residual at 4e-6 against a
+// tolerance of 1e-6, and the viewer showed a blank screen for the last two
+// phases of a run TestMERIDIAN takes all the way to the templates.
+//
+// MERIDIAN::run says why in as many words at its own Stage 8: run it even when
+// Stage 6 fell short, because the arrangement is where the failure becomes a
+// *place* -- this face has three corners, that cone is one arc short -- rather
+// than a residual. Q2 likewise: cone angles a little off make some sectors
+// something other than quarters, which Stage 8 counts and reports face by face.
+// The one thing that cannot be allowed is what this still refuses: curves that
+// never closed, and a Psi that folded, on which an arrangement is not a
+// partition of anything.
 bool CrossGenWidget::meridianTraceIsClean() const {
     if (!separatrices_.has_value() || !meridianLayout_.has_value()) return false;
     const Separatrices::Report &r = separatrices_->getReport();
     if (!r.valid) return false;
     if (r.emitted == 0) return false;
-    return meridianLayout_->getReport().valid;
+    return meridianLayout_->getReport().injective;
+}
+
+// A stage that has nothing to hand the phase after it, said in the three places
+// it has to be said: the console, which is where the rest of the run is; the
+// terminal, which keeps a transcript the console cannot; and the overlay, which
+// is the only one still on screen when the blank phase is.
+void CrossGenWidget::blockPipeline(const std::string &stage, const std::string &what) {
+    console_.log("[" + stage + "] " + what);
+    std::cerr << "[Viewer] " << stage << ": " << what << "\n";
+    pipelineBlocked_ = stage + " -- " + what;
 }
 
 // Stages 8 and 9: the curves become a planar subdivision of S, and each arc of
@@ -2982,17 +3047,62 @@ bool CrossGenWidget::meridianTraceIsClean() const {
 // fit is a reconstruction of the layout, not a change to it. The numbers are
 // where they differ, so both reports are printed in full.
 void CrossGenWidget::runMERIDIANPatches() {
-    patchesAttempted_ = true;
+    // Not "attempted" until the curves it is to be built from are there. This
+    // is called from advancePhase() as well as from runComputations(), and the
+    // window between them is real: Stage 6 and Stage 7 hold the GUI thread for
+    // seconds on a model with forty cones, every keypress made in the meantime
+    // is delivered when they return, and two of them walk the phase past this
+    // stage before Stage 7 has produced anything. Setting the flag here would
+    // then retire Stage 8 for the rest of the run -- the arrangement, the
+    // splines, the mesh and the templates all silently absent, on a phase whose
+    // whole picture they are.
     if (!separatrices_.has_value() || !meridianLabels_.has_value()) return;
+    patchesAttempted_ = true;
 
+    pipelineBlocked_.clear();
     if (!meridianTraceIsClean()) {
-        // Refusing rather than drawing a layout that is not one. The separatrix
-        // phase has already said which curves failed and offered the dialog
-        // that can do something about them.
-        console_.log("[Patches] not built: Stage 7 did not finish cleanly, so the curves "
-                     "do not partition S. Press 'c' to re-open the connectivity dialog and "
-                     "trace again");
+        // Refusing rather than drawing a partition that is not one -- and
+        // naming which of the reasons it was, because their remedies differ:
+        // curves that never closed are what the connectivity dialog can do
+        // something about, and a folded Psi is not.
+        const Separatrices::Report &sr = separatrices_->getReport();
+        std::ostringstream oss;
+        if (!meridianLayout_.has_value()) {
+            oss << "Stage 6 produced no layout to read";
+        } else if (sr.emitted == 0) {
+            oss << "Stage 7 emitted no separatrices";
+        } else if (!sr.valid) {
+            oss << "Q5 failed on the curves Stage 7 traced, so they do not partition S -- "
+                   "press 'n' to re-open the connectivity dialog and trace again";
+        } else {
+            oss << "Psi folded (" << meridianLayout_->getReport().invertedTriangles
+                << " inverted triangle(s)), and an arrangement of curves on a map that is "
+                   "not injective is not a partition";
+        }
+        blockPipeline("Stage 8 not built", oss.str());
         return;
+    }
+
+    // Built, but on a layout that fell short: said here rather than left to be
+    // inferred from Stage 8's own counts, because the picture that follows
+    // looks exactly like one from a layout that did not.
+    {
+        const LayoutEnergy::Report &er = meridianLayout_->getReport();
+        if (!er.constraintsMet || !er.anglesHeld) {
+            std::ostringstream oss;
+            oss << "[Patches] built on a layout Stage 6 did not close out -- ";
+            if (!er.constraintsMet)
+                oss << "the E5 residual stopped at " << std::scientific << std::setprecision(2)
+                    << er.maxTopoResidual << " of the image extent";
+            if (!er.constraintsMet && !er.anglesHeld) oss << ", and ";
+            if (!er.anglesHeld)
+                oss << "a cone is " << std::scientific << std::setprecision(2)
+                    << er.maxConeAngleResidual << " rad off the angle Stage 1 prescribed";
+            oss << ". Every curve Stage 7 traced still satisfies Q5, so the partition is "
+                   "there to look at; where it went wrong is a face with the wrong number "
+                   "of corners below, not a residual";
+            console_.log(oss.str());
+        }
     }
 
     auto t0 = Clock::now();
@@ -3000,7 +3110,7 @@ void CrossGenWidget::runMERIDIANPatches() {
         arrangement_.emplace(*separatrices_, *meridianLabels_);
     } catch (const std::exception &e) {
         arrangement_.reset();
-        console_.log(std::string("[Patches] arrangement FAILED: ") + e.what());
+        blockPipeline("Stage 8 failed", e.what());
         return;
     }
     auto t1 = Clock::now();
@@ -3058,7 +3168,7 @@ void CrossGenWidget::runMERIDIANPatches() {
         splines_.emplace(*arrangement_);
     } catch (const std::exception &e) {
         splines_.reset();
-        console_.log(std::string("[Patches] spline fit FAILED: ") + e.what());
+        blockPipeline("Stage 9 failed", e.what());
         return;
     }
     auto t3 = Clock::now();
@@ -3204,6 +3314,53 @@ bool CrossGenWidget::promptMERIDIANMesh() {
     form->addRow(splineBox);
     form->addRow(new QLabel("The grid is transfinite interpolation only:\n"
                             "no smoothing is run on it.", &dlg));
+
+    // Stage 11's three settings live in Stage 10's dialog, because Stage 11 is
+    // rerun with the mesh and never on its own: the fill is built on the rim
+    // the interval assignment produced, so trying another squareness means
+    // meshing again. Shown only where something was excised.
+    QDoubleSpinBox *squareBox = nullptr;
+    QSpinBox *ringBox = nullptr, *smoothBox = nullptr;
+    if (!inclusions_.empty()) {
+        form->addRow(new QLabel(QString("Stage 11 — the O-grid on %1 excised inclusion(s)")
+                                    .arg(static_cast<int>(inclusions_.size())), &dlg));
+
+        squareBox = new QDoubleSpinBox(&dlg);
+        squareBox->setRange(0.0, 1.0);
+        squareBox->setDecimals(2);
+        squareBox->setSingleStep(0.05);
+        squareBox->setValue(diskSettings_.squareness);
+        squareBox->setToolTip(
+            "How square the core block's boundary is.\n"
+            "0 is a scaled copy of the rim, which puts a straight angle at each of\n"
+            "the four core corners — the very defect meshing the disk as one patch\n"
+            "has. 1 is the straight chords between them, which makes the ring 1.6x\n"
+            "deeper at the middle of a side than at its ends.");
+
+        ringBox = new QSpinBox(&dlg);
+        ringBox->setRange(0, 64);
+        ringBox->setValue(diskSettings_.ringDepth);
+        ringBox->setSpecialValueText("auto");
+        ringBox->setToolTip(
+            "Rows of elements between the rim and the core.\n"
+            "Auto takes it from the rim spacing, so a ring element is about as\n"
+            "deep as it is wide.");
+
+        smoothBox = new QSpinBox(&dlg);
+        smoothBox->setRange(0, 5000);
+        smoothBox->setValue(diskSettings_.smoothing);
+        smoothBox->setToolTip(
+            "Laplacian sweeps over the nodes the template placed, the rim held.\n"
+            "A move is taken only where it does not lower the worst scaled\n"
+            "Jacobian around the node, so this cannot fold an element.\n"
+            "Unlike Stage 10's smoothing, which this dialog leaves off, it is\n"
+            "what takes the transfinite start to the O-grid picture.");
+
+        form->addRow("core squareness", squareBox);
+        form->addRow("ring rows", ringBox);
+        form->addRow("template smoothing sweeps", smoothBox);
+    }
+
     form->addRow(buttons);
 
     if (dlg.exec() != QDialog::Accepted) return false;
@@ -3212,6 +3369,9 @@ bool CrossGenWidget::promptMERIDIANMesh() {
     meshSettings_.minEdges   = minBox->value();
     meshSettings_.maxEdges   = maxBox->value();
     meshSettings_.useSplines = splineBox->isChecked();
+    if (squareBox) diskSettings_.squareness = squareBox->value();
+    if (ringBox)   diskSettings_.ringDepth  = ringBox->value();
+    if (smoothBox) diskSettings_.smoothing  = smoothBox->value();
     return true;
 }
 
@@ -3223,12 +3383,14 @@ bool CrossGenWidget::promptMERIDIANMesh() {
 // this phase is a picture of. What the smoothing buys is measured in
 // TestMERIDIAN, where the before and the after can be put side by side.
 void CrossGenWidget::runMERIDIANMesh() {
-    meshAttempted_ = true;
-    quadMesh_.reset();
-    if (!splines_.has_value()) {
-        console_.log("[Mesh] not built: Stage 9 produced no patches to mesh");
+    if (!splines_.has_value()) {           // Stage 9 not there yet: not an attempt
+        blockPipeline("Stage 10 not built", "Stage 9 produced no patches to mesh");
         return;
     }
+    meshAttempted_ = true;
+    quadMesh_.reset();
+    diskFill_.reset();
+    pipelineBlocked_.clear();
 
     QuadMesh::Options qopts;
     qopts.targetEdgeLength = meshSettings_.target;
@@ -3237,12 +3399,24 @@ void CrossGenWidget::runMERIDIANMesh() {
     qopts.useSplines       = meshSettings_.useSplines;
     qopts.smoothingPasses  = 0;   // the grid TFI gives, and nothing after it
 
+    // Which arcs lie on each excised rim. Wanted here rather than at Stage 11
+    // because the interval assignment has to know: a rim with an odd number of
+    // edges cannot be quadrangulated by any template at all, so the counts are
+    // chosen with that parity constraint in them. Empty on a model where
+    // nothing was excised, and then this is Stage 10 exactly as it was.
+    std::vector<std::vector<int>> rims;
+    if (!inclusions_.empty() && arrangement_.has_value()) {
+        rims = DiskTemplate::rimArcs(*arrangement_, inclusions_);
+        for (const std::vector<int> &r : rims)
+            if (!r.empty()) qopts.evenLoops.push_back(r);
+    }
+
     auto t0 = Clock::now();
     try {
         quadMesh_.emplace(*splines_, qopts);
     } catch (const std::exception &e) {
         quadMesh_.reset();
-        console_.log(std::string("[Mesh] FAILED: ") + e.what());
+        blockPipeline("Stage 10 failed", e.what());
         return;
     }
     auto t1 = Clock::now();
@@ -3321,8 +3495,247 @@ void CrossGenWidget::runMERIDIANMesh() {
         console_.log(oss.str());
         std::cerr << "[Viewer] " << oss.str() << "\n";
     }
+    if (!qopts.evenLoops.empty()) {
+        std::ostringstream oss;
+        oss << "[Mesh] rim parity: " << qr.oddLoops << " of " << qopts.evenLoops.size()
+            << " rim(s) came out odd, " << qr.parityChordsMoved
+            << " chord(s) moved by one edge to fix it, " << qr.oddLoopsLeft << " left odd";
+        console_.log(oss.str());
+    }
     console_.log("[Mesh] transfinite grid, unsmoothed: grey is a mesh edge, blue a block "
                  "wall, red a folded element. Press 'c' to mesh again at another target");
+
+    runDiskTemplates(rims);
+}
+
+// ── Stage 0c: the circular inclusions, taken out before anything is built ────
+//
+// Called from the mode keys and nowhere else. Every stage of either pipeline is
+// written on mesh_, so the one moment this can happen is after the mode is
+// chosen and before the first of them runs -- there is no phase for it, and the
+// phase it would sit in is the one the field is already built by.
+//
+// What it buys is in DiskTemplate's header: eight cones per inclusion that the
+// penalty continuation of Sec. 3.3 does not have to place, which on
+// data/geometry/multimat/bubbles is the difference between a layout and 57% of
+// the model left unmeshed.
+void CrossGenWidget::runDiskExcision() {
+    // Once per run, like every other stage here: the mode can only be chosen
+    // from Unselected, so this is belt and braces rather than a live guard.
+    if (disksAttempted_ || !mesh_) return;
+    disksAttempted_ = true;
+    inclusions_.clear();
+    diskFill_.reset();
+
+    std::vector<std::string> msgs;
+    std::vector<DiskTemplate::Inclusion> found = DiskTemplate::detect(*mesh_, msgs);
+    // detect() says why it refused a component that looked like a candidate --
+    // the model itself being one circle, a disk touching dS -- and those are
+    // worth reading even though the answer is "nothing to do".
+    for (const std::string &m : msgs) console_.log("[Disks] Stage 0c: " + m);
+    if (found.empty()) return;
+
+    if (!promptDiskExcision(found)) {
+        std::ostringstream oss;
+        oss << "[Disks] Stage 0c declined: the " << found.size()
+            << " circular inclusion(s) stay in the layout problem, cones and all";
+        console_.log(oss.str());
+        return;
+    }
+
+    std::shared_ptr<Mesh> excised = DiskTemplate::excise(*mesh_, found);
+    if (!excised || excised->triangles.empty()) {
+        console_.log("[Disks] Stage 0c: excising the inclusions would leave no mesh "
+                     "behind, so they are laid out like any other region");
+        return;
+    }
+
+    int excisedTris = 0;
+    for (const DiskTemplate::Inclusion &inc : found)
+        excisedTris += static_cast<int>(inc.triangles.size());
+
+    inputMesh_  = mesh_;
+    mesh_       = excised;
+    inclusions_ = std::move(found);
+
+    // Anything already standing on the mesh that was just replaced has to go
+    // with it. Nothing should be, since this runs before the mode is set and
+    // therefore before runComputations() will build any of it -- but "should
+    // be" is exactly what a nested event loop breaks, and every stage below
+    // checks that its inputs were measured on the mesh it was handed and
+    // throws when they were not. Cheap, and it makes the ordering a property
+    // of this function rather than of its one caller.
+    quadMesh_.reset();
+    splines_.reset();
+    arrangement_.reset();
+    separatrices_.reset();
+    meridianLayout_.reset();
+    meridianLabels_.reset();
+    immersion_.reset();
+    integration_.reset();
+    tutte_.reset();
+    scaffold_.reset();
+    frames_.reset();
+    coneMetric_.reset();
+    ricci_.reset();
+    coneCut_.reset();
+    cones_.reset();
+    interfaces_.reset();
+    sipgField_.reset();
+    flatMetric_ = viewer::FlatMetric{};
+    coneFans_.clear();
+    ricciU_.resize(0);
+    psiR_.clear();
+    integratedMap_.clear();
+    fieldIndex_.clear();
+    interfaceMessagesSeen_ = 0;
+    interfacesAttempted_ = conesAttempted_ = cutAttempted_ = false;
+    ricciAttempted_ = ricciAnnounced_ = false;
+    framesAttempted_ = integrationAttempted_ = integrationAnnounced_ = false;
+    layoutAttempted_ = layoutAnnounced_ = false;
+    separatricesAttempted_ = separatricesAnnounced_ = false;
+    patchesAttempted_ = patchesAnnounced_ = false;
+    meshAttempted_ = false;
+    sipgSteppingStarted_ = sipgConverged_ = false;
+    sipgStepCount_ = 0;
+
+    {
+        std::ostringstream oss;
+        oss << "[Disks] Stage 0c: excised " << inclusions_.size() << " circular "
+            << "inclusion(s), " << excisedTris << " of " << inputMesh_->triangles.size()
+            << " triangle(s). The layout is asked for the matrix with holes; Stage 11 "
+            << "puts each O-grid back from a template.";
+        console_.log(oss.str());
+        std::cerr << "[Viewer] " << oss.str() << "\n";
+    }
+}
+
+// The dialog. Opened only when there is something to decide, so a model with no
+// circular inclusion never sees it and the pipeline is unchanged for every
+// model that had none.
+//
+// The list is the point of opening a dialog rather than assuming: whether these
+// components are the inclusions the model is about, or something the fit
+// happened to accept, is a question about this model, and the radii and the
+// deviation of each fit are how it is answered.
+bool CrossGenWidget::promptDiskExcision(const std::vector<DiskTemplate::Inclusion> &found) {
+    QDialog dlg(this);
+    dlg.setWindowTitle("Stage 0c — circular inclusions");
+
+    std::ostringstream oss;
+    oss << found.size() << " circular inclusion(s) found:\n";
+    const std::size_t shown = std::min<std::size_t>(found.size(), 12);
+    for (std::size_t i = 0; i < shown; ++i) {
+        const DiskTemplate::Inclusion &inc = found[i];
+        oss << "  material " << inc.matId << "  r = " << std::fixed << std::setprecision(4)
+            << inc.circle.radius << "  at (" << inc.circle.center[0] << ", "
+            << inc.circle.center[1] << ")  fit " << std::setprecision(1)
+            << (100.0 * inc.circle.maxRelDev) << "%\n" << std::setprecision(4);
+    }
+    if (shown < found.size()) oss << "  ... and " << (found.size() - shown) << " more\n";
+
+    auto *summary = new QLabel(QString::fromStdString(oss.str()), &dlg);
+    summary->setTextFormat(Qt::PlainText);
+
+    auto *why = new QLabel(
+        "Excising them asks the layout for the matrix with a hole where each disk\n"
+        "was, and fills the holes back in from an O-grid template after Stage 10.\n"
+        "A disk carries eight cones — four +1 inside, four −1 in the matrix — and\n"
+        "it is placing those, many times over, that the Sec. 3.3 continuation\n"
+        "cannot do. Declining lays them out like any other region.", &dlg);
+    why->setTextFormat(Qt::PlainText);
+
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    buttons->button(QDialogButtonBox::Ok)->setText("Excise");
+    buttons->button(QDialogButtonBox::Cancel)->setText("Leave them in");
+    QObject::connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    QObject::connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+
+    auto *layout = new QVBoxLayout(&dlg);
+    layout->addWidget(summary);
+    layout->addWidget(why);
+    layout->addWidget(buttons);
+
+    // The dialog remembers the last answer only in so far as it decides which
+    // button is the default one, since the decision itself is per model.
+    buttons->button(diskSettings_.excise ? QDialogButtonBox::Ok : QDialogButtonBox::Cancel)
+        ->setDefault(true);
+
+    const bool accepted = dlg.exec() == QDialog::Accepted;
+    diskSettings_.excise = accepted;
+    return accepted;
+}
+
+// ── Stage 11: the O-grid templates ──────────────────────────────────────────
+//
+// Straight after Stage 10 and off the same rim arcs it was given, because the
+// two are one decision: the fill exists only if the rim carries an even number
+// of edges, and that is a property of the interval assignment. A no-op when
+// Stage 0c excised nothing.
+void CrossGenWidget::runDiskTemplates(const std::vector<std::vector<int>> &rims) {
+    diskFill_.reset();
+    if (inclusions_.empty() || rims.empty()) return;
+    if (!quadMesh_.has_value() || !arrangement_.has_value()) return;
+
+    DiskTemplate::Options topts;
+    topts.coreSquareness   = diskSettings_.squareness;
+    topts.ringDepth        = diskSettings_.ringDepth;
+    topts.smoothingPasses  = diskSettings_.smoothing;
+
+    auto t0 = Clock::now();
+    try {
+        diskFill_.emplace(quadMesh_->vertices(), quadMesh_->quads(),
+                          quadMesh_->quadMaterials(),
+                          DiskTemplate::rimVertexLoops(*arrangement_, *quadMesh_, rims),
+                          inclusions_, topts);
+    } catch (const std::exception &e) {
+        diskFill_.reset();
+        console_.log(std::string("[Disks] Stage 11 FAILED: ") + e.what());
+        return;
+    }
+    auto t1 = Clock::now();
+
+    const DiskTemplate::Report &dr = diskFill_->getReport();
+    {
+        std::ostringstream oss;
+        oss << "[Disks] Stage 11: " << dr.filled << " of " << dr.inclusions
+            << " inclusion(s) templated -- " << dr.blocks << " block(s), " << dr.quads
+            << " element(s), " << dr.vertices << " new vertex/vertices, "
+            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+    }
+    if (dr.refusedOdd || dr.refusedShort || dr.refusedOpen) {
+        std::ostringstream oss;
+        oss << "[Disks] refused: " << dr.refusedOdd << " rim(s) with an odd edge count, "
+            << dr.refusedShort << " too short to hold a ring and a core, "
+            << dr.refusedOpen << " Stage 10 did not close -- each is left as a hole";
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Disks] merged mesh: " << dr.mergedVertices << " vertices, "
+            << dr.mergedQuads << " quad(s); scaled Jacobian " << std::fixed
+            << std::setprecision(4) << dr.minScaledJacobian << " worst, "
+            << dr.meanScaledJacobian << " mean (" << dr.templateMinScaledJacobian
+            << " worst on the templates)";
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Disks] " << dr.interiorEdges << " interior and " << dr.boundaryEdges
+            << " boundary edge(s), " << dr.nonManifoldEdges << " used a third time, "
+            << dr.cracks << " crack(s): "
+            << (dr.conforming ? "conforming [PASS]" : "not conforming [FAIL]");
+        console_.log(oss.str());
+    }
+    for (const std::string &m : dr.messages) console_.log("[Disks] " + m);
+    {
+        std::ostringstream oss;
+        oss << "[Disks] Stage 11 " << (dr.valid ? "validates [PASS]"
+                                                : "does not validate [FAIL]");
+        console_.log(oss.str());
+        std::cerr << "[Viewer] " << oss.str() << "\n";
+    }
 }
 
 // Stages 5 to 7 again from the immersion already computed, at whatever the
@@ -3340,7 +3753,9 @@ void CrossGenWidget::rerunMERIDIANConnectivity() {
     // Reverse construction order: SplineFit holds a reference to the
     // arrangement, the arrangement to the separatrices and the labels,
     // LayoutEnergy to the immersion and the labels, SubdomainLabels to the
-    // immersion.
+    // immersion. Stage 11 is a copy of Stage 10's arrays and goes with them.
+    pipelineBlocked_.clear();
+    diskFill_.reset();
     quadMesh_.reset();
     meshAttempted_ = false;
     splines_.reset();
@@ -3455,6 +3870,12 @@ void CrossGenWidget::advancePhase() {
             if (!patchesAttempted_) runMERIDIANPatches();
         }
         if (pipePhase_ == PipelinePhase::Mesh && splines_.has_value()) {
+            // Marked as asked before the dialog opens, for the same reason the
+            // catch-up in runComputations() does it in that order: the dialog
+            // paints, painting reaches that catch-up, and a second dialog on
+            // top of this one is what it would otherwise open. Cancelling
+            // counts as having been asked, and 'c' here is what re-opens it.
+            meshAttempted_ = true;
             if (promptMERIDIANMesh()) runMERIDIANMesh();
         }
     }
@@ -3914,6 +4335,24 @@ void CrossGenWidget::runComputations() {
         } else {
             runMERIDIANPatches();
         }
+    }
+
+    // ── Both pipelines: Stage 10, when the phase arrived before Stage 9 ──────
+    //
+    // The mesh dialog normally opens on the keypress that enters this phase,
+    // which is the right moment: it is a judgement about the model and it wants
+    // making with the patches on screen. But that keypress can land while
+    // Stages 6 and 7 still have the GUI thread, and then it enters a phase
+    // whose input does not exist yet -- the dialog does not open, and nothing
+    // afterwards asks for it. So the phase asks again, once, as soon as Stage 9
+    // has something to mesh. Cancelling counts as having asked: 'c' re-opens it.
+    if (inPipeline() && pipePhase_ == PipelinePhase::Mesh && splines_.has_value() &&
+        !meshAttempted_) {
+        // Marked as asked *before* the dialog opens, not after: the dialog runs
+        // a nested event loop, that loop paints, and painting comes back here.
+        // Cancelling counts as having been asked; 'c' re-opens it.
+        meshAttempted_ = true;
+        if (promptMERIDIANMesh()) runMERIDIANMesh();
     }
 
 
@@ -4446,7 +4885,14 @@ void CrossGenWidget::renderMERIDIANModel() {
     // that was the point of the phase to get past. It is worse at the mesh
     // phase than at the patch one, where the quadrilaterals are near the size
     // of the triangles beneath them and the two grids read as one.
-    if (pipePhase_ >= PipelinePhase::Patches) return;
+    //
+    // Unless there is no decomposition to draw. A stage that refused leaves the
+    // phase with nothing of its own, and dropping the model as well turns that
+    // into an empty window -- which says "the viewer is broken" when what
+    // happened is "Stage 8 refused, and here is why" on the overlay. So the
+    // model is kept whenever the picture that was to replace it is not there.
+    const bool replaced = quadMesh_.has_value() || arrangement_.has_value();
+    if (pipePhase_ >= PipelinePhase::Patches && replaced) return;
 
     if (showMetric) {
         // The metric replaces the wireframe rather than covering it: every edge
@@ -4899,6 +5345,10 @@ void CrossGenWidget::renderNormal() {
             // Stage 0b needs neither, so its network is already there to see.
             if (showInterfaces_ && interfaces_.has_value())
                 viewer::drawInterfaceNetwork(*interfaces_, 0.4 * avgEdge_, 3.0f);
+            // And Stage 0c's circles over the holes it left, so that the holes
+            // read as something taken out on purpose rather than as a gap in
+            // the input.
+            viewer::drawInclusionCircles(inclusions_, 1.5f);
             if (pipePhase_ >= PipelinePhase::CrossField && sipgField_.has_value()) {
                 viewer::drawTriangleCrossField(*mesh_, *sipgField_, scale_);
                 const double ballRadius = 0.5 * avgEdge_;
@@ -4922,9 +5372,17 @@ void CrossGenWidget::renderNormal() {
                 // sourced copy of them over the first. A face Stage 10 could
                 // not mesh has no wall here, which is the point: the blank is
                 // where the mesh is not.
-                viewer::drawQuadMesh(*quadMesh_, 1.0f, 2.5f,
-                                     showMaterialFill_ && interfaces_.has_value() &&
-                                         interfaces_->multiMaterial());
+                //
+                // Where Stage 11 ran it is the merged mesh that is drawn, not
+                // Stage 10's: the templates are elements of that one mesh, and
+                // an inclusion the fill refused stays a hole here, which is
+                // exactly what the report says of it.
+                const bool matFill = showMaterialFill_ && interfaces_.has_value() &&
+                                     interfaces_->multiMaterial();
+                if (diskFill_.has_value())
+                    viewer::drawQuadMesh(*diskFill_, &*quadMesh_, 1.0f, 2.5f, matFill);
+                else
+                    viewer::drawQuadMesh(*quadMesh_, 1.0f, 2.5f, matFill);
             } else if (pipePhase_ >= PipelinePhase::Patches && arrangement_.has_value()) {
                 viewer::drawLayoutPatches(*arrangement_,
                                           splines_.has_value() ? &*splines_ : nullptr,
@@ -4938,6 +5396,10 @@ void CrossGenWidget::renderNormal() {
             if (showInterfaces_ && pipePhase_ >= PipelinePhase::Patches &&
                 interfaces_.has_value())
                 viewer::drawInterfaceNetwork(*interfaces_, 0.25 * avgEdge_, 2.0f);
+            // The excised circles, until Stage 11 has put the O-grids back:
+            // after that the elements are the picture and a circle over them
+            // says nothing the rim does not.
+            if (!diskFill_.has_value()) viewer::drawInclusionCircles(inclusions_, 1.5f);
         }
     } else if (mode_ == Mode::MedialAxis) {
         viewer::drawAxis(view_);
@@ -5078,10 +5540,13 @@ void CrossGenWidget::renderNormal() {
     // appended to whatever the phase's own help says, since they apply at every
     // phase of either pipeline and to none of the other modes.
     const std::string meridianKeys =
-        (inPipeline() && interfaces_.has_value() && interfaces_->multiMaterial())
-            ? std::string("press 'i' to show/hide the interface network\n"
-                          "press 'm' to fill the triangles by material\n")
-            : std::string();
+        (inPipeline() ? (pipelineBlocked_.empty() ? std::string()
+                                                  : pipelineBlocked_ + "\n")
+                      : std::string()) +
+        ((inPipeline() && interfaces_.has_value() && interfaces_->multiMaterial())
+             ? std::string("press 'i' to show/hide the interface network\n"
+                           "press 'm' to fill the triangles by material\n")
+             : std::string());
 
     if (mode_ == Mode::Unselected) {
         renderOverlay("press '1' for PolyVector mode\npress '2' for MBO mode\n"

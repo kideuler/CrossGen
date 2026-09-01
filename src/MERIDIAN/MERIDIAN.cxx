@@ -4,6 +4,7 @@
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 #include <vector>
 
 #include "SIPG/SIPG.hxx"
@@ -30,22 +31,6 @@ MERIDIAN::~MERIDIAN() = default;
 // The same convergence test as TestSIPG: the MBO error is a sum over triangles,
 // so the threshold scales with the triangle count.
 // ---------------------------------------------------------------------------
-// Whether an interface edge is on the rim of a circular inclusion: one of its
-// two triangles lies in a material component Mesh::computeMaterialCircles
-// accepted as a circle. See Options::diskTemplates.
-bool MERIDIAN::onCircularRim(int e) const {
-    if (e < 0 || e >= static_cast<int>(mesh->edgeTriangles.size())) return false;
-    if (mesh->triangleComponent.size() != mesh->triangles.size()) return false;
-    for (int k = 0; k < 2; ++k) {
-        const int t = mesh->edgeTriangles[e][k];
-        if (t < 0) continue;
-        const int c = mesh->triangleComponent[t];
-        if (c < 0 || c >= static_cast<int>(mesh->materialComponents.size())) continue;
-        if (mesh->materialComponents[c].circle.isCircle) return true;
-    }
-    return false;
-}
-
 void MERIDIAN::runField() {
     field = std::make_unique<SIPG>(mesh, options.sipgMaxSteps, options.sipgGamma);
     // On a multi-material domain the interfaces are Dirichlet data for the field
@@ -53,22 +38,12 @@ void MERIDIAN::runField() {
     // not before it: an interface is a curve the layout has to keep, so the
     // field has to be tangent to it, and a field that is not carries none of the
     // cones the regions either side of it need. Empty on a single-material mesh.
+    //
+    // A templated inclusion has no rim here to align to: Stage 0c took it out
+    // of the mesh, so the rim is dS and the field is tangent to it for the
+    // ordinary reason.
     if (interfaces && interfaces->multiMaterial() && options.alignFieldToInterfaces) {
-        // Not to a templated rim, though. Alignment is how the field is made to
-        // carry the cones a region needs, and a templated disk needs none: its
-        // four quarter turns are on its rim, prescribed, and the O-grid inside
-        // it comes from Stage 10. Held tangent to the rim anyway the field
-        // reports the O-grid regardless -- four +1 inside and four -1 out in
-        // the matrix, eight per inclusion -- and those are exactly the cones
-        // clearDiskCones() would then have to take away again. Left alone, it
-        // runs through the rim and reads nothing there, which is what the
-        // layout is being asked for. See Options::diskTemplates.
-        std::vector<int> aligned;
-        for (int e : interfaces->interfaceEdges()) {
-            if (options.diskTemplates && onCircularRim(e)) continue;
-            aligned.push_back(e);
-        }
-        field->setAlignedInteriorEdges(aligned);
+        field->setAlignedInteriorEdges(interfaces->interfaceEdges());
         status.fieldAlignedToInterfaces = true;
     }
     field->initialize();
@@ -88,100 +63,54 @@ void MERIDIAN::runField() {
 }
 
 // ---------------------------------------------------------------------------
-// clearDiskCones()
+// exciseDisks()  --  Stage 0c
 //
-// A circular inclusion arrives at Stage 1 carrying its O-grid: four +1 cones
-// inside it, at about 0.6 of the radius, and four -1 cones outside it, at
-// about 1.4. That is the right block structure and the field is right to find
-// it. It is also eight cones the continuation of Sec. 3.3 then has to place,
-// which is where a model with ten inclusions stops working -- so the layout is
-// asked for the exterior alone and Stage 10 puts the O-grid back from a
-// template.
-//
-// Taking the cones away is legitimate exactly when they cancel. The pair
-// straddles the rim, so the disk's own Gauss-Bonnet count and the matrix's
-// both move by four quarter turns when it goes, and the four LoopSplit nodes
-// on the rim are where balance() then puts them back: one quarter inside and
-// three outside, which is the case its own comment names. If what a ball of
-// `diskConeRadius` radii holds does not sum to zero, the field found something
-// other than an O-grid there -- two inclusions near enough to share a cone, or
-// a rim close enough to dS that a member of the pair landed on it -- and the
-// disk is left alone and reported rather than balanced by force.
+// Before everything, because everything downstream is indexed on the mesh this
+// leaves behind. What comes back is the matrix with a hole where each circular
+// inclusion was: the rims are dS, the regions the inclusions used to bound are
+// gone from the material network, and the layout is asked for a problem with
+// eight fewer cones per inclusion. See DiskTemplate.
 // ---------------------------------------------------------------------------
-void MERIDIAN::clearDiskCones() {
-    diskComponents.clear();
-    const std::vector<MaterialComponent> &comps = mesh->materialComponents;
-    if (comps.empty()) return;
+void MERIDIAN::exciseDisks() {
+    std::vector<std::string> msgs;
+    inclusions = DiskTemplate::detect(*mesh, msgs);
+    for (const std::string &m : msgs) status.messages.push_back("Stage 0c: " + m);
+    status.diskInclusions = static_cast<int>(inclusions.size());
+    if (inclusions.empty()) return;
 
-    const int nV = static_cast<int>(mesh->vertices.size());
-    const std::vector<int> &idx = cones->getIndices();
-    if (static_cast<int>(idx.size()) != nV) return;
-
-    // Each vertex to the circle whose ball it is deepest inside, measured in
-    // radii so that a small inclusion beside a large one keeps its own cones.
-    std::vector<int> owner(nV, -1);
-    std::vector<double> best(nV, std::numeric_limits<double>::infinity());
-    for (size_t c = 0; c < comps.size(); ++c) {
-        const CircleFit &cf = comps[c].circle;
-        if (!cf.isCircle || cf.radius <= 0.0) continue;
-        for (int v = 0; v < nV; ++v) {
-            const double r = normP(mesh->vertices[v] - cf.center) / cf.radius;
-            if (r > options.diskConeRadius || r >= best[v]) continue;
-            best[v] = r;
-            owner[v] = static_cast<int>(c);
-        }
+    std::shared_ptr<Mesh> excised = DiskTemplate::excise(*mesh, inclusions);
+    if (!excised || excised->triangles.empty()) {
+        inclusions.clear();
+        status.diskInclusions = 0;
+        status.messages.push_back(
+            "Stage 0c: excising the circular inclusions would leave no mesh behind, so "
+            "they are laid out like any other region.");
+        return;
     }
 
-    std::vector<std::pair<int, int>> zero;
-    for (size_t c = 0; c < comps.size(); ++c) {
-        if (!comps[c].circle.isCircle) continue;
-
-        int sum = 0, count = 0;
-        std::vector<int> mine;
-        bool onBoundary = false;
-        for (int v = 0; v < nV; ++v) {
-            if (owner[v] != static_cast<int>(c) || idx[v] == 0) continue;
-            if (mesh->isBoundaryVertex[v]) { onBoundary = true; break; }
-            sum += idx[v];
-            ++count;
-            mine.push_back(v);
-        }
-
-        if (onBoundary || count == 0 || sum != 0) {
-            ++status.diskTemplatesRefused;
-            std::ostringstream oss;
-            oss << "The circular inclusion at (" << comps[c].circle.center[0] << ", "
-                << comps[c].circle.center[1] << ") is not templated: the "
-                << count << " cone(s) within " << options.diskConeRadius
-                << " radii of it sum to " << (onBoundary ? 0 : sum)
-                << (onBoundary ? " and one of them is on dS" : "")
-                << ", so removing them would change Eq. (4). It is laid out "
-                << "like any other inclusion.";
-            status.messages.push_back("Stage 1: " + oss.str());
-            continue;
-        }
-
-        for (int v : mine) zero.push_back({v, 0});
-        status.diskConesCleared += count;
-        diskComponents.push_back(static_cast<int>(c));
+    for (const DiskTemplate::Inclusion &inc : inclusions) {
+        status.diskTrianglesExcised += static_cast<int>(inc.triangles.size());
     }
-
-    status.diskTemplates = static_cast<int>(diskComponents.size());
-    if (zero.empty()) return;
-    cones->prescribe(zero);
+    inputMesh = mesh;
+    mesh = excised;
 
     std::ostringstream oss;
-    oss << "Cleared " << status.diskConesCleared << " cone(s) from "
-        << status.diskTemplates << " circular inclusion(s): the O-grid they "
-        << "describe is the one Stage 10 puts there from a template, so the "
-        << "layout is asked for the exterior alone. Each rim now needs its four "
-        << "quarter turns from Stage 0b's balance instead.";
-    status.messages.push_back("Stage 1: " + oss.str());
+    oss << "Excised " << inclusions.size() << " circular inclusion(s), "
+        << status.diskTrianglesExcised << " of " << inputMesh->triangles.size()
+        << " triangle(s): the layout is asked for the matrix with holes and Stage 11 "
+        << "puts each O-grid back from a template. The eight cones an inclusion "
+        << "carries -- four +1 inside it and four -1 in the matrix -- are what the "
+        << "continuation of Sec. 3.3 cannot place ten times over, and they go with it.";
+    status.messages.push_back("Stage 0c: " + oss.str());
 }
 
 bool MERIDIAN::run() {
     status = Status();
     size_t balanceMessagesSeen = 0;
+
+    // --- Stage 0c: excise the circular inclusions -------------------------
+    // First, because it replaces the mesh every later stage is written on.
+    if (options.diskTemplates) exciseDisks();
 
     // --- Stage 0b: the material interface network -------------------------
     // Before the field, because it says nothing about the field and everything
@@ -192,10 +121,7 @@ bool MERIDIAN::run() {
         Interfaces::Options iopts;
         iopts.kinkAngle = options.interfaceKinkAngle;
         iopts.loopSplits = options.interfaceLoopSplits;
-        // A templated disk is split like any other closed loop: the four
-        // nodes are where its quarter turns go, and with its cones gone they
-        // are the only place left for them. See Options::diskTemplates.
-        iopts.splitCircleLoops = options.splitCircleLoops || options.diskTemplates;
+        iopts.splitCircleLoops = options.splitCircleLoops;
         interfaces = std::make_unique<Interfaces>(mesh, iopts);
         const Interfaces::Report &fr = interfaces->getReport();
         status.materials = fr.materials;
@@ -252,14 +178,6 @@ bool MERIDIAN::run() {
                 << "region's Gauss-Bonnet count.";
             status.messages.push_back("Stage 1: " + oss.str());
         }
-    }
-
-    // The cones a circular inclusion carries, which Stage 10's template
-    // supplies instead. Before the Gauss-Bonnet check for the same reason the
-    // dipoles are: what goes sums to zero, so the check is the one that says
-    // so. See Options::diskTemplates.
-    if (options.diskTemplates && interfaces && interfaces->multiMaterial()) {
-        clearDiskCones();
     }
 
     ConeSingularities::GaussBonnetReport gb = cones->gaussBonnet();
@@ -552,6 +470,11 @@ bool MERIDIAN::run() {
     qopts.featuresOnTracedArcs = options.quadFeaturesOnTracedArcs;
     qopts.smoothingPasses = options.quadSmoothingPasses;
     qopts.smoothingThreshold = options.quadSmoothingThreshold;
+    // Each excised rim has to come out with an even number of edges or Stage 11
+    // has nothing it can fill it with. See QuadMesh::fixLoopParity.
+    const std::vector<std::vector<int>> rims =
+        DiskTemplate::rimArcs(*arrangement, inclusions);
+    for (const std::vector<int> &r : rims) if (!r.empty()) qopts.evenLoops.push_back(r);
     try {
         quads = std::make_unique<QuadMesh>(*splines, qopts);
     } catch (const std::exception &e) {
@@ -567,7 +490,32 @@ bool MERIDIAN::run() {
     status.meshMinScaledJacobian = qr.minScaledJacobian;
     status.meshConforming = qr.conforming;
     status.meshValid = qr.valid;
+    status.meshOddLoops = qr.oddLoops;
+    status.meshParityChordsMoved = qr.parityChordsMoved;
+    status.meshOddLoopsLeft = qr.oddLoopsLeft;
     for (const std::string &m : qr.messages) status.messages.push_back("Stage 10: " + m);
+
+    // --- Stage 11: the O-grid templates -----------------------------------
+    if (inclusions.empty()) return status.layoutValid;
+    DiskTemplate::Options topts;
+    topts.coreSquareness = options.diskCoreSquareness;
+    topts.ringDepth = options.diskRingDepth;
+    topts.smoothingPasses = options.diskSmoothingPasses;
+    diskFill = std::make_unique<DiskTemplate>(
+        quads->vertices(), quads->quads(), quads->quadMaterials(),
+        DiskTemplate::rimVertexLoops(*arrangement, *quads, rims), inclusions, topts);
+    const DiskTemplate::Report &tr = diskFill->getReport();
+    status.diskTemplatesRan = true;
+    status.diskTemplatesFilled = tr.filled;
+    status.diskTemplateBlocks = tr.blocks;
+    status.diskTemplateQuads = tr.quads;
+    status.diskTemplatesRefused = tr.refusedOdd + tr.refusedShort + tr.refusedOpen;
+    status.diskTemplateMinScaledJacobian = tr.templateMinScaledJacobian;
+    status.mergedVertices = tr.mergedVertices;
+    status.mergedQuads = tr.mergedQuads;
+    status.mergedMinScaledJacobian = tr.minScaledJacobian;
+    status.diskTemplatesValid = tr.valid;
+    for (const std::string &m : tr.messages) status.messages.push_back("Stage 11: " + m);
 
     return status.layoutValid;
 }

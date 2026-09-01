@@ -759,6 +759,11 @@ void usage(const char *prog) {
               << "  --no-splines       skip Stage 9\n"
               << "  --no-mesh          skip Stage 10\n"
               << "  --target <h>       Stage 10 target edge, model units     (default 0.05)\n"
+              << "  --disk-templates   excise every circular inclusion (Stage 0c) and fill it\n"
+              << "                     back in with an O-grid template (Stage 11)\n"
+              << "  --disk-squareness <w>  how square the template's core is  (default 0.55)\n"
+              << "  --disk-ring <n>    rows of elements in the ring, 0 = auto (default 0)\n"
+              << "  --disk-smooth <n>  smoothing sweeps over the template     (default 300)\n"
               << "  --repair <n>       rounds of Sec. 3.3's repair           (default 6)\n"
               << "  --cones <n>        list at most n cones                  (default 20)\n\n"
               << "Output\n"
@@ -833,6 +838,12 @@ int main(int argc, char **argv) {
         else if (a == "--no-splines")                   opts.runSplines = false;
         else if (a == "--no-mesh")                      opts.runQuadMesh = false;
         else if (a == "--target" && i + 1 < argc)       opts.quadTargetEdge = std::stod(argv[++i]);
+        else if (a == "--disk-templates")               opts.diskTemplates = true;
+        else if (a == "--disk-squareness" && i + 1 < argc)
+            opts.diskCoreSquareness = std::stod(argv[++i]);
+        else if (a == "--disk-ring" && i + 1 < argc)    opts.diskRingDepth = std::stoi(argv[++i]);
+        else if (a == "--disk-smooth" && i + 1 < argc)
+            opts.diskSmoothingPasses = std::stoi(argv[++i]);
         else if (a == "--repair" && i + 1 < argc)       opts.repairPasses = std::stoi(argv[++i]);
         else if (a == "--cones" && i + 1 < argc)        coneListLimit = std::stoi(argv[++i]);
         else if (a == "--psi" && i + 1 < argc)          psiOut = argv[++i];
@@ -1292,11 +1303,32 @@ int main(int argc, char **argv) {
         // on; this is the test the mesh is actually used under.
         verdict(st.meshMinScaledJacobian > 0.0,
                 "Every corner of every element turns the right way (scaled Jacobian > 0)");
-        if (!quadOut.empty()) {
-            if (pipeline.getQuadMesh().writeOBJ(quadOut)) std::cout << "  Wrote the quad mesh to " << quadOut << "\n";
-            else warn("Failed to write " + quadOut);
-        }
         stageMessages("Stage 10: ");
+    }
+    if (pipeline.hasDiskTemplate()) {
+        heading("Stage 11  O-grid templates on the excised inclusions");
+        const DiskTemplate::Report &dr = pipeline.getDiskTemplate().getReport();
+        std::cout << "  " << dr.filled << " of " << dr.inclusions
+                  << " inclusion(s) templated: " << dr.blocks << " block(s), "
+                  << dr.quads << " element(s), " << dr.vertices << " new vertex/vertices\n";
+        std::cout << "  Merged mesh: " << dr.mergedVertices << " vertices, "
+                  << dr.mergedQuads << " quadrilateral(s); scaled Jacobian "
+                  << std::fixed << std::setprecision(4) << dr.minScaledJacobian
+                  << " worst, " << dr.meanScaledJacobian << " mean ("
+                  << dr.templateMinScaledJacobian << " worst on the templates)"
+                  << std::defaultfloat << "\n";
+        verdict(dr.filled == dr.inclusions, "Every circular inclusion was templated");
+        verdict(dr.nonManifoldEdges == 0 && dr.cracks == 0,
+                "Conforming and watertight across the rims");
+        verdict(dr.invertedQuads == 0, "No element of the merged mesh is inverted");
+        stageMessages("Stage 11: ");
+    }
+    if (!quadOut.empty() && st.quadMeshRan) {
+        const bool wrote = pipeline.hasDiskTemplate()
+                               ? pipeline.getDiskTemplate().writeOBJ(quadOut)
+                               : pipeline.getQuadMesh().writeOBJ(quadOut);
+        if (wrote) std::cout << "  Wrote the quad mesh to " << quadOut << "\n";
+        else warn("Failed to write " + quadOut);
     }
 
     heading("Result");

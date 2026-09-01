@@ -77,6 +77,8 @@ add_library(PolyVector SHARED
     src/MERIDIAN/Separatrices.cxx
     src/MERIDIAN/Arrangement.hxx
     src/MERIDIAN/Arrangement.cxx
+    src/MERIDIAN/DiskTemplate.hxx
+    src/MERIDIAN/DiskTemplate.cxx
     src/MERIDIAN/SplineFit.hxx
     src/MERIDIAN/SplineFit.cxx
     src/MERIDIAN/QuadMesh.hxx
@@ -330,6 +332,22 @@ foreach(MERIDIAN_CASE singlemat/geom001 singlemat/geom003 singlemat/geom012 mult
              COMMAND TestMERIDIAN ${CMAKE_CURRENT_SOURCE_DIR}/data/meshes/${MERIDIAN_CASE}.obj)
 endforeach()
 
+# Stages 0c and 11, the circular-inclusion templates, on the model they exist
+# for: ten disks in a matrix block. Without them the layout has eighty cones it
+# cannot place and leaves 57% of the model unmeshed; with them the excised
+# problem reaches Definition 2.1 and every inclusion comes back as an O-grid.
+# See DiskTemplate.
+#
+# --near-miss is not decoration. At the default 0.15 Gamma_topo over-seeds the
+# matrix and four of the ten rims come back without a closed loop for the
+# template to attach to; 0.04 is the tolerance measured in
+# SubdomainLabels::Options::nearMissTolerance and it is what makes this model
+# converge. The exit code is the whole pipeline's, templates included.
+add_test(NAME MERIDIAN_Templates_multimat_bubbles
+         COMMAND TestMERIDIAN ${CMAKE_CURRENT_SOURCE_DIR}/data/meshes/multimat/bubbles.obj
+                 --disk-templates --near-miss 0.04)
+set_tests_properties(MERIDIAN_Templates_multimat_bubbles PROPERTIES TIMEOUT 2400)
+
 # The four pieces Pipeline B adds -- the combing and its matchings, the
 # constrained integration, the Tutte embedding, and the field reference -- on
 # inputs whose answers are known in closed form before the code runs. A square
@@ -361,6 +379,14 @@ foreach(TORSION_CASE singlemat/geom001 singlemat/geom003 singlemat/geom012 multi
     # residual the penalties cannot spend away and the full schedule runs.
     set_tests_properties(TORSION_Layout_${TORSION_CASE_NAME} PROPERTIES TIMEOUT 2400)
 endforeach()
+
+# The same templates through Pipeline B. Stages 0c and 11 are shared code and
+# the point of running them both ways is that the excised problem is the same
+# problem: both routes reach a layout on it and both fill all ten inclusions.
+add_test(NAME TORSION_Templates_multimat_bubbles
+         COMMAND TestTORSION ${CMAKE_CURRENT_SOURCE_DIR}/data/meshes/multimat/bubbles.obj
+                 --disk-templates --near-miss 0.04)
+set_tests_properties(TORSION_Templates_multimat_bubbles PROPERTIES TIMEOUT 2400)
 
 # Sec. 4 of docs/cf_flow_pipeline.md asks for the field reference to be tested
 # standalone, from psi_R, before any integration exists to be blamed for its

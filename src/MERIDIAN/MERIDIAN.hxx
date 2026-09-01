@@ -9,6 +9,7 @@
 #include "MERIDIAN/Arrangement.hxx"
 #include "MERIDIAN/ConeCut.hxx"
 #include "MERIDIAN/ConeSingularities.hxx"
+#include "MERIDIAN/DiskTemplate.hxx"
 #include "MERIDIAN/Immersion.hxx"
 #include "MERIDIAN/Interfaces.hxx"
 #include "MERIDIAN/LayoutEnergy.hxx"
@@ -205,55 +206,38 @@ public:
         // times, and a node anywhere else on it emits a layout edge nothing
         // receives. See Interfaces::Options::splitCircleLoops.
         bool splitCircleLoops = false;
-        // Take the block structure of a circular inclusion from a template
-        // instead of asking Stage 6 for one.
+        // Stages 0c and 11: take every circular inclusion out of the layout
+        // problem and put its O-grid back from a template. See DiskTemplate,
+        // where the reasoning and the parity argument live.
         //
-        // The O-grid is the only block structure a disk has: a square core and
-        // four ring blocks, four +1 cones at the corners of the core and four
-        // -1 cones answering them out in the matrix. It is not a choice, it is
-        // what the topology of a disk in a plane leaves, and the cross field
-        // finds it unaided -- one inclusion comes out of Stage 1 with exactly
-        // those eight cones, four at 0.58 of the radius and four at 1.44 of
-        // it. Asking Stage 6 for it is what does not work: eight cones per
-        // disk is 80 on data/meshes/multimat/bubbles, and the continuation
-        // walls out at about 40 interior cones whatever the geometry.
+        // The short version. The O-grid is the only block structure a disk has
+        // -- a core block and a ring of blocks around it -- and the cross field
+        // finds it unaided: an inclusion comes out of Stage 1 with eight cones,
+        // four +1 inside at about 0.6 of the radius and four -1 out in the
+        // matrix at about 1.4. Asking Stage 6 to place them is what does not
+        // work. Eight cones per disk is eighty on
+        // data/meshes/multimat/bubbles, the continuation of Sec. 3.3 walls out
+        // somewhere near forty interior cones whatever the geometry, and what
+        // comes out has 57% of the model unmeshed.
         //
-        // Since the answer is known there is no reason to solve for it. What
-        // the layout is asked for instead is the *exterior* -- the box with
-        // holes -- and the disk is handed to it as a single patch:
+        // So the disks are excised before Stage 0b and the layout is asked for
+        // the matrix with holes, which is a different problem and a far easier
+        // one: on bubbles it reaches Definition 2.1 with every face a
+        // quadrilateral, every element positive and nothing left unmeshed.
+        // Stage 11 then fills each hole from the template, which costs no solve.
         //
-        //   * the rim is cut into four arcs, as any closed interface loop is,
-        //     and each of the four nodes is given one quarter turn on the
-        //     inside and three on the outside. Eq. (4) restricted to the disk
-        //     is then 4 . 1 = 4 = 4 chi and restricted to the matrix is
-        //     4 - 4n = 4 chi, so *neither region needs an interior cone at
-        //     all*. Stage 0b's balance() already knows how to move a quarter
-        //     across a node and its own comment names this case; all this does
-        //     is take the eight cones away so that the move is the one it
-        //     finds.
-        //
-        //   * Stage 10 then meshes that patch as an O-grid rather than as a
-        //     transfinite grid, which is the step the whole arrangement is
-        //     for. A disk carried as one patch has its four corners at smooth
-        //     points of the rim, and a structured grid on it puts a 180 degree
-        //     element corner at each of them. The template does not: the four
-        //     rim arcs become the outer ring, the core square is inset, and
-        //     the rim nodes come out with two elements inside and three
-        //     outside. The counts match without arithmetic, because the disk
-        //     is a quadrilateral patch and Stage 10's chords already force its
-        //     opposite sides to agree.
-        //
-        // Only a component Mesh::computeMaterialCircles accepted as a circle
-        // takes this path, and only when the cones it is carrying cancel --
-        // see diskConeRadius. Everything else is laid out exactly as before.
+        // The one thing the excised problem has to be told is that each rim
+        // must carry an even number of edges, because a quadrangulation of a
+        // disk cannot have an odd boundary. That goes through
+        // QuadMesh::Options::evenLoops and is arranged by moving a chord or
+        // two by one edge.
         bool diskTemplates = false;
-        // How far out, in radii of the disk, the cones cleared with it are
-        // looked for. The pair a disk carries straddles its rim, so both
-        // members have to go or Eq. (4) stops holding; the outer member sits
-        // at about 1.4 radii on the corpus and 2 leaves room without reaching
-        // the next inclusion. A disk whose cones do not sum to zero over that
-        // ball is left alone and reported.
-        double diskConeRadius = 2.0;
+        // How square the core block's boundary is, how many rows of elements
+        // the ring has (0 chooses it from the rim spacing), and how hard the
+        // template is smoothed. See DiskTemplate::Options.
+        double diskCoreSquareness = 0.55;
+        int diskRingDepth = 0;
+        int diskSmoothingPasses = 300;
         // Align the Stage 0 cross field to the interfaces as well as to dS.
         //
         // Without this the field has no boundary condition on an interface and
@@ -435,13 +419,10 @@ public:
         bool fieldAlignedToInterfaces = false;
         // Index units cancelDipoles() annihilated, Stage 1.
         int coneDipoleUnits = 0;
-        // Stage 1, the disk templates: circular components whose cones were
-        // cleared because Stage 10 supplies their O-grid, how many cones went
-        // with them, and how many circles were left alone because what they
-        // carried did not cancel.
-        int diskTemplates = 0;
-        int diskConesCleared = 0;
-        int diskTemplatesRefused = 0;
+        // Stage 0c: circular inclusions found, and the triangles they took out
+        // of the layout problem with them.
+        int diskInclusions = 0;
+        int diskTrianglesExcised = 0;
 
         // Stage 0b
         int materials = 1;
@@ -533,10 +514,28 @@ public:
         int meshQuads = 0;
         int meshChords = 0;
         int meshUnmeshedPatches = 0;
-        int meshDiskTemplates = 0;   // patches meshed as an O-grid, Stage 10
         double meshMinScaledJacobian = 0.0;
         bool meshConforming = false;
         bool meshValid = false;
+        // The rim loops Stage 11 needs even, and what the interval assignment
+        // had to do about them. See QuadMesh::fixLoopParity.
+        int meshOddLoops = 0;
+        int meshParityChordsMoved = 0;
+        int meshOddLoopsLeft = 0;
+
+        // Stage 11: the O-grid templates.
+        bool diskTemplatesRan = false;
+        int diskTemplatesFilled = 0;
+        int diskTemplateBlocks = 0;
+        int diskTemplateQuads = 0;
+        int diskTemplatesRefused = 0;
+        double diskTemplateMinScaledJacobian = 0.0;
+        // Over the matrix mesh and the templates together, which is the mesh a
+        // caller actually gets.
+        int mergedVertices = 0;
+        int mergedQuads = 0;
+        double mergedMinScaledJacobian = 0.0;
+        bool diskTemplatesValid = false;
 
         // Stage 9
         bool splinesRan = false;
@@ -635,6 +634,8 @@ public:
     const Arrangement& getArrangement() const { return *arrangement; }
     const SplineFit& getSplines() const { return *splines; }
     const QuadMesh& getQuadMesh() const { return *quads; }
+    const DiskTemplate& getDiskTemplate() const { return *diskFill; }
+    const std::vector<DiskTemplate::Inclusion>& getInclusions() const { return inclusions; }
 
     // Null until the stage that builds them has run.
     bool hasInterfaces() const { return interfaces != nullptr; }
@@ -648,23 +649,26 @@ public:
     bool hasArrangement() const { return arrangement != nullptr; }
     bool hasSplines() const { return splines != nullptr; }
     bool hasQuadMesh() const { return quads != nullptr; }
+    bool hasDiskTemplate() const { return diskFill != nullptr; }
 
     const Status& getStatus() const { return status; }
 
+    // The mesh the layout was computed on. With Options::diskTemplates this is
+    // the *excised* mesh -- the matrix with a hole where each inclusion was --
+    // and every index in every stage downstream of Stage 0c refers to it.
+    // getInputMesh() is what came in.
     const Mesh& getMesh() const { return *mesh; }
     std::shared_ptr<Mesh> getMeshPtr() const { return mesh; }
+    const Mesh& getInputMesh() const { return inputMesh ? *inputMesh : *mesh; }
 
 private:
     void runField();
-    // Stage 1: take the cross field's O-grid away from every circular
-    // inclusion whose cones cancel over a ball of Options::diskConeRadius
-    // radii, and record which components those were so that Stage 10 can put
-    // the template back. See Options::diskTemplates.
-    void clearDiskCones();
-    // Whether an interface edge lies on the rim of a circular inclusion.
-    bool onCircularRim(int edge) const;
+    // Stage 0c: find the circular inclusions and take them out of `mesh`.
+    void exciseDisks();
 
     std::shared_ptr<Mesh> mesh;
+    // What run() was handed, kept only when Stage 0c replaced it.
+    std::shared_ptr<Mesh> inputMesh;
     Options options;
     Status status;
 
@@ -680,10 +684,11 @@ private:
     std::unique_ptr<Arrangement> arrangement;
     std::unique_ptr<SplineFit> splines;
     std::unique_ptr<QuadMesh> quads;
+    std::unique_ptr<DiskTemplate> diskFill;
 
-    // Material components Stage 10 meshes as an O-grid, and the four rim
-    // vertices of each. Empty unless Options::diskTemplates.
-    std::vector<int> diskComponents;
+    // The circular inclusions Stage 0c took out. Empty unless
+    // Options::diskTemplates.
+    std::vector<DiskTemplate::Inclusion> inclusions;
 };
 
 #endif // __MERIDIAN_HXX__

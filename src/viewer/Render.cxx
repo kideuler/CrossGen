@@ -2618,10 +2618,24 @@ void drawLayoutPatches(const Arrangement &arr, const SplineFit *fit,
     }
 }
 
-void drawQuadMesh(const QuadMesh &qm, float lineWidth, float blockLineWidth,
-                  bool materialFill) {
-    const std::vector<Point> &V = qm.vertices();
-    const std::vector<std::array<int, 4>> &Q = qm.quads();
+namespace {
+
+// One structured block, as the two counts and the vertex array both QuadMesh
+// and DiskTemplate store it in. The two types are the same grid and differ only
+// in which stage built it, so the drawing takes this rather than either.
+struct GridRef {
+    int ns = 0, nt = 0;
+    const std::vector<int> *vert = nullptr;
+};
+
+// The body of drawQuadMesh, written against the arrays rather than against the
+// stage that produced them, so that Stage 10's mesh and the merged mesh of
+// Stage 11 are drawn by one routine and not by two that could drift apart.
+void drawQuadMeshArrays(const std::vector<Point> &V,
+                        const std::vector<std::array<int, 4>> &Q,
+                        const std::vector<int> &mat,
+                        const std::vector<GridRef> &grids,
+                        float lineWidth, float blockLineWidth, bool materialFill) {
     if (V.empty() || Q.empty()) return;
 
     auto ok = [&](int v) { return v >= 0 && v < static_cast<int>(V.size()); };
@@ -2637,7 +2651,6 @@ void drawQuadMesh(const QuadMesh &qm, float lineWidth, float blockLineWidth,
 
     // The materials, filled, under everything -- including under the folds, so
     // a folded element in the middle of a region still reads as red.
-    const std::vector<int> &mat = qm.quadMaterials();
     if (materialFill && mat.size() == Q.size()) {
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -2739,11 +2752,11 @@ void drawQuadMesh(const QuadMesh &qm, float lineWidth, float blockLineWidth,
     // was skipped leaves a gap here exactly as it does in the mesh.
     glColor3f(0.42f, 0.74f, 1.0f);
     glLineWidth(blockLineWidth);
-    for (const QuadMesh::Block &b : qm.blocks()) {
+    for (const GridRef &b : grids) {
         const int ns = b.ns, nt = b.nt;
-        if (ns < 1 || nt < 1) continue;
-        if (static_cast<int>(b.vert.size()) != (ns + 1) * (nt + 1)) continue;
-        auto at = [&](int i, int j) { return b.vert[j * (ns + 1) + i]; };
+        if (!b.vert || ns < 1 || nt < 1) continue;
+        if (static_cast<int>(b.vert->size()) != (ns + 1) * (nt + 1)) continue;
+        auto at = [&](int i, int j) { return (*b.vert)[j * (ns + 1) + i]; };
         auto strip = [&](auto next) {
             glBegin(GL_LINE_STRIP);
             next();
@@ -2753,6 +2766,50 @@ void drawQuadMesh(const QuadMesh &qm, float lineWidth, float blockLineWidth,
         strip([&] { for (int i = 0; i <= ns; ++i) if (ok(at(i, nt))) glVertex2d(V[at(i, nt)][0], V[at(i, nt)][1]); });
         strip([&] { for (int j = 0; j <= nt; ++j) if (ok(at(0, j)))  glVertex2d(V[at(0, j)][0],  V[at(0, j)][1]); });
         strip([&] { for (int j = 0; j <= nt; ++j) if (ok(at(ns, j))) glVertex2d(V[at(ns, j)][0], V[at(ns, j)][1]); });
+    }
+    glLineWidth(1.0f);
+}
+
+std::vector<GridRef> gridsOf(const QuadMesh &qm) {
+    std::vector<GridRef> g;
+    g.reserve(qm.blocks().size());
+    for (const QuadMesh::Block &b : qm.blocks()) g.push_back({ b.ns, b.nt, &b.vert });
+    return g;
+}
+
+} // namespace
+
+void drawQuadMesh(const QuadMesh &qm, float lineWidth, float blockLineWidth,
+                  bool materialFill) {
+    drawQuadMeshArrays(qm.vertices(), qm.quads(), qm.quadMaterials(), gridsOf(qm),
+                       lineWidth, blockLineWidth, materialFill);
+}
+
+void drawQuadMesh(const DiskTemplate &dt, const QuadMesh *qm, float lineWidth,
+                  float blockLineWidth, bool materialFill) {
+    std::vector<GridRef> grids = qm ? gridsOf(*qm) : std::vector<GridRef>();
+    for (const DiskTemplate::Block &b : dt.blocks()) grids.push_back({ b.ns, b.nt, &b.vert });
+    drawQuadMeshArrays(dt.vertices(), dt.quads(), dt.quadMaterials(), grids,
+                       lineWidth, blockLineWidth, materialFill);
+}
+
+// The fitted circle of every inclusion, sampled. Dashed would say "removed"
+// more plainly, but a dash pattern at this radius reads as a coarse polygon, so
+// it is drawn whole and dim instead and the hole underneath does the saying.
+void drawInclusionCircles(const std::vector<DiskTemplate::Inclusion> &inclusions,
+                          float lineWidth, int samples) {
+    if (inclusions.empty() || samples < 3) return;
+    glLineWidth(lineWidth);
+    glColor3f(0.55f, 0.62f, 0.72f);
+    for (const DiskTemplate::Inclusion &inc : inclusions) {
+        if (inc.circle.radius <= 0.0) continue;
+        glBegin(GL_LINE_LOOP);
+        for (int k = 0; k < samples; ++k) {
+            const double t = 2.0 * M_PI * k / samples;
+            glVertex2d(inc.circle.center[0] + inc.circle.radius * std::cos(t),
+                       inc.circle.center[1] + inc.circle.radius * std::sin(t));
+        }
+        glEnd();
     }
     glLineWidth(1.0f);
 }

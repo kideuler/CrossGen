@@ -1,11 +1,14 @@
 #include "MERIDIAN/QuadMesh.hxx"
 
 #include <algorithm>
+#include <cstdint>
+#include <iterator>
 #include <map>
 #include <set>
 #include <cmath>
 #include <fstream>
 #include <limits>
+#include <sstream>
 #include <unordered_map>
 
 namespace {
@@ -355,8 +358,9 @@ void QuadMesh::assignIntervals() {
         for (int a : c.arcs) intervals[a] = c.intervals;
 
         if (c.clamped) ++report.clampedChords;
-        sumN += c.intervals;
     }
+
+    fixLoopParity(chordSpans);
 
     report.chords = static_cast<int>(chordList.size());
     report.minIntervals = std::numeric_limits<int>::max();
@@ -364,9 +368,150 @@ void QuadMesh::assignIntervals() {
         report.minIntervals = std::min(report.minIntervals, c.intervals);
         report.maxIntervals = std::max(report.maxIntervals, c.intervals);
         report.arcsAssigned += static_cast<int>(c.arcs.size());
+        sumN += c.intervals;
     }
     if (chordList.empty()) report.minIntervals = 0;
     report.meanIntervals = chordList.empty() ? 0.0 : sumN / chordList.size();
+}
+
+// ---------------------------------------------------------------------------
+// fixLoopParity()
+//
+// Options::evenLoops. Each loop's edge total has to come out even, and the
+// total is a sum of the chord counts weighted by how many of the loop's arcs
+// each chord owns -- so *modulo two* the whole thing is linear, and moving one
+// chord by one edge flips the parity of every loop it owns an odd number of
+// arcs on. Writing one bit per loop, chord c is a column vector and the loops
+// that are currently odd are a right-hand side; what is wanted is a set of
+// chords summing to it over GF(2).
+//
+// Which set matters, because every chord moved is an edge length pushed away
+// from the target. The candidates are therefore sorted by what the move costs
+// in F -- the same objective the counts were chosen against, with the cheaper
+// of +1 and -1 taken for each chord -- and the elimination takes them in that
+// order, so the basis it builds is made of the cheapest columns that still
+// span. That is greedy rather than a minimum-weight solution, which would be an
+// integer program; on the corpus every loop is crossed by chords that touch no
+// other loop, so the greedy pick is the obvious one and the distinction has not
+// arisen.
+//
+// A loop whose arcs are not all assigned -- one beside a patch Stage 8 could
+// not close -- has no parity to speak of and is skipped; the fill will refuse
+// it anyway, for the better reason that its rim is not closed.
+// ---------------------------------------------------------------------------
+void QuadMesh::fixLoopParity(std::vector<std::vector<double>> &chordSpans) {
+    const int m = static_cast<int>(options.evenLoops.size());
+    if (m == 0 || chordList.empty() || m > 62) return;
+
+    const double h = options.targetEdgeLength;
+    const size_t nChords = chordList.size();
+    std::vector<std::uint64_t> colMask(nChords, 0);
+    std::uint64_t need = 0;
+
+    std::vector<int> touch(nChords, 0);
+    for (int L = 0; L < m; ++L) {
+        std::fill(touch.begin(), touch.end(), 0);
+        long long sum = 0;
+        bool complete = true;
+        for (int a : options.evenLoops[L]) {
+            if (a < 0 || a >= static_cast<int>(intervals.size()) || intervals[a] < 0 ||
+                chordOf[a] < 0) { complete = false; break; }
+            sum += intervals[a];
+            ++touch[chordOf[a]];
+        }
+        if (!complete) continue;
+        if (sum % 2 != 0) { need |= 1ull << L; ++report.oddLoops; }
+        for (size_t c = 0; c < nChords; ++c) {
+            if (touch[c] % 2) colMask[c] |= 1ull << L;
+        }
+    }
+    if (need == 0) return;
+
+    auto cost = [&](size_t slot, int N) {
+        double s = 0.0;
+        for (double S : chordSpans[slot]) {
+            if (!(S > 0.0)) continue;
+            const double r = std::log(S / (N * h));
+            s += r * r;
+        }
+        return s;
+    };
+
+    struct Cand { double dcost; size_t slot; int delta; };
+    std::vector<Cand> cand;
+    const int floorN = std::max(1, options.minIntervals);
+    for (size_t slot = 0; slot < nChords; ++slot) {
+        if (colMask[slot] == 0) continue;
+        const int N = chordList[slot].intervals;
+        const double base = cost(slot, N);
+        double best = std::numeric_limits<double>::infinity();
+        int bestDelta = 0;
+        if (options.maxIntervals <= 0 || N + 1 <= options.maxIntervals) {
+            best = cost(slot, N + 1) - base;
+            bestDelta = 1;
+        }
+        if (N - 1 >= floorN) {
+            const double d = cost(slot, N - 1) - base;
+            if (d < best) { best = d; bestDelta = -1; }
+        }
+        if (bestDelta != 0) cand.push_back({best, slot, bestDelta});
+    }
+    std::sort(cand.begin(), cand.end(),
+              [](const Cand &x, const Cand &y) { return x.dcost < y.dcost; });
+
+    auto symdiff = [](std::vector<int> &a, const std::vector<int> &b) {
+        std::vector<int> out;
+        std::set_symmetric_difference(a.begin(), a.end(), b.begin(), b.end(),
+                                      std::back_inserter(out));
+        a.swap(out);
+    };
+
+    std::vector<std::uint64_t> basisMask(m, 0);
+    std::vector<std::vector<int>> basisSet(m);
+    for (size_t i = 0; i < cand.size(); ++i) {
+        std::uint64_t msk = colMask[cand[i].slot];
+        std::vector<int> set{static_cast<int>(i)};
+        while (msk) {
+            const int r = __builtin_ctzll(msk);
+            if (basisMask[r] == 0) { basisMask[r] = msk; basisSet[r] = set; break; }
+            msk ^= basisMask[r];
+            symdiff(set, basisSet[r]);
+        }
+    }
+
+    std::uint64_t rem = need;
+    std::vector<int> solution;
+    while (rem) {
+        const int r = __builtin_ctzll(rem);
+        if (basisMask[r] == 0) break;      // this loop cannot be reached at all
+        rem ^= basisMask[r];
+        symdiff(solution, basisSet[r]);
+    }
+    for (int L = 0; L < m; ++L) if (rem >> L & 1) ++report.oddLoopsLeft;
+
+    for (int i : solution) {
+        Chord &c = chordList[cand[i].slot];
+        c.intervals += cand[i].delta;
+        for (int a : c.arcs) intervals[a] = c.intervals;
+        if (c.intervals > 0) {
+            c.minEdge = c.minSpan / c.intervals;
+            c.maxEdge = c.maxSpan / c.intervals;
+        }
+        report.parityCost += cand[i].dcost;
+        ++report.parityChordsMoved;
+    }
+
+    std::ostringstream oss;
+    oss << "Moved " << report.parityChordsMoved << " chord(s) by one edge to make "
+        << report.oddLoops << " loop(s) carry an even number of edges, at a cost of "
+        << report.parityCost << " in the interval objective";
+    if (report.oddLoopsLeft > 0) {
+        oss << "; " << report.oddLoopsLeft << " loop(s) are still odd, because every "
+            << "chord that reaches them reaches another odd loop with them";
+    }
+    oss << ". A quadrangulation of a disk has an even boundary, so a loop something "
+        << "downstream means to fill has no choice about this.";
+    report.messages.push_back(oss.str());
 }
 
 // ---------------------------------------------------------------------------
