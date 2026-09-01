@@ -49,6 +49,10 @@ FieldIntegration::FieldIntegration(const ConeCut &cut, const FieldFrames &frames
 void FieldIntegration::assemble(const ConeCut &cut, const FieldFrames &frames,
                                 const Immersion &scaffold) {
     const Mesh &om = cut.getCutMesh();
+    // The target: the frames', unless the caller supplied one of its own. See
+    // Options::targetJacobian.
+    target = opts.targetJacobian.size() == om.triangles.size() ? opts.targetJacobian
+                                                               : frames.frames();
     const int nV = static_cast<int>(om.vertices.size());
     const int nT = static_cast<int>(om.triangles.size());
     const int n = 2 * nV;
@@ -60,7 +64,7 @@ void FieldIntegration::assemble(const ConeCut &cut, const FieldFrames &frames,
         report.messages.push_back("Omega is empty; there is nothing to integrate.");
         return;
     }
-    if (frames.frames().size() != static_cast<size_t>(nT)) {
+    if (target.size() != static_cast<size_t>(nT)) {
         report.messages.push_back("The frames have one J* per face of S and Omega has a "
                                   "different number of faces; the two do not belong to the "
                                   "same mesh.");
@@ -89,7 +93,7 @@ void FieldIntegration::assemble(const ConeCut &cut, const FieldFrames &frames,
         }
 
         // The target gradients: the rows of J*_t.
-        const std::array<double, 4> &Js = frames.frames()[t];
+        const std::array<double, 4> &Js = target[t];
         const Point X{Js[0], Js[1]};
         const Point Y{Js[2], Js[3]};
 
@@ -138,6 +142,33 @@ void FieldIntegration::assemble(const ConeCut &cut, const FieldFrames &frames,
         row += 2;
     }
 
+    // --- Sec. 6.4: the alignment rows -------------------------------------
+    //
+    // One equation per held edge, in the same homogeneous form as the seam
+    // rows above: u_i - u_j = 0, or v_i - v_j = 0. Nothing here decides which;
+    // FieldFrames read that off the frame per chain and this only writes it
+    // down.
+    if (!opts.alignAxis.empty()) {
+        if (opts.alignAxis.size() != om.edges.size()) {
+            report.messages.push_back(
+                "The alignment has one axis per edge of Omega and this one does not; the "
+                "boundary and the interfaces were left to Stage 6.");
+        } else {
+            for (int e = 0; e < static_cast<int>(om.edges.size()); ++e) {
+                const int hold = opts.alignAxis[e];
+                if (hold != 0 && hold != 1) continue;
+                const int i = om.edges[e][0], j = om.edges[e][1];
+                if (i < 0 || j < 0 || i == j) continue;
+                const int di = (hold == 0) ? dofU(i) : dofV(i);
+                const int dj = (hold == 0) ? dofU(j) : dofV(j);
+                ctrip.emplace_back(row, di, 1.0);
+                ctrip.emplace_back(row, dj, -1.0);
+                ++row;
+                ++report.alignedEdges;
+            }
+        }
+    }
+
     // The pin. The energy's null space is a constant added to u and a constant
     // added to v; the tangent constraints are blind to both, so it survives
     // them and has to be removed here.
@@ -169,6 +200,24 @@ void FieldIntegration::assemble(const ConeCut &cut, const FieldFrames &frames,
     b[n + pinRow + 0] = opts.pinnedTo[0];
     b[n + pinRow + 1] = opts.pinnedTo[1];
 
+    // Two steps of iterative refinement on whichever factorisation takes. The
+    // -eps I on the multiplier block is what makes the saddle matrix quasi
+    // definite and the LDL^T stable on it, and it is also a perturbation of the
+    // system being solved: with the seam rows alone that showed at 1e-12, and
+    // with Sec. 6.4's alignment rows -- some hundreds more, and the boundary
+    // chains make many of them nearly dependent -- it showed at 1e-6, which is
+    // large enough to be visible in psi_0's own edge lengths. Refinement costs
+    // two triangular solves against a factorisation that already exists and
+    // takes it back to rounding.
+    auto refine = [&](auto &solver, Eigen::VectorXd &x) {
+        for (int it = 0; it < 2; ++it) {
+            const Eigen::VectorXd r = b - K * x;
+            const Eigen::VectorXd d = solver.solve(r);
+            if (solver.info() != Eigen::Success || !d.allFinite()) break;
+            x += d;
+        }
+    };
+
     Eigen::VectorXd sol;
     {
         Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> ldlt;
@@ -176,6 +225,7 @@ void FieldIntegration::assemble(const ConeCut &cut, const FieldFrames &frames,
         if (ldlt.info() == Eigen::Success) {
             sol = ldlt.solve(b);
             if (ldlt.info() == Eigen::Success && sol.allFinite()) {
+                refine(ldlt, sol);
                 report.factorised = true;
                 report.solvedWithLDLT = true;
             }
@@ -197,6 +247,7 @@ void FieldIntegration::assemble(const ConeCut &cut, const FieldFrames &frames,
             report.messages.push_back("The constrained least-squares system would not solve.");
             return;
         }
+        refine(lu, sol);
         report.factorised = true;
         report.messages.push_back(
             "The saddle system needed the LU fallback: the LDL^T found it indefinite past its "
@@ -238,6 +289,37 @@ void FieldIntegration::measure(const ConeCut &cut, const FieldFrames &frames,
         const Point dm = uv[pairs[p][3]] - uv[pairs[p][2]];
         const Point r = dp - Immersion::rotateQuarter(dm, arcs[a].k);
         report.maxSeamResidual = std::max(report.maxSeamResidual, normP(r) / extent);
+    }
+
+    // Sec. 6.4, as it came out. The residual is the equality's own -- it should
+    // be at rounding -- and the strain is the angle between the image of an
+    // aligned edge and the direction the frame wanted for it, which is the
+    // disagreement between the field and the cone set made visible.
+    if (opts.alignAxis.size() == om.edges.size()) {
+        for (int e = 0; e < static_cast<int>(om.edges.size()); ++e) {
+            const int hold = opts.alignAxis[e];
+            if (hold != 0 && hold != 1) continue;
+            const int i = om.edges[e][0], j = om.edges[e][1];
+            const Point d = uv[j] - uv[i];
+            report.maxAlignResidual =
+                std::max(report.maxAlignResidual, std::fabs(d[hold]) / extent);
+            // The other coordinate is the length the edge kept; against it, the
+            // length the frame asked for. An edge whose image collapsed is
+            // strained by all of itself.
+            const double model = normP(om.vertices[j] - om.vertices[i]);
+            const int f = (om.edgeTriangles[e][0] >= 0) ? om.edgeTriangles[e][0]
+                                                        : om.edgeTriangles[e][1];
+            if (f < 0 || !(model > 0.0)) continue;
+            const std::array<double, 4> &Js = target[f];
+            const Point want{Js[0] * (om.vertices[j][0] - om.vertices[i][0]) +
+                                 Js[1] * (om.vertices[j][1] - om.vertices[i][1]),
+                             Js[2] * (om.vertices[j][0] - om.vertices[i][0]) +
+                                 Js[3] * (om.vertices[j][1] - om.vertices[i][1])};
+            const double wlen = normP(want);
+            if (!(wlen > 0.0)) continue;
+            report.alignmentStrain =
+                std::max(report.alignmentStrain, normP(d - want) / wlen);
+        }
     }
 
     // Cones, for "how far is each flip from one".
@@ -289,7 +371,7 @@ void FieldIntegration::measure(const ConeCut &cut, const FieldFrames &frames,
             gv = gv + g[i] * uv[tri[i]][1];
         }
 
-        const std::array<double, 4> &Js = frames.frames()[t];
+        const std::array<double, 4> &Js = target[t];
         const Point X{Js[0], Js[1]}, Y{Js[2], Js[3]};
         const double scale = dotP(X, X) + dotP(Y, Y);
         const Point ru = gu - X, rv = gv - Y;

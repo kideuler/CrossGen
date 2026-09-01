@@ -1740,12 +1740,52 @@ void CrossGenWidget::runTORSIONFrames() {
     framesAttempted_ = true;
     if (!sipgField_.has_value() || !coneCut_.has_value() || !cones_.has_value()) return;
 
+    // Sec. 4, and C4. The frame the plan first wrote down was (1/h) R(-theta),
+    // which asks the map to be an isometry of the model everywhere and so is
+    // not integrable at a cone whatever the field does; the conformal factor of
+    // the flat cone metric is what it is missing, and the same u is the
+    // reference metric Stage 6 needs. One Newton solve answers both.
+    coneMetric_.reset();
+    {
+        ConeMetric::Options cmopts;
+        try {
+            coneMetric_.emplace(*mesh_, *cones_, cmopts);
+        } catch (const std::exception &e) {
+            console_.log(std::string("[Frames] cone metric FAILED: ") + e.what());
+        }
+        if (coneMetric_.has_value()) {
+            const ConeMetric::Report &cmr = coneMetric_->getReport();
+            std::ostringstream oss;
+            oss << "[Frames] Sec. 4 cone metric: ||K - Kbar||_inf " << std::scientific
+                << std::setprecision(2) << cmr.initialError << " -> " << cmr.finalError
+                << " rad in " << cmr.newtonIterations << " Newton step(s), exp(u) in ["
+                << std::fixed << std::setprecision(3) << cmr.minScale << ", " << cmr.maxScale
+                << "], " << cmr.nonRealisable << " face(s) not realisable "
+                << (cmr.solved ? "[PASS]" : "[FAIL]");
+            console_.log(oss.str());
+            for (const std::string &m : cmr.messages) console_.log("[Frames] " + m);
+            if (!cmr.solved) coneMetric_.reset();
+        }
+    }
+
     FieldFrames::Options fopts;
     fopts.referenceIndex = fieldIndex_;
+    if (coneMetric_.has_value()) {
+        const TORSION::Options defaults;
+        fopts.sizing = coneMetric_->sizingField(defaults.targetEdge);
+        fopts.metricLengths = coneMetric_->edgeLengths();
+        if (defaults.targetEdge > 0.0) {
+            for (double &l : fopts.metricLengths) l /= defaults.targetEdge;
+        }
+    }
 
     auto t0 = Clock::now();
     try {
-        frames_.emplace(*sipgField_, *coneCut_, *cones_, fopts);
+        // The interfaces go in for Sec. 6.4's alignment: an interface branch is
+        // a curve of the layout in exactly the way a chain of dS is, and the
+        // field is pinned tangent to it in the same way.
+        frames_.emplace(*sipgField_, *coneCut_, *cones_, fopts,
+                        interfaces_.has_value() ? &*interfaces_ : nullptr);
     } catch (const std::exception &e) {
         frames_.reset();
         console_.log(std::string("[Frames] FAILED: ") + e.what());
@@ -1830,10 +1870,11 @@ void CrossGenWidget::runTORSIONFrames() {
 // when the target is unrealisable, which is exactly the situation a
 // non-integrable field puts it in.
 //
-// The reference is the metric the *least-squares map* induces, not the frame.
-// The frame is a scaled rotation, so E1 against it is E1 against the model's
-// Euclidean geometry -- see LayoutEnergy.hxx for the algebra -- and that
-// reference has no cones, which is the failure this whole route has to avoid.
+// The reference is Sec. 4's flat cone metric, falling back to the metric the
+// least-squares map induces if it could not be built. Not the frame: the frame
+// is a scaled rotation, so E1 against it is E1 against the model's Euclidean
+// geometry -- see LayoutEnergy.hxx for the algebra -- and that reference has no
+// cones, which is the failure this whole route has to avoid.
 std::vector<Point> CrossGenWidget::runTORSIONUntangle() {
     if (!coneCut_.has_value() || !cones_.has_value() || !frames_.has_value()) return {};
     const Mesh &omega = coneCut_->getCutMesh();
@@ -1873,7 +1914,10 @@ std::vector<Point> CrossGenWidget::runTORSIONUntangle() {
 
     LayoutEnergy::Options eopts;
     eopts.reference = LayoutEnergy::Reference::Induced;
-    eopts.referenceLengths = TORSION::inducedLengths(*mesh_, *coneCut_, integratedMap_);
+    eopts.referenceLengths =
+        coneMetric_.has_value()
+            ? coneMetric_->edgeLengths()
+            : TORSION::inducedLengths(*mesh_, *coneCut_, integratedMap_);
     // mu is E4's penalty and nothing else is switched on, so it is set through
     // lambdaFactor rather than through lambdaInit: run() floors lambda_4 at
     // lambda_1, and that floor would swallow a starting mu below 1.
@@ -1961,7 +2005,13 @@ void CrossGenWidget::runTORSIONIntegration() {
 
     auto t0 = Clock::now();
     try {
-        integration_.emplace(*coneCut_, *frames_, *scaffold_, FieldIntegration::Options());
+        // Sec. 6.4: hold every chain of dS - G and every interface branch to
+        // the axis the frame read for it, so that psi_0 satisfies Q3 -- and Q2
+        // at every boundary vertex -- as the solve returns rather than after
+        // Stage 6 has driven a residual there.
+        FieldIntegration::Options iopts;
+        iopts.alignAxis = frames_->alignmentAxis();
+        integration_.emplace(*coneCut_, *frames_, *scaffold_, iopts);
     } catch (const std::exception &e) {
         integration_.reset();
         console_.log(std::string("[psi_0] FAILED: ") + e.what());
@@ -2655,16 +2705,24 @@ void CrossGenWidget::runMERIDIANLayout() {
     // against a reference metric, and a field-integrated map has no flat metric
     // to be measured against; leaving it Euclidean is the failure
     // LayoutEnergy.hxx documents on geom003, where a reference with no cones
-    // and Q2 are contradictory statements about the same vertex. What psi_0
-    // does have is the metric it induces itself -- the integration's seam
-    // constraints are exact rotations, so its image angle sum at each cone is
-    // already 2 pi - (pi/2) I before the continuation starts -- and that is a
-    // flat cone metric with the right cones, got without a flow.
+    // and Q2 are contradictory statements about the same vertex.
+    //
+    // psi_0's own induced metric is not the answer either, though it looks like
+    // one: the seam constraints are exact rotations, so its angle sum at each
+    // cone is already 2 pi - (pi/2) I, and C4 reads 1e-10 on it. The cone
+    // angles are only the part of the reference that lives at the cones, and
+    // the rest of it is the shape of every other triangle -- E1 against psi_0's
+    // lengths says "reproduce psi_0", shear and all, so the cone fans stay
+    // however the least-squares fit distributed them and the patch at a cone
+    // comes out with a reflex corner. What is used is Sec. 4's flat cone
+    // metric, built from the model's own triangles by ConeMetric.
     LayoutEnergy::Options eopts;
     if (mode_ == Mode::TORSION) {
         eopts.reference = LayoutEnergy::Reference::Induced;
         eopts.referenceLengths =
-            TORSION::inducedLengths(*mesh_, *coneCut_, immersion_->getUV());
+            coneMetric_.has_value()
+                ? coneMetric_->edgeLengths()
+                : TORSION::inducedLengths(*mesh_, *coneCut_, immersion_->getUV());
         // Sec. 9's closing note: the field is already aligned to dS and to the
         // interfaces, so E2 and E3 start small and over-penalising them early
         // only fights E1; E4 starts higher because the untangling introduced

@@ -81,6 +81,8 @@ add_library(PolyVector SHARED
     src/MERIDIAN/SplineFit.cxx
     src/MERIDIAN/QuadMesh.hxx
     src/MERIDIAN/QuadMesh.cxx
+    src/TORSION/ConeMetric.hxx
+    src/TORSION/ConeMetric.cxx
     src/TORSION/FieldFrames.hxx
     src/TORSION/FieldFrames.cxx
     src/TORSION/TutteEmbedding.hxx
@@ -335,6 +337,11 @@ endforeach()
 # zero, the integration's answer is exactly x -> x/h, and Reference::Field must
 # report det J = 1 on every triangle. A circle has none of that and is there for
 # the branch selection and the seam transitions to have something to do.
+# Case 3 adds Sec. 4's cone metric on both: the square's four corners already
+# carry the pi/2 their index asks for, so u is constant there and any movement
+# is movement for no reason; the disk has 2 pi of boundary turning to move and
+# what is known of it is the target, K = Kbar to rounding on a metric that is
+# still realisable.
 add_test(NAME TORSION_SelfTest COMMAND TestTORSION --selftest)
 
 # End-to-end on the same four models MERIDIAN_Layout uses, with psi_0 integrated

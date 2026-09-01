@@ -1,6 +1,7 @@
 #ifndef __TORSION_FIELDINTEGRATION_HXX__
 #define __TORSION_FIELDINTEGRATION_HXX__
 
+#include <array>
 #include <string>
 #include <vector>
 
@@ -80,6 +81,42 @@ public:
         Point pinnedTo{0.0, 0.0};
         // Multiplier-block regularisation, relative to the mean diagonal of L.
         double regularisation = 1e-10;
+
+        // Sec. 6.4: which coordinate each edge of Omega holds constant --
+        // 0 for u, 1 for v, -1 for free -- as FieldFrames::alignmentAxis()
+        // reads it off the frame. Empty leaves Q3 and E3 entirely to Stage 6,
+        // which is what this stage did before.
+        //
+        // These rows are of exactly the kind the seam rows already are:
+        // homogeneous, on a difference of two vertex values, and an equality
+        // rather than a penalty. What they buy is that psi_0 satisfies Q3 --
+        // and, at every boundary vertex, Q2 -- the moment the solve returns,
+        // instead of after a penalty continuation has driven a residual of 1e-1
+        // down to 1e-6. Pipeline A gets the same thing from a different
+        // direction: Stage 1 prescribes zero curvature at every non-cone
+        // boundary vertex, so the flow makes dS geodesic and psi_R's boundary
+        // is a rectilinear polygon before Stage 6 sees it.
+        //
+        // What they cost is that the least-squares fit no longer gets to choose
+        // the boundary. Where the field is genuinely off the axis its chain was
+        // given, the map is being asked for something the field did not offer,
+        // and Report::alignmentStrain is that disagreement measured after the
+        // fact.
+        std::vector<int> alignAxis;
+
+        // The Jacobian the fit is asked for, one 2x2 row-major per face of
+        // Omega. Empty means the frames', which is Sec. 6 as written.
+        //
+        // It is here for one caller: the re-projection of Sec. 6.5. Stage 4R
+        // returns an injective map that has lost the alignment -- it was built
+        // from a Tutte embedding of a circle and E2 only pulled it back part of
+        // the way -- and the cheapest way to put the alignment back is to fit
+        // *that map's own Jacobian* under the same constraints. Its target is
+        // integrable by construction, being a gradient, so the unconstrained
+        // answer is the map itself and the constrained one is the nearest map
+        // to it that satisfies Q3 and Q4 exactly.
+        std::vector<std::array<double, 4>> targetJacobian;
+
         // det J_t at or below this counts as inverted, relative to the model
         // triangle's area.
         double flipTolerance = 0.0;
@@ -89,6 +126,7 @@ public:
         int vertices = 0;
         int faces = 0;
         int seamPairs = 0;
+        int alignedEdges = 0;
         int constraintRows = 0;
 
         bool factorised = false;
@@ -100,6 +138,17 @@ public:
         // divided by the extent of the image. This is the price of the
         // regularisation above and it should be at rounding level.
         double maxSeamResidual = 0.0;
+
+        // The alignment as it came out: the worst held coordinate difference
+        // over the aligned edges, divided by the extent -- which should be at
+        // rounding, the rows being equalities -- and how far the aligned edges'
+        // images ended up from the direction the *field* wanted for them,
+        // relative to their length. The second is the price of Sec. 6.4 and is
+        // not an error: it is the field's own disagreement with the cone set,
+        // moved from Stage 8, where it would have been a spurious node, to
+        // here, where it is a strained triangle.
+        double maxAlignResidual = 0.0;
+        double alignmentStrain = 0.0;
 
         // Sec. 7.1's census.
         int flippedFaces = 0;
@@ -151,6 +200,7 @@ private:
     void measure(const ConeCut &cut, const FieldFrames &frames, const Immersion &scaffold);
 
     Options opts;
+    std::vector<std::array<double, 4>> target;   // the frames', or Options'
     std::vector<Point> uv;
     std::vector<double> fitResidual;
     std::vector<double> areaRatio;

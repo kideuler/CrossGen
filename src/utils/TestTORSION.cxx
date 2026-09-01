@@ -40,9 +40,12 @@
 #include <vector>
 
 #include "MERIDIAN/MERIDIAN.hxx"
+#include "MERIDIAN/QuadMesh.hxx"
+#include "MERIDIAN/SplineFit.hxx"
 #include "Parameterization/CutMesh.hxx"
 #include "Parameterization/MIQ.hxx"
 #include "SIPG/SIPG.hxx"
+#include "TORSION/ConeMetric.hxx"
 #include "TORSION/TORSION.hxx"
 #include "TestHelper.hxx"
 
@@ -283,6 +286,66 @@ int selfTest() {
         }
         for (const std::string &m : st.messages) {
             if (m.find("Stage 4") != std::string::npos) std::cout << "     " << m << "\n";
+        }
+    }
+
+    // -----------------------------------------------------------------
+    heading("Case 3  The cone metric, where its answer is known before it runs");
+    // -----------------------------------------------------------------
+    //
+    // Sec. 4's Newton solve, on two models whose conformal factor is known in
+    // closed form.
+    //
+    // The square is the sharper of the two: its four corners are the four
+    // cones, each carries I = +1, and pi - (pi/2)(+1) = pi/2 is *already* the
+    // angle the model has there. Every other vertex wants what it already has
+    // too, so K = Kbar everywhere before a step is taken, the metric is the
+    // model's own, and u is constant. A solve that moves anything here is
+    // moving it for a reason that does not exist.
+    //
+    // The disk has no such luck -- its boundary carries 2 pi of turning that
+    // has to go into the cones -- so what is known there is not u but what u
+    // must achieve: K = Kbar at every vertex, to rounding, and a metric that is
+    // still a metric when it gets there.
+    {
+        struct Case {
+            const char *what;
+            std::shared_ptr<Mesh> mesh;
+            bool flat;      // is u constant?
+        };
+        std::vector<Case> cases = {
+            {"square", TestHelper::createBox(0.0, 0.0, 1.0, 1.0, 0.05), true},
+            {"disk", TestHelper::createCircle(0.0, 0.0, 1.0, 0.05), false},
+        };
+        for (Case &c : cases) {
+            SIPG field(c.mesh, 500, 10.0);
+            field.initialize();
+            const double nTris = static_cast<double>(c.mesh->triangles.size());
+            for (int i = 0; i < 500; ++i) {
+                field.step();
+                if (field.error < 2.0 * nTris * 1e-5) break;
+            }
+            field.computeSingularities();
+            ConeSingularities cones(field);
+            ConeMetric metric(*c.mesh, cones);
+            const ConeMetric::Report &r = metric.getReport();
+            std::cout << "  " << c.what << ": ||K - Kbar||_inf " << std::scientific
+                      << std::setprecision(3) << r.initialError << " -> " << r.finalError
+                      << " rad in " << r.newtonIterations << " Newton step(s); exp(u) in ["
+                      << std::fixed << std::setprecision(6) << r.minScale << ", " << r.maxScale
+                      << "]" << std::defaultfloat << "\n";
+            check(r.solved, std::string(c.what) + ": every face of the metric is realisable");
+            check(r.finalError < 1e-6,
+                  std::string(c.what) + ": K = Kbar at every vertex");
+            check(r.coneResidual < 1e-6,
+                  std::string(c.what) + ": C4, the angle sum at every cone is 2 pi - (pi/2) I");
+            if (c.flat) {
+                check(std::fabs(r.maxScale / r.minScale - 1.0) < 1e-9,
+                      "square: u is constant, because the model already is the flat cone metric");
+            } else {
+                check(r.maxScale / r.minScale > 1.001,
+                      "disk: u is not constant, because 2 pi of boundary turning had to move");
+            }
         }
     }
 
@@ -658,7 +721,13 @@ void usage(const char *prog) {
               << "  --untangle-mu <m>  starting weight on E4 in that fit     (default 1e-2)\n"
               << "  --reg <e>          saddle-block regularisation           (default 1e-10)\n"
               << "  --no-seed-check    skip the second-seed spot check\n"
-              << "  --ref <r>          E1's reference metric, C4:                (default induced)\n"
+              << "  --no-align         leave Q3 and E3 entirely to Stage 6 (Sec. 6.4 off)\n"
+              << "  --no-align-fallback  keep the aligned solve even when it inverts more\n"
+              << "  --no-conformal-sizing  leave the frame unscaled: J* = (1/h) R(-theta)\n"
+              << "  --ref <r>          E1's reference metric, C4:                (default cone)\n"
+              << "                       cone      the flat cone metric of the cone set, from\n"
+              << "                                 ConeMetric's Newton solve on the model's\n"
+              << "                                 own triangles. The answer to C4\n"
               << "                       induced   the metric psi_0 induces on Omega, which\n"
               << "                                 has the cone angles the seam constraints\n"
               << "                                 already forced into it\n"
@@ -683,6 +752,7 @@ void usage(const char *prog) {
               << "  --align-factor <f> factor on lambda_2, lambda_3          (default 0.1)\n"
               << "  --seam-factor <f>  factor on lambda_4                    (default 10)\n"
               << "  --no-topo          skip the Gamma_topo seeding (E5 off)\n"
+              << "  --near-miss <f>    Gamma_topo seeding tolerance          (default 0.15)\n"
               << "  --no-layout        stop after Stage 4\n"
               << "  --no-trace         skip Stage 7\n"
               << "  --no-arrange       skip Stage 8\n"
@@ -696,7 +766,9 @@ void usage(const char *prog) {
               << "  --raw <file.obj>   write the integration's map before any untangling\n"
               << "  --tutte <file.obj> write the Tutte embedding\n"
               << "  --layout <file.obj> write Psi, the Stage 6 result\n"
-              << "  --cut <file.obj>   write Omega\n";
+              << "  --cut <file.obj>   write Omega\n"
+              << "  --arr <file.obj>   write the Stage 8 arrangement, on the model\n"
+              << "  --quads <file.obj> write the Stage 10 quadrilateral mesh\n";
 }
 
 } // namespace
@@ -717,7 +789,7 @@ int main(int argc, char **argv) {
 
     const std::string path = first;
     TORSION::Options opts;
-    std::string psiOut, rawOut, tutteOut, layoutOut, cutOut;
+    std::string psiOut, rawOut, tutteOut, layoutOut, cutOut, quadOut, arrOut;
     int coneListLimit = 20;
 
     for (int i = 2; i < argc; ++i) {
@@ -728,9 +800,13 @@ int main(int argc, char **argv) {
         else if (a == "--untangle-mu" && i + 1 < argc)  opts.untangleSeamWeight = std::stod(argv[++i]);
         else if (a == "--reg" && i + 1 < argc)          opts.integrationRegularisation = std::stod(argv[++i]);
         else if (a == "--no-seed-check")                opts.checkSecondSeed = false;
+        else if (a == "--no-align")                     opts.alignInIntegration = false;
+        else if (a == "--no-conformal-sizing")          opts.conformalSizing = false;
+        else if (a == "--no-align-fallback")            opts.alignmentFallback = false;
         else if (a == "--ref" && i + 1 < argc) {
             const std::string r = argv[++i];
-            if (r == "induced")        opts.reference = TORSION::Options::Reference::Induced;
+            if (r == "cone")           opts.reference = TORSION::Options::Reference::Cone;
+            else if (r == "induced")   opts.reference = TORSION::Options::Reference::Induced;
             else if (r == "field")     opts.reference = TORSION::Options::Reference::Field;
             else if (r == "euclidean") opts.reference = TORSION::Options::Reference::Euclidean;
             else if (r == "ricci")     opts.reference = TORSION::Options::Reference::Ricci;
@@ -750,6 +826,7 @@ int main(int argc, char **argv) {
         else if (a == "--align-factor" && i + 1 < argc) opts.lambdaAlignmentFactor = std::stod(argv[++i]);
         else if (a == "--seam-factor" && i + 1 < argc)  opts.lambdaSeamFactor = std::stod(argv[++i]);
         else if (a == "--no-topo")                      opts.seedTopoConstraints = false;
+        else if (a == "--near-miss" && i + 1 < argc)    opts.topoNearMiss = std::stod(argv[++i]);
         else if (a == "--no-layout")                    opts.runLayout = false;
         else if (a == "--no-trace")                     opts.runSeparatrices = false;
         else if (a == "--no-arrange")                   opts.runArrangement = false;
@@ -763,6 +840,8 @@ int main(int argc, char **argv) {
         else if (a == "--tutte" && i + 1 < argc)        tutteOut = argv[++i];
         else if (a == "--layout" && i + 1 < argc)       layoutOut = argv[++i];
         else if (a == "--cut" && i + 1 < argc)          cutOut = argv[++i];
+        else if (a == "--quads" && i + 1 < argc)        quadOut = argv[++i];
+        else if (a == "--arr" && i + 1 < argc)          arrOut = argv[++i];
         else { std::cerr << "Unknown option: " << a << "\n"; usage(argv[0]); return 1; }
     }
 
@@ -868,6 +947,25 @@ int main(int argc, char **argv) {
     }
 
     // ---------------------------------------------------------------------
+    if (st.coneMetricRan) {
+        heading("Stage 4C  The flat cone metric of the cone set (Sec. 4, C4)");
+        std::cout << "  ||K - Kbar||_inf " << std::scientific << std::setprecision(3)
+                  << st.coneMetricInitialError << " rad on the model, " << st.coneMetricLinearError
+                  << " after the linear solve, " << st.coneMetricFinalError << " after "
+                  << st.coneMetricNewtonSteps << " Newton step(s)" << std::defaultfloat << "\n";
+        std::cout << "  exp(u) in [" << std::fixed << std::setprecision(4) << st.coneMetricMinScale
+                  << ", " << st.coneMetricMaxScale << "]" << std::defaultfloat << "; "
+                  << st.coneMetricNonRealisable << " face(s) fail the triangle inequality\n";
+        verdict(st.coneMetricSolved, "The cone metric is a metric: every face realisable");
+        verdict(st.coneMetricConeResidual < 1e-6,
+                "Its angle sum at every cone is the 2 pi - (pi/2) I the layout is held to");
+        if (st.conformalSizingUsed) {
+            std::cout << "  The frame is scaled by it: J*_t = (exp(u_t)/h) R(-theta_t)\n";
+        }
+        stageMessages("Stage 4C: ");
+    }
+
+    // ---------------------------------------------------------------------
     heading("Stage 3F  Combing, matchings and the index audit (Sec. 5)");
     const FieldFrames &ff = pipeline.getFrames();
     const FieldFrames::Report &fr = ff.getReport();
@@ -915,6 +1013,23 @@ int main(int argc, char **argv) {
     if (fr.highIndexCones > 0) {
         warn(std::to_string(fr.highIndexCones) + " cone(s) of index |I| > 2");
     }
+    // Sec. 6.4. The three numbers that matter are the last three: how many
+    // edges Stage 4F will hold outright, how many steps of the field's own
+    // staircase were taken out to do it, and how far off an axis the field was
+    // on the worst of them.
+    std::cout << "  Alignment: " << fr.alignmentChains << " chain(s) of dS - G and of the "
+              << "interface network -> " << fr.alignedBoundaryEdges << " boundary + "
+              << fr.alignedInterfaceEdges << " interface edge(s) held; "
+              << fr.alignmentOverrides << " staircase step(s) removed over "
+              << fr.alignmentSteppedChains << " chain(s)\n";
+    std::cout << "  Left free: " << fr.alignmentClosedChains << " closed, "
+              << fr.alignmentReversedChains << " that turn back on themselves, "
+              << fr.alignmentAbstained << " the field is not on an axis of\n";
+    if (fr.alignedBoundaryEdges + fr.alignedInterfaceEdges > 0) {
+        std::cout << "  Worst edge held is " << std::scientific << std::setprecision(3)
+                  << fr.maxAlignmentResidual << std::defaultfloat
+                  << " rad off the axis the frame reads for it\n";
+    }
     stageMessages("Stage 3F: ");
 
     if (!pipeline.hasIntegration()) {
@@ -931,6 +1046,14 @@ int main(int argc, char **argv) {
               << (ir.solvedWithLDLT ? "LDL^T" : "the LU fallback") << "\n";
     std::cout << "  Seam residual " << std::scientific << std::setprecision(3)
               << ir.maxSeamResidual << " of the extent" << std::defaultfloat << "\n";
+    if (ir.alignedEdges > 0) {
+        std::cout << "  Sec. 6.4: " << ir.alignedEdges << " edge(s) held to an axis; residual "
+                  << std::scientific << std::setprecision(3) << ir.maxAlignResidual
+                  << " of the extent, strain " << ir.alignmentStrain << " relative"
+                  << std::defaultfloat << "\n";
+    } else if (st.alignmentWasDropped) {
+        std::cout << "  Sec. 6.4: the alignment was dropped -- see the message below\n";
+    }
     std::cout << "  Non-integrability, per triangle: " << std::scientific << std::setprecision(3)
               << ir.maxFitResidual << " worst, " << ir.meanFitResidual << " mean"
               << std::defaultfloat;
@@ -957,6 +1080,7 @@ int main(int argc, char **argv) {
         warn("Sec. 7: the field is not integrable here, so the least-squares map inverted "
              + std::to_string(ir.flippedFaces) + " face(s). Stage 4R is what pays for that.");
     }
+    stageMessages("Stage 4F: ");
     if (!rawOut.empty()) {
         std::ofstream out(rawOut);
         if (out) {
@@ -969,8 +1093,15 @@ int main(int argc, char **argv) {
     }
 
     // ---------------------------------------------------------------------
-    if (st.untangleRan || pipeline.hasTutte()) {
-        heading("Stage 4R  Untangling: Tutte, then target-Jacobian fitting (Sec. 7.2)");
+    if (st.untangleRan || pipeline.hasTutte() || st.localUntangleRan) {
+        heading("Stage 4R  Untangling: the local kernel pass, then Tutte (Secs. 7.2a, 7.2)");
+        if (st.localUntangleRan) {
+            std::cout << "  Sec. 7.2a: " << st.localUntangleFlippedFaces
+                      << " inverted face(s) left after moving the interior vertices around "
+                      << "the tangle to the centres of their one-ring kernels\n";
+            verdict(st.localUntangleFlippedFaces == 0 || pipeline.hasTutte(),
+                    "The tangle was cleared locally, or handed on to Sec. 7.2");
+        }
         if (pipeline.hasTutte()) {
             const TutteEmbedding::Report &tr = pipeline.getTutte().getReport();
             std::cout << "  Tutte: " << tr.boundaryVertices << " boundary + "
@@ -1058,6 +1189,7 @@ int main(int argc, char **argv) {
     const LayoutEnergy::Report &er = pipeline.getLayout().getReport();
     const char *refName = "induced (psi_0's own metric)";
     switch (opts.reference) {
+        case TORSION::Options::Reference::Cone:      refName = "the flat cone metric (Sec. 4)"; break;
         case TORSION::Options::Reference::Field:     refName = "the field frame (Sec. 4)"; break;
         case TORSION::Options::Reference::Euclidean: refName = "the model's Euclidean geometry"; break;
         case TORSION::Options::Reference::Ricci:     refName = "a Ricci flat cone metric"; break;
@@ -1087,6 +1219,7 @@ int main(int argc, char **argv) {
     verdict(er.injective, "Q1: det J > 0 on every triangle");
     verdict(er.constraintsMet, "Q3, Q4, Q5 and the features are under tolerance");
     verdict(er.anglesHeld, "Q2: cone angle sums are the prescribed multiples of pi/2");
+    stageMessages("Stage 6: ");
     if (er.leftHandedFrames > 0) {
         warn(std::to_string(er.leftHandedFrames) +
              " triangle(s) fell back to the Euclidean reference for want of a valid frame");
@@ -1106,6 +1239,7 @@ int main(int argc, char **argv) {
         std::cout << "  Repair: " << st.repairPasses << " pass(es), "
                   << st.repairConstraintsAdded << " constraint(s) added\n";
         verdict(st.q5Verified, "Q5: every curve ends at a cone or leaves through dS");
+        stageMessages("Stage 7: ");
     }
     if (st.arrangementRan) {
         heading("Stage 8  Arrangement (Sec. 4)");
@@ -1114,24 +1248,55 @@ int main(int argc, char **argv) {
                   << " are simple quadrilaterals; coverage " << std::fixed
                   << std::setprecision(4) << st.layoutCoverage << std::defaultfloat << "\n";
         verdict(st.arrangementValid, "The curves partition S into four-sided faces");
+        if (!arrOut.empty()) {
+            if (pipeline.getArrangement().writeOBJ(arrOut)) std::cout << "  Wrote the arrangement to " << arrOut << "\n";
+            else warn("Failed to write " + arrOut);
+        }
+        stageMessages("Stage 8: ");
     }
     if (st.splinesRan) {
         heading("Stage 9  Spline reconstruction (Sec. 5)");
+        const SplineFit::Report &sr = pipeline.getSplines().getReport();
         std::cout << "  " << st.splinePatches << " bicubic patch(es), "
                   << st.splineControlPoints << " control point(s) per arc; worst deviation "
                   << std::scientific << std::setprecision(3) << st.splineMaxDeviation
                   << std::defaultfloat << "\n";
+        std::cout << "  " << sr.fittedArcs << " arc(s) fitted, " << sr.exactArcs
+                  << " carried exactly; worst sampled cell " << std::fixed
+                  << std::setprecision(4) << sr.minCellRatio << " of the mean"
+                  << std::defaultfloat << "\n";
         verdict(st.splinesWatertight, "Watertight: both patches on an arc share its control points");
+        verdict(sr.foldedPatches == 0, "No patch folds under its Coons blend");
+        if (sr.foldedPatches > 0) {
+            warn(std::to_string(sr.foldedPatches) +
+                 " patch(es) fold: the four arcs they are built on do not bound a "
+                 "quadrilateral the blend can fill, so Stage 10 meshes a fold.");
+        }
+        stageMessages("Stage 9: ");
     }
     if (st.quadMeshRan) {
         heading("Stage 10  Quadrilateral mesh");
         std::cout << "  " << st.meshVertices << " vertices, " << st.meshQuads
                   << " quadrilateral(s) over " << st.meshChords << " chord(s); "
                   << st.meshUnmeshedPatches << " patch(es) unmeshed\n";
+        const QuadMesh::Report &qr2 = pipeline.getQuadMesh().getReport();
         std::cout << "  Scaled Jacobian " << std::fixed << std::setprecision(4)
-                  << st.meshMinScaledJacobian << " worst" << std::defaultfloat << "\n";
+                  << st.meshMinScaledJacobian << " worst, " << qr2.meanScaledJacobian
+                  << " mean" << std::defaultfloat << "\n";
+        std::cout << "  " << qr2.invertedQuads << " element(s) of non-positive area, "
+                  << qr2.reflexCorners << " reflex corner(s) of the layout\n";
         verdict(st.meshConforming, "Conforming: every edge is shared by two elements or bounds the mesh");
-        verdict(st.meshValid, "No element is inverted");
+        verdict(st.meshValid, "No element has non-positive area");
+        // An element with a positive area can still have a reversed corner, and
+        // a solver will not take it. The area test is what `valid` is written
+        // on; this is the test the mesh is actually used under.
+        verdict(st.meshMinScaledJacobian > 0.0,
+                "Every corner of every element turns the right way (scaled Jacobian > 0)");
+        if (!quadOut.empty()) {
+            if (pipeline.getQuadMesh().writeOBJ(quadOut)) std::cout << "  Wrote the quad mesh to " << quadOut << "\n";
+            else warn("Failed to write " + quadOut);
+        }
+        stageMessages("Stage 10: ");
     }
 
     heading("Result");

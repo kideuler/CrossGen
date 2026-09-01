@@ -18,6 +18,7 @@
 #include "MERIDIAN/Separatrices.hxx"
 #include "MERIDIAN/SplineFit.hxx"
 #include "MERIDIAN/SubdomainLabels.hxx"
+#include "TORSION/ConeMetric.hxx"
 #include "TORSION/FieldFrames.hxx"
 #include "TORSION/FieldIntegration.hxx"
 #include "TORSION/TutteEmbedding.hxx"
@@ -36,12 +37,16 @@ class SIPG;
 //     MERIDIAN     Stage 3  discrete Ricci flow          -> a flat cone metric
 //                  Stage 4  unfold it, triangle by triangle
 //
-//     TORSION      Stage 3F comb the field, read the matchings, audit the
-//                           indices                          -> FieldFrames
-//                  Stage 4F one constrained least-squares solve on Omega
+//     TORSION      Stage 3F comb the field, move its singularities onto the
+//                           cone set, read the matchings, audit the indices,
+//                           and read the axis of every chain of dS - G and of
+//                           the interface network      -> FieldFrames
+//                  Stage 4F one constrained least-squares solve on Omega, with
+//                           the seam *and* those axes as equalities
 //                                                            -> FieldIntegration
-//                  Stage 4R untangle, if the solve inverted anything
-//                                                     -> TutteEmbedding + Stage 6
+//                  Stage 4R untangle, if the solve inverted anything: locally
+//                           first, and only then through a Tutte embedding
+//                                        -> relaxToKernel + TutteEmbedding
 //
 // Both routes end at the same place -- an `Immersion` -- and every stage after
 // it takes that by reference and cannot tell which route filled it. That is the
@@ -54,20 +59,52 @@ class SIPG;
 //            least-squares fitted and snapped, so C2 holds by construction and
 //            Immersion::Report::maxSnapError becomes a check on the branch
 //            selection instead of a rounding step. Boundary and feature
-//            alignment come free on the field, so E2 and E3 start small. The
-//            initial map costs one sparse solve rather than up to a hundred
-//            Newton steps on the flow. And sizing becomes a per-face h_t rather
-//            than one global scaling of a Ricci metric.
+//            alignment are not merely small on the field but *exact*: the field
+//            is pinned tangent to dS and to every interface, so the axis of
+//            each chain can be read off the frame and held as an equation in
+//            the same solve the seam is held in (Sec. 6.4). The initial map
+//            costs one sparse solve rather than up to a hundred Newton steps on
+//            the flow -- and the flat cone metric E1 needs costs four or five
+//            more, because on a planar model the curvature to be moved is only
+//            what sits on the boundary and Newton on the vertex scaling gets it
+//            in a handful of Laplacian solves (Sec. 4, ConeMetric). And sizing
+//            becomes a per-face h_t rather than one global scaling of a Ricci
+//            metric -- which is also where that metric's conformal factor
+//            enters the frame.
+//
+//            Sec. 6.4 is what closes the gap that made this pipeline slow. A
+//            Ricci map arrives at Stage 6 with Q3 true to 1e-15, because Stage
+//            1 prescribes zero curvature at every non-cone boundary vertex and
+//            the flow makes dS geodesic; a least-squares map arrived with a
+//            boundary residual the size of the field's non-integrability, and
+//            the continuation had to spend its whole budget getting there. On
+//            singlemat/geom001 that was 8 outer steps and 236 inner iterations
+//            against Pipeline A's 1 and 0 -- 12.1 s against 0.31 s. Held as
+//            equalities it is 1 and 0, and 0.24 s.
 //
 //   Paid.    Local injectivity. A discrete cross field is generically
 //            non-integrable, so the least-squares closest map inverts triangles
 //            -- generically at the cones and in high-distortion pockets. Stage
 //            6's barrier preserves Q1 and cannot restore it, so a map with
-//            flips has to be untangled before it is a legal psi_0. Stage 4R
-//            does that, out of parts that already existed: a Tutte embedding,
-//            which is bijective by theorem, and then Stage 6 itself with E1
-//            against the integrated map's own metric, a single mu on E4, and
-//            everything else switched off.
+//            flips has to be untangled before it is a legal psi_0.
+//
+//            Rather less of it than it looks, once the frame carries the
+//            conformal factor: a good part of what Report::maxFitResidual used
+//            to read was the frame asking for an isometry, not the field being
+//            non-integrable. See C4 below.
+//
+//            Stage 4R does that on a ladder. The usual tangle is single figures
+//            of faces in one cone's one ring, and for that the map does not
+//            need rebuilding: the signed area of each triangle at one vertex is
+//            affine in that vertex, so "every triangle here is positive" is an
+//            intersection of half planes and its interior is the kernel of the
+//            one-ring polygon. Moving the vertex to the centre of it clears the
+//            tangle and touches nothing else -- so psi_0 keeps the cone angles,
+//            the seam and Sec. 6.4's alignment. Where that needs one of the
+//            equalities let go, Sec. 6.5's projection puts it back by fitting
+//            the untangled map's own Jacobian under it. Only what none of that
+//            clears goes to the Tutte pass, which is bijective by theorem and
+//            keeps nothing at all.
 //
 // ### The one thing that is easy to miss (C4)
 //
@@ -97,14 +134,53 @@ class SIPG;
 // quadrilaterals instead of 1001, four of them inverted. LayoutEnergy.hxx
 // carries the algebra.
 //
-// What answers C4 is a reference whose *triangles are a different shape*, and
-// the field route has one for free. The integration's seam constraints are
-// exact rotations, so psi_0's image angle sum at each cone is already
-// 2 pi - (pi/2) I to eight digits before Stage 6 starts: the metric psi_0
-// induces on Omega is a flat cone metric with the cones the layout wants, got
-// without a flow. That is Reference::Induced and it is this pipeline's default.
-// Options::reference selects among the four so that the paragraph above stays a
-// measurement rather than a claim.
+// What answers C4 is a reference whose *triangles are a different shape*. The
+// obvious candidate is the metric psi_0 induces on Omega: the seam constraints
+// are exact rotations, so its angle sum at every cone is 2 pi - (pi/2) I to
+// eight digits before Stage 6 starts, and Status::referenceConeResidual duly
+// reads 1e-10 on it. **That is not enough, and the corpus says so.** The cone
+// angles are only the part of the reference that lives at the cones; the rest
+// of it is the shape of every other triangle, and E1 against psi_0's own
+// lengths says "reproduce psi_0" -- shear, non-integrability and all. So the
+// cone *fans* stay however the least-squares fit distributed them, the three
+// rays of a +1 cone leave at 200, 60 and 100 degrees instead of 120 each, the
+// patch at that cone has a reflex corner, and Stage 10 meshes an element the
+// scaled Jacobian reads as -0.39 -- on multimat/geom001, whose layout passes
+// Q1 to Q5 with residuals of 1e-7. Q1-Q5 do not see it, which is exactly why
+// Reference::Induced survived as a default for as long as it did.
+//
+// The reference has to be a *flat cone metric*: conformal to the model away
+// from the cones, and carrying the prescribed angle defect at them. Pipeline A
+// gets one from the flow. The field route does not need the flow to have one,
+// because the model is planar: the interior curvature is already zero, the
+// whole of the flow's work is moving the boundary's turning into the cones,
+// and a conformal change of a triangulation is a vertex scaling whose exact
+// Jacobian dK/du is the cotangent Laplacian. So the metric is a Newton solve
+// on the model's own triangles -- one linear solve for the first order and
+// three or four more for the rest. That is ConeMetric, it is
+// Reference::Cone, and it is this pipeline's default. On the corpus it is the
+// same metric --ref ricci computes, and it costs a handful of Laplacian solves
+// rather than the flow's circle packing, flow triangulation and edge flips.
+//
+// The same u fixes something upstream of the reference. The frame was
+//
+//     J*_t = (1/h) R(-theta_t),
+//
+// which asks the map to be an isometry of the model *everywhere*, and a map
+// with cones cannot be one: Sec. 3's own Schwarz-Christoffel integrand has
+// modulus prod |z - p_k|^(-I_k/4), which is exp(u) and is not constant. The
+// target the integration was being handed was therefore not integrable even
+// where the field is, and Report::maxFitResidual was reading a
+// non-integrability that was partly the frame's. With the frame scaled --
+// Options::conformalSizing, on by default --
+//
+//     singlemat/geom003     6 inverted faces at Stage 4F  ->  0
+//     multimat/geom002      3                             ->  0, and Sec. 6.4's
+//                                                            strain 0.27 -> 0.11
+//
+// Status::referenceConeResidual is the reference's own cone angles, read before
+// the continuation is allowed to use it. Options::reference selects among the
+// five so that the paragraphs above stay measurements rather than claims.
 class TORSION {
 public:
     struct Options {
@@ -142,6 +218,29 @@ public:
         // is the spot check Sec. 13's checklist asks for on top of it.
         bool checkSecondSeed = true;
 
+        // Sec. 6.4: read the axis of every chain of dS - G and of every
+        // interface branch off the frame, and hold it *exactly* in the
+        // integration rather than asking for it with lambda_2 and lambda_3.
+        //
+        // This is what closes the gap the head of this file calls structural.
+        // A Ricci map arrives at Stage 6 with Q3 already true -- Stage 1
+        // prescribes zero curvature at every non-cone boundary vertex, so the
+        // flow makes dS geodesic and psi_R's boundary is a rectilinear polygon
+        // -- and the continuation then exits at its first level on the easy
+        // models. A least-squares map arrives with a boundary residual the size
+        // of the field's non-integrability, and the continuation has to spend
+        // its whole budget driving that down. Holding the axis instead costs
+        // one equation per boundary edge in a solve that already has the seam
+        // as equalities, and it takes the staircase out at the same time: the
+        // axis is decided per chain and the chains end at the cones.
+        bool alignInIntegration = true;
+        // If the aligned solve inverts more faces than the free one would, keep
+        // the free one. One extra factorisation, taken only when the aligned
+        // solve inverted something, and it is what makes the alignment a
+        // strictly-better-or-equal change on the flip census rather than a
+        // trade.
+        bool alignmentFallback = true;
+
         // --- Stage 4F: the integration -------------------------------------
         double integrationRegularisation = 1e-10;
 
@@ -150,29 +249,93 @@ public:
         // the solve returned it, which stops the pipeline at Stage 4's gate --
         // and that is the measurement Sec. 7.1's census is for.
         bool untangle = true;
+        // Sec. 7.2a: try the local repair before Sec. 7.2's global one. It
+        // moves the interior vertices around an inverted face to the centre of
+        // their one-ring kernels and touches nothing on dOmega, so a map it
+        // clears keeps its cone angles, its seam and Sec. 6.4's alignment
+        // exactly -- all three of which the Tutte pass throws away and Stage 6
+        // then has to rebuild. See relaxToKernel() in TORSION.cxx.
+        bool localUntangle = true;
+        int localUntangleSweeps = 32;
+        // Let a seam vertex move at rungs 0 and 1 of that ladder, with its
+        // partner moving under R_k so that Q4 is unchanged. See
+        // TORSION::seamPairing().
+        //
+        // **Off, and measured.** The construction is right and the extra
+        // freedom is real, and on this corpus it buys nothing: the tangles that
+        // survive rung 0 are not tangles one paired displacement can undo --
+        // rungs 0 and 1 clear the same one model with it as without -- and the
+        // trajectory it takes at rung 2 leaves the seam far enough out that
+        // Sec. 6.5's projection stops being able to put it back, which costs
+        // multimat/geom002 its layout. Kept behind a flag because the argument
+        // for it does not go away with the measurement: on a model whose tangle
+        // straddles the cut rather than sitting beside it, this is the freedom
+        // that pass needs.
+        bool pairSeamInUntangle = false;
         // Outer steps of the target-fitting continuation, and the weight on E4
         // relative to E1 at the first of them. mu grows by lambdaGrowth per
         // step exactly as the main continuation's penalties do.
         int untangleOuterSteps = 8;
         int untangleInnerIterations = 60;
         double untangleSeamWeight = 1e-2;
+        // The weight on E2 and E3 in that fit, relative to E1, on the same
+        // schedule as E4's.
+        //
+        // **Off, and measured.** The argument for it is that the pass starts
+        // from a Tutte embedding of a circle, which has none of Sec. 6.4's
+        // alignment, and that carrying the alignment across the pass is
+        // cheaper than letting Stage 6 rediscover it. The measurement does not
+        // support it: on geom004 the cone at the end of the cut comes back
+        // 2 pi out -- the fit spends its budget dragging the boundary onto the
+        // axes and settles for a cone that has changed valence -- and Q2 then
+        // cannot be recovered by anything downstream. Sec. 6.5's re-projection
+        // does the same job afterwards, as a projection onto an equality rather
+        // than as one more term competing with E1 for the same budget, and it
+        // does not have to fight the barrier to do it.
+        double untangleAlignWeight = 0.0;
+        // Sec. 6.5: after the untangling, fit the untangled map's own Jacobian
+        // under the seam and alignment equalities, so that Q3 and Q4 come back
+        // exactly. Kept only when it inverts nothing. See
+        // FieldIntegration::Options::targetJacobian.
+        bool reprojectAfterUntangle = true;
 
         // --- Stage 6 -------------------------------------------------------
-        // C4: what "undistorted" means to E1. See the class comment for why
-        // Field is not the answer the plan expected it to be and Induced is.
+        // C4: what "undistorted" means to E1.
         //
-        //   Induced    the metric psi_0 itself induces on Omega, which has the
-        //              cone angles the seam constraints already forced into it.
-        //              The default.
+        //   Cone       the flat cone metric of Stage 1's cone set, built from
+        //              the model's own triangles by ConeMetric's Newton solve.
+        //              The default, and the answer to C4.
+        //   Induced    the metric psi_0 itself induces on Omega. It has the
+        //              cone *angles* -- the seam equalities forced them in --
+        //              and none of the shape: E1 against it says "reproduce
+        //              psi_0", including the shear the non-integrability of
+        //              the field left in it, so the cone fans stay however the
+        //              integration distributed them. Measured on the corpus it
+        //              is much nearer Euclidean than to a flat cone metric.
         //   Field      Sec. 4's construction, kept so that the measurement
-        //              against it can be repeated. Identical to Euclidean.
+        //              against it can be repeated. Identical to Euclidean: the
+        //              frame is a rotation and E1 is invariant under one.
         //   Euclidean  the model's own geometry, which on a planar input has no
         //              cones at all. The known failure.
-        //   Ricci      Pipeline A's flat cone metric. Requires the flow, which
-        //              this pipeline otherwise does not run, and is here as the
-        //              known-good yardstick rather than as a working default.
-        enum class Reference { Induced, Field, Euclidean, Ricci };
-        Reference reference = Reference::Induced;
+        //   Ricci      Pipeline A's flat cone metric, from the flow. The same
+        //              object Cone builds, computed the expensive way, and the
+        //              yardstick Cone is checked against.
+        enum class Reference { Cone, Induced, Field, Euclidean, Ricci };
+        Reference reference = Reference::Cone;
+
+        // Scale the frame by the cone metric's conformal factor, so that the
+        // integration's target is J*_t = (exp(u_t)/h) R(-theta_t) rather than
+        // (1/h) R(-theta_t).
+        //
+        // The unscaled frame asks the map to be an isometry of the model
+        // everywhere at once, and a map with cones cannot be one -- the
+        // Schwarz-Christoffel integrand of Sec. 3 has modulus
+        // prod |z - p_k|^(-I_k/4), which is exp(u) and is not constant. So the
+        // target the integration was being handed was not integrable *even
+        // where the field is*, and Report::maxFitResidual was reading a
+        // non-integrability that was partly the frame's own. Scaling it costs
+        // one multiplication per face; u is already computed for the reference.
+        bool conformalSizing = true;
 
         bool runLayout = true;
         // Sec. 9's closing note: E2 and E3 start small on a field-integrated
@@ -282,9 +445,21 @@ public:
         bool secondSeedAgrees = true;
         bool framesValid = false;
 
+        // --- Stage 3F: the alignment (Sec. 6.4) ----------------------------
+        int alignmentChains = 0;
+        int alignedBoundaryEdges = 0;
+        int alignedInterfaceEdges = 0;
+        int alignmentOverrides = 0;
+        int alignmentClosedChains = 0;
+        double maxAlignmentResidual = 0.0;
+
         // --- Stage 4F: the integration -------------------------------------
         bool integrationRan = false;
         bool integrationSolved = false;
+        int integrationAlignedEdges = 0;
+        double integrationAlignResidual = 0.0;
+        double integrationAlignStrain = 0.0;
+        bool alignmentWasDropped = false;
         double integrationSeamResidual = 0.0;
         int integrationFlippedFaces = 0;
         double integrationFlippedAreaFraction = 0.0;
@@ -295,11 +470,20 @@ public:
         double integrationNearestFlipToCone = 0.0;
 
         // --- Stage 4R: the untangling --------------------------------------
+        bool localUntangleRan = false;
+        int localUntangleFlippedFaces = 0;   // after Sec. 7.2a, before Sec. 7.2
+        // Which rung of Sec. 7.2a's ladder cleared it: 0 held the seam and the
+        // alignment throughout, 1 let the alignment go, 2 let the seam go too.
+        int localUntangleLevel = -1;
         bool untangleRan = false;
         bool tutteValid = false;
         int untangleOuterSteps = 0;
         int untangleFlippedFaces = 0;     // after the pass
         double untangleSeamResidual = 0.0;
+        // Sec. 6.5's re-projection: whether it ran and whether it was kept.
+        bool reprojectionRan = false;
+        bool reprojectionKept = false;
+        int reprojectionFlippedFaces = 0;
 
         // --- Stage 4: psi_0 ------------------------------------------------
         bool immersionValid = false;
@@ -340,6 +524,23 @@ public:
         // that is the whole of C4 in one number, taken before the continuation
         // rather than inferred from what it produced.
         double referenceConeResidual = 0.0;
+
+        // The cone metric of Sec. 4, whether it is E1's reference or not: it is
+        // built whenever conformalSizing is on, and its residual is the
+        // statement that the flat cone metric of this cone set exists and was
+        // found on the model's own triangulation.
+        bool coneMetricRan = false;
+        bool coneMetricSolved = false;
+        bool coneMetricConverged = false;
+        int coneMetricNewtonSteps = 0;
+        double coneMetricInitialError = 0.0;
+        double coneMetricLinearError = 0.0;
+        double coneMetricFinalError = 0.0;
+        double coneMetricConeResidual = 0.0;
+        double coneMetricMinScale = 1.0;
+        double coneMetricMaxScale = 1.0;
+        int coneMetricNonRealisable = 0;
+        bool conformalSizingUsed = false;
 
         bool separatricesRan = false;
         int separatrices = 0;
@@ -404,6 +605,8 @@ public:
     // supply E1's reference metric -- psi_0 still comes from the integration.
     const RicciFlow& getReferenceFlow() const { return *referenceFlow; }
     bool hasReferenceFlow() const { return referenceFlow != nullptr; }
+    const ConeMetric& getConeMetric() const { return *coneMetric; }
+    bool hasConeMetric() const { return coneMetric != nullptr; }
     const FieldIntegration& getIntegration() const { return *integration; }
     const TutteEmbedding& getTutte() const { return *tutte; }
     const Immersion& getImmersion() const { return *immersion; }
@@ -455,6 +658,13 @@ private:
     // the cone set is inadmissible or the cut is not a disk, which are the two
     // things every route downstream depends on.
     bool runFront();
+    // Which coordinates each vertex of Omega may move in without undoing an
+    // equality Stage 4F imposed. See TORSION.cxx.
+    std::vector<unsigned char> vertexFreedom(int level) const;
+    // The two children of each seam vertex of Omega and the quarter turn
+    // between their displacements, so that Sec. 7.2a can move a tangle sitting
+    // on the seam without letting go of Q4. See TORSION.cxx.
+    void seamPairing(std::vector<int> &mate, std::vector<int> &turn) const;
     // Stage 4R. Takes the frames and returns an untangled map, or an empty
     // vector when it could not.
     std::vector<Point> untangle();
@@ -469,6 +679,7 @@ private:
     std::unique_ptr<ConeCut> cutter;
     std::unique_ptr<FieldFrames> frames;
     std::unique_ptr<RicciFlow> referenceFlow;
+    std::unique_ptr<ConeMetric> coneMetric;
     std::unique_ptr<Immersion> scaffold;
     std::unique_ptr<FieldIntegration> integration;
     std::unique_ptr<TutteEmbedding> tutte;
@@ -484,6 +695,9 @@ private:
     // set Sec. 5.1's audit is run against.
     std::vector<int> fieldIndex;
     std::vector<Point> integratedMap;
+    // The alignment Stage 4F actually used, after its fallback chose among the
+    // three. Sec. 6.5's re-projection has to hold the same one.
+    std::vector<int> usedAxis;
 };
 
 #endif // __TORSION_HXX__

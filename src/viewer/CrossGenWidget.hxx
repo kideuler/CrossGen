@@ -46,6 +46,7 @@
 #include "UMBER/ChordCollapse.hxx"
 #include "UMBER/MotorcycleGraph.hxx"
 #include "UMBER/UMBER.hxx"
+#include "TORSION/ConeMetric.hxx"
 #include "TORSION/FieldFrames.hxx"
 #include "TORSION/TORSION.hxx"
 #include "TORSION/FieldIntegration.hxx"
@@ -577,6 +578,10 @@ private:
     // reports a disagreement between the matchings and the field and not the
     // pipeline doing its job.
     std::vector<int>                 fieldIndex_;
+    // Sec. 4's flat cone metric: the conformal factor the frame is scaled by
+    // and the reference E1 is measured against. Built with the frames, because
+    // the frames want its sizing field.
+    std::optional<ConeMetric>        coneMetric_;
     std::optional<FieldFrames>       frames_;
     std::optional<Immersion>         scaffold_;
     std::optional<FieldIntegration>  integration_;
