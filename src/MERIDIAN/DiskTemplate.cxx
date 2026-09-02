@@ -223,7 +223,11 @@ std::vector<std::vector<int>> DiskTemplate::rimArcs(
 // The arcs of a rim are chained through the nodes they share, and each
 // contributes the vertices Stage 10 placed along it. A rim with an arc Stage 10
 // left unmeshed, or whose arcs do not close into one cycle, comes back empty
-// and the fill declines it with a reason.
+// and the fill declines it with a reason. An arc Stage 10 *contracted* is not
+// that case: it carries one vertex instead of two, contributes no edge, and the
+// chain passes through it -- so a rim can lose an arc to the contraction and
+// still be a closed loop, which is the whole point of holding it above
+// QuadMesh::Options::minLoopEdges while that runs.
 // ---------------------------------------------------------------------------
 std::vector<std::vector<int>> DiskTemplate::rimVertexLoops(
         const Arrangement &arr, const QuadMesh &qm,
@@ -239,7 +243,11 @@ std::vector<std::vector<int>> DiskTemplate::rimVertexLoops(
         bool complete = true;
         std::unordered_map<int, std::vector<int>> at;   // node -> its rim arcs
         for (int a : mine) {
-            if (a >= static_cast<int>(nodesOn.size()) || nodesOn[a].size() < 2) {
+            // One entry is a rim arc Stage 10 contracted: its two ends are the
+            // same vertex, so it carries no edge of the rim and the chain runs
+            // straight through it. None at all is an arc Stage 10 never
+            // assigned, which is a rim with a hole in it.
+            if (a >= static_cast<int>(nodesOn.size()) || nodesOn[a].empty()) {
                 complete = false;
                 break;
             }

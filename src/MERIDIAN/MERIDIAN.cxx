@@ -1,6 +1,8 @@
 #include "MERIDIAN.hxx"
 
 #include <array>
+#include <cmath>
+#include <iomanip>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -283,10 +285,197 @@ bool MERIDIAN::run() {
     }
     if (!options.runLayout) return true;
 
+    // --- Stages 5 to 8, at the Gamma_topo tolerance that works ------------
+    //
+    // See Options::topoNearMissRetry. The first attempt is the tolerance the
+    // caller asked for; a second one, tighter, is run only when the first left
+    // a piece of S that Stage 10 has no grid for, and it is kept only when it
+    // leaves less. Both are measured on the same thing -- the fraction of S in
+    // faces that are not quadrilaterals with one arc a side -- so "better" here
+    // is the property the retry exists to buy and not a proxy for it.
+    const Status statusBeforeLayout = status;
+    if (!runLayoutStages(options.topoNearMiss)) return status.layoutValid;
+
+    if (options.topoNearMissRetry > 0.0 &&
+        options.topoNearMissRetry != options.topoNearMiss && arrangement &&
+        unmeshableFraction(*arrangement) > 0.0) {
+        const double firstUnmeshable = unmeshableFraction(*arrangement);
+        const int firstUnresolved = status.separatricesUnresolved;
+
+        Status firstStatus = status;
+        std::unique_ptr<SubdomainLabels> firstLabels = std::move(labels);
+        std::unique_ptr<LayoutEnergy> firstLayout = std::move(layout);
+        std::unique_ptr<Separatrices> firstSeparatrices = std::move(separatrices);
+        std::unique_ptr<Arrangement> firstArrangement = std::move(arrangement);
+
+        status = statusBeforeLayout;
+        const bool reached = runLayoutStages(options.topoNearMissRetry);
+        const double secondUnmeshable =
+            (reached && arrangement) ? unmeshableFraction(*arrangement) : 1.0;
+        const int secondUnresolved = status.separatricesUnresolved;
+
+        // Lexicographic, and a tie goes to the first: the tolerance the caller
+        // asked for is the one to keep when the retry bought nothing.
+        const bool keepSecond =
+            reached && arrangement &&
+            (secondUnmeshable < firstUnmeshable - 1e-12 ||
+             (secondUnmeshable <= firstUnmeshable + 1e-12 &&
+              secondUnresolved < firstUnresolved));
+
+        std::ostringstream oss;
+        oss << "Stage 5: the layout at a near-miss tolerance of " << options.topoNearMiss
+            << " left " << std::fixed << std::setprecision(2) << 100.0 * firstUnmeshable
+            << "% of S in faces Stage 10 has no grid for, so it was seeded again at "
+            << std::defaultfloat << options.topoNearMissRetry << ", which left "
+            << std::fixed << std::setprecision(2) << 100.0 * secondUnmeshable << "%"
+            << std::defaultfloat << ". Kept the "
+            << (keepSecond ? "second" : "first")
+            << ". Gamma_topo can only be added to, never taken back, so a tolerance "
+               "that over-seeds is not recoverable by the repair loop and a tighter "
+               "one is; that asymmetry is the whole reason this retry runs in this "
+               "direction and not the other.";
+
+        if (!keepSecond) {
+            status = std::move(firstStatus);
+            labels = std::move(firstLabels);
+            layout = std::move(firstLayout);
+            separatrices = std::move(firstSeparatrices);
+            arrangement = std::move(firstArrangement);
+        }
+        status.topoNearMissUsed = keepSecond ? options.topoNearMissRetry
+                                             : options.topoNearMiss;
+        status.topoNearMissRetried = true;
+        status.messages.push_back(oss.str());
+    } else {
+        status.topoNearMissUsed = options.topoNearMiss;
+    }
+
+    // --- Stage 9: the spline reconstruction, Sec. 5 -----------------------
+    if (!options.runSplines) return status.layoutValid;
+    SplineFit::Options fopts;
+    fopts.segments = options.splineSegments;
+    fopts.samples = options.splineSamples;
+    fopts.fitBoundaryArcs = options.fitBoundaryArcs;
+    fopts.fitInterfaceArcs = options.fitInterfaceArcs;
+    try {
+        splines = std::make_unique<SplineFit>(*arrangement, fopts);
+    } catch (const std::exception &e) {
+        status.messages.push_back(std::string("Stage 9: could not be built: ") + e.what());
+        return status.layoutValid;
+    }
+    const SplineFit::Report &fr2 = splines->getReport();
+    status.splinesRan = true;
+    status.splinePatches = fr2.patches;
+    status.splineControlPoints = fr2.controlPointsPerArc;
+    status.splineMaxDeviation = fr2.maxDeviation;
+    status.splinesWatertight = fr2.watertight;
+    status.splinesValid = fr2.valid;
+    for (const std::string &m : fr2.messages) status.messages.push_back("Stage 9: " + m);
+
+    // --- Stage 10: the quadrilateral mesh -------------------------------
+    // Run on whatever Stage 8 closed. A layout with three broken patches still
+    // meshes everywhere else, and the fraction of S left uncovered is a more
+    // useful statement of the damage than refusing to mesh at all.
+    if (!options.runQuadMesh) return status.layoutValid;
+    QuadMesh::Options qopts;
+    qopts.targetEdgeLength = options.quadTargetEdge;
+    qopts.minIntervals = options.quadMinIntervals;
+    qopts.maxIntervals = options.quadMaxIntervals;
+    qopts.collapseSpan = options.quadCollapseSpan;
+    qopts.useSplines = options.quadUseSplines;
+    qopts.featuresOnTracedArcs = options.quadFeaturesOnTracedArcs;
+    qopts.smoothingPasses = options.quadSmoothingPasses;
+    qopts.smoothingThreshold = options.quadSmoothingThreshold;
+    // Each excised rim has to come out with an even number of edges or Stage 11
+    // has nothing it can fill it with. See QuadMesh::fixLoopParity.
+    const std::vector<std::vector<int>> rims =
+        DiskTemplate::rimArcs(*arrangement, inclusions);
+    for (const std::vector<int> &r : rims) if (!r.empty()) qopts.evenLoops.push_back(r);
+    try {
+        quads = std::make_unique<QuadMesh>(*splines, qopts);
+    } catch (const std::exception &e) {
+        status.messages.push_back(std::string("Stage 10: could not be built: ") + e.what());
+        return status.layoutValid;
+    }
+    const QuadMesh::Report &qr = quads->getReport();
+    status.quadMeshRan = true;
+    status.meshVertices = qr.vertices;
+    status.meshQuads = qr.quads;
+    status.meshChords = qr.chords;
+    status.meshUnmeshedPatches = qr.unmeshedPatches;
+    status.meshMinScaledJacobian = qr.minScaledJacobian;
+    status.meshConforming = qr.conforming;
+    status.meshValid = qr.valid;
+    status.meshOddLoops = qr.oddLoops;
+    status.meshParityChordsMoved = qr.parityChordsMoved;
+    status.meshOddLoopsLeft = qr.oddLoopsLeft;
+    for (const std::string &m : qr.messages) status.messages.push_back("Stage 10: " + m);
+
+    // --- Stage 11: the O-grid templates -----------------------------------
+    if (inclusions.empty()) return status.layoutValid;
+    DiskTemplate::Options topts;
+    topts.coreSquareness = options.diskCoreSquareness;
+    topts.ringDepth = options.diskRingDepth;
+    topts.smoothingPasses = options.diskSmoothingPasses;
+    diskFill = std::make_unique<DiskTemplate>(
+        quads->vertices(), quads->quads(), quads->quadMaterials(),
+        DiskTemplate::rimVertexLoops(*arrangement, *quads, rims), inclusions, topts);
+    const DiskTemplate::Report &tr = diskFill->getReport();
+    status.diskTemplatesRan = true;
+    status.diskTemplatesFilled = tr.filled;
+    status.diskTemplateBlocks = tr.blocks;
+    status.diskTemplateQuads = tr.quads;
+    status.diskTemplatesRefused = tr.refusedOdd + tr.refusedShort + tr.refusedOpen;
+    status.diskTemplateMinScaledJacobian = tr.templateMinScaledJacobian;
+    status.mergedVertices = tr.mergedVertices;
+    status.mergedQuads = tr.mergedQuads;
+    status.mergedMinScaledJacobian = tr.minScaledJacobian;
+    status.diskTemplatesValid = tr.valid;
+    for (const std::string &m : tr.messages) status.messages.push_back("Stage 11: " + m);
+
+    return status.layoutValid;
+}
+
+// ---------------------------------------------------------------------------
+// unmeshableFraction()  --  how much of S the layout leaves without a grid
+//
+// Stage 10 meshes a face as an n_s x n_t block, and the only faces it can do
+// that to are the ones with four corners and one arc on each side. Everything
+// else -- a face with three corners, a face whose side was cut in two by a
+// crossing -- is left out and shows up downstream as a hole in the mesh and,
+// beside an excised inclusion, as a rim that does not close. Measuring it by
+// *area* rather than by count is what makes two layouts of different fineness
+// comparable: 3 broken faces of 30 and 3 of 500 are not the same defect.
+// ---------------------------------------------------------------------------
+double MERIDIAN::unmeshableFraction(const Arrangement &arr) {
+    const double domain = arr.getReport().domainArea;
+    if (!(domain > 0.0)) return 0.0;
+    const std::vector<Arrangement::Face> &faces = arr.getFaces();
+    double bad = 0.0;
+    for (int f : arr.patchFaces()) {
+        if (f < 0 || f >= static_cast<int>(faces.size())) continue;
+        if (faces[f].quad && faces[f].simple) continue;
+        bad += std::fabs(faces[f].area);
+    }
+    return bad / domain;
+}
+
+// ---------------------------------------------------------------------------
+// runLayoutStages()  --  Stages 5 to 8 at one Gamma_topo seeding tolerance
+//
+// Everything between the labelling and the arrangement depends on
+// `nearMiss` and on nothing else that run() has not already fixed, so it is
+// separated out to be run more than once. Options::topoNearMissRetry is why;
+// the reasoning is there.
+//
+// Returns false when a stage stopped the pipeline, in which case run() is
+// done and there is nothing to retry.
+// ---------------------------------------------------------------------------
+bool MERIDIAN::runLayoutStages(double nearMiss) {
     // --- Stage 5: subdomain labelling, Sec. 3.3 ---------------------------
     SubdomainLabels::Options lopts;
     lopts.seedTopoConstraints = options.seedTopoConstraints;
-    lopts.nearMissTolerance = options.topoNearMiss;
+    lopts.nearMissTolerance = nearMiss;
     lopts.seedSelfReturns = options.seedSelfReturns;
     lopts.seedAllConnections = options.seedAllConnections;
     lopts.maxTraceSteps = options.separatrixMaxSteps;
@@ -342,7 +531,7 @@ bool MERIDIAN::run() {
     };
     drainLayoutMessages();
 
-    if (!options.runSeparatrices) return status.layoutValid;
+    if (!options.runSeparatrices) return false;
 
     // --- Stage 7 and Sec. 3.3's repair ------------------------------------
     Separatrices::Options sopts;
@@ -413,7 +602,7 @@ bool MERIDIAN::run() {
     // *place* -- this face has three corners, that cone is one arc short --
     // rather than a residual. Sec. 4's own "on failure" list is written against
     // exactly this output.
-    if (!separatrices || !options.runArrangement) return status.layoutValid;
+    if (!separatrices || !options.runArrangement) return false;
     Arrangement::Options aopts;
     aopts.mergeTolerance = options.arrangementMerge;
     aopts.cornerTolerance = options.arrangementCorner;
@@ -423,7 +612,7 @@ bool MERIDIAN::run() {
         arrangement = std::make_unique<Arrangement>(*separatrices, *labels, aopts);
     } catch (const std::exception &e) {
         status.messages.push_back(std::string("Stage 8: could not be built: ") + e.what());
-        return status.layoutValid;
+        return false;
     }
     const Arrangement::Report &ar = arrangement->getReport();
     status.arrangementRan = true;
@@ -434,90 +623,7 @@ bool MERIDIAN::run() {
     status.layoutCoverage = ar.areaCoverage;
     status.arrangementValid = ar.valid;
     for (const std::string &m : ar.messages) status.messages.push_back("Stage 8: " + m);
-
-    // --- Stage 9: the spline reconstruction, Sec. 5 -----------------------
-    if (!options.runSplines) return status.layoutValid;
-    SplineFit::Options fopts;
-    fopts.segments = options.splineSegments;
-    fopts.samples = options.splineSamples;
-    fopts.fitBoundaryArcs = options.fitBoundaryArcs;
-    fopts.fitInterfaceArcs = options.fitInterfaceArcs;
-    try {
-        splines = std::make_unique<SplineFit>(*arrangement, fopts);
-    } catch (const std::exception &e) {
-        status.messages.push_back(std::string("Stage 9: could not be built: ") + e.what());
-        return status.layoutValid;
-    }
-    const SplineFit::Report &fr2 = splines->getReport();
-    status.splinesRan = true;
-    status.splinePatches = fr2.patches;
-    status.splineControlPoints = fr2.controlPointsPerArc;
-    status.splineMaxDeviation = fr2.maxDeviation;
-    status.splinesWatertight = fr2.watertight;
-    status.splinesValid = fr2.valid;
-    for (const std::string &m : fr2.messages) status.messages.push_back("Stage 9: " + m);
-
-    // --- Stage 10: the quadrilateral mesh -------------------------------
-    // Run on whatever Stage 8 closed. A layout with three broken patches still
-    // meshes everywhere else, and the fraction of S left uncovered is a more
-    // useful statement of the damage than refusing to mesh at all.
-    if (!options.runQuadMesh) return status.layoutValid;
-    QuadMesh::Options qopts;
-    qopts.targetEdgeLength = options.quadTargetEdge;
-    qopts.minIntervals = options.quadMinIntervals;
-    qopts.maxIntervals = options.quadMaxIntervals;
-    qopts.useSplines = options.quadUseSplines;
-    qopts.featuresOnTracedArcs = options.quadFeaturesOnTracedArcs;
-    qopts.smoothingPasses = options.quadSmoothingPasses;
-    qopts.smoothingThreshold = options.quadSmoothingThreshold;
-    // Each excised rim has to come out with an even number of edges or Stage 11
-    // has nothing it can fill it with. See QuadMesh::fixLoopParity.
-    const std::vector<std::vector<int>> rims =
-        DiskTemplate::rimArcs(*arrangement, inclusions);
-    for (const std::vector<int> &r : rims) if (!r.empty()) qopts.evenLoops.push_back(r);
-    try {
-        quads = std::make_unique<QuadMesh>(*splines, qopts);
-    } catch (const std::exception &e) {
-        status.messages.push_back(std::string("Stage 10: could not be built: ") + e.what());
-        return status.layoutValid;
-    }
-    const QuadMesh::Report &qr = quads->getReport();
-    status.quadMeshRan = true;
-    status.meshVertices = qr.vertices;
-    status.meshQuads = qr.quads;
-    status.meshChords = qr.chords;
-    status.meshUnmeshedPatches = qr.unmeshedPatches;
-    status.meshMinScaledJacobian = qr.minScaledJacobian;
-    status.meshConforming = qr.conforming;
-    status.meshValid = qr.valid;
-    status.meshOddLoops = qr.oddLoops;
-    status.meshParityChordsMoved = qr.parityChordsMoved;
-    status.meshOddLoopsLeft = qr.oddLoopsLeft;
-    for (const std::string &m : qr.messages) status.messages.push_back("Stage 10: " + m);
-
-    // --- Stage 11: the O-grid templates -----------------------------------
-    if (inclusions.empty()) return status.layoutValid;
-    DiskTemplate::Options topts;
-    topts.coreSquareness = options.diskCoreSquareness;
-    topts.ringDepth = options.diskRingDepth;
-    topts.smoothingPasses = options.diskSmoothingPasses;
-    diskFill = std::make_unique<DiskTemplate>(
-        quads->vertices(), quads->quads(), quads->quadMaterials(),
-        DiskTemplate::rimVertexLoops(*arrangement, *quads, rims), inclusions, topts);
-    const DiskTemplate::Report &tr = diskFill->getReport();
-    status.diskTemplatesRan = true;
-    status.diskTemplatesFilled = tr.filled;
-    status.diskTemplateBlocks = tr.blocks;
-    status.diskTemplateQuads = tr.quads;
-    status.diskTemplatesRefused = tr.refusedOdd + tr.refusedShort + tr.refusedOpen;
-    status.diskTemplateMinScaledJacobian = tr.templateMinScaledJacobian;
-    status.mergedVertices = tr.mergedVertices;
-    status.mergedQuads = tr.mergedQuads;
-    status.mergedMinScaledJacobian = tr.minScaledJacobian;
-    status.diskTemplatesValid = tr.valid;
-    for (const std::string &m : tr.messages) status.messages.push_back("Stage 11: " + m);
-
-    return status.layoutValid;
+    return true;
 }
 
 // ---------------------------------------------------------------------------

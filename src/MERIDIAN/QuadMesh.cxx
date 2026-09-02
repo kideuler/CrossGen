@@ -79,6 +79,7 @@ QuadMesh::QuadMesh(const SplineFit &f, const Options &opts)
 
     assignIntervals();
     meshArcs();
+    weldCollapsed();
     meshPatches();
     smooth();
     classifyMaterials();
@@ -360,6 +361,7 @@ void QuadMesh::assignIntervals() {
         if (c.clamped) ++report.clampedChords;
     }
 
+    collapseThinChords();
     fixLoopParity(chordSpans);
 
     report.chords = static_cast<int>(chordList.size());
@@ -372,6 +374,118 @@ void QuadMesh::assignIntervals() {
     }
     if (chordList.empty()) report.minIntervals = 0;
     report.meanIntervals = chordList.empty() ? 0.0 : sumN / chordList.size();
+}
+
+// ---------------------------------------------------------------------------
+// collapseThinChords()
+//
+// Options::collapseSpan. A chord every patch of which is thinner than the
+// elements being asked for is taken to zero edges, which contracts those
+// patches and lets the blocks either side of them meet. See the header for the
+// argument; what is here is the two refusals and the order.
+//
+// The order is narrowest first. Each refusal is checked against the state as it
+// then stands, so a loop that has already given up edges to one contraction is
+// protected from the next by the count it has left rather than by the count it
+// started with -- the greedy pass is therefore safe to run to the end, and the
+// chords it declines are the widest of the candidates, which are the ones the
+// mesh loses least by keeping.
+// ---------------------------------------------------------------------------
+void QuadMesh::collapseThinChords() {
+    if (!(options.collapseSpan > 0.0) || chordList.empty()) return;
+    const double limit = options.collapseSpan * options.targetEdgeLength;
+
+    std::vector<int> candidate;
+    for (size_t slot = 0; slot < chordList.size(); ++slot) {
+        const Chord &c = chordList[slot];
+        if (c.intervals <= 0) continue;
+        if (c.maxSpan > 0.0 && c.maxSpan < limit && c.maxLength < limit) {
+            candidate.push_back(static_cast<int>(slot));
+        }
+    }
+    if (candidate.empty()) return;
+    std::sort(candidate.begin(), candidate.end(), [&](int a, int b) {
+        return chordList[a].maxSpan < chordList[b].maxSpan;
+    });
+
+    // A patch with a feature -- dS or an interface -- on both of the sides that
+    // would meet is a place where the model is genuinely thin, and closing it
+    // would join two curves the model keeps apart. Which chords those are is
+    // read off the faces once.
+    const std::vector<Arrangement::Arc> &arcs = arr->getArcs();
+    auto isFeature = [&](int a) {
+        return a >= 0 && a < static_cast<int>(arcs.size()) &&
+               arcs[a].kind != Arrangement::ArcKind::Separatrix;
+    };
+    std::vector<char> weldsFeatures(chordList.size(), 0);
+    for (int f : arr->patchFaces()) {
+        const std::vector<Arrangement::Side> sides = arr->patchSides(f);
+        if (sides.size() != 4) continue;
+        bool known = true;
+        for (const Arrangement::Side &sd : sides) {
+            if (sd.arc < 0 || chordOf[sd.arc] < 0) known = false;
+        }
+        if (!known) continue;
+        if (isFeature(sides[1].arc) && isFeature(sides[3].arc)) {
+            weldsFeatures[chordOf[sides[0].arc]] = 1;
+        }
+        if (isFeature(sides[0].arc) && isFeature(sides[2].arc)) {
+            weldsFeatures[chordOf[sides[1].arc]] = 1;
+        }
+    }
+
+    const size_t nLoops = options.evenLoops.size();
+    std::vector<long long> loopTotal(nLoops, 0);
+    std::vector<char> loopKnown(nLoops, 1);
+    for (size_t L = 0; L < nLoops; ++L) {
+        for (int a : options.evenLoops[L]) {
+            if (a < 0 || a >= static_cast<int>(intervals.size()) || intervals[a] < 0) {
+                loopKnown[L] = 0;
+                break;
+            }
+            loopTotal[L] += intervals[a];
+        }
+    }
+
+    int refusedLoop = 0, refusedFeature = 0;
+    std::vector<long long> after;
+    for (int slot : candidate) {
+        if (weldsFeatures[slot]) { ++refusedFeature; continue; }
+        after = loopTotal;
+        bool ok = true;
+        for (size_t L = 0; L < nLoops && ok; ++L) {
+            if (!loopKnown[L]) continue;
+            for (int a : options.evenLoops[L]) {
+                if (chordOf[a] == slot) after[L] -= intervals[a];
+            }
+            if (after[L] < options.minLoopEdges) ok = false;
+        }
+        if (!ok) { ++refusedLoop; continue; }
+        loopTotal.swap(after);
+
+        Chord &c = chordList[slot];
+        c.intervals = 0;
+        c.minEdge = c.maxEdge = 0.0;
+        for (int a : c.arcs) intervals[a] = 0;
+        ++report.collapsedChords;
+    }
+
+    if (report.collapsedChords == 0 && refusedLoop == 0 && refusedFeature == 0) return;
+    std::ostringstream oss;
+    oss << "Contracted " << report.collapsedChords << " chord(s) of " << chordList.size()
+        << " whose every patch was thinner than " << options.collapseSpan
+        << " of the target edge length, so the blocks either side of them meet instead"
+        << " of being separated by a row of elements no one asked for";
+    if (refusedLoop > 0) {
+        oss << "; " << refusedLoop << " more were kept to leave a loop the fill needs "
+            << "at least " << options.minLoopEdges << " edge(s)";
+    }
+    if (refusedFeature > 0) {
+        oss << "; " << refusedFeature << " more were kept because contracting them would "
+            << "have welded two pieces of dS or of the interface network together";
+    }
+    oss << ".";
+    report.messages.push_back(oss.str());
 }
 
 // ---------------------------------------------------------------------------
@@ -442,6 +556,10 @@ void QuadMesh::fixLoopParity(std::vector<std::vector<double>> &chordSpans) {
     const int floorN = std::max(1, options.minIntervals);
     for (size_t slot = 0; slot < nChords; ++slot) {
         if (colMask[slot] == 0) continue;
+        // A contracted chord is not a candidate. Moving it to one edge would
+        // put back the row of elements collapseThinChords() decided against,
+        // and moving it to minus one is not a mesh.
+        if (chordList[slot].intervals <= 0) continue;
         const int N = chordList[slot].intervals;
         const double base = cost(slot, N);
         double best = std::numeric_limits<double>::infinity();
@@ -528,8 +646,23 @@ void QuadMesh::meshArcs() {
     arcParams.assign(list.size(), {});
     nodeVert.assign(arr->getNodes().size(), -1);
 
+    // An arc with no edges has its two ends at one point of the mesh. Joining
+    // the nodes here, before any vertex is placed, is what makes that one
+    // vertex rather than two at the same place -- and it composes, so a run of
+    // contracted arcs end to end becomes a single node without anything special
+    // being done about the run.
+    nodeClass.resize(arr->getNodes().size());
+    for (size_t n = 0; n < nodeClass.size(); ++n) nodeClass[n] = static_cast<int>(n);
+    for (size_t a = 0; a < list.size(); ++a) {
+        if (intervals[a] != 0) continue;
+        if (list[a].from >= 0 && list[a].to >= 0) {
+            unite(nodeClass, list[a].from, list[a].to);
+        }
+    }
+
     auto vertexForNode = [&](int n) {
         if (n < 0 || n >= static_cast<int>(nodeVert.size())) return -1;
+        n = findRoot(nodeClass, n);
         if (nodeVert[n] < 0) {
             nodeVert[n] = static_cast<int>(verts.size());
             verts.push_back(arr->getNodes()[n].p);
@@ -539,8 +672,16 @@ void QuadMesh::meshArcs() {
 
     for (size_t a = 0; a < list.size(); ++a) {
         const int N = intervals[a];
-        if (N <= 0) continue;
+        if (N < 0) continue;
         const Arrangement::Arc &ar = list[a];
+        if (N == 0) {
+            // The single vertex both ends became. Kept as a one-entry list so
+            // that anything walking a chain of arcs -- DiskTemplate's rim, for
+            // one -- passes through it without a special case.
+            arcNodes[a].assign(1, vertexForNode(ar.from));
+            arcParams[a].assign(1, 0.0);
+            continue;
+        }
         arcNodes[a].assign(N + 1, -1);
         arcParams[a].assign(N + 1, 0.0);
 
@@ -559,6 +700,111 @@ void QuadMesh::meshArcs() {
             verts.push_back(evaluateArc(static_cast<int>(a), u));
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// weldCollapsed()
+//
+// A face whose s-chord was contracted is a block with n_s = 0: one column of
+// nodes, not a grid. Its two t-sides are therefore the *same* column, and the
+// two blocks on the far side of them -- which up to here placed their own
+// vertices on their own arcs -- have to be handed one set of indices, or the
+// mesh comes back with two rows of vertices a hair apart and every edge used
+// once. That is the contraction of Sec. 5.2 of Campen, Bommes & Kobbelt (2015)
+// and of TMeshContract::contractZeroEdges, done on the vertices rather than on
+// the abstract T-mesh because that is where this stage keeps the answer.
+//
+// Union-find again, and for the same reason as everywhere else here: a face
+// contracted in both directions, and a run of contracted faces side by side,
+// come out as the ordinary case without being recognised as one.
+//
+// Where the merged vertex goes is not the average when the class holds a node
+// of dS or of an interface. Those are curves the input gave, and moving one off
+// its curve to meet a separatrix would put the mesh boundary inside the model
+// by half the contracted width. The feature members alone decide the position;
+// the class is refused earlier if two *different* features would be welded, so
+// what is left is a feature and a set of interior nodes agreeing to meet it.
+// ---------------------------------------------------------------------------
+void QuadMesh::weldCollapsed() {
+    if (report.collapsedChords == 0 || verts.empty()) return;
+
+    const std::vector<Arrangement::Arc> &arcs = arr->getArcs();
+    std::vector<char> onFeature(verts.size(), 0);
+    for (size_t a = 0; a < arcs.size(); ++a) {
+        if (intervals[a] < 0 || arcs[a].kind == Arrangement::ArcKind::Separatrix) continue;
+        for (int v : arcNodes[a]) if (v >= 0) onFeature[v] = 1;
+    }
+
+    std::vector<int> vp(verts.size());
+    for (size_t i = 0; i < vp.size(); ++i) vp[i] = static_cast<int>(i);
+
+    for (int f : arr->patchFaces()) {
+        const std::vector<Arrangement::Side> sides = arr->patchSides(f);
+        if (sides.size() != 4) continue;
+        bool known = true;
+        for (const Arrangement::Side &sd : sides) {
+            if (sd.arc < 0 || intervals[sd.arc] < 0) known = false;
+        }
+        if (!known) continue;
+        const int ns = intervals[sides[0].arc];
+        const int nt = intervals[sides[1].arc];
+        if (ns != 0 && nt != 0) continue;
+
+        // The same index arithmetic meshPatches() uses, which is where the
+        // orientation of each side comes from; with n_s = 0 its at(0, j) and
+        // at(ns, j) are one slot, and this is that statement.
+        if (ns == 0 && nt > 0) {
+            for (int j = 0; j <= nt; ++j) {
+                const int ml = sides[3].forward ? nt - j : j;
+                const int mr = sides[1].forward ? j : nt - j;
+                unite(vp, arcNodes[sides[3].arc][ml], arcNodes[sides[1].arc][mr]);
+            }
+        } else if (nt == 0 && ns > 0) {
+            for (int i = 0; i <= ns; ++i) {
+                const int mb = sides[0].forward ? i : ns - i;
+                const int mt = sides[2].forward ? ns - i : i;
+                unite(vp, arcNodes[sides[0].arc][mb], arcNodes[sides[2].arc][mt]);
+            }
+        }
+        // Both contracted: the face is a point already, because every one of
+        // its four arcs joined its own two nodes in meshArcs().
+    }
+
+    std::vector<int> slot(verts.size(), -1);
+    std::vector<Point> merged;
+    std::vector<Point> featureSum;
+    std::vector<int> memberCount, featureCount;
+    for (size_t v = 0; v < verts.size(); ++v) {
+        const int r = findRoot(vp, static_cast<int>(v));
+        if (slot[r] < 0) {
+            slot[r] = static_cast<int>(merged.size());
+            merged.push_back(Point{0.0, 0.0});
+            featureSum.push_back(Point{0.0, 0.0});
+            memberCount.push_back(0);
+            featureCount.push_back(0);
+        }
+        const int k = slot[r];
+        merged[k] = merged[k] + verts[v];
+        ++memberCount[k];
+        if (onFeature[v]) {
+            featureSum[k] = featureSum[k] + verts[v];
+            ++featureCount[k];
+        }
+    }
+    for (size_t k = 0; k < merged.size(); ++k) {
+        merged[k] = featureCount[k] > 0
+                        ? featureSum[k] * (1.0 / featureCount[k])
+                        : merged[k] * (1.0 / memberCount[k]);
+    }
+
+    report.weldedVertices = static_cast<int>(verts.size() - merged.size());
+    if (report.weldedVertices == 0) return;
+
+    for (std::vector<int> &nodes : arcNodes) {
+        for (int &v : nodes) if (v >= 0) v = slot[findRoot(vp, v)];
+    }
+    for (int &v : nodeVert) if (v >= 0) v = slot[findRoot(vp, v)];
+    verts.swap(merged);
 }
 
 // ---------------------------------------------------------------------------
@@ -583,6 +829,19 @@ void QuadMesh::meshPatches() {
     for (int f : arr->patchFaces()) {
         const std::vector<Arrangement::Side> sides = arr->patchSides(f);
         const int pi = (f < static_cast<int>(facePatch.size())) ? facePatch[f] : -1;
+
+        // A face the contraction took to zero in either direction has no grid
+        // and is not meant to have one: weldCollapsed() has already moved the
+        // blocks on either side of it together, so the area is covered and the
+        // face is counted apart from the ones that were left out.
+        if (sides.size() == 4 && sides[0].arc >= 0 && sides[1].arc >= 0 &&
+            (intervals[sides[0].arc] == 0 || intervals[sides[1].arc] == 0)) {
+            ++report.collapsedPatches;
+            if (domain > 0.0) report.collapsedArea += faces[f].area / domain;
+            report.patchArea += faces[f].area;
+            continue;
+        }
+
         bool ok = sides.size() == 4 && pi >= 0;
         if (ok) {
             for (const Arrangement::Side &sd : sides) {

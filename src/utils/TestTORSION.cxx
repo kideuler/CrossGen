@@ -549,6 +549,7 @@ int referenceTest(const std::string &path) {
                 SplineFit fit(arr, sfo);
                 QuadMesh::Options qo;
                 qo.targetEdgeLength = opts.quadTargetEdge;
+                qo.collapseSpan = opts.quadCollapseSpan;
                 qo.smoothingPasses = opts.quadSmoothingPasses;
                 QuadMesh qm(fit, qo);
                 r.minScaledJacobian = qm.getReport().minScaledJacobian;
@@ -753,12 +754,18 @@ void usage(const char *prog) {
               << "  --seam-factor <f>  factor on lambda_4                    (default 10)\n"
               << "  --no-topo          skip the Gamma_topo seeding (E5 off)\n"
               << "  --near-miss <f>    Gamma_topo seeding tolerance          (default 0.15)\n"
+              << "  --retry <f>        tolerance to re-seed from when the first layout\n"
+              << "                     leaves a piece of S no grid covers      (default 0.04)\n"
+              << "  --no-retry         one attempt only, at --near-miss\n"
               << "  --no-layout        stop after Stage 4\n"
               << "  --no-trace         skip Stage 7\n"
               << "  --no-arrange       skip Stage 8\n"
               << "  --no-splines       skip Stage 9\n"
               << "  --no-mesh          skip Stage 10\n"
               << "  --target <h>       Stage 10 target edge, model units     (default 0.05)\n"
+              << "  --collapse-span <f>  contract a chord whose every patch is thinner\n"
+              << "                     than this times the target                 (default 0.5)\n"
+              << "  --no-collapse      keep every chord, however thin its patches\n"
               << "  --disk-templates   excise every circular inclusion (Stage 0c) and fill it\n"
               << "                     back in with an O-grid template (Stage 11)\n"
               << "  --disk-squareness <w>  how square the template's core is  (default 0.55)\n"
@@ -831,12 +838,16 @@ int main(int argc, char **argv) {
         else if (a == "--align-factor" && i + 1 < argc) opts.lambdaAlignmentFactor = std::stod(argv[++i]);
         else if (a == "--seam-factor" && i + 1 < argc)  opts.lambdaSeamFactor = std::stod(argv[++i]);
         else if (a == "--no-topo")                      opts.seedTopoConstraints = false;
+        else if (a == "--no-retry")                    opts.topoNearMissRetry = 0.0;
+        else if (a == "--retry" && i + 1 < argc)       opts.topoNearMissRetry = std::stod(argv[++i]);
         else if (a == "--near-miss" && i + 1 < argc)    opts.topoNearMiss = std::stod(argv[++i]);
         else if (a == "--no-layout")                    opts.runLayout = false;
         else if (a == "--no-trace")                     opts.runSeparatrices = false;
         else if (a == "--no-arrange")                   opts.runArrangement = false;
         else if (a == "--no-splines")                   opts.runSplines = false;
         else if (a == "--no-mesh")                      opts.runQuadMesh = false;
+        else if (a == "--collapse-span" && i + 1 < argc) opts.quadCollapseSpan = std::stod(argv[++i]);
+        else if (a == "--no-collapse")                 opts.quadCollapseSpan = 0.0;
         else if (a == "--target" && i + 1 < argc)       opts.quadTargetEdge = std::stod(argv[++i]);
         else if (a == "--disk-templates")               opts.diskTemplates = true;
         else if (a == "--disk-squareness" && i + 1 < argc)
@@ -1194,6 +1205,9 @@ int main(int argc, char **argv) {
     if (st.materials > 1) {
         std::cout << "  " << st.interfaceCorners << " interface sector(s) for E6\n";
     }
+    std::cout << "  Near-miss tolerance " << st.topoNearMissUsed
+              << (st.topoNearMissRetried ? "  (after a retry)" : "") << "\n";
+    stageMessages("Stage 5: ");
 
     // ---------------------------------------------------------------------
     heading("Stage 6  Layout-inducing energies against the field reference");
@@ -1296,6 +1310,16 @@ int main(int argc, char **argv) {
                   << " mean" << std::defaultfloat << "\n";
         std::cout << "  " << qr2.invertedQuads << " element(s) of non-positive area, "
                   << qr2.reflexCorners << " reflex corner(s) of the layout\n";
+        std::cout << "  Edge length in [" << std::fixed << std::setprecision(4)
+                  << qr2.minEdge << ", " << qr2.maxEdge << "], rms log ratio "
+                  << qr2.edgeRatioRms << std::defaultfloat << "\n";
+        if (qr2.collapsedChords > 0) {
+            std::cout << "  Contracted " << qr2.collapsedChords << " chord(s), which merged "
+                      << qr2.collapsedPatches << " face(s) -- " << std::fixed
+                      << std::setprecision(2) << (100.0 * qr2.collapsedArea)
+                      << "% of S -- into their neighbours on " << qr2.weldedVertices
+                      << " welded vertex/vertices" << std::defaultfloat << "\n";
+        }
         verdict(st.meshConforming, "Conforming: every edge is shared by two elements or bounds the mesh");
         verdict(st.meshValid, "No element has non-positive area");
         // An element with a positive area can still have a reversed corner, and

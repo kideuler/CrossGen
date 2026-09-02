@@ -311,6 +311,35 @@ public:
         // automatically from near-misses of the separatrices on psi_R.
         bool seedTopoConstraints = true;
         double topoNearMiss = 0.15;  // as a fraction of the mean cone spacing
+
+        // A second, tighter tolerance to seed from when the first one's layout
+        // came out with a piece of S no grid covers. Zero switches the retry
+        // off and leaves `topoNearMiss` as the only attempt.
+        //
+        // The two ends of the tolerance fail differently and only one of them
+        // is recoverable. Seed too tightly and connections that exist are
+        // missed, which Sec. 3.3's repair then puts back one at a time, nearest
+        // miss first, rolling a round back when it lands worse -- so an
+        // under-seeded start is a start the loop can walk away from. Seed too
+        // widely and E5 is handed a set of integral curves no map has before
+        // the continuation begins; nothing downstream can drop a constraint
+        // again, and what comes back is a compromise with det J pushed toward
+        // zero. The retry therefore runs downward and never upward.
+        //
+        // It is *conditional* because the wider tolerance is worth having when
+        // it works: it joins more cones, so the layout has fewer and larger
+        // patches and the elements come out nearer the target edge length. On
+        // the nine box-with-disks domains in data/meshes/disks the default
+        // tolerance already leaves nothing unmeshed, and re-seeding them at
+        // 0.04 would roughly triple the rms log edge ratio for no coverage at
+        // all. multimat/bubbles is the case that needs it: ten inclusions leave
+        // 12% of S in faces without four corners at 0.15, and none at 0.04.
+        //
+        // The measure both attempts are scored on is that same fraction -- the
+        // area of S in faces that are not quadrilaterals with one arc a side --
+        // with the number of unresolved separatrices breaking a tie and the
+        // first attempt winning an exact one.
+        double topoNearMissRetry = 0.04;
         // Q5's "possibly identical" case -- the curve of Fig. 9, out of a cone
         // and back to it -- and the second and later curves joining a pair of
         // cones already joined by one. Both are constraints in their own right
@@ -361,6 +390,12 @@ public:
         double quadTargetEdge = 0.05;
         int quadMinIntervals = 1;
         int quadMaxIntervals = 0;
+        // QuadMesh::Options::collapseSpan: chords every patch of which is
+        // thinner than this multiple of the target edge length are contracted
+        // and the blocks either side of them merged, so that a layout finer
+        // than the elements asked for does not force elements finer than that.
+        // Zero keeps every chord.
+        double quadCollapseSpan = 0.5;
         // Place the nodes along the Stage 9 fits. Off, they go on the traced
         // polylines instead, which tells a meshing artefact apart from a
         // fitting one. See QuadMesh::Options::useSplines.
@@ -470,6 +505,10 @@ public:
         int topoPaths = 0;
         int topoSelfReturns = 0;    // paths back to the cone they left, Fig. 9
         int topoExtraPerPair = 0;   // second and later curves of one cone pair
+        // Which seeding tolerance the layout below was actually built at, and
+        // whether Options::topoNearMissRetry had to run a second attempt.
+        double topoNearMissUsed = 0.0;
+        bool topoNearMissRetried = false;
 
         // Stage 5/6, the interface terms
         int interfaceCorners = 0;
@@ -611,6 +650,14 @@ public:
                                        const RepairOptions &opts,
                                        const std::function<void(const std::string &)> &log);
 
+    // The fraction of S that Stage 10 has no grid for: the area of the faces
+    // inside S that are not quadrilaterals with one arc on each side, over the
+    // area of S. Zero is Sec. 4's validation passing on the only count that
+    // decides whether the model comes out meshed. Static, and taking the
+    // arrangement rather than reading a member, so that TORSION scores its own
+    // attempts with this function and not a second copy of it.
+    static double unmeshableFraction(const Arrangement &arr);
+
     explicit MERIDIAN(std::shared_ptr<Mesh> mesh);
     MERIDIAN(std::shared_ptr<Mesh> mesh, const Options &opts);
     ~MERIDIAN();
@@ -665,6 +712,9 @@ private:
     void runField();
     // Stage 0c: find the circular inclusions and take them out of `mesh`.
     void exciseDisks();
+    // Stages 5 to 8 at one Gamma_topo seeding tolerance. False when a stage
+    // stopped the pipeline, in which case there is nothing to retry.
+    bool runLayoutStages(double nearMiss);
 
     std::shared_ptr<Mesh> mesh;
     // What run() was handed, kept only when Stage 0c replaced it.

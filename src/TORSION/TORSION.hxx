@@ -362,6 +362,12 @@ public:
 
         bool seedTopoConstraints = true;
         double topoNearMiss = 0.15;
+        // A second, tighter tolerance to seed from when the first one's layout
+        // left a piece of S no grid covers, and zero to switch that off.
+        // MERIDIAN::Options::topoNearMissRetry is the argument for it; this
+        // pipeline seeds Gamma_topo with the same code and inherits the same
+        // asymmetry, that a constraint can be added and never taken back.
+        double topoNearMissRetry = 0.04;
         bool seedSelfReturns = true;
         bool seedAllConnections = true;
 
@@ -391,6 +397,12 @@ public:
         double quadTargetEdge = 0.05;
         int quadMinIntervals = 1;
         int quadMaxIntervals = 0;
+        // QuadMesh::Options::collapseSpan: chords every patch of which is
+        // thinner than this multiple of the target edge length are contracted
+        // and the blocks either side of them merged, so that a layout finer
+        // than the elements asked for does not force elements finer than that.
+        // Zero keeps every chord.
+        double quadCollapseSpan = 0.5;
         bool quadUseSplines = true;
         bool quadFeaturesOnTracedArcs = true;
         int quadSmoothingPasses = 500;
@@ -511,6 +523,10 @@ public:
         int topoPaths = 0;
         int topoSelfReturns = 0;
         int topoExtraPerPair = 0;
+        // Which seeding tolerance the layout below was built at, and whether
+        // Options::topoNearMissRetry had to run a second attempt.
+        double topoNearMissUsed = 0.0;
+        bool topoNearMissRetried = false;
 
         int interfaceCorners = 0;
         int interfaceLabelsCorrected = 0;
@@ -687,6 +703,9 @@ private:
     // Stage 0c, MERIDIAN's unchanged: find the circular inclusions and take
     // them out of `mesh`. See DiskTemplate.
     void exciseDisks();
+    // Stages 5 to 8 at one Gamma_topo seeding tolerance. False when a stage
+    // stopped the pipeline, in which case there is nothing to retry.
+    bool runLayoutStages(double nearMiss);
     // Stages 0b, 0, 1 and 2, which are MERIDIAN's unchanged. Returns false when
     // the cone set is inadmissible or the cut is not a disk, which are the two
     // things every route downstream depends on.

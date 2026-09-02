@@ -729,6 +729,15 @@ private:
     bool patchesAnnounced_      = false;
     bool patchesAttempted_      = false;
     bool meshAttempted_         = false;
+    // MERIDIAN::Options::topoNearMissRetry, in the viewer. Stages 5 to 7 are
+    // already re-runnable from the connectivity dialog, so the retry is that
+    // path with the number filled in: once per run, and only when Stage 8 came
+    // back with a piece of S no grid covers. The two saved numbers are what the
+    // first attempt left, so the second can be said against it rather than
+    // reported on its own.
+    bool   nearMissRetried_   = false;
+    double unmeshableBefore_  = -1.0;
+    double nearMissBefore_    = 0.0;
     // Stage 0c is attempted once per run, at the moment the mode is chosen.
     bool disksAttempted_        = false;
 
@@ -762,6 +771,11 @@ private:
         int    minEdges    = 1;
         int    maxEdges    = 0;      // 0 = no ceiling
         bool   useSplines  = true;
+        // QuadMesh::Options::collapseSpan. Its own default, because a layout
+        // finer than the elements asked for is the common case rather than the
+        // exception and the contraction is what the target edge length means
+        // there; 0 in the dialog turns it off and shows what it was doing.
+        double collapseSpan = QuadMesh::Options().collapseSpan;
     };
     MERIDIANMeshSettings meshSettings_;
 

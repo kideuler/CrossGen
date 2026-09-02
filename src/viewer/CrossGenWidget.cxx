@@ -691,6 +691,8 @@ void CrossGenWidget::doReset() {
     separatricesAttempted_ = false;
     patchesAnnounced_      = false;
     patchesAttempted_      = false;
+    nearMissRetried_       = false;
+    unmeshableBefore_      = -1.0;
     meshAttempted_         = false;
     disksAttempted_        = false;
 
@@ -3163,6 +3165,51 @@ void CrossGenWidget::runMERIDIANPatches() {
         std::cerr << "[Viewer] " << oss.str() << "\n";
     }
 
+    // The one number that decides whether the model comes out meshed: the area
+    // of S in faces Stage 10 has no grid for. MERIDIAN::run answers it by
+    // seeding Gamma_topo again, tighter, and keeping whichever attempt leaves
+    // less. The same retry is run here, once, in place -- a tolerance that
+    // over-seeds is not recoverable by the repair loop, which can only add
+    // constraints, and a tighter one is, which is why it runs downward. What
+    // the viewer does not do is keep the first attempt: Stage 8 holds pointers
+    // into Stages 5 to 7 and putting those back would mean holding two of each,
+    // so the second is reported against the first and 'n' is the way back.
+    {
+        const double unmeshable = MERIDIAN::unmeshableFraction(*arrangement_);
+        const double retryTol = MERIDIAN::Options().topoNearMissRetry;
+        if (unmeshableBefore_ >= 0.0) {
+            std::ostringstream oss;
+            oss << "[Patches] re-seeded: " << std::fixed << std::setprecision(2)
+                << 100.0 * unmeshableBefore_ << "% of S had no grid at a near-miss "
+                << "tolerance of " << std::setprecision(3) << nearMissBefore_ << ", "
+                << std::setprecision(2) << 100.0 * unmeshable << "% at "
+                << std::setprecision(3) << meridianConn_.labels.nearMissTolerance;
+            if (unmeshable > unmeshableBefore_) {
+                oss << " -- the retry left more of S uncovered, so press 'n' and set the "
+                    << "tolerance back to " << nearMissBefore_;
+            }
+            console_.log(oss.str());
+            unmeshableBefore_ = -1.0;
+        } else if (unmeshable > 0.0 && !nearMissRetried_ && retryTol > 0.0 &&
+                   meridianConn_.labels.nearMissTolerance > retryTol) {
+            nearMissRetried_ = true;
+            unmeshableBefore_ = unmeshable;
+            nearMissBefore_ = meridianConn_.labels.nearMissTolerance;
+            std::ostringstream oss;
+            oss << "[Patches] " << std::fixed << std::setprecision(2) << 100.0 * unmeshable
+                << "% of S is in faces Stage 10 has no grid for. Seeding Gamma_topo again at "
+                << std::setprecision(3) << retryTol << " and tracing from there; this blocks";
+            console_.log(oss.str());
+            std::cerr << "[Viewer] " << oss.str() << "\n";
+            meridianConn_.labels.nearMissTolerance = retryTol;
+            // Everything from Stage 5 down is rebuilt, this arrangement with
+            // it, so nothing below may touch it and the frame after this one
+            // builds Stage 8 again.
+            rerunMERIDIANConnectivity();
+            return;
+        }
+    }
+
     auto t2 = Clock::now();
     try {
         splines_.emplace(*arrangement_);
@@ -3292,6 +3339,23 @@ bool CrossGenWidget::promptMERIDIANMesh() {
     maxBox->setSpecialValueText("none");
     maxBox->setToolTip("Most edges any chord may be given. 0 for no ceiling.");
 
+    auto *collapseBox = new QDoubleSpinBox(&dlg);
+    collapseBox->setRange(0.0, 2.0);
+    collapseBox->setDecimals(2);
+    collapseBox->setSingleStep(0.05);
+    collapseBox->setValue(meshSettings_.collapseSpan);
+    collapseBox->setSpecialValueText("off");
+    collapseBox->setToolTip(
+        "Contract a chord every patch of which is thinner than this many target\n"
+        "edge lengths, and let the blocks either side of it meet.\n"
+        "No integer assignment can make an element bigger than the block it sits\n"
+        "in, so where the layout is finer than the target it is the layout, and\n"
+        "not the target, that sets the element size — on bubbles a tenth of the\n"
+        "faces are under a sixteenth of one element in area. At 0.5 the trade is\n"
+        "even: keeping the chord puts every element on it below half the target,\n"
+        "contracting it moves the mesh by less than half an element. Off keeps\n"
+        "every chord and is what shows the difference.");
+
     auto *splineBox = new QCheckBox("place the nodes on the Stage 9 splines", &dlg);
     splineBox->setChecked(meshSettings_.useSplines);
     splineBox->setToolTip(
@@ -3311,6 +3375,7 @@ bool CrossGenWidget::promptMERIDIANMesh() {
     form->addRow("implied sizing", derived);
     form->addRow("fewest edges per chord", minBox);
     form->addRow("most edges per chord", maxBox);
+    form->addRow("contract chords thinner than", collapseBox);
     form->addRow(splineBox);
     form->addRow(new QLabel("The grid is transfinite interpolation only:\n"
                             "no smoothing is run on it.", &dlg));
@@ -3369,6 +3434,7 @@ bool CrossGenWidget::promptMERIDIANMesh() {
     meshSettings_.minEdges   = minBox->value();
     meshSettings_.maxEdges   = maxBox->value();
     meshSettings_.useSplines = splineBox->isChecked();
+    meshSettings_.collapseSpan = collapseBox->value();
     if (squareBox) diskSettings_.squareness = squareBox->value();
     if (ringBox)   diskSettings_.ringDepth  = ringBox->value();
     if (smoothBox) diskSettings_.smoothing  = smoothBox->value();
@@ -3397,6 +3463,7 @@ void CrossGenWidget::runMERIDIANMesh() {
     qopts.minIntervals     = meshSettings_.minEdges;
     qopts.maxIntervals     = meshSettings_.maxEdges;
     qopts.useSplines       = meshSettings_.useSplines;
+    qopts.collapseSpan     = meshSettings_.collapseSpan;
     qopts.smoothingPasses  = 0;   // the grid TFI gives, and nothing after it
 
     // Which arcs lie on each excised rim. Wanted here rather than at Stage 11
@@ -3467,6 +3534,16 @@ void CrossGenWidget::runMERIDIANMesh() {
             << " patch(es) not meshed -- Stage 8 did not close them as quadrilaterals of "
             << "one arc a side; they are " << std::fixed << std::setprecision(4)
             << qr.unmeshedArea << " of S and are left blank";
+        console_.log(oss.str());
+    }
+    if (qr.collapsedChords > 0) {
+        std::ostringstream oss;
+        oss << "[Mesh] " << qr.collapsedChords << " chord(s) contracted, merging "
+            << qr.collapsedPatches << " face(s) -- " << std::fixed << std::setprecision(4)
+            << qr.collapsedArea << " of S -- into their neighbours on " << qr.weldedVertices
+            << " welded vertex/vertices. Those faces were thinner than the elements asked "
+            << "for, so no interval assignment could have covered them at the target size; "
+            << "the dialog's \"contract chords thinner than\" is what to turn off to see it";
         console_.log(oss.str());
     }
     {

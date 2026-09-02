@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <iomanip>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -927,6 +928,262 @@ std::vector<Point> TORSION::untangle() {
 }
 
 // ---------------------------------------------------------------------------
+// runLayoutStages()  --  Stages 5 to 8 at one Gamma_topo seeding tolerance
+//
+// MERIDIAN::runLayoutStages with this pipeline's Stage 6 in the middle of it.
+// Separated out for the same reason and driven the same way; see
+// Options::topoNearMissRetry.
+//
+// Returns false when a stage stopped the pipeline, in which case run() is done
+// and there is nothing to retry.
+// ---------------------------------------------------------------------------
+bool TORSION::runLayoutStages(double nearMiss) {
+    // --- Stage 5: the subdomain labelling, MERIDIAN's unchanged -----------
+    SubdomainLabels::Options lopts;
+    lopts.seedTopoConstraints = options.seedTopoConstraints;
+    lopts.nearMissTolerance = nearMiss;
+    lopts.seedSelfReturns = options.seedSelfReturns;
+    lopts.seedAllConnections = options.seedAllConnections;
+    lopts.maxTraceSteps = options.separatrixMaxSteps;
+    lopts.interfaceCorners = options.interfaceCorners;
+    lopts.propagateInterfaceLabels = options.propagateInterfaceLabels;
+    labels = std::make_unique<SubdomainLabels>(*immersion, lopts, interfaces.get());
+    const SubdomainLabels::Report &lr = labels->getReport();
+    status.boundaryEdgesU = lr.boundaryEdgesU;
+    status.boundaryEdgesV = lr.boundaryEdgesV;
+    status.featureChains = lr.featureChains;
+    status.interfaceCorners = lr.interfaceCorners;
+    status.interfaceLabelsCorrected = lr.featureLabelsCorrected;
+    status.topoPaths = lr.topoPaths;
+    status.topoSelfReturns = lr.topoSelfReturns;
+    status.topoExtraPerPair = lr.topoExtraPerPair;
+    for (const std::string &m : lr.messages) status.messages.push_back("Stage 5: " + m);
+
+    // --- E1's reference metric, C4 ----------------------------------------
+    //
+    // The lengths psi_0 induces on Omega, re-indexed by the edges of S, which is
+    // the indexing buildReference() reads. A seam edge has two images in Omega
+    // and they are the same length to the seam residual, because the transition
+    // holding them together is a rotation; either one will do and the first is
+    // taken.
+    std::vector<double> inducedLen;
+    if (options.reference == Options::Reference::Induced) {
+        inducedLen = inducedLengths(*mesh, *cutter, immersion->getUV());
+    } else if (options.reference == Options::Reference::Cone) {
+        // Already built, before Stage 3F. If it failed to come out a metric at
+        // all, fall back to the lengths psi_0 induces rather than to the
+        // Euclidean ones, which have no cones.
+        if (!coneMetric) {
+            inducedLen = inducedLengths(*mesh, *cutter, immersion->getUV());
+            status.messages.push_back(
+                "Stage 6: the cone metric was not realisable, so E1 measures against the "
+                "lengths psi_0 induces instead. C4 below is what that is worth here.");
+        }
+    } else if (options.reference == Options::Reference::Ricci) {
+        // Pipeline A's flat cone metric, computed here for one purpose only:
+        // to be E1's notion of undistorted. psi_0 still comes from the
+        // integration. This is the known-good yardstick the other two are
+        // measured against, and it is the one setting under which this pipeline
+        // still needs the flow.
+        referenceFlow = std::make_unique<RicciFlow>(mesh, *cones);
+        referenceFlow->solve();
+        for (const std::string &m : referenceFlow->getReport().messages) {
+            status.messages.push_back("Stage 6 (reference flow): " + m);
+        }
+    }
+
+    // What that reference actually does at the cones, measured before the
+    // continuation is allowed to use it. C4 in one number: a reference with no
+    // cones reports (pi/2)|I| here, and the plan's whole warning is that E1 and
+    // Q2 are then contradictory statements about the same vertex.
+    {
+        const std::vector<double> *refLen = nullptr;
+        std::vector<double> ricciLen;
+        if (options.reference == Options::Reference::Induced) {
+            refLen = &inducedLen;
+        } else if (options.reference == Options::Reference::Cone) {
+            refLen = coneMetric ? &coneMetric->edgeLengths() : &inducedLen;
+        } else if (options.reference == Options::Reference::Ricci && referenceFlow) {
+            ricciLen = referenceFlow->originalEdgeLengthsCompleted(nullptr);
+            refLen = &ricciLen;
+        }
+        std::vector<double> euclid;
+        if (!refLen) {
+            // Field and Euclidean are the same reference; measure the one they
+            // both are.
+            euclid.assign(mesh->edges.size(), 0.0);
+            for (size_t e = 0; e < euclid.size(); ++e) {
+                euclid[e] = normP(mesh->vertices[mesh->edges[e][1]] -
+                                  mesh->vertices[mesh->edges[e][0]]);
+            }
+            refLen = &euclid;
+        }
+        std::vector<double> sum(mesh->vertices.size(), 0.0);
+        for (int t = 0; t < static_cast<int>(mesh->triangles.size()); ++t) {
+            const double a = (*refLen)[mesh->triangleEdges[t][0]];
+            const double b = (*refLen)[mesh->triangleEdges[t][1]];
+            const double c = (*refLen)[mesh->triangleEdges[t][2]];
+            const double l[3] = {a, b, c};   // l[i] joins tri[i] and tri[i+1]
+            for (int i = 0; i < 3; ++i) {
+                const double p = l[i], q = l[(i + 2) % 3], r = l[(i + 1) % 3];
+                if (!(p > 0.0) || !(q > 0.0)) continue;
+                double cosA = (p * p + q * q - r * r) / (2.0 * p * q);
+                cosA = std::max(-1.0, std::min(1.0, cosA));
+                sum[mesh->triangles[t][i]] += std::acos(cosA);
+            }
+        }
+        const std::vector<int> &idx = cones->getIndices();
+        for (const auto &c : cones->getCones()) {
+            const double full = mesh->isBoundaryVertex[c.vertex] ? M_PI : 2.0 * M_PI;
+            const double want = full - M_PI_2 * idx[c.vertex];
+            status.referenceConeResidual =
+                std::max(status.referenceConeResidual, std::fabs(sum[c.vertex] - want));
+        }
+    }
+
+    // --- Stage 6: the layout energies -------------------------------------
+    LayoutEnergy::Options eopts;
+    eopts.lambdaInit = options.lambdaInit;
+    eopts.lambdaGrowth = options.lambdaGrowth;
+    eopts.outerSteps = options.outerSteps;
+    eopts.innerIterations = options.innerIterations;
+    eopts.alternateReference = false;
+    eopts.relabel = options.relabelBetweenSteps;
+    eopts.lagInterfaceScales = options.lagInterfaceScales;
+    switch (options.reference) {
+        case Options::Reference::Cone:
+            eopts.reference = LayoutEnergy::Reference::Induced;
+            eopts.referenceLengths = coneMetric ? coneMetric->edgeLengths() : inducedLen;
+            break;
+        case Options::Reference::Induced:
+            eopts.reference = LayoutEnergy::Reference::Induced;
+            eopts.referenceLengths = inducedLen;
+            break;
+        case Options::Reference::Field:
+            eopts.reference = LayoutEnergy::Reference::Field;
+            eopts.fieldFrames = frames->frames();
+            break;
+        case Options::Reference::Euclidean:
+            eopts.reference = LayoutEnergy::Reference::Euclidean;
+            break;
+        case Options::Reference::Ricci:
+            eopts.reference = LayoutEnergy::Reference::Induced;
+            eopts.referenceLengths = referenceFlow
+                ? referenceFlow->originalEdgeLengthsCompleted(nullptr)
+                : std::vector<double>();
+            break;
+    }
+    // Sec. 9's closing note. E2 and E3 start an order of magnitude lower
+    // because the field is already aligned to dS and to the interfaces, so
+    // their residuals start small and over-penalising them early only fights
+    // E1; E4 starts higher because the untangling introduced seam error, and
+    // because -- exactly as in Pipeline A -- Q4 and Q2 are the same statement
+    // in different units and Q4 is not free to trade away.
+    eopts.lambdaFactor[2] = options.lambdaAlignmentFactor;
+    eopts.lambdaFactor[3] = options.lambdaAlignmentFactor;
+    eopts.lambdaFactor[4] = options.lambdaSeamFactor;
+    layout = std::make_unique<LayoutEnergy>(*immersion, *labels, eopts);
+    status.layoutRan = layout->run();
+    {
+        const LayoutEnergy::Report &er = layout->getReport();
+        status.layoutInjective = er.injective;
+        status.layoutConstrained = er.constraintsMet;
+        status.outerStepsTaken = er.outerSteps;
+        status.layoutValid = er.valid;
+        status.layoutConeAngleResidual = er.maxConeAngleResidual;
+        status.layoutRegularAngleResidual = er.maxRegularAngleResidual;
+        status.layoutReferenceLeftHanded =
+            std::max(status.layoutReferenceLeftHanded, er.leftHandedFrames);
+        status.interfaceResidual = er.maxInterfaceResidual;
+        status.interfaceCornerChanges = er.interfaceCornerChanges;
+        status.interfacesAligned = er.interfaceCornerChanges == 0 &&
+                                   er.maxInterfaceResidual < 1e-3;
+        for (const std::string &m : er.messages) status.messages.push_back("Stage 6: " + m);
+    }
+
+    if (!options.runSeparatrices) return false;
+
+    // --- Stage 7 and Sec. 3.3's repair, MERIDIAN's unchanged --------------
+    Separatrices::Options sopts;
+    sopts.coneSnapTolerance = options.separatrixSnap;
+    sopts.maxSteps = options.separatrixMaxSteps;
+    sopts.coneSnapRings = options.separatrixSnapRings;
+    sopts.detectCycles = options.separatrixDetectCycles;
+    sopts.nearMissWindow = options.repairGapLimit;
+    if (interfaces && interfaces->multiMaterial()) {
+        sopts.extraEmitters = interfaces->emitterNodes();
+    }
+
+    MERIDIAN::RepairOptions ropts;
+    ropts.passes = options.seedTopoConstraints ? options.repairPasses : 0;
+    ropts.maxPerPass = options.repairMaxPerPass;
+    ropts.gapLimit = options.repairGapLimit;
+    ropts.lambdaBoost = options.repairLambdaBoost;
+    ropts.outerSteps = options.repairOuterSteps;
+    ropts.scoreArrangement = options.runArrangement && options.repairScoresArrangement;
+    ropts.patience = options.repairPatience;
+    ropts.arrangement.mergeTolerance = options.arrangementMerge;
+    ropts.arrangement.cornerTolerance = options.arrangementCorner;
+    ropts.arrangement.collapseTolerance = options.arrangementCollapse;
+    ropts.arrangement.trimUnresolvedAtCrossings = options.arrangementTrim;
+
+    MERIDIAN::RepairResult rep = MERIDIAN::traceAndRepair(
+        *labels, *layout, sopts, ropts,
+        [&](const std::string &m) { status.messages.push_back(m); });
+    separatrices = std::move(rep.separatrices);
+    status.repairPasses = rep.passesTaken;
+    status.repairConstraintsAdded = rep.constraintsAdded;
+    status.topoPaths = labels->getReport().topoPaths;
+    status.topoSelfReturns = labels->getReport().topoSelfReturns;
+    status.topoExtraPerPair = labels->getReport().topoExtraPerPair;
+
+    {
+        const LayoutEnergy::Report &er = layout->getReport();
+        status.layoutInjective = er.injective;
+        status.layoutConstrained = er.constraintsMet;
+        status.outerStepsTaken = er.outerSteps;
+        status.layoutValid = er.valid;
+        status.layoutConeAngleResidual = er.maxConeAngleResidual;
+        status.layoutRegularAngleResidual = er.maxRegularAngleResidual;
+    }
+
+    if (separatrices) {
+        const Separatrices::Report &sr = separatrices->getReport();
+        status.separatricesRan = true;
+        status.separatrices = sr.emitted;
+        status.separatricesToCone = sr.endedAtCone;
+        status.separatricesToBoundary = sr.endedAtBoundary;
+        status.separatricesUnresolved = sr.capped + sr.cycled + sr.stuck + sr.degenerate;
+        status.separatricesNearMisses = sr.nearMisses + sr.grazes;
+        status.q5Verified = sr.valid;
+    }
+
+    // --- Stage 8 ----------------------------------------------------------
+    if (!separatrices || !options.runArrangement) return false;
+    Arrangement::Options aopts;
+    aopts.mergeTolerance = options.arrangementMerge;
+    aopts.cornerTolerance = options.arrangementCorner;
+    aopts.collapseTolerance = options.arrangementCollapse;
+    aopts.trimUnresolvedAtCrossings = options.arrangementTrim;
+    try {
+        arrangement = std::make_unique<Arrangement>(*separatrices, *labels, aopts);
+    } catch (const std::exception &e) {
+        status.messages.push_back(std::string("Stage 8: could not be built: ") + e.what());
+        return false;
+    }
+    const Arrangement::Report &ar = arrangement->getReport();
+    status.arrangementRan = true;
+    status.layoutNodes = ar.nodes;
+    status.layoutArcs = ar.arcs;
+    status.layoutPatches = ar.patches;
+    status.layoutQuads = ar.simpleQuads;
+    status.layoutCoverage = ar.areaCoverage;
+    status.arrangementValid = ar.valid;
+    for (const std::string &m : ar.messages) status.messages.push_back("Stage 8: " + m);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 bool TORSION::run() {
     status = Status();
 
@@ -1325,248 +1582,64 @@ bool TORSION::run() {
     }
     if (!options.runLayout) return true;
 
-    // --- Stage 5: the subdomain labelling, MERIDIAN's unchanged -----------
-    SubdomainLabels::Options lopts;
-    lopts.seedTopoConstraints = options.seedTopoConstraints;
-    lopts.nearMissTolerance = options.topoNearMiss;
-    lopts.seedSelfReturns = options.seedSelfReturns;
-    lopts.seedAllConnections = options.seedAllConnections;
-    lopts.maxTraceSteps = options.separatrixMaxSteps;
-    lopts.interfaceCorners = options.interfaceCorners;
-    lopts.propagateInterfaceLabels = options.propagateInterfaceLabels;
-    labels = std::make_unique<SubdomainLabels>(*immersion, lopts, interfaces.get());
-    const SubdomainLabels::Report &lr = labels->getReport();
-    status.boundaryEdgesU = lr.boundaryEdgesU;
-    status.boundaryEdgesV = lr.boundaryEdgesV;
-    status.featureChains = lr.featureChains;
-    status.interfaceCorners = lr.interfaceCorners;
-    status.interfaceLabelsCorrected = lr.featureLabelsCorrected;
-    status.topoPaths = lr.topoPaths;
-    status.topoSelfReturns = lr.topoSelfReturns;
-    status.topoExtraPerPair = lr.topoExtraPerPair;
-    for (const std::string &m : lr.messages) status.messages.push_back("Stage 5: " + m);
-
-    // --- E1's reference metric, C4 ----------------------------------------
+    // --- Stages 5 to 8, at the Gamma_topo tolerance that works ------------
     //
-    // The lengths psi_0 induces on Omega, re-indexed by the edges of S, which is
-    // the indexing buildReference() reads. A seam edge has two images in Omega
-    // and they are the same length to the seam residual, because the transition
-    // holding them together is a rotation; either one will do and the first is
-    // taken.
-    std::vector<double> inducedLen;
-    if (options.reference == Options::Reference::Induced) {
-        inducedLen = inducedLengths(*mesh, *cutter, immersion->getUV());
-    } else if (options.reference == Options::Reference::Cone) {
-        // Already built, before Stage 3F. If it failed to come out a metric at
-        // all, fall back to the lengths psi_0 induces rather than to the
-        // Euclidean ones, which have no cones.
-        if (!coneMetric) {
-            inducedLen = inducedLengths(*mesh, *cutter, immersion->getUV());
-            status.messages.push_back(
-                "Stage 6: the cone metric was not realisable, so E1 measures against the "
-                "lengths psi_0 induces instead. C4 below is what that is worth here.");
+    // MERIDIAN::run's retry, unchanged, on this pipeline's stages. See
+    // Options::topoNearMissRetry.
+    const Status statusBeforeLayout = status;
+    if (!runLayoutStages(options.topoNearMiss)) return status.layoutValid;
+
+    if (options.topoNearMissRetry > 0.0 &&
+        options.topoNearMissRetry != options.topoNearMiss && arrangement &&
+        MERIDIAN::unmeshableFraction(*arrangement) > 0.0) {
+        const double firstUnmeshable = MERIDIAN::unmeshableFraction(*arrangement);
+        const int firstUnresolved = status.separatricesUnresolved;
+
+        Status firstStatus = status;
+        std::unique_ptr<SubdomainLabels> firstLabels = std::move(labels);
+        std::unique_ptr<LayoutEnergy> firstLayout = std::move(layout);
+        std::unique_ptr<Separatrices> firstSeparatrices = std::move(separatrices);
+        std::unique_ptr<Arrangement> firstArrangement = std::move(arrangement);
+
+        status = statusBeforeLayout;
+        const bool reached = runLayoutStages(options.topoNearMissRetry);
+        const double secondUnmeshable =
+            (reached && arrangement) ? MERIDIAN::unmeshableFraction(*arrangement) : 1.0;
+        const int secondUnresolved = status.separatricesUnresolved;
+
+        const bool keepSecond =
+            reached && arrangement &&
+            (secondUnmeshable < firstUnmeshable - 1e-12 ||
+             (secondUnmeshable <= firstUnmeshable + 1e-12 &&
+              secondUnresolved < firstUnresolved));
+
+        std::ostringstream retryMsg;
+        retryMsg << "Stage 5: the layout at a near-miss tolerance of " << options.topoNearMiss
+                 << " left " << std::fixed << std::setprecision(2) << 100.0 * firstUnmeshable
+                 << "% of S in faces Stage 10 has no grid for, so it was seeded again at "
+                 << std::defaultfloat << options.topoNearMissRetry << ", which left "
+                 << std::fixed << std::setprecision(2) << 100.0 * secondUnmeshable << "%"
+                 << std::defaultfloat << ". Kept the "
+                 << (keepSecond ? "second" : "first")
+                 << ". Gamma_topo can only be added to, never taken back, so a tolerance "
+                    "that over-seeds is not recoverable by the repair loop and a tighter "
+                    "one is; that asymmetry is the whole reason this retry runs in this "
+                    "direction and not the other.";
+
+        if (!keepSecond) {
+            status = std::move(firstStatus);
+            labels = std::move(firstLabels);
+            layout = std::move(firstLayout);
+            separatrices = std::move(firstSeparatrices);
+            arrangement = std::move(firstArrangement);
         }
-    } else if (options.reference == Options::Reference::Ricci) {
-        // Pipeline A's flat cone metric, computed here for one purpose only:
-        // to be E1's notion of undistorted. psi_0 still comes from the
-        // integration. This is the known-good yardstick the other two are
-        // measured against, and it is the one setting under which this pipeline
-        // still needs the flow.
-        referenceFlow = std::make_unique<RicciFlow>(mesh, *cones);
-        referenceFlow->solve();
-        for (const std::string &m : referenceFlow->getReport().messages) {
-            status.messages.push_back("Stage 6 (reference flow): " + m);
-        }
+        status.topoNearMissUsed = keepSecond ? options.topoNearMissRetry
+                                             : options.topoNearMiss;
+        status.topoNearMissRetried = true;
+        status.messages.push_back(retryMsg.str());
+    } else {
+        status.topoNearMissUsed = options.topoNearMiss;
     }
-
-    // What that reference actually does at the cones, measured before the
-    // continuation is allowed to use it. C4 in one number: a reference with no
-    // cones reports (pi/2)|I| here, and the plan's whole warning is that E1 and
-    // Q2 are then contradictory statements about the same vertex.
-    {
-        const std::vector<double> *refLen = nullptr;
-        std::vector<double> ricciLen;
-        if (options.reference == Options::Reference::Induced) {
-            refLen = &inducedLen;
-        } else if (options.reference == Options::Reference::Cone) {
-            refLen = coneMetric ? &coneMetric->edgeLengths() : &inducedLen;
-        } else if (options.reference == Options::Reference::Ricci && referenceFlow) {
-            ricciLen = referenceFlow->originalEdgeLengthsCompleted(nullptr);
-            refLen = &ricciLen;
-        }
-        std::vector<double> euclid;
-        if (!refLen) {
-            // Field and Euclidean are the same reference; measure the one they
-            // both are.
-            euclid.assign(mesh->edges.size(), 0.0);
-            for (size_t e = 0; e < euclid.size(); ++e) {
-                euclid[e] = normP(mesh->vertices[mesh->edges[e][1]] -
-                                  mesh->vertices[mesh->edges[e][0]]);
-            }
-            refLen = &euclid;
-        }
-        std::vector<double> sum(mesh->vertices.size(), 0.0);
-        for (int t = 0; t < static_cast<int>(mesh->triangles.size()); ++t) {
-            const double a = (*refLen)[mesh->triangleEdges[t][0]];
-            const double b = (*refLen)[mesh->triangleEdges[t][1]];
-            const double c = (*refLen)[mesh->triangleEdges[t][2]];
-            const double l[3] = {a, b, c};   // l[i] joins tri[i] and tri[i+1]
-            for (int i = 0; i < 3; ++i) {
-                const double p = l[i], q = l[(i + 2) % 3], r = l[(i + 1) % 3];
-                if (!(p > 0.0) || !(q > 0.0)) continue;
-                double cosA = (p * p + q * q - r * r) / (2.0 * p * q);
-                cosA = std::max(-1.0, std::min(1.0, cosA));
-                sum[mesh->triangles[t][i]] += std::acos(cosA);
-            }
-        }
-        const std::vector<int> &idx = cones->getIndices();
-        for (const auto &c : cones->getCones()) {
-            const double full = mesh->isBoundaryVertex[c.vertex] ? M_PI : 2.0 * M_PI;
-            const double want = full - M_PI_2 * idx[c.vertex];
-            status.referenceConeResidual =
-                std::max(status.referenceConeResidual, std::fabs(sum[c.vertex] - want));
-        }
-    }
-
-    // --- Stage 6: the layout energies -------------------------------------
-    LayoutEnergy::Options eopts;
-    eopts.lambdaInit = options.lambdaInit;
-    eopts.lambdaGrowth = options.lambdaGrowth;
-    eopts.outerSteps = options.outerSteps;
-    eopts.innerIterations = options.innerIterations;
-    eopts.alternateReference = false;
-    eopts.relabel = options.relabelBetweenSteps;
-    eopts.lagInterfaceScales = options.lagInterfaceScales;
-    switch (options.reference) {
-        case Options::Reference::Cone:
-            eopts.reference = LayoutEnergy::Reference::Induced;
-            eopts.referenceLengths = coneMetric ? coneMetric->edgeLengths() : inducedLen;
-            break;
-        case Options::Reference::Induced:
-            eopts.reference = LayoutEnergy::Reference::Induced;
-            eopts.referenceLengths = inducedLen;
-            break;
-        case Options::Reference::Field:
-            eopts.reference = LayoutEnergy::Reference::Field;
-            eopts.fieldFrames = frames->frames();
-            break;
-        case Options::Reference::Euclidean:
-            eopts.reference = LayoutEnergy::Reference::Euclidean;
-            break;
-        case Options::Reference::Ricci:
-            eopts.reference = LayoutEnergy::Reference::Induced;
-            eopts.referenceLengths = referenceFlow
-                ? referenceFlow->originalEdgeLengthsCompleted(nullptr)
-                : std::vector<double>();
-            break;
-    }
-    // Sec. 9's closing note. E2 and E3 start an order of magnitude lower
-    // because the field is already aligned to dS and to the interfaces, so
-    // their residuals start small and over-penalising them early only fights
-    // E1; E4 starts higher because the untangling introduced seam error, and
-    // because -- exactly as in Pipeline A -- Q4 and Q2 are the same statement
-    // in different units and Q4 is not free to trade away.
-    eopts.lambdaFactor[2] = options.lambdaAlignmentFactor;
-    eopts.lambdaFactor[3] = options.lambdaAlignmentFactor;
-    eopts.lambdaFactor[4] = options.lambdaSeamFactor;
-    layout = std::make_unique<LayoutEnergy>(*immersion, *labels, eopts);
-    status.layoutRan = layout->run();
-    {
-        const LayoutEnergy::Report &er = layout->getReport();
-        status.layoutInjective = er.injective;
-        status.layoutConstrained = er.constraintsMet;
-        status.outerStepsTaken = er.outerSteps;
-        status.layoutValid = er.valid;
-        status.layoutConeAngleResidual = er.maxConeAngleResidual;
-        status.layoutRegularAngleResidual = er.maxRegularAngleResidual;
-        status.layoutReferenceLeftHanded =
-            std::max(status.layoutReferenceLeftHanded, er.leftHandedFrames);
-        status.interfaceResidual = er.maxInterfaceResidual;
-        status.interfaceCornerChanges = er.interfaceCornerChanges;
-        status.interfacesAligned = er.interfaceCornerChanges == 0 &&
-                                   er.maxInterfaceResidual < 1e-3;
-        for (const std::string &m : er.messages) status.messages.push_back("Stage 6: " + m);
-    }
-
-    if (!options.runSeparatrices) return status.layoutValid;
-
-    // --- Stage 7 and Sec. 3.3's repair, MERIDIAN's unchanged --------------
-    Separatrices::Options sopts;
-    sopts.coneSnapTolerance = options.separatrixSnap;
-    sopts.maxSteps = options.separatrixMaxSteps;
-    sopts.coneSnapRings = options.separatrixSnapRings;
-    sopts.detectCycles = options.separatrixDetectCycles;
-    sopts.nearMissWindow = options.repairGapLimit;
-    if (interfaces && interfaces->multiMaterial()) {
-        sopts.extraEmitters = interfaces->emitterNodes();
-    }
-
-    MERIDIAN::RepairOptions ropts;
-    ropts.passes = options.seedTopoConstraints ? options.repairPasses : 0;
-    ropts.maxPerPass = options.repairMaxPerPass;
-    ropts.gapLimit = options.repairGapLimit;
-    ropts.lambdaBoost = options.repairLambdaBoost;
-    ropts.outerSteps = options.repairOuterSteps;
-    ropts.scoreArrangement = options.runArrangement && options.repairScoresArrangement;
-    ropts.patience = options.repairPatience;
-    ropts.arrangement.mergeTolerance = options.arrangementMerge;
-    ropts.arrangement.cornerTolerance = options.arrangementCorner;
-    ropts.arrangement.collapseTolerance = options.arrangementCollapse;
-    ropts.arrangement.trimUnresolvedAtCrossings = options.arrangementTrim;
-
-    MERIDIAN::RepairResult rep = MERIDIAN::traceAndRepair(
-        *labels, *layout, sopts, ropts,
-        [&](const std::string &m) { status.messages.push_back(m); });
-    separatrices = std::move(rep.separatrices);
-    status.repairPasses = rep.passesTaken;
-    status.repairConstraintsAdded = rep.constraintsAdded;
-    status.topoPaths = labels->getReport().topoPaths;
-    status.topoSelfReturns = labels->getReport().topoSelfReturns;
-    status.topoExtraPerPair = labels->getReport().topoExtraPerPair;
-
-    {
-        const LayoutEnergy::Report &er = layout->getReport();
-        status.layoutInjective = er.injective;
-        status.layoutConstrained = er.constraintsMet;
-        status.outerStepsTaken = er.outerSteps;
-        status.layoutValid = er.valid;
-        status.layoutConeAngleResidual = er.maxConeAngleResidual;
-        status.layoutRegularAngleResidual = er.maxRegularAngleResidual;
-    }
-
-    if (separatrices) {
-        const Separatrices::Report &sr = separatrices->getReport();
-        status.separatricesRan = true;
-        status.separatrices = sr.emitted;
-        status.separatricesToCone = sr.endedAtCone;
-        status.separatricesToBoundary = sr.endedAtBoundary;
-        status.separatricesUnresolved = sr.capped + sr.cycled + sr.stuck + sr.degenerate;
-        status.separatricesNearMisses = sr.nearMisses + sr.grazes;
-        status.q5Verified = sr.valid;
-    }
-
-    // --- Stage 8 ----------------------------------------------------------
-    if (!separatrices || !options.runArrangement) return status.layoutValid;
-    Arrangement::Options aopts;
-    aopts.mergeTolerance = options.arrangementMerge;
-    aopts.cornerTolerance = options.arrangementCorner;
-    aopts.collapseTolerance = options.arrangementCollapse;
-    aopts.trimUnresolvedAtCrossings = options.arrangementTrim;
-    try {
-        arrangement = std::make_unique<Arrangement>(*separatrices, *labels, aopts);
-    } catch (const std::exception &e) {
-        status.messages.push_back(std::string("Stage 8: could not be built: ") + e.what());
-        return status.layoutValid;
-    }
-    const Arrangement::Report &ar = arrangement->getReport();
-    status.arrangementRan = true;
-    status.layoutNodes = ar.nodes;
-    status.layoutArcs = ar.arcs;
-    status.layoutPatches = ar.patches;
-    status.layoutQuads = ar.simpleQuads;
-    status.layoutCoverage = ar.areaCoverage;
-    status.arrangementValid = ar.valid;
-    for (const std::string &m : ar.messages) status.messages.push_back("Stage 8: " + m);
 
     // --- Stage 9 ----------------------------------------------------------
     if (!options.runSplines) return status.layoutValid;
@@ -1596,6 +1669,7 @@ bool TORSION::run() {
     qopts.targetEdgeLength = options.quadTargetEdge;
     qopts.minIntervals = options.quadMinIntervals;
     qopts.maxIntervals = options.quadMaxIntervals;
+    qopts.collapseSpan = options.quadCollapseSpan;
     qopts.useSplines = options.quadUseSplines;
     qopts.featuresOnTracedArcs = options.quadFeaturesOnTracedArcs;
     qopts.smoothingPasses = options.quadSmoothingPasses;

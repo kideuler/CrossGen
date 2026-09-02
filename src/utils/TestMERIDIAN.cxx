@@ -239,6 +239,9 @@ void usage(const char *argv0) {
               << "  --lambda <l>       initial lambda_2..lambda_5    (default 1e-2)\n"
               << "  --growth <g>       lambda growth per outer step  (default 10)\n"
               << "  --near-miss <f>    Gamma_topo seeding tolerance      (default 0.15)\n"
+              << "  --retry <f>        tolerance to re-seed from when the first layout\n"
+              << "                     leaves a piece of S no grid covers  (default 0.04)\n"
+              << "  --no-retry         one attempt only, at --near-miss\n"
               << "  --alt-ref          let a stalled Stage 6 swap E1's reference to\n"
               << "                     the model's Euclidean metric (off; it has no\n"
               << "                     cones, so it shreds the cone one-rings)\n"
@@ -279,6 +282,9 @@ void usage(const char *argv0) {
               << "  --surf <file.obj>  write the reconstructed patches\n"
               << "  --no-mesh          skip Stage 10 (quadrilateral meshing)\n"
               << "  --target <h>       target edge length, model units      (default 0.05)\n"
+              << "  --collapse-span <f>  contract a chord whose every patch is thinner\n"
+              << "                     than this times the target             (default 0.5)\n"
+              << "  --no-collapse      keep every chord, however thin its patches\n"
               << "  --min-edges <n>    fewest edges per chord               (default 1)\n"
               << "  --max-edges <n>    most edges per chord, 0 = no cap     (default 0)\n"
               << "  --polyline-mesh    mesh the traced arcs, not the spline fits\n"
@@ -345,6 +351,8 @@ int main(int argc, char **argv) {
         else if (a == "--growth" && i + 1 < argc)  opts.lambdaGrowth = std::stod(argv[++i]);
         else if (a == "--alt-ref")                 opts.alternateReference = true;
         else if (a == "--no-topo")                 opts.seedTopoConstraints = false;
+        else if (a == "--no-retry")                opts.topoNearMissRetry = 0.0;
+        else if (a == "--retry" && i + 1 < argc)   opts.topoNearMissRetry = std::stod(argv[++i]);
         else if (a == "--near-miss" && i + 1 < argc) opts.topoNearMiss = std::stod(argv[++i]);
         else if (a == "--no-layout")               opts.runLayout = false;
         else if (a == "--no-trace")                opts.runSeparatrices = false;
@@ -381,6 +389,8 @@ int main(int argc, char **argv) {
         else if (a == "--surf" && i + 1 < argc)    surfOut = argv[++i];
         else if (a == "--no-mesh")                 opts.runQuadMesh = false;
         else if (a == "--target" && i + 1 < argc)  opts.quadTargetEdge = std::stod(argv[++i]);
+        else if (a == "--collapse-span" && i+1 < argc) opts.quadCollapseSpan = std::stod(argv[++i]);
+        else if (a == "--no-collapse")             opts.quadCollapseSpan = 0.0;
         else if (a == "--min-edges" && i + 1 < argc) opts.quadMinIntervals = std::stoi(argv[++i]);
         else if (a == "--max-edges" && i + 1 < argc) opts.quadMaxIntervals = std::stoi(argv[++i]);
         else if (a == "--polyline-mesh")           opts.quadUseSplines = false;
@@ -822,6 +832,8 @@ int main(int argc, char **argv) {
     }
     std::cout << "   (mean cone spacing " << std::fixed << std::setprecision(4)
               << sr.meanConeSpacing << std::defaultfloat << ")\n";
+    std::cout << "  Near-miss tolerance " << st.topoNearMissUsed
+              << (st.topoNearMissRetried ? "  (after a retry)" : "") << "\n";
 
     verdict(sr.boundaryEdges > 0, "Every curve of dS carries a label");
     for (const std::string &m : sr.messages) std::cout << "  " << kWarn << " " << m << "\n";
@@ -1312,6 +1324,13 @@ int main(int argc, char **argv) {
                   << "% of S" << std::defaultfloat;
     }
     std::cout << "\n";
+    if (qr.collapsedChords > 0) {
+        std::cout << "  Contracted " << qr.collapsedChords << " chord(s), which merged "
+                  << qr.collapsedPatches << " face(s) -- " << std::fixed
+                  << std::setprecision(2) << (100.0 * qr.collapsedArea)
+                  << "% of S -- into their neighbours on " << qr.weldedVertices
+                  << " welded vertex/vertices" << std::defaultfloat << "\n";
+    }
     // The spread is the price of the integer constraint: a chord that runs
     // through patches of different sizes has one count for all of them, so an
     // arc at either end of its length range is cut into edges away from the

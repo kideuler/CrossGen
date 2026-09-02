@@ -87,6 +87,15 @@
 // node at all, and the difference shows up on the models whose layouts have a
 // few very short arcs holding a corner together.
 //
+// The one thing that overrides that floor is a chord whose patches are all
+// *thinner than the elements asked for*. No integer makes an element bigger
+// than the block it sits in, so on a layout finer than the target the floor is
+// what fixes the element size, at whatever the layout happens to be -- and on
+// data/meshes/multimat/bubbles that is a fifth of the target over a tenth of
+// the faces. Such a chord is taken to zero instead and the faces it crosses are
+// contracted, which merges the blocks either side of them; see
+// Options::collapseSpan for the threshold and for what is never contracted.
+//
 // ### Where the points go
 //
 // Along an arc, at equal arc length of the *fitted spline* -- not equal
@@ -156,6 +165,59 @@ public:
         // gets at least the floor; 0 for maxIntervals means no ceiling.
         int minIntervals = 1;
         int maxIntervals = 0;
+
+        // The one exception to that floor: a chord every patch of which is
+        // thinner than `collapseSpan` times the target edge length takes *zero*
+        // edges and the patches it crosses are contracted out of the mesh. Zero
+        // switches this off and the floor is absolute.
+        //
+        // ### Why a floor of one is not enough
+        //
+        // The chords are an integer assignment on a block structure the layout
+        // fixed, and an integer assignment cannot make an element larger than
+        // the block it sits in. Where the layout is coarser than the target
+        // that is no constraint at all. Where it is finer it is the binding one:
+        // on data/meshes/multimat/bubbles the median layout face is 0.55 of one
+        // target element in area and a tenth of them are below 0.06 of one, so
+        // a floor of one edge puts a whole row of elements a fifth of the
+        // target size across a face nothing asked to be resolved. Measured
+        // there: edges from 0.045 to 1.9 times the target and an rms log ratio
+        // of 0.90, against 0.36 on the same model with a coarser layout.
+        //
+        // The remedy is the one Sec. 6.3 of Campen, Bommes & Kobbelt (2015)
+        // gives for the same situation and the reason their quantization is
+        // allowed to reach zero: a cell of zero width is not a cell, and
+        // deleting it lets the two blocks either side of it meet. It is a
+        // *merge* of blocks, not a coarsening of elements -- the layout's block
+        // structure is what changes, and the elements that remain are the ones
+        // the target asked for. src/quantization/TMeshContract.{hxx,cxx} is the
+        // same operation on the abstract T-mesh.
+        //
+        // ### What it costs, and why the threshold is where it is
+        //
+        // Contracting a chord moves the mesh off the layout by that chord's
+        // widest patch, and it contracts each of its arcs -- a piece of a
+        // separatrix, of dS, or of an interface -- to a point. Both are bounded
+        // by the same number, so the threshold is stated once and applies to
+        // both: a chord is contracted only when its widest patch *and* its
+        // longest arc are under it. At 0.5 the break-even is exact -- keeping
+        // the chord puts every element on it below half the target, contracting
+        // it moves the mesh by less than half an element -- and it is the
+        // default for that reason rather than by search.
+        //
+        // Two things are never contracted, whatever their size. A chord that
+        // would take a loop of `evenLoops` below `minLoopEdges`, because the
+        // fill waiting on that loop needs the edges more than the mesh needs
+        // the merge; and a chord whose contraction would weld two *feature*
+        // curves together -- a patch with dS or an interface on both of the
+        // sides that would meet is a real thinness of the model, and closing it
+        // would join two pieces of the boundary that the model keeps apart.
+        double collapseSpan = 0.5;
+
+        // The fewest edges a loop of `evenLoops` may be left with by the
+        // contraction above. Eight is DiskTemplate::Options::minRimEdges: the
+        // shortest rim that still holds a ring and a core.
+        int minLoopEdges = 8;
 
         // Closed loops of arcs that must come out with an **even** number of
         // edges in total. Empty unless something downstream needs one.
@@ -293,6 +355,16 @@ public:
         int unmeshedPatches = 0;      // faces without four sides of one arc
         double unmeshedArea = 0.0;    // of those, as a fraction of S
 
+        // Options::collapseSpan: chords taken to zero edges, the faces that
+        // left with no grid at all, their area as a fraction of S, and the
+        // vertices the two sides of those faces merged into one. A contracted
+        // face is *not* an unmeshed one -- the blocks either side of it moved
+        // together and cover it -- which is why it is counted apart.
+        int collapsedChords = 0;
+        int collapsedPatches = 0;
+        double collapsedArea = 0.0;
+        int weldedVertices = 0;
+
         int vertices = 0;
         int quads = 0;
 
@@ -373,8 +445,10 @@ public:
     const Report& getReport() const { return report; }
     const Options& getOptions() const { return options; }
 
-    // Edges assigned to each arc of the arrangement, or -1 where the arc bounds
-    // no meshable patch, and the vertices placed along it from `from` to `to`.
+    // Edges assigned to each arc of the arrangement: -1 where the arc bounds no
+    // meshable patch, 0 where Options::collapseSpan contracted its chord, and
+    // the vertices placed along it from `from` to `to`. A contracted arc comes
+    // back from arcVertices() as the single vertex both its ends became.
     const std::vector<int>& arcIntervals() const { return intervals; }
     const std::vector<std::vector<int>>& arcVertices() const { return arcNodes; }
     // The chord each arc belongs to, or -1.
@@ -388,9 +462,16 @@ public:
 
 private:
     void assignIntervals();
+    // Options::collapseSpan, applied before the parity fix so that the parity
+    // is computed on the counts the mesh is actually built at.
+    void collapseThinChords();
     // Options::evenLoops, applied to the counts assignIntervals() chose.
     void fixLoopParity(std::vector<std::vector<double>> &chordSpans);
     void meshArcs();
+    // The two sides of a contracted face are one row of nodes. Merges them and
+    // renumbers the vertices, between meshArcs() and meshPatches() so that the
+    // blocks are built on the merged positions rather than corrected after.
+    void weldCollapsed();
     void meshPatches();
     void smooth();
     void classifyMaterials();
@@ -425,6 +506,10 @@ private:
     std::vector<std::vector<int>> arcNodes; // per arc, intervals + 1 vertices
     std::vector<std::vector<double>> arcParams; // ... and their curve parameters
     std::vector<int> nodeVert;              // arrangement node -> vertex
+    // Union-find over the arrangement's nodes: the classes are the runs of
+    // nodes a contracted chord identified. Empty of content when nothing was
+    // contracted, in which case every node is its own class.
+    std::vector<int> nodeClass;
     std::vector<int> facePatch;             // arrangement face -> SplineFit patch
     std::vector<Table> tables;              // per arc
 
