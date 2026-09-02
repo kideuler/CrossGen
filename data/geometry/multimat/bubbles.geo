@@ -1,8 +1,10 @@
-// Particulate dispersion: ten disks (mat 2) scattered through a 1 x 0.5
-// matrix block (mat 1). The disks are the inclusions of a two-phase
-// composite -- bubbles in a melt, voids in a casting, second-phase particles
-// in an alloy. Radii run 0.032 to 0.057 against a domain 1 wide, and the
-// inclusions take up 13% of the area.
+// Particulate dispersion: ten disks scattered through a 1 x 0.5 matrix block
+// (mat 1). Five disks are mat 2 and five are mat 3, alternating in x, so two
+// distinct inclusion phases sit interspersed in the same matrix -- e.g. two
+// second-phase particle populations, or bubbles plus voids. The disks are
+// otherwise identical in kind: same construction, same radius range. Radii
+// run 0.032 to 0.057 against a domain 1 wide, and the inclusions take up 13%
+// of the area.
 //
 // The block is written in unit coordinates, x in [0,1] and y in [0,0.5], so
 // the numbers in this file are already the fractions of the domain that
@@ -11,16 +13,18 @@
 //
 // What this domain is for. Two things nothing else in the corpus does:
 //
-//  * Count. Mat 2 is ONE material on TEN disconnected surfaces
-//    (Physical Surface(2) = {300:309}), against geom014's six and icf's two,
-//    and the matrix is one surface with ten holes punched in it, so its
+//  * Count. Mat 2 and mat 3 are each ONE material on FIVE disconnected
+//    surfaces (Physical Surface(2) = {300,302,304,306,308}, Physical
+//    Surface(3) = {301,303,305,307,309}), against geom014's six and icf's
+//    two, and the matrix is one surface with ten holes punched in it, so its
 //    Euler characteristic is 1 - 10 = -9 and it needs forty -1/4 cones to
-//    the disks' forty +1/4.
+//    the disks' forty +1/4, split 20/20 between the two inclusion materials.
 //
-//  * Ten independent copies of the same local problem. Every inclusion poses
-//    the identical question to the field and the layout, at ten places and
-//    at radii spanning a factor of 1.8, so whether the answers agree is
-//    directly readable.
+//  * Ten independent copies of the same local problem, now across two
+//    materials. Every inclusion poses the identical question to the field
+//    and the layout, at ten places and at radii spanning a factor of 1.8, so
+//    whether the answers agree -- both within a material and across the
+//    mat 2 / mat 3 boundary -- is directly readable.
 //
 // There are no junctions of any kind: no interface touches dS and no two
 // interfaces touch, so every interface is a smooth closed curve and the
@@ -89,5 +93,19 @@ EndFor
 // interfaces are conformal on both sides.
 Plane Surface(1) = {1, holes[]};
 
+// Alternate disk parity by index (even = mat 2, odd = mat 3), which also
+// alternates in x since cx[] is already sorted -- the two materials
+// interleave across the block rather than clustering on one side.
+mat2[] = {};
+mat3[] = {};
+For k In {0:9}
+  If (Fmod(k, 2) == 0)
+    mat2[] += 300 + k;
+  Else
+    mat3[] += 300 + k;
+  EndIf
+EndFor
+
 Physical Surface(1) = {1};
-Physical Surface(2) = {300:309};
+Physical Surface(2) = {mat2[]};
+Physical Surface(3) = {mat3[]};
