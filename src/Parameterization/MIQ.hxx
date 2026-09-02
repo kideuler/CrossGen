@@ -1,6 +1,12 @@
 #ifndef __MIQ_HXX__
 #define __MIQ_HXX__
 
+// MIQSolver is built on CoMISo's constrained solver, so the whole class is
+// only declared when CrossGen was configured with CROSSGEN_ENABLE_COMISO
+// (see the top-level CMakeLists.txt). Code that uses MIQSolver must guard
+// itself with the same #ifdef.
+#ifdef CROSSGEN_WITH_COMISO
+
 #include <complex>
 #include <string>
 #include <vector>
@@ -234,5 +240,7 @@ private:
     Eigen::MatrixXd quadVertices_;  // quad mesh vertices in original coordinates
     Eigen::MatrixXi quadFaces_;     // quad mesh faces (Nx4)
 };
+
+#endif // CROSSGEN_WITH_COMISO
 
 #endif // __MIQ_HXX__

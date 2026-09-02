@@ -43,7 +43,9 @@
 #include "MERIDIAN/QuadMesh.hxx"
 #include "MERIDIAN/SplineFit.hxx"
 #include "Parameterization/CutMesh.hxx"
+#ifdef CROSSGEN_WITH_COMISO
 #include "Parameterization/MIQ.hxx"
+#endif
 #include "SIPG/SIPG.hxx"
 #include "TORSION/ConeMetric.hxx"
 #include "TORSION/TORSION.hxx"
@@ -661,6 +663,7 @@ int referenceTest(const std::string &path) {
 // this field on this corpus inverts a handful of triangles or a tenth of the
 // model.
 // ---------------------------------------------------------------------------
+#ifdef CROSSGEN_WITH_COMISO
 int census(const std::vector<std::string> &paths) {
     std::cout << "Sec. 7.1 flip census: MIQ from the SIPG field, doRound = false\n\n";
     std::cout << std::left << std::setw(34) << "model" << std::right
@@ -710,6 +713,7 @@ int census(const std::vector<std::string> &paths) {
               << " model(s) inverted something; worst " << worst << " triangle(s).\n";
     return 0;
 }
+#endif // CROSSGEN_WITH_COMISO
 
 void usage(const char *prog) {
     std::cout << "Usage: " << prog << " <mesh.obj> [options]\n"
@@ -796,9 +800,15 @@ int main(int argc, char **argv) {
         return referenceTest(argv[2]);
     }
     if (first == "--census") {
+#ifdef CROSSGEN_WITH_COMISO
         std::vector<std::string> paths(argv + 2, argv + argc);
         if (paths.empty()) { usage(argv[0]); return 1; }
         return census(paths);
+#else
+        std::cerr << "--census requires MIQ, which needs CrossGen built with "
+                     "CROSSGEN_ENABLE_COMISO=ON.\n";
+        return 1;
+#endif
     }
 
     const std::string path = first;

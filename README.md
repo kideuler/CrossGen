@@ -25,5 +25,6 @@ A purely 2D implementation of Cross-fields along with block decomposition
 - [X] Templated circular inclusions: excise them (Stage 0c) and fill each with an O-grid (Stage 11).
 - [X] Get Laghos to output to paraview.
 - [X] Get bubble working correctly (`--disk-templates --near-miss 0.04`, both pipelines)
+- [ ] Create a QuadMesh class and do TMOP.
 - [ ] Get tests ready.
 - [ ] Try to parallelize (for a little)

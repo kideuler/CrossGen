@@ -1,5 +1,10 @@
 #include "MIQ.hxx"
 
+// The declaration of MIQSolver itself is compiled out when CrossGen was
+// configured without CoMiSo (CROSSGEN_ENABLE_COMISO=OFF); mirror that here so
+// this translation unit becomes a no-op instead of failing to find the class.
+#ifdef CROSSGEN_WITH_COMISO
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -1646,9 +1651,11 @@ bool MIQSolver::writeQuadMesh(const std::string& filename) const {
     
     // Write quad faces
     for (int f = 0; f < static_cast<int>(quadFaces_.rows()); ++f) {
-        out << "f " << (quadFaces_(f, 0) + 1) << " " << (quadFaces_(f, 1) + 1) 
+        out << "f " << (quadFaces_(f, 0) + 1) << " " << (quadFaces_(f, 1) + 1)
             << " " << (quadFaces_(f, 2) + 1) << " " << (quadFaces_(f, 3) + 1) << "\n";
     }
-    
+
     return true;
 }
+
+#endif // CROSSGEN_WITH_COMISO

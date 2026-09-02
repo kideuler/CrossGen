@@ -568,6 +568,7 @@ void drawTextOverlay(int fbw, int fbh, const char *text, float x, float y, float
     glPopMatrix();
 }
 
+#ifdef CROSSGEN_WITH_COMISO
 void computeUVMeshBounds(const MIQSolver &miq, double &cx, double &cy, double &baseW, double &baseH) {
     const Eigen::MatrixXd &UV = miq.getUV();
 
@@ -732,6 +733,7 @@ void drawSingularitiesOnUV(const MIQSolver &miq, const CutMesh &cutMesh,
         }
     }
 }
+#endif // CROSSGEN_WITH_COMISO
 
 void drawMedialAxis(const MedialAxis &ma, double vertexRadius) {
     // Draw medial axis edges (Voronoi dual edges) in orange

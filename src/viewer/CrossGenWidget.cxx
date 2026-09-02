@@ -51,10 +51,21 @@ Phase nextPhase(Phase p) {
         case Phase::MeshOnly:      return Phase::CrossField;
         case Phase::CrossField:    return Phase::Singularities;
         case Phase::Singularities: return Phase::CutSeams;
+#ifdef CROSSGEN_WITH_COMISO
         case Phase::CutSeams:      return Phase::UVMesh;
         case Phase::UVMesh:        return Phase::UVMesh;
+#else
+        // No CoMiSo, no MIQSolver: the UV mesh phase would have nothing to
+        // show, so cut seams is the last stop.
+        case Phase::CutSeams:      return Phase::CutSeams;
+        case Phase::UVMesh:        return Phase::CutSeams;
+#endif
     }
+#ifdef CROSSGEN_WITH_COMISO
     return Phase::UVMesh;
+#else
+    return Phase::CutSeams;
+#endif
 }
 
 MBOPhase nextMBOPhase(MBOPhase p) {
@@ -121,7 +132,12 @@ const char *phaseName(Phase p) {
         case Phase::CrossField:    return "2) crossfield";
         case Phase::Singularities: return "3) singularities";
         case Phase::CutSeams:      return "4) cut seams";
-        case Phase::UVMesh:        return "5) UV mesh (MIQ)";
+        case Phase::UVMesh:
+#ifdef CROSSGEN_WITH_COMISO
+            return "5) UV mesh (MIQ)";
+#else
+            return "5) UV mesh (disabled, built without CoMiSo)";
+#endif
     }
     return "?";
 }
@@ -588,7 +604,9 @@ void CrossGenWidget::wheelEvent(QWheelEvent *event) {
 void CrossGenWidget::doReset() {
     field_.reset();
     cutMesh_.reset();
+#ifdef CROSSGEN_WITH_COMISO
     miqSolver_.reset();
+#endif
     crossField_.reset();
     sipgField_.reset();
     separatrixTrace_.reset();
@@ -4749,6 +4767,7 @@ void CrossGenWidget::runComputations() {
                   << cutMesh_->getSingularityPathCutEdges().size() << "\n";
     }
 
+#ifdef CROSSGEN_WITH_COMISO
     // ── PolyVector: MIQ parametrization ──────────────────────────────────────
     if (mode_ == Mode::PolyVector && phase_ >= Phase::UVMesh &&
         cutMesh_.has_value() && !miqSolver_.has_value()) {
@@ -4772,6 +4791,7 @@ void CrossGenWidget::runComputations() {
         uvView_.fbw  = view_.fbw;
         uvView_.fbh  = view_.fbh;
     }
+#endif
 }
 
 // ── animation render paths ───────────────────────────────────────────────────
@@ -4845,7 +4865,10 @@ void CrossGenWidget::renderTraceAnimation() {
 // Whether the right half of the window is showing a parameter domain, which is
 // what decides where a drag or a scroll lands.
 bool CrossGenWidget::inUVSplitScreen() const {
-    return (mode_ == Mode::PolyVector && phase_ == Phase::UVMesh && miqSolver_.has_value()) ||
+    return
+#ifdef CROSSGEN_WITH_COMISO
+           (mode_ == Mode::PolyVector && phase_ == Phase::UVMesh && miqSolver_.has_value()) ||
+#endif
            // The chord collapse phase takes the whole window back: what it has
            // to show is the structure before against the structure after, and
            // both of those live in the model.
@@ -5021,6 +5044,7 @@ void CrossGenWidget::renderMERIDIANModel() {
 // ── normal render ─────────────────────────────────────────────────────────────
 
 void CrossGenWidget::renderNormal() {
+#ifdef CROSSGEN_WITH_COMISO
     if (mode_ == Mode::PolyVector && phase_ == Phase::UVMesh && miqSolver_.has_value()) {
         // ── Split-screen: left = original mesh, right = UV mesh ───────────────
         int w = fbw(), h = fbh();
@@ -5064,7 +5088,9 @@ void CrossGenWidget::renderNormal() {
         }
 
         drawSplitDivider(halfW);
-    } else if (mode_ == Mode::MBO) {
+    } else
+#endif
+    if (mode_ == Mode::MBO) {
         viewer::drawAxis(view_);
         // The quantized grid is the payoff of this whole mode, and the
         // triangulation underneath only buries it -- the medial axis mode's

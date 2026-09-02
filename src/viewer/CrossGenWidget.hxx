@@ -28,7 +28,9 @@
 #include "MERIDIAN/SubdomainLabels.hxx"
 #include "Parameterization/CutMesh.hxx"
 #include "Parameterization/HarmonicCut.hxx"
+#ifdef CROSSGEN_WITH_COMISO
 #include "Parameterization/MIQ.hxx"
+#endif
 #include "Parameterization/UVGParam.hxx"
 #include "polyvector/PolyVectors.hxx"
 #include "crossfield/CrossField.hxx"
@@ -527,7 +529,9 @@ private:
 
     std::optional<PolyField>   field_;
     std::optional<CutMesh>     cutMesh_;
+#ifdef CROSSGEN_WITH_COMISO
     std::optional<MIQSolver>   miqSolver_;
+#endif
     std::optional<CrossField>  crossField_;
     std::optional<SIPG>        sipgField_;
     std::shared_ptr<SeparatrixTrace> separatrixTrace_;
