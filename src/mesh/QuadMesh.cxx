@@ -403,12 +403,17 @@ static std::vector<std::vector<int>> featureNeighbors(const QuadMesh &m) {
 void QuadMesh::classifyNodes() {
     const int nV = static_cast<int>(vertices.size());
     nodeType.assign(nV, NodeFree);
+    featureNeighborOf.assign(nV, std::array<int, 2>{-1, -1});
     if (pinned.size() != vertices.size()) pinned.resize(nV, false);
 
     const std::vector<std::vector<int>> fn = featureNeighbors(*this);
     const double cosLimit = std::cos((180.0 - options.cornerAngle) * M_PI / 180.0);
 
     for (int v = 0; v < nV; ++v) {
+        // Recorded whatever the node type turns out to be, so the feature graph
+        // stays walkable through corners and pins.
+        if (fn[v].size() == 2) featureNeighborOf[v] = {fn[v][0], fn[v][1]};
+
         if (pinned[v]) { nodeType[v] = NodeFixed; continue; }
         if (!isFeatureVertex[v]) { nodeType[v] = NodeFree; continue; }
         if (options.fixAllFeatureNodes) { nodeType[v] = NodeFixed; continue; }
@@ -424,22 +429,107 @@ void QuadMesh::classifyNodes() {
         // cos(180 - cornerAngle).
         nodeType[v] = (dotP(a, b) > cosLimit) ? NodeFixed : NodeSliding;
     }
+
+    anchorFreeFeatureLoops();
+}
+
+// Every node of a closed feature curve with no corner anywhere on it -- a
+// finely discretised inclusion rim, a round outer dS -- comes out Sliding, and
+// each is individually held to its own tangent. The *loop*, though, is held by
+// nothing: its nodes can all creep the same way around it and reparameterise
+// the curve, drifting the discretisation without any single node ever leaving
+// the polyline. Pinning one node per such loop costs one degree of freedom and
+// removes the drift.
+//
+// This walks the feature graph rather than `boundaryLoops`, so an interior
+// material-interface ring is caught exactly as an outer boundary is. It runs
+// after the pins and the corner test, so a loop that already has a fixed node
+// anywhere on it is left alone: the walk simply reaches that node and stops.
+void QuadMesh::anchorFreeFeatureLoops() {
+    const int nV = static_cast<int>(vertices.size());
+    std::vector<bool> visited(nV, false);
+
+    for (int seed = 0; seed < nV; ++seed) {
+        if (visited[seed] || nodeType[seed] != NodeSliding) continue;
+
+        // Walk one way out of the seed for as long as the run stays sliding.
+        // It ends either on a non-sliding node -- the run is an open arc
+        // between two fixed ends and is already anchored -- or back on the
+        // seed, which is the case this pass exists for.
+        std::vector<int> run{seed};
+        visited[seed] = true;
+        int prev = seed, cur = featureNeighborOf[seed][1];
+        bool closed = false;
+        while (cur >= 0) {
+            if (cur == seed) { closed = true; break; }
+            if (nodeType[cur] != NodeSliding) break;
+            run.push_back(cur);
+            visited[cur] = true;
+            const std::array<int, 2> &f = featureNeighborOf[cur];
+            const int next = (f[0] == prev) ? f[1] : f[0];
+            prev = cur;
+            cur = next;
+        }
+
+        if (closed) {
+            // Lowest index rather than the seed itself: the choice has to not
+            // depend on which node the outer loop happened to reach first, so
+            // a rebuild anchors the same node twice running.
+            int anchor = run[0];
+            for (int v : run) anchor = std::min(anchor, v);
+            nodeType[anchor] = NodeFixed;
+            continue;
+        }
+
+        // Open run: mark the other half visited too, so the next seed does not
+        // walk the same arc again from its middle.
+        prev = seed;
+        cur = featureNeighborOf[seed][0];
+        while (cur >= 0 && cur != seed && nodeType[cur] == NodeSliding) {
+            visited[cur] = true;
+            const std::array<int, 2> &f = featureNeighborOf[cur];
+            const int next = (f[0] == prev) ? f[1] : f[0];
+            prev = cur;
+            cur = next;
+        }
+    }
+}
+
+void QuadMesh::updateSlideTangent(int v) {
+    if (v < 0 || v >= static_cast<int>(vertices.size())) return;
+    if (slideTangent.size() != vertices.size())
+        slideTangent.assign(vertices.size(), Point{0.0, 0.0});
+    if (v >= static_cast<int>(nodeType.size()) ||
+        v >= static_cast<int>(featureNeighborOf.size()) ||
+        nodeType[v] != NodeSliding) {
+        slideTangent[v] = Point{0.0, 0.0};
+        return;
+    }
+    const std::array<int, 2> &fn = featureNeighborOf[v];
+    if (fn[0] < 0 || fn[1] < 0) { slideTangent[v] = Point{0.0, 0.0}; return; }
+    // The chord through the two feature neighbours. On dS and on a material
+    // interface this is not an approximation of some truer curve: those are
+    // never splined, so the polyline through the neighbours is the geometry,
+    // and a step along this direction keeps the node exactly on the segment it
+    // already sits on.
+    slideTangent[v] = normalizeP(vertices[fn[1]] - vertices[fn[0]]);
 }
 
 void QuadMesh::computeSlideTangents() {
     slideTangent.assign(vertices.size(), Point{0.0, 0.0});
     if (nodeType.size() != vertices.size()) return;
+    for (int v = 0; v < static_cast<int>(vertices.size()); ++v) updateSlideTangent(v);
+}
 
-    const std::vector<std::vector<int>> fn = featureNeighbors(*this);
-    for (int v = 0; v < static_cast<int>(vertices.size()); ++v) {
-        if (nodeType[v] != NodeSliding || fn[v].size() != 2) continue;
-        // The chord through the two feature neighbours: the best straight-line
-        // approximation to the curve's tangent that the mesh itself carries.
-        // Exact only to the discretisation -- a smoother that needs the true
-        // geometry has to project onto it, which this class does not know how
-        // to do.
-        slideTangent[v] = normalizeP(vertices[fn[v][1]] - vertices[fn[v][0]]);
+Point QuadMesh::projectStep(int v, const Point &displacement) const {
+    if (v < 0 || v >= static_cast<int>(nodeType.size())) return Point{0.0, 0.0};
+    if (nodeType[v] == NodeFixed) return Point{0.0, 0.0};
+    if (nodeType[v] == NodeSliding) {
+        if (v >= static_cast<int>(slideTangent.size())) return Point{0.0, 0.0};
+        const Point &t = slideTangent[v];
+        return t * dotP(t, displacement);
     }
+    return displacement;
 }
 
 bool QuadMesh::markFeatureEdge(int edge) {

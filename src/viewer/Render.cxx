@@ -2795,6 +2795,15 @@ void drawQuadMesh(const DiskTemplate &dt, const QuadMesh *qm, float lineWidth,
                        lineWidth, blockLineWidth, materialFill);
 }
 
+void drawQuadMesh(const mesh::QuadMesh &sm, const QuadMesh *qm, const DiskTemplate *dt,
+                  float lineWidth, float blockLineWidth, bool materialFill) {
+    std::vector<GridRef> grids = qm ? gridsOf(*qm) : std::vector<GridRef>();
+    if (dt)
+        for (const DiskTemplate::Block &b : dt->blocks()) grids.push_back({ b.ns, b.nt, &b.vert });
+    drawQuadMeshArrays(sm.vertices, sm.quads, sm.quadMatId, grids,
+                       lineWidth, blockLineWidth, materialFill);
+}
+
 // The fitted circle of every inclusion, sampled. Dashed would say "removed"
 // more plainly, but a dash pattern at this radius reads as a coarse polygon, so
 // it is drawn whole and dim instead and the hole underneath does the saying.

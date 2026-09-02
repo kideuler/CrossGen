@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 
+#include <Eigen/Dense>
+
 #include "MERIDIAN/Arrangement.hxx"
 #include "MERIDIAN/ConeCut.hxx"
 #include "MERIDIAN/ConeSingularities.hxx"
@@ -187,6 +189,24 @@ public:
         // --- Stage 0 and 0b, identical to MERIDIAN's -----------------------
         double sipgGamma = 10.0;
         int sipgMaxSteps = 500;
+
+        // Stage 0 override: one unit spin-4 value per triangle of the mesh the
+        // layout is computed on, used instead of running the MBO solve.
+        //
+        // Every stage after Stage 0 reads the field through `SIPG::u_k_prev`
+        // and through nothing else -- ConeSingularities takes it in its
+        // constructor and FieldFrames combs it -- so substituting the vector is
+        // the whole of substituting the field. That is what makes a controlled
+        // comparison possible at all: the experiment holds Stages 0b to 11
+        // fixed, swaps this, and attributes the difference in the layout to the
+        // field it came from rather than to a second pipeline.
+        //
+        // Empty runs the solver, which is the ordinary path and what the
+        // pipeline itself always does. A vector whose length is not the
+        // triangle count is refused and the solver runs instead, with a message
+        // -- the length can legitimately change under the caller's feet when
+        // Options::diskTemplates excises the inclusions before Stage 0.
+        Eigen::VectorXcd externalField;
 
         bool materialInterfaces = true;
         double interfaceKinkAngle = M_PI / 4.0;

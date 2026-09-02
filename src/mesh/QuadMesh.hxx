@@ -48,6 +48,7 @@
 // | which nodes an element touches | `quads[q]` |
 // | which elements a node touches, and *at which corner* | `vertexQuads` |
 // | which nodes may move, and how | `nodeType`, `slideTangent` |
+// | a step legal for that node | `projectStep` |
 // | one-ring stencil for a local/Gauss-Seidel sweep | `vertexNeighbors` |
 // | current quality, to accept or reject a step | `scaledJacobian`, `quality` |
 //
@@ -128,10 +129,18 @@ public:
         double cornerAngle = 45.0;
 
         // Pin every feature node instead of letting the smooth ones slide.
-        // The safe setting, and the one to start a smoother from: sliding needs
-        // a projection back onto the true geometry, which this class does not
-        // carry -- `slideTangent` is the chord tangent of the mesh's own
-        // polyline, exact only to the discretisation.
+        //
+        // A debug and isolation knob, not the setting to start from. Pinning
+        // the whole boundary freezes its discretisation density at whatever an
+        // earlier stage left it while the interior metric pulls towards its own
+        // ideal spacing, and the mismatch is absorbed by the one ring of
+        // elements touching the boundary -- the "bubbly" boundary ring. Sliding
+        // (the default) lets that ring redistribute instead, and it is exact
+        // rather than approximate here: dS and the material interfaces are
+        // never splined, so the chord through a node's two feature neighbours
+        // *is* the polyline the node was placed on. Turn this on to compare a
+        // suspect result against a fully pinned one and tell whether a
+        // regression came from the sliding or from the interior metric.
         bool fixAllFeatureNodes = false;
 
         // Treat material interfaces as features. Off, only dS is a feature and
@@ -274,6 +283,18 @@ public:
     // Unit tangent of the feature curve at a sliding node, {0,0} otherwise.
     std::vector<Point> slideTangent;
 
+    // The two feature-curve neighbours of a vertex that has exactly two, and
+    // {-1,-1} for every other vertex -- an interior node, a curve end, a
+    // junction where three feature curves meet. This is what makes the tangent
+    // refresh below O(1); it is also the feature graph itself, walkable as an
+    // adjacency list.
+    //
+    // It is filled for *any* vertex with two feature neighbours, not only the
+    // sliding ones, so a walk along a feature polyline passes through the
+    // corners on it rather than stopping at them. The node type is what says
+    // whether a vertex may move; this says only what it is joined to.
+    std::vector<std::array<int, 2>> featureNeighborOf;
+
     // ---- TMOP targets ----------------------------------------------------
 
     // Target (ideal) Jacobian W per quad, row-major as Jacobian2. The identity
@@ -309,10 +330,45 @@ public:
 
     // Recompute slideTangent from the current positions. Cheap, and the one
     // topology-independent thing a smoother invalidates when it moves a node.
+    // A thin loop over updateSlideTangent().
     void computeSlideTangents();
 
+    // Recompute slideTangent[v] alone, in O(1), from the current positions of
+    // v's two feature neighbours.
+    //
+    // A Gauss-Seidel sweep has to call this immediately before each node's own
+    // local solve: the neighbours may already have moved earlier in the same
+    // sweep, and a stale tangent no longer lies along the current polyline, so
+    // the "the node stays exactly on the segment it was placed on" guarantee
+    // that projectStep() gives would quietly stop holding.
+    void updateSlideTangent(int v);
+
+    // The displacement node `v` is actually allowed to take, given a
+    // displacement a solver would like it to take: zero for NodeFixed, the
+    // component along slideTangent[v] for NodeSliding, unchanged for NodeFree.
+    //
+    // On a curved feature the chord through the two neighbours does not contain
+    // the node, so a sliding step does move it a little off the polyline -- by
+    // at most one segment's sagitta, and no further however many steps it
+    // takes, because each step starts from wherever the node then is. What the
+    // chord does give exactly is the **area**: a node moving parallel to the
+    // line through its neighbours leaves the triangle they span unchanged, and
+    // that triangle is the polygon's only dependence on the node. So the domain
+    // a sliding boundary encloses is conserved to rounding, however far the
+    // nodes redistribute along it.
+    //
+    // This is the one place the mobility constraint lives, so an optimizer's
+    // inner loop never re-derives it per call site. It is a post-hoc
+    // projection of a full 2-D step rather than a reduced local system solved
+    // in the tangent direction -- the same accept-a-displacement shape the
+    // hand-rolled smoothers in DiskTemplate::smooth() and
+    // TORSION::relaxToKernel() already use.
+    Point projectStep(int v, const Point &displacement) const;
+
     // Classify nodes into Free / Sliding / Fixed from the feature flags and
-    // Options::cornerAngle. Called by buildTopology().
+    // Options::cornerAngle, fill featureNeighborOf, and anchor any feature loop
+    // that would otherwise be free to drift (see the .cxx). Called by
+    // buildTopology().
     void classifyNodes();
 
     // Mark an edge (by its index in `edges`) as a feature, and both its
@@ -495,6 +551,10 @@ private:
     void buildVertexQuads();
     void buildBoundaryLoops();
     void markInterfaceEdges();
+    // Fix one node on every closed feature loop that has no fixed node on it
+    // already. Run at the end of classifyNodes(); see the .cxx for why it is
+    // unconditional rather than an Options flag.
+    void anchorFreeFeatureLoops();
 
     // Caller-pinned vertices, kept across a rebuild so classifyNodes() can
     // re-apply them.

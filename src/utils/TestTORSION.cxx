@@ -51,6 +51,7 @@
 #include "TORSION/TORSION.hxx"
 #include "TestHelper.hxx"
 #include "mesh/QuadMesh.hxx"
+#include "mesh/TMOP.hxx"
 
 namespace {
 
@@ -786,7 +787,9 @@ void usage(const char *prog) {
               << "  --cut <file.obj>   write Omega\n"
               << "  --arr <file.obj>   write the Stage 8 arrangement, on the model\n"
               << "  --quads <file.obj> write the Stage 10 quadrilateral mesh\n"
-              << "  --mfem <f.mesh>    write the final mesh for MFEM, material id per element\n";
+              << "  --mfem <f.mesh>    write the final mesh for MFEM, material id per element\n"
+              << "  --tmop <n>         smooth the final mesh with n TMOP sweeps (metric 007,\n"
+              << "                     shape and size) before writing it, 0 = off (default 0)\n";
 }
 
 } // namespace
@@ -815,6 +818,7 @@ int main(int argc, char **argv) {
     TORSION::Options opts;
     std::string psiOut, rawOut, tutteOut, layoutOut, cutOut, quadOut, arrOut, mfemOut;
     int coneListLimit = 20;
+    int tmopSweeps = 0;
 
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
@@ -877,6 +881,7 @@ int main(int argc, char **argv) {
         else if (a == "--quads" && i + 1 < argc)        quadOut = argv[++i];
         else if (a == "--mfem" && i + 1 < argc)         mfemOut = argv[++i];
         else if (a == "--arr" && i + 1 < argc)          arrOut = argv[++i];
+        else if (a == "--tmop" && i + 1 < argc)         tmopSweeps = std::stoi(argv[++i]);
         else { std::cerr << "Unknown option: " << a << "\n"; usage(argv[0]); return 1; }
     }
 
@@ -1367,7 +1372,7 @@ int main(int argc, char **argv) {
     // on the mesh rather than a restatement of the pipeline's own report.
     if (st.quadMeshRan && pipeline.hasQuadMesh()) {
         heading("Final mesh (mesh::QuadMesh)");
-        const mesh::QuadMesh finalMesh =
+        mesh::QuadMesh finalMesh =
             pipeline.hasDiskTemplate() ? mesh::QuadMesh::from(pipeline.getDiskTemplate())
                                        : mesh::QuadMesh::from(pipeline.getQuadMesh());
         const mesh::QuadMesh::Quality &fq = finalMesh.quality;
@@ -1387,6 +1392,28 @@ int main(int argc, char **argv) {
         verdict(fq.allCounterClockwise && fq.invertedQuads == 0,
                 "Every element is counter-clockwise with a positive Jacobian at every corner");
         verdict(fq.nonManifoldEdges == 0, "Every edge is shared by at most two elements");
+
+        if (tmopSweeps > 0) {
+            heading("TMOP smoothing (mesh::TMOP)");
+            mesh::TMOP::Options topt;
+            topt.metric = mesh::TMOP::ShapeSize007;
+            topt.maxSweeps = tmopSweeps;
+            mesh::TMOP smoother(finalMesh, topt);
+            smoother.run();
+            const mesh::TMOP::Report &tr = smoother.getReport();
+            std::cout << "  " << tr.sweeps << " sweep(s)";
+            if (tr.untangleSweeps > 0)
+                std::cout << " after " << tr.untangleSweeps << " untangling sweep(s)";
+            std::cout << ", " << tr.colors << " colour(s), " << tr.threads << " thread(s)"
+                      << (tr.openMP ? "" : " (no OpenMP)") << ", " << std::fixed
+                      << std::setprecision(3) << tr.seconds << " s\n";
+            std::cout << "  Scaled Jacobian: worst " << std::fixed << std::setprecision(4)
+                      << tr.minScaledJacobianBefore << " -> " << tr.minScaledJacobianAfter
+                      << ", mean " << tr.meanScaledJacobianBefore << " -> "
+                      << tr.meanScaledJacobianAfter << std::defaultfloat << "\n";
+            for (const std::string &m : tr.messages) warn(m);
+            verdict(tr.invertedAfter == 0, "No element of the smoothed mesh is inverted");
+        }
 
         if (!mfemOut.empty()) {
             mesh::QuadMesh::MFEMOptions mo;

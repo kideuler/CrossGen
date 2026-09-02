@@ -26,6 +26,7 @@
 #include "MERIDIAN/MERIDIAN.hxx"
 #include "SIPG/SIPG.hxx"
 #include "mesh/QuadMesh.hxx"
+#include "mesh/TMOP.hxx"
 #include "TestHelper.hxx"
 
 namespace {
@@ -292,6 +293,10 @@ void usage(const char *argv0) {
               << "  --smooth <n>       Winslow sweeps per block, 0 = off      (default 500)\n"
               << "  --smooth-below <j> smooth blocks worse than this Jacobian (default 0)\n"
               << "  --chords <n>       list at most n chords                (default 0)\n"
+              << "  --tmop <n>         smooth the final mesh with n TMOP sweeps, 0 = off\n"
+              << "  --tmop-power <p>   TMOP exponent: 1 optimises the average, 2 (default)\n"
+              << "                     and up chase the worst element\n"
+              << "  --pin-features     TMOP pins every feature node instead of sliding\n"
               << "  --mesh <file.obj>  write the quadrilateral mesh\n"
               << "  --mesh-vtu <f.vtu> write it as a VTK unstructured grid\n"
               << "  --mfem <f.mesh>   write it as an MFEM mesh, material id per element\n";
@@ -307,6 +312,9 @@ int main(int argc, char **argv) {
     MERIDIAN::Options opts;
     std::string cutOut, psiOut, layoutOut, sepOut, sepUVOut;
     std::string arcsOut, facesOut, fitOut, netOut, surfOut, meshOut, meshVTUOut, mfemOut;
+    int tmopSweeps = 0;
+    double tmopPower = 2.0;
+    bool tmopPinFeatures = false;
     int coneListLimit = 20;
     int curveListLimit = 10;
     int chordListLimit = 0;
@@ -399,6 +407,9 @@ int main(int argc, char **argv) {
         else if (a == "--smooth" && i + 1 < argc)  opts.quadSmoothingPasses = std::stoi(argv[++i]);
         else if (a == "--smooth-below" && i + 1 < argc) opts.quadSmoothingThreshold = std::stod(argv[++i]);
         else if (a == "--chords" && i + 1 < argc)  chordListLimit = std::stoi(argv[++i]);
+        else if (a == "--tmop" && i + 1 < argc)    tmopSweeps = std::stoi(argv[++i]);
+        else if (a == "--tmop-power" && i + 1 < argc) tmopPower = std::stod(argv[++i]);
+        else if (a == "--pin-features")            tmopPinFeatures = true;
         else if (a == "--mesh" && i + 1 < argc)    meshOut = argv[++i];
         else if (a == "--mesh-vtu" && i + 1 < argc) meshVTUOut = argv[++i];
         else if (a == "--mfem" && i + 1 < argc)    mfemOut = argv[++i];
@@ -1462,9 +1473,11 @@ int main(int argc, char **argv) {
     // so what it reports here is a second opinion on the same mesh rather
     // than a restatement of the pipeline's own bookkeeping.
     heading("Final mesh (mesh::QuadMesh)");
-    const mesh::QuadMesh finalMesh = pipeline.hasDiskTemplate()
-                                         ? mesh::QuadMesh::from(pipeline.getDiskTemplate())
-                                         : mesh::QuadMesh::from(qm);
+    mesh::QuadMesh::Options finalOpts;
+    finalOpts.fixAllFeatureNodes = tmopPinFeatures;
+    mesh::QuadMesh finalMesh = pipeline.hasDiskTemplate()
+                                   ? mesh::QuadMesh::from(pipeline.getDiskTemplate(), finalOpts)
+                                   : mesh::QuadMesh::from(qm, finalOpts);
     {
         const mesh::QuadMesh::Quality &fq = finalMesh.quality;
         std::cout << "  " << fq.vertices << " vertices, " << fq.quads
@@ -1483,6 +1496,54 @@ int main(int argc, char **argv) {
         verdict(fq.allCounterClockwise && fq.invertedQuads == 0,
                 "Every element is counter-clockwise with a positive Jacobian at every corner");
         verdict(fq.nonManifoldEdges == 0, "Every edge is shared by at most two elements");
+    }
+
+    // ---------------------------------------------------------------------
+    // Stage 12 -- TMOP. Node-local Newton on the TMOP energy over the mesh
+    // above, with the boundary and the material interfaces free to slide along
+    // themselves. Everything written below this point is the smoothed mesh, so
+    // --mesh, --mesh-vtu and --mfem all agree with what is reported here.
+    bool tmopOK = true;
+    if (tmopSweeps > 0) {
+        heading("Stage 12  TMOP smoothing (mesh::TMOP)");
+        mesh::TMOP::Options topt;
+        topt.metric = mesh::TMOP::ShapeSize007;
+        topt.maxSweeps = tmopSweeps;
+        topt.exponent = tmopPower;
+        mesh::TMOP smoother(finalMesh, topt);
+        tmopOK = smoother.run();
+        const mesh::TMOP::Report &tr2 = smoother.getReport();
+        std::cout << "  " << tr2.sweeps << " sweep(s)";
+        if (tr2.untangleSweeps > 0)
+            std::cout << " after " << tr2.untangleSweeps << " untangling sweep(s)";
+        std::cout << ", " << tr2.colors << " colour(s), " << tr2.threads << " thread(s)"
+                  << (tr2.openMP ? "" : " (no OpenMP)") << ", " << std::fixed
+                  << std::setprecision(3) << tr2.seconds << " s\n";
+        std::cout << "  Nodes: " << tr2.freeNodes << " free, " << tr2.slidingNodes
+                  << " sliding, " << tr2.fixedNodes << " fixed\n";
+        std::cout << "  Energy per unit target area: " << std::scientific
+                  << std::setprecision(3) << tr2.energyBefore << " -> " << tr2.energyAfter
+                  << std::defaultfloat << "\n";
+        std::cout << "  Scaled Jacobian: worst " << std::fixed << std::setprecision(4)
+                  << tr2.minScaledJacobianBefore << " -> " << tr2.minScaledJacobianAfter
+                  << ", mean " << tr2.meanScaledJacobianBefore << " -> "
+                  << tr2.meanScaledJacobianAfter << "\n";
+        std::cout << "  Worst aspect ratio: " << tr2.worstAspectBefore << " -> "
+                  << tr2.worstAspectAfter << std::defaultfloat << "\n";
+        for (const std::string &m : tr2.messages) std::cout << "  " << kWarn << " " << m << "\n";
+        verdict(tr2.invertedAfter == 0, "No element of the smoothed mesh is inverted");
+        verdict(tr2.minScaledJacobianAfter >= tr2.minScaledJacobianBefore - 1e-12,
+                "The worst element is no worse than it was");
+        // Sliding moves nodes along the chord through their two feature
+        // neighbours, which leaves the triangle those neighbours span -- and so
+        // the polygon's area -- unchanged. A difference here means the domain
+        // itself moved, which no amount of smoothing is worth.
+        verdict(std::fabs(tr2.areaAfter - tr2.areaBefore) <= 1e-9 * std::fabs(tr2.areaBefore),
+                "The domain has exactly the area it started with");
+        if (!tr2.converged)
+            std::cout << "  " << kWarn << " stopped on the sweep cap, still moving "
+                      << std::scientific << std::setprecision(2) << tr2.lastSweepMove
+                      << " mean edge(s) per sweep" << std::defaultfloat << "\n";
     }
 
     if (!mfemOut.empty()) {
@@ -1506,24 +1567,31 @@ int main(int argc, char **argv) {
         }
     }
 
+    // Without --tmop these go out through the pipeline's own writers, which
+    // carry a little more than the adopted mesh does; with it, the smoothed
+    // positions are only in finalMesh, so that is what has to be written.
     if (!meshOut.empty()) {
-        const bool wrote = pipeline.hasDiskTemplate()
-                               ? pipeline.getDiskTemplate().writeOBJ(meshOut)
-                               : qm.writeOBJ(meshOut);
+        const bool wrote = tmopSweeps > 0
+                               ? finalMesh.writeOBJ(meshOut)
+                               : (pipeline.hasDiskTemplate()
+                                      ? pipeline.getDiskTemplate().writeOBJ(meshOut)
+                                      : qm.writeOBJ(meshOut));
         if (wrote) std::cout << "  Wrote the quad mesh to " << meshOut << "\n";
         else std::cout << "  " << kWarn << " Failed to write " << meshOut << "\n";
     }
     if (!meshVTUOut.empty()) {
-        const bool wrote = pipeline.hasDiskTemplate()
-                               ? pipeline.getDiskTemplate().writeVTU(meshVTUOut)
-                               : qm.writeVTU(meshVTUOut);
+        const bool wrote = tmopSweeps > 0
+                               ? finalMesh.writeVTU(meshVTUOut)
+                               : (pipeline.hasDiskTemplate()
+                                      ? pipeline.getDiskTemplate().writeVTU(meshVTUOut)
+                                      : qm.writeVTU(meshVTUOut));
         if (wrote) std::cout << "  Wrote the quad mesh to " << meshVTUOut << "\n";
         else std::cout << "  " << kWarn << " Failed to write " << meshVTUOut << "\n";
     }
 
     // ---------------------------------------------------------------------
     heading("Result");
-    if (ok && tr.valid && arep.valid && sf.valid && qr.valid && templatesOK) {
+    if (ok && tr.valid && arep.valid && sf.valid && qr.valid && templatesOK && tmopOK) {
         std::cout << "  " << kPass << " " << sf.patches
                   << " watertight bicubic patch(es), C0 across their shared curves and C2 "
                   << "inside, from a layout satisfying Q1-Q5, meshed into " << qr.quads
@@ -1533,8 +1601,17 @@ int main(int argc, char **argv) {
             std::cout << ", plus " << dr.filled << " templated inclusion(s) for a merged "
                       << "mesh of " << dr.mergedQuads << " element(s)";
         }
+        if (tmopSweeps > 0)
+            std::cout << ", smoothed to a worst scaled Jacobian of " << std::fixed
+                      << std::setprecision(4) << finalMesh.quality.minScaledJacobian
+                      << std::defaultfloat;
         std::cout << ".\n";
         return 0;
+    }
+    if (ok && tr.valid && arep.valid && sf.valid && qr.valid && templatesOK && !tmopOK) {
+        std::cout << "  " << kWarn << " The layout and the mesh are clean, but TMOP left "
+                  << "the mesh no better than it found it; see Stage 12 above.\n";
+        return 5;
     }
     if (ok && tr.valid && arep.valid && sf.valid && qr.valid && !templatesOK) {
         const DiskTemplate::Report &dr = pipeline.getDiskTemplate().getReport();

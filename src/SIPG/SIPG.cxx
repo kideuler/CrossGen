@@ -223,7 +223,7 @@ void SIPG::initialize() {
         minY = std::min(minY, p[1]); maxY = std::max(maxY, p[1]);
     }
     double D = std::sqrt((maxX - minX) * (maxX - minX) + (maxY - minY) * (maxY - minY));
-    tau = D * D / 10.0;
+    tau = tauScale * D * D / 10.0;
 
     // -----------------------------------------------------------------------
     // Step 6 – Form A = M + tau*K, then eliminate boundary triangle DOFs
@@ -239,9 +239,15 @@ void SIPG::initialize() {
     const std::complex<double> czero(0.0, 0.0);
     const std::complex<double> cone (1.0, 0.0);
 
-    // Build a fast lookup for pinned triangles (on dS or on an aligned edge)
+    // Build a fast lookup for pinned triangles (on dS or on an aligned edge).
+    //
+    // Empty when the alignment is imposed weakly: A and b are then left as the
+    // Nitsche form assembled them and no row is eliminated, which is exactly
+    // the ablation setHardBoundaryConditions describes.
     std::unordered_set<int> bndTriSet;
-    for (const auto &[ti, _] : boundaryTriangleBC) bndTriSet.insert(ti);
+    if (hardBoundary) {
+        for (const auto &[ti, _] : boundaryTriangleBC) bndTriSet.insert(ti);
+    }
 
     // Zero boundary rows in M (column-major iteration)
     for (int col = 0; col < M.outerSize(); ++col) {

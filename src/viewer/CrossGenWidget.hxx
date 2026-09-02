@@ -13,6 +13,8 @@
 #include "viewer/Geometry.hxx"
 
 #include "mesh/Mesh.hxx"
+#include "mesh/QuadMesh.hxx"
+#include "mesh/TMOP.hxx"
 #include "MERIDIAN/Arrangement.hxx"
 #include "MERIDIAN/ConeCut.hxx"
 #include "MERIDIAN/MERIDIAN.hxx"
@@ -230,6 +232,27 @@ enum class UMBERPhase {
 //              arrangement of curves that did not close is not a layout, and
 //              drawing one as though it were is the one thing this picture
 //              must not do.
+//
+//   Smoothed   Stage 12, TMOP (mesh::TMOP). Not a stage of the paper: the mesh
+//              Stage 10 hands over is transfinite interpolation and nothing
+//              else, and its element quality is whatever the interval
+//              assignment and the patch shapes happened to give. This phase
+//              runs the node-local TMOP solve over it.
+//
+//              It takes the whole window rather than splitting it, and is
+//              driven by a dialog like the Stage 10 phase above it and for the
+//              same reason -- which metric, which exponent and how many sweeps
+//              are judgements about the model that only trying a number
+//              settles, so 'c' here re-opens the dialog and smooths the Stage
+//              10 mesh again from scratch rather than smoothing the smoothed
+//              one further.
+//
+//              Drawn exactly as the phase before it is, materials and folds and
+//              block walls included, because the whole question is what moved:
+//              two pictures that differ in how they were drawn cannot answer
+//              it. The block walls come from Stage 10's own blocks and still
+//              index the smoothed vertex array, so a wall is drawn where the
+//              smoothing left it.
 enum class PipelinePhase {
     MeshOnly     = 1,
     CrossField   = 2,
@@ -242,6 +265,7 @@ enum class PipelinePhase {
     Separatrices = 9,
     Patches      = 10,
     Mesh         = 11,
+    Smoothed     = 12,
 };
 
 // OASIS is a one-shot solve driven by a parameter dialog rather than a
@@ -448,6 +472,26 @@ private:
     // the one that answers whether the interval assignment was right. The
     // smoothed mesh is a different question and TestMERIDIAN asks it.
     void runMERIDIANMesh();
+
+    // Stage 12: the TMOP settings, in a dialog for the same reason Stage 10's
+    // are. What the numbers on it come to is a question about this mesh -- how
+    // many elements there are to sweep over, how many of its nodes are free to
+    // move at all -- so the dialog reports those next to them, the way the
+    // meshing dialog reports what a target edge length comes to on this model.
+    //
+    // Cancelling leaves whatever is already on screen, so backing out is never
+    // destructive.
+    bool promptTMOP();
+
+    // Build a mesh::QuadMesh from Stage 10's mesh (or Stage 11's merged one)
+    // and run mesh::TMOP over it at the dialog's settings, leaving the result
+    // in smoothMesh_.
+    //
+    // Always from the Stage 10 mesh and never from the last smoothed one, so
+    // that trying a second metric is a fresh attempt and not a further one --
+    // the same discipline runChordCollapse follows. This is what makes the
+    // before/after numbers in the console mean what they say.
+    void runTMOP();
 
     // Record why a stage produced nothing: to the console in full, to the
     // terminal, and to `pipelineBlocked_` as the short form the overlay keeps
@@ -656,6 +700,10 @@ private:
     std::vector<DiskTemplate::Inclusion> inclusions_;
     std::shared_ptr<Mesh>                inputMesh_;
     std::optional<DiskTemplate>          diskFill_;
+    // Stage 12. A copy of whichever of the two above is the finished mesh, with
+    // its nodes moved, so the phase before it still has its own picture to
+    // draw; cleared whenever either of them is rebuilt.
+    std::optional<mesh::QuadMesh>        smoothMesh_;
 
     // Guiding field for the OASIS orientation term. Held by shared_ptr because
     // OASIS keeps a reference to it for as long as it lives; separate from
@@ -733,6 +781,7 @@ private:
     bool patchesAnnounced_      = false;
     bool patchesAttempted_      = false;
     bool meshAttempted_         = false;
+    bool tmopAttempted_         = false;
     // MERIDIAN::Options::topoNearMissRetry, in the viewer. Stages 5 to 7 are
     // already re-runnable from the connectivity dialog, so the retry is that
     // path with the number filled in: once per run, and only when Stage 8 came
@@ -797,6 +846,32 @@ private:
         int    smoothing   = DiskTemplate::Options().smoothingPasses;
     };
     DiskTemplateSettings diskSettings_;
+
+    // Stage 12's settings, surviving a reset like the two above. Every default
+    // is mesh::TMOP::Options' own -- they were measured over the corpus and
+    // there is nothing about running in a window that changes what they should
+    // be -- except the sweep cap, which is raised because this phase is a
+    // picture rather than a test and 200 sweeps stops most models short of
+    // where they were going, and the metric, which defaults to 007 (shape and
+    // size) here since the viewer is where a per-model size field is actually
+    // visible.
+    struct TMOPSettings {
+        int    metric      = mesh::TMOP::ShapeSize007;
+        double gamma       = mesh::TMOP::Options().gamma;
+        double exponent    = mesh::TMOP::Options().exponent;
+        int    target      = mesh::TMOP::Options().target;
+        double targetSize  = mesh::TMOP::Options().targetSize;  // 0 = the mean edge
+        bool   corners     = false;   // quadrature: 2x2 Gauss, or the corners
+        int    sweeps      = 1000;
+        bool   untangle    = mesh::TMOP::Options().untangle;
+        int    threads     = mesh::TMOP::Options().threads;     // 0 = the runtime's own
+        // QuadMesh::Options, not TMOP::Options: they decide which nodes are
+        // allowed to move before the smoother is handed the mesh at all, which
+        // is why changing either of them rebuilds it.
+        bool   pinFeatures = mesh::QuadMesh::Options().fixAllFeatureNodes;
+        double cornerAngle = mesh::QuadMesh::Options().cornerAngle;
+    };
+    TMOPSettings tmopSettings_;
 
     // Chord collapse settings, surviving a reset the way oasisLambda_ does so
     // that the dialog opens on whatever was tried last.

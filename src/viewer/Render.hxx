@@ -20,6 +20,7 @@
 #include "MERIDIAN/QuadMesh.hxx"
 #include "MERIDIAN/SplineFit.hxx"
 #include "MERIDIAN/SubdomainLabels.hxx"
+#include "mesh/QuadMesh.hxx"
 #include "Parameterization/CutMesh.hxx"
 #ifdef CROSSGEN_WITH_COMISO
 #include "Parameterization/MIQ.hxx"
@@ -537,6 +538,22 @@ void drawQuadMesh(const QuadMesh &qm, float lineWidth, float blockLineWidth,
 // rims are where they meet.
 void drawQuadMesh(const DiskTemplate &dt, const QuadMesh *qm, float lineWidth,
                   float blockLineWidth, bool materialFill = false);
+
+// Stage 12: the same mesh again after TMOP has moved its nodes.
+//
+// Drawn by the same routine as the two above, and deliberately so -- the whole
+// question at this phase is what moved, and a picture drawn by different code
+// would put its own differences into that answer. `sm` supplies the positions,
+// the elements and the materials; `qm` and `dt` supply nothing but the block
+// vertex lists, which still index `sm` because mesh::QuadMesh::from copies the
+// vertex array without renumbering it. So the walls are drawn where the
+// smoothed nodes are, and a block whose interior rows have straightened is
+// visibly the same block.
+//
+// Either pointer may be null: `qm` is null when there is no Stage 10 mesh to
+// take walls from, `dt` when nothing was excised.
+void drawQuadMesh(const mesh::QuadMesh &sm, const QuadMesh *qm, const DiskTemplate *dt,
+                  float lineWidth, float blockLineWidth, bool materialFill = false);
 
 // The circular inclusions Stage 0c took out of the layout problem, as the
 // circles that were fitted to them: what the holes in the model *are*, drawn

@@ -30,6 +30,49 @@ else()
     message(STATUS "CROSSGEN_ENABLE_COMISO is OFF: skipping CoMiSo build (MIQ disabled)")
 endif()
 
+# OpenMP
+#
+# Used by the TMOP smoother (src/mesh/TMOP.cxx) and by nothing else so far. The
+# smoother sweeps in colour order, so its answer does not depend on the thread
+# count and a build without OpenMP is a correct build, only a slower one --
+# every pragma is compiled out through _OPENMP.
+#
+# AppleClang is the awkward case: it understands the pragmas but ships no
+# runtime, so plain find_package(OpenMP) fails on a Mac that has Homebrew's
+# libomp installed and working. Fall back to wiring libomp up by hand there.
+option(CROSSGEN_ENABLE_OPENMP "Use OpenMP to parallelise the TMOP smoother" ON)
+
+set(CROSSGEN_OPENMP_TARGET "")
+if (CROSSGEN_ENABLE_OPENMP)
+    find_package(OpenMP QUIET COMPONENTS CXX)
+    if (OpenMP_CXX_FOUND)
+        set(CROSSGEN_OPENMP_TARGET OpenMP::OpenMP_CXX)
+        message(STATUS "OpenMP found: ${OpenMP_CXX_FLAGS}")
+    elseif (APPLE)
+        execute_process(COMMAND brew --prefix libomp
+                        OUTPUT_VARIABLE LIBOMP_PREFIX
+                        OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+        if (NOT LIBOMP_PREFIX)
+            set(LIBOMP_PREFIX "/opt/homebrew/opt/libomp")
+        endif()
+        if (EXISTS "${LIBOMP_PREFIX}/include/omp.h")
+            add_library(CrossGenOpenMP INTERFACE)
+            target_compile_options(CrossGenOpenMP INTERFACE -Xpreprocessor -fopenmp)
+            target_include_directories(CrossGenOpenMP INTERFACE "${LIBOMP_PREFIX}/include")
+            if (EXISTS "${LIBOMP_PREFIX}/lib/libomp.dylib")
+                target_link_libraries(CrossGenOpenMP INTERFACE "${LIBOMP_PREFIX}/lib/libomp.dylib")
+            else()
+                target_link_libraries(CrossGenOpenMP INTERFACE "${LIBOMP_PREFIX}/lib/libomp.a")
+            endif()
+            set(CROSSGEN_OPENMP_TARGET CrossGenOpenMP)
+            message(STATUS "OpenMP via Homebrew libomp at ${LIBOMP_PREFIX}")
+        endif()
+    endif()
+endif()
+if (NOT CROSSGEN_OPENMP_TARGET)
+    message(STATUS "No OpenMP: TMOP will run single-threaded")
+endif()
+
 option(BUILD_MESH2GMSH "Build the Mesh2Dgmsh utility" ON)
 
 if (BUILD_MESH2GMSH)
@@ -52,6 +95,8 @@ add_library(PolyVector SHARED
     src/mesh/Mesh.hxx
     src/mesh/QuadMesh.cxx
     src/mesh/QuadMesh.hxx
+    src/mesh/TMOP.cxx
+    src/mesh/TMOP.hxx
     src/polyvector/PolyVectors.hxx
     src/polyvector/PolyVectors.cxx
     src/SIPG/SIPG.hxx
@@ -144,6 +189,9 @@ target_include_directories(PolyVector PUBLIC src)
 target_include_directories(PolyVector PUBLIC src/triangle)
 target_compile_definitions(PolyVector PRIVATE TRILIBRARY ANSI_DECLARATORS)
 target_link_libraries(PolyVector PUBLIC Eigen3::Eigen)
+if (CROSSGEN_OPENMP_TARGET)
+    target_link_libraries(PolyVector PUBLIC ${CROSSGEN_OPENMP_TARGET})
+endif()
 if (CROSSGEN_ENABLE_COMISO)
     target_link_libraries(PolyVector PUBLIC CoMISo::CoMISo)
     target_compile_definitions(PolyVector PUBLIC CROSSGEN_WITH_COMISO)
@@ -186,6 +234,13 @@ target_link_libraries(TestOasis PRIVATE PolyVector)
 # Test p=0 DG/SIPG MBO cross-field solver
 add_executable(TestSIPG src/utils/TestSIPG.cxx)
 target_link_libraries(TestSIPG PRIVATE PolyVector)
+
+# Smooth a quadrilateral mesh with the in-house TMOP optimizer of
+# src/mesh/TMOP.hxx, and self-test it together with the node-mobility layer of
+# mesh::QuadMesh it stands on. Takes a *quad* .obj -- what TestMERIDIAN --mesh
+# writes; --selftest builds its own meshes and needs no files.
+add_executable(TestTMOP src/utils/TestTMOP.cxx)
+target_link_libraries(TestTMOP PRIVATE PolyVector)
 
 # Test the UMBER frame field optimization (Wang et al. 2022, Secs. 4.1-4.2)
 add_executable(TestUMBER src/utils/TestUMBER.cxx)
@@ -420,6 +475,30 @@ add_test(NAME TORSION_ReferenceMetrics
          COMMAND TestTORSION --ref-test
                  ${CMAKE_CURRENT_SOURCE_DIR}/data/meshes/singlemat/geom003.obj)
 set_tests_properties(TORSION_ReferenceMetrics PROPERTIES TIMEOUT 2400)
+
+# The TMOP smoother and the node-mobility layer under it, on meshes built in
+# memory: a distorted grid whose boundary is straight (so a shape metric has to
+# recover it exactly), an annulus whose two rims are closed feature loops with
+# no corner on them (the case the closed-loop anchor exists for), a
+# two-material grid (an interface is a feature curve that is not on dS), and a
+# grid with one node dragged across its own one-ring (the untangler). It also
+# differentiates the energy by hand against the analytic gradient and Hessian,
+# and checks that one thread and many threads give bit-identical meshes -- the
+# property the colouring is there to buy.
+add_test(NAME TMOP_SelfTest COMMAND TestTMOP --selftest)
+
+# TMOP end to end, on a mesh the pipeline actually produced rather than one
+# built for it. geom012 is the model to run it on: a dozen voids, so 337 of its
+# 1014 nodes are on a feature and slide rather than move freely, and it is the
+# one case in the corpus where minimising the *average* metric (exponent 1)
+# drives the worst scaled Jacobian down from 0.625 to 0.512 -- below where it
+# started. At the default exponent of 2 it goes up, to 0.731, and the run
+# asserts that the worst element is no worse than it was.
+add_test(NAME MERIDIAN_TMOP_singlemat_geom012
+         COMMAND TestMERIDIAN ${CMAKE_CURRENT_SOURCE_DIR}/data/meshes/singlemat/geom012.obj
+                 --tmop 500)
+set_tests_properties(MERIDIAN_TMOP_singlemat_geom012 PROPERTIES TIMEOUT 2400)
+
 # Optional Qt6 OpenGL viewer (replaces the old GLFW-based viewer)
 #
 # Builds without CoMiSo too: the UV-mesh split-screen view (phase 5, MIQ) is
@@ -455,3 +534,6 @@ if (BUILD_OPENGL_VIEWER)
 endif()
 add_executable(TopoDiag src/utils/TopoDiag.cxx)
 target_link_libraries(TopoDiag PRIVATE PolyVector)
+
+# The Tier-1 experiments of the paper (Sec. 6): E1 to E5.
+add_subdirectory(paper_tests)

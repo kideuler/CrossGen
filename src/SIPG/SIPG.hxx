@@ -87,6 +87,44 @@ public:
     // order. Empty until initialize() has run.
     const std::vector<int>& getDiskCenterTriangles() const { return diskCenterTriangles; }
 
+    // Multiply the tau = D^2/10 heuristic of Step 5 by this factor.
+    //
+    // 1 is the heuristic and is what every caller in the pipeline uses. It is
+    // settable because the heuristic is a heuristic: tau is the diffusion time
+    // one MBO step takes, and how far it may be moved before the singularity
+    // count starts to depend on it is a measurement, not a derivation. That
+    // measurement is paper_tests/E1_Verification, and this is the knob it
+    // turns. Call before initialize().
+    void setTauScale(double s) { tauScale = s; }
+    double getTau() const { return tau; }
+    double getGamma() const { return gamma; }
+
+    // Impose the boundary and interface alignment weakly instead of pinning.
+    //
+    // The assembly of initialize() builds the Nitsche/penalty form for the
+    // Dirichlet data whether or not it is pinned: K carries kappa_e on the
+    // diagonal of every triangle with an aligned edge and b carries
+    // kappa_e * g_e, so A = M + tau*K with that RHS *is* the weak form. Step 6
+    // then eliminates those rows, which turns the weak statement into a hard
+    // one -- the triangle takes its prescribed cross exactly and the alignment
+    // stops competing with smoothness.
+    //
+    // Hard is the default and is what the pipeline runs. Off leaves the
+    // elimination out and solves the weak form as assembled, which is the
+    // ablation the paper reports: the two differ only in how much the field is
+    // allowed to trade alignment against the SIPG penalty at the boundary, and
+    // the honest way to say which one the results use is to be able to run
+    // both. Call before initialize().
+    void setHardBoundaryConditions(bool on) { hardBoundary = on; }
+
+    // The Dirichlet data as initialize() computed it: triangle -> the unit
+    // spin-4 value its incident boundary/interface edges ask for. Non-empty
+    // whether or not the pin is hard, because it is the *data* and not the way
+    // of imposing it. Read by the alignment-error metrics.
+    const std::unordered_map<int, std::complex<double>>& getBoundaryData() const {
+        return boundaryTriangleBC;
+    }
+
     void step();
 
     void computeSingularities();
@@ -108,8 +146,10 @@ private:
     bool useBiCGSTAB = false; // flag to indicate which solver to use
 
     double tau;          // time step size
+    double tauScale = 1.0; // multiplier on the D^2/10 heuristic, see setTauScale
     double gamma;        // SIPG penalty parameter
     int maxIterations;   // maximum number of iterations
+    bool hardBoundary = true; // see setHardBoundaryConditions
 
     // Interior edges promoted to aligned (Dirichlet) edges, per edge of the
     // mesh. Empty when there are none, which is the single-material case.

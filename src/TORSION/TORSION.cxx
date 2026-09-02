@@ -395,6 +395,27 @@ void TORSION::runField() {
     }
     field->initialize();
 
+    // Options::externalField: the caller has a field already and wants Stages
+    // 0b to 11 run on it unchanged. initialize() still runs, because the
+    // Dirichlet data it computes is read downstream as data even when the
+    // solve it factorised is never used.
+    if (options.externalField.size() > 0) {
+        if (options.externalField.size() == static_cast<Eigen::Index>(mesh->triangles.size())) {
+            field->u_k_prev = options.externalField;
+            field->u_k = options.externalField;
+            field->error = 0.0;
+            status.fieldConverged = true;
+            status.messages.push_back(
+                "Stage 0: using the caller's cross field; the MBO solve was skipped.");
+            return;
+        }
+        std::ostringstream oss;
+        oss << "the supplied cross field has " << options.externalField.size()
+            << " value(s) and this mesh has " << mesh->triangles.size()
+            << " triangle(s), so it was ignored and the MBO solve was run instead.";
+        status.messages.push_back("Stage 0: " + oss.str());
+    }
+
     const double nTris = static_cast<double>(mesh->triangles.size());
     for (int i = 0; i < options.sipgMaxSteps; ++i) {
         field->step();

@@ -7,6 +7,7 @@
 #include "viewer/Render.hxx"
 
 #include <QCheckBox>
+#include <QComboBox>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDoubleSpinBox>
@@ -108,9 +109,10 @@ PipelinePhase nextPipelinePhase(PipelinePhase p) {
         case PipelinePhase::Layout:     return PipelinePhase::Separatrices;
         case PipelinePhase::Separatrices: return PipelinePhase::Patches;
         case PipelinePhase::Patches:    return PipelinePhase::Mesh;
-        case PipelinePhase::Mesh:       return PipelinePhase::Mesh;
+        case PipelinePhase::Mesh:       return PipelinePhase::Smoothed;
+        case PipelinePhase::Smoothed:   return PipelinePhase::Smoothed;
     }
-    return PipelinePhase::Mesh;
+    return PipelinePhase::Smoothed;
 }
 
 MedialAxisPhase nextMedialAxisPhase(MedialAxisPhase p) {
@@ -191,6 +193,7 @@ const char *pipelinePhaseName(PipelinePhase p, Mode m) {
         case PipelinePhase::Separatrices: return "9) separatrices (Sec. 4, Q5)";
         case PipelinePhase::Patches:    return "10) arrangement and splines (Secs. 4, 5)";
         case PipelinePhase::Mesh:       return "11) quadrilateral mesh (Sec. 5)";
+        case PipelinePhase::Smoothed:   return "12) TMOP smoothing (mesh::TMOP)";
     }
     return "?";
 }
@@ -384,6 +387,29 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
                 // that stood on them; step back to the phase that rebuilds
                 // them rather than drawing over a stale one.
                 pipePhase_ = PipelinePhase::Patches;
+            }
+        }
+        break;
+
+    case Qt::Key_E:
+        // The Stage 10 dialog again. It used to sit on 'c' at the Mesh phase,
+        // which was the last one; Stage 12 is now, and 'c' there re-opens the
+        // TMOP dialog. A target edge length is still a judgement about the
+        // model that only trying a number settles, so it keeps a key of its
+        // own -- the same move the connectivity dialog made onto 'n' when this
+        // phase displaced it.
+        //
+        // Offered from Stage 12 as well as from Stage 10, because that is where
+        // the reason to re-mesh usually shows up: a target the smoother cannot
+        // rescue is a target, and not a smoother, that was wrong.
+        if (inPipeline() && pipePhase_ >= PipelinePhase::Mesh && splines_.has_value()) {
+            meshAttempted_ = true;
+            if (promptMERIDIANMesh()) {
+                runMERIDIANMesh();
+                // The mesh Stage 12 smoothed is gone with it. Step back to the
+                // phase that shows the new one rather than leaving an empty
+                // Stage 12 on screen; 'c' from there smooths it.
+                pipePhase_ = PipelinePhase::Mesh;
             }
         }
         break;
@@ -635,6 +661,7 @@ void CrossGenWidget::doReset() {
     // the cut, the flow and the cones, and both the flow and the cut on the
     // cones.
     diskFill_.reset();
+    smoothMesh_.reset();
     pipelineBlocked_.clear();
     // Stage 0c replaced the mesh every later stage was written on, so the reset
     // has to put the loaded one back before anything is built on it again.
@@ -712,6 +739,7 @@ void CrossGenWidget::doReset() {
     nearMissRetried_       = false;
     unmeshableBefore_      = -1.0;
     meshAttempted_         = false;
+    tmopAttempted_         = false;
     disksAttempted_        = false;
 
     view_.cx    = 0.5 * (bounds_.minx + bounds_.maxx);
@@ -3474,6 +3502,10 @@ void CrossGenWidget::runMERIDIANMesh() {
     meshAttempted_ = true;
     quadMesh_.reset();
     diskFill_.reset();
+    // Stage 12 stood on the mesh that is about to be replaced, so it goes with
+    // it rather than being drawn over the next one.
+    smoothMesh_.reset();
+    tmopAttempted_ = false;
     pipelineBlocked_.clear();
 
     QuadMesh::Options qopts;
@@ -3603,6 +3635,343 @@ void CrossGenWidget::runMERIDIANMesh() {
     runDiskTemplates(rims);
 }
 
+// ── Stage 12: TMOP ───────────────────────────────────────────────────────────
+//
+// The dialog. Three of its rows are the decision and the rest are safety
+// catches, so they are ordered that way: the metric, the exponent and the sweep
+// cap first, then which nodes are allowed to move, then the target and the
+// quadrature, then the two switches -- untangling and the thread count -- that
+// only ever answer "is this a defect of the smoother or of the mesh?".
+//
+// The line under the metric box is the reason this is a dialog and not a
+// constant. Every barrier metric is infinite on an inverted element, and Stage
+// 10 delivers folds on exactly the models where they are hardest to look at, so
+// what a given metric can even be started on is a fact about *this* mesh. The
+// counts are read off the mesh that is about to be smoothed and not off the
+// last one.
+bool CrossGenWidget::promptTMOP() {
+    if (!quadMesh_.has_value()) return false;
+
+    QDialog dlg(this);
+    dlg.setWindowTitle("Stage 12 — TMOP smoothing");
+
+    auto *metricBox = new QComboBox(&dlg);
+    // Ordered as the header lists them, and paired with the enum value rather
+    // than with the row index so that reordering this list cannot silently
+    // change what the viewer runs.
+    const std::vector<std::pair<int, const char *>> metrics = {
+        { mesh::TMOP::Shape002,       "002  shape, barrier  (|T|^2 / 2tau - 1)" },
+        { mesh::TMOP::Shape004,       "004  shape, no barrier  (|T|^2 - 2 tau)" },
+        { mesh::TMOP::ShapeSize007,   "007  shape and size, barrier" },
+        { mesh::TMOP::Size055,        "055  size only, no barrier" },
+        { mesh::TMOP::Size056,        "056  size only, barrier" },
+        { mesh::TMOP::ShapeSizeCombo, "100  (1-g) 002 + g 056" },
+        { mesh::TMOP::Untangle022,    "022  untangler, on its own" },
+    };
+    for (const auto &m : metrics)
+        metricBox->addItem(QString::fromUtf8(m.second), m.first);
+    {
+        const int at = metricBox->findData(tmopSettings_.metric);
+        metricBox->setCurrentIndex(at >= 0 ? at : 0);
+    }
+    metricBox->setToolTip(
+        "What mu measures. 002 is pure shape: it asks every element to be square\n"
+        "and says nothing about how big it is, which is what a mesh coming out of\n"
+        "transfinite interpolation at an already-chosen element count wants.\n"
+        "A barrier metric is +inf on a folded element, so a mesh with one has to\n"
+        "be untangled before it can be started on — see the switch below.");
+
+    auto *gammaBox = new QDoubleSpinBox(&dlg);
+    gammaBox->setRange(0.0, 1.0);
+    gammaBox->setDecimals(2);
+    gammaBox->setSingleStep(0.05);
+    gammaBox->setValue(tmopSettings_.gamma);
+    gammaBox->setToolTip("Weight on the size term of metric 100. Ignored by every other metric.");
+
+    auto *powerBox = new QDoubleSpinBox(&dlg);
+    powerBox->setRange(1.0, 8.0);
+    powerBox->setDecimals(1);
+    powerBox->setSingleStep(1.0);
+    powerBox->setValue(tmopSettings_.exponent);
+    powerBox->setToolTip(
+        "Minimise the integral of mu^p rather than of mu.\n"
+        "1 optimises the average, and an average can be lowered by making most\n"
+        "elements better and the worst one worse — which is the wrong trade for a\n"
+        "mesh, whose usable timestep is set by its worst element. 2 is the default\n"
+        "and measurably the better of the two on every model in data/meshes.\n"
+        "Values between 1 and 2 are raised to 2: there mu^p has a singular second\n"
+        "derivative exactly where a good element sits.");
+
+    auto *sweepBox = new QSpinBox(&dlg);
+    sweepBox->setRange(1, 100000);
+    sweepBox->setValue(tmopSettings_.sweeps);
+    sweepBox->setToolTip(
+        "Most Gauss-Seidel sweeps over the movable nodes. The solve stops before\n"
+        "this when a sweep stops moving anything, and says which of the two it was.");
+
+    auto *pinBox = new QCheckBox("pin every feature node instead of sliding it", &dlg);
+    pinBox->setChecked(tmopSettings_.pinFeatures);
+    pinBox->setToolTip(
+        "On, only interior nodes move and the boundary and the material interfaces\n"
+        "stay exactly where Stage 10 put them. Off, a node on a smooth stretch of\n"
+        "either slides along the chord through its two feature neighbours, which\n"
+        "redistributes the boundary without moving the domain: that chord is\n"
+        "parallel to the base of the only triangle the enclosed area depends on\n"
+        "that node through, so the area is conserved to rounding either way.\n"
+        "Pinning is the isolation knob — it is what tells an interior defect from\n"
+        "a boundary one.");
+
+    auto *cornerBox = new QDoubleSpinBox(&dlg);
+    cornerBox->setRange(0.0, 90.0);
+    cornerBox->setDecimals(1);
+    cornerBox->setSingleStep(5.0);
+    cornerBox->setValue(tmopSettings_.cornerAngle);
+    cornerBox->setToolTip(
+        "A feature node whose two incident feature edges meet at less than\n"
+        "(180 - this) degrees is a corner and is fixed; anything straighter slides.\n"
+        "Generous on purpose: a node on a discretised circle turns by 360/nSeg,\n"
+        "and none of those may be mistaken for corners.");
+
+    auto *targetBox = new QComboBox(&dlg);
+    targetBox->addItem("uniform square, side h", mesh::TMOP::TargetUniformSquare);
+    targetBox->addItem("each element's own current shape", mesh::TMOP::TargetCurrentShape);
+    {
+        const int at = targetBox->findData(tmopSettings_.target);
+        targetBox->setCurrentIndex(at >= 0 ? at : 0);
+    }
+    targetBox->setToolTip(
+        "Where W comes from. The uniform square is the ordinary choice for shape\n"
+        "optimisation. The current shape starts every element at T = I, so the\n"
+        "solve removes only the variation of shape *within* an element and cannot\n"
+        "introduce a size mismatch of its own — which is what to use when the\n"
+        "question is whether the node mobility is behaving.");
+
+    auto *sizeBox = new QDoubleSpinBox(&dlg);
+    sizeBox->setRange(0.0, 10.0);
+    sizeBox->setDecimals(4);
+    sizeBox->setSingleStep(0.01);
+    sizeBox->setValue(tmopSettings_.targetSize);
+    sizeBox->setSpecialValueText("mean edge");
+    sizeBox->setToolTip("h for the uniform-square target. Blank takes the mesh's own mean edge length.");
+
+    auto *cornerQuadBox = new QCheckBox("sample mu at the corners instead of 2x2 Gauss", &dlg);
+    cornerQuadBox->setChecked(tmopSettings_.corners);
+    cornerQuadBox->setToolTip(
+        "The corner Jacobians are the ones the scaled-Jacobian report reads, so\n"
+        "this drives exactly the number the result is judged by. 2x2 Gauss is the\n"
+        "default because it sees the interior of the element and not only its rim.");
+
+    auto *untangleBox = new QCheckBox("untangle first where an element is folded", &dlg);
+    untangleBox->setChecked(tmopSettings_.untangle);
+    untangleBox->setToolTip(
+        "Run metric 022 first, whose barrier sits below the worst determinant on\n"
+        "the mesh rather than at zero, until nothing is inverted. Without it a\n"
+        "barrier metric cannot be started on a mesh with a fold at all — which is\n"
+        "what turning this off is for: it shows which folds Stage 10 left.");
+
+    auto *threadBox = new QSpinBox(&dlg);
+    threadBox->setRange(0, 256);
+    threadBox->setValue(tmopSettings_.threads);
+    threadBox->setSpecialValueText("auto");
+    threadBox->setToolTip(
+        "OpenMP threads. The mesh that comes out is bit-identical whatever this\n"
+        "is — the sweep is coloured, so two nodes updated together never share an\n"
+        "element — so this changes how long the phase takes and nothing else.");
+
+    // What the settings come to on this mesh. Recomputed as the two mobility
+    // boxes move, because those are the ones that change the answer: the metric
+    // and the exponent decide what is minimised, but the node types decide how
+    // much of the mesh is even allowed to move.
+    auto *derived = new QLabel(&dlg);
+    derived->setTextFormat(Qt::PlainText);
+    auto updateDerived = [&, derived, pinBox, cornerBox]() {
+        mesh::QuadMesh::Options o;
+        o.cornerAngle = cornerBox->value();
+        o.fixAllFeatureNodes = pinBox->isChecked();
+        // This runs inside a Qt signal, where an escaping exception is a
+        // terminate rather than a message. A mesh the class refuses to build is
+        // a real answer to "what would the smoother see here", so it is shown
+        // in the label the counts would have gone in.
+        mesh::QuadMesh m;
+        try {
+            m = diskFill_.has_value() ? mesh::QuadMesh::from(*diskFill_, o)
+                                      : mesh::QuadMesh::from(*quadMesh_, o);
+        } catch (const std::exception &e) {
+            derived->setText(QString("cannot be built: %1").arg(e.what()));
+            return;
+        }
+        const mesh::QuadMesh::Quality &q = m.quality;
+        std::ostringstream oss;
+        oss << q.quads << " element(s) on " << q.vertices << " node(s)\n"
+            << q.freeNodes << " free, " << q.slidingNodes << " sliding, "
+            << q.fixedNodes << " fixed\n"
+            << "scaled Jacobian " << std::fixed << std::setprecision(4)
+            << q.minScaledJacobian << " worst, " << q.meanScaledJacobian << " mean";
+        if (q.invertedQuads > 0)
+            oss << "\n" << q.invertedQuads << " element(s) folded: a barrier metric "
+                << "needs the untangler";
+        derived->setText(QString::fromStdString(oss.str()));
+    };
+    QObject::connect(pinBox, &QCheckBox::toggled, &dlg, updateDerived);
+    QObject::connect(cornerBox, &QDoubleSpinBox::valueChanged, &dlg, updateDerived);
+    updateDerived();
+
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    buttons->button(QDialogButtonBox::Ok)->setText("Smooth");
+    QObject::connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    QObject::connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+
+    auto *form = new QFormLayout(&dlg);
+    form->addRow("metric", metricBox);
+    form->addRow("size weight gamma (metric 100)", gammaBox);
+    form->addRow("exponent p", powerBox);
+    form->addRow("sweeps at most", sweepBox);
+    form->addRow(pinBox);
+    form->addRow("corner if the feature turns by", cornerBox);
+    form->addRow("target", targetBox);
+    form->addRow("target size h", sizeBox);
+    form->addRow(cornerQuadBox);
+    form->addRow(untangleBox);
+    form->addRow("threads", threadBox);
+    form->addRow("this mesh", derived);
+    form->addRow(new QLabel("Always run on the Stage 10 mesh, never on the last\n"
+                            "smoothed one, so a second setting is a fresh attempt.", &dlg));
+    form->addRow(buttons);
+
+    if (dlg.exec() != QDialog::Accepted) return false;
+
+    tmopSettings_.metric      = metricBox->currentData().toInt();
+    tmopSettings_.gamma       = gammaBox->value();
+    tmopSettings_.exponent    = powerBox->value();
+    tmopSettings_.sweeps      = sweepBox->value();
+    tmopSettings_.pinFeatures = pinBox->isChecked();
+    tmopSettings_.cornerAngle = cornerBox->value();
+    tmopSettings_.target      = targetBox->currentData().toInt();
+    tmopSettings_.targetSize  = sizeBox->value();
+    tmopSettings_.corners     = cornerQuadBox->isChecked();
+    tmopSettings_.untangle    = untangleBox->isChecked();
+    tmopSettings_.threads     = threadBox->value();
+    return true;
+}
+
+// Stage 12 itself. Blocking, like the three solves before it, but on a
+// different scale: a thousand sweeps over a mesh of this size is a fraction of
+// a second, so it is not announced a frame ahead the way the Ricci solve is.
+void CrossGenWidget::runTMOP() {
+    if (!quadMesh_.has_value()) {
+        blockPipeline("Stage 12 not run", "Stage 10 produced no mesh to smooth");
+        return;
+    }
+    tmopAttempted_ = true;
+    smoothMesh_.reset();
+    pipelineBlocked_.clear();
+
+    // Stage 11's merged mesh where there is one, Stage 10's otherwise. The two
+    // are the same mesh to this code -- the templates' elements are elements of
+    // it -- and DiskTemplate's vertex array extends Stage 10's rather than
+    // replacing it, so the blocks the drawing takes its walls from still index
+    // what comes back.
+    mesh::QuadMesh::Options mopts;
+    mopts.cornerAngle = tmopSettings_.cornerAngle;
+    mopts.fixAllFeatureNodes = tmopSettings_.pinFeatures;
+
+    auto t0 = Clock::now();
+    try {
+        smoothMesh_.emplace(diskFill_.has_value()
+                                ? mesh::QuadMesh::from(*diskFill_, mopts)
+                                : mesh::QuadMesh::from(*quadMesh_, mopts));
+    } catch (const std::exception &e) {
+        smoothMesh_.reset();
+        blockPipeline("Stage 12 failed", e.what());
+        return;
+    }
+
+    mesh::TMOP::Options topt;
+    topt.metric     = static_cast<mesh::TMOP::Metric>(tmopSettings_.metric);
+    topt.gamma      = tmopSettings_.gamma;
+    topt.exponent   = tmopSettings_.exponent;
+    topt.target     = static_cast<mesh::TMOP::Target>(tmopSettings_.target);
+    topt.targetSize = tmopSettings_.targetSize;
+    topt.quadrature = tmopSettings_.corners ? mesh::TMOP::Corners : mesh::TMOP::Gauss2x2;
+    topt.maxSweeps  = tmopSettings_.sweeps;
+    topt.untangle   = tmopSettings_.untangle;
+    topt.threads    = tmopSettings_.threads;
+
+    // Nothing below the solve is allowed to take the window down with it: a
+    // stage that refuses says so on the overlay and leaves the phase before it
+    // on screen, which is the discipline every other stage here follows.
+    mesh::TMOP smoother(*smoothMesh_, topt);
+    bool ok = false;
+    try {
+        ok = smoother.run();
+    } catch (const std::exception &e) {
+        smoothMesh_.reset();
+        blockPipeline("Stage 12 failed", e.what());
+        return;
+    }
+    auto t1 = Clock::now();
+    const mesh::TMOP::Report &tr = smoother.getReport();
+
+    {
+        std::ostringstream oss;
+        oss << "[TMOP] Stage 12: " << tr.sweeps << " sweep(s)";
+        if (tr.untangleSweeps > 0) oss << " after " << tr.untangleSweeps << " untangling";
+        oss << " over " << tr.colors << " colour(s) on " << tr.threads << " thread(s)"
+            << (tr.openMP ? "" : " (no OpenMP)") << ", "
+            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count())
+            << (tr.converged ? "" : " -- stopped on the sweep cap");
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[TMOP] nodes: " << tr.freeNodes << " free, " << tr.slidingNodes
+            << " sliding, " << tr.fixedNodes << " fixed";
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[TMOP] scaled Jacobian " << std::fixed << std::setprecision(4)
+            << tr.minScaledJacobianBefore << " -> " << tr.minScaledJacobianAfter
+            << " worst, " << tr.meanScaledJacobianBefore << " -> "
+            << tr.meanScaledJacobianAfter << " mean";
+        if (tr.invertedBefore > 0 || tr.invertedAfter > 0)
+            oss << ", folds " << tr.invertedBefore << " -> " << tr.invertedAfter;
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[TMOP] worst aspect ratio " << std::fixed << std::setprecision(2)
+            << tr.worstAspectBefore << " -> " << tr.worstAspectAfter
+            << ", energy " << std::scientific << std::setprecision(3)
+            << tr.energyBefore << " -> " << tr.energyAfter;
+        console_.log(oss.str());
+    }
+    {
+        // Sliding moves a node along the chord through its two feature
+        // neighbours, which leaves the triangle they span -- and so the
+        // polygon's area -- unchanged. A difference here is the domain itself
+        // moving, which no amount of smoothing is worth, so it is reported
+        // whether it happened or not rather than only when it did.
+        const double drift = std::fabs(tr.areaAfter - tr.areaBefore);
+        const bool held = drift <= 1e-9 * std::fabs(tr.areaBefore);
+        std::ostringstream oss;
+        oss << "[TMOP] nodes moved " << std::fixed << std::setprecision(3)
+            << tr.meanDisplacement << " mean edge(s) on average, " << tr.maxDisplacement
+            << " at most; area " << (held ? "unchanged [PASS]" : "changed [FAIL]");
+        console_.log(oss.str());
+    }
+    for (const std::string &m : tr.messages) console_.log("[TMOP] " + m);
+    {
+        std::ostringstream oss;
+        oss << "[TMOP] Stage 12 " << (ok ? "left the mesh better than it found it [PASS]"
+                                         : "did not improve the mesh [FAIL]");
+        console_.log(oss.str());
+        std::cerr << "[Viewer] " << oss.str() << "\n";
+    }
+    console_.log("[TMOP] the same picture as Stage 10, with the nodes where the solve "
+                 "left them. Press 'c' to smooth the Stage 10 mesh again at other settings");
+}
+
 // ── Stage 0c: the circular inclusions, taken out before anything is built ────
 //
 // Called from the mode keys and nowhere else. Every stage of either pipeline is
@@ -3660,6 +4029,7 @@ void CrossGenWidget::runDiskExcision() {
     // checks that its inputs were measured on the mesh it was handed and
     // throws when they were not. Cheap, and it makes the ordering a property
     // of this function rather than of its one caller.
+    smoothMesh_.reset();
     quadMesh_.reset();
     splines_.reset();
     arrangement_.reset();
@@ -3690,7 +4060,7 @@ void CrossGenWidget::runDiskExcision() {
     layoutAttempted_ = layoutAnnounced_ = false;
     separatricesAttempted_ = separatricesAnnounced_ = false;
     patchesAttempted_ = patchesAnnounced_ = false;
-    meshAttempted_ = false;
+    meshAttempted_ = tmopAttempted_ = false;
     sipgSteppingStarted_ = sipgConverged_ = false;
     sipgStepCount_ = 0;
 
@@ -3850,9 +4220,10 @@ void CrossGenWidget::rerunMERIDIANConnectivity() {
     // LayoutEnergy to the immersion and the labels, SubdomainLabels to the
     // immersion. Stage 11 is a copy of Stage 10's arrays and goes with them.
     pipelineBlocked_.clear();
+    smoothMesh_.reset();
     diskFill_.reset();
     quadMesh_.reset();
-    meshAttempted_ = false;
+    meshAttempted_ = tmopAttempted_ = false;
     splines_.reset();
     arrangement_.reset();
     patchesAttempted_ = false;
@@ -3972,6 +4343,14 @@ void CrossGenWidget::advancePhase() {
             // counts as having been asked, and 'c' here is what re-opens it.
             meshAttempted_ = true;
             if (promptMERIDIANMesh()) runMERIDIANMesh();
+        }
+        // Stage 12, the same way and for the same reasons: marked as asked
+        // before the dialog opens, cancelling counts as having been asked, and
+        // 'c' at this phase re-opens it. This is now the last phase, so 'c'
+        // arrives here rather than at the Mesh one.
+        if (pipePhase_ == PipelinePhase::Smoothed && quadMesh_.has_value()) {
+            tmopAttempted_ = true;
+            if (promptTMOP()) runTMOP();
         }
     }
 }
@@ -4450,6 +4829,17 @@ void CrossGenWidget::runComputations() {
         if (promptMERIDIANMesh()) runMERIDIANMesh();
     }
 
+    // ── Both pipelines: Stage 12, when the phase arrived before Stage 10 ─────
+    //
+    // The same catch-up as above and for the same reason: 'c' pressed twice in
+    // quick succession can land this phase while Stage 10 has not run, and then
+    // the dialog that belongs to it never opens. Cancelling counts as having
+    // asked; 'c' re-opens it.
+    if (inPipeline() && pipePhase_ == PipelinePhase::Smoothed && quadMesh_.has_value() &&
+        !tmopAttempted_) {
+        tmopAttempted_ = true;
+        if (promptTMOP()) runTMOP();
+    }
 
     // ── Medial Axis: Delaunay re-triangulation ────────────────────────────────
     if (mode_ == Mode::MedialAxis && maPhase_ >= MedialAxisPhase::DelaunayMesh && !delaunayMesh_) {
@@ -5469,7 +5859,7 @@ void CrossGenWidget::renderNormal() {
             // The blocks over the model, once Stages 8 and 9 have produced
             // any: this is the whole of what the phase is for, and it is
             // drawn last so no wireframe edge crosses a patch side.
-            if (pipePhase_ == PipelinePhase::Mesh && quadMesh_.has_value()) {
+            if (pipePhase_ >= PipelinePhase::Mesh && quadMesh_.has_value()) {
                 // Stage 10 draws its own block walls off the blocks it built,
                 // so drawLayoutPatches would only lay a second, differently
                 // sourced copy of them over the first. A face Stage 10 could
@@ -5482,7 +5872,18 @@ void CrossGenWidget::renderNormal() {
                 // exactly what the report says of it.
                 const bool matFill = showMaterialFill_ && interfaces_.has_value() &&
                                      interfaces_->multiMaterial();
-                if (diskFill_.has_value())
+                // Stage 12, once it has run, is the same picture drawn by the
+                // same routine off the same block walls, with the nodes where
+                // TMOP left them: the phases are meant to be comparable by
+                // flipping between them, and a second way of drawing would put
+                // its own differences into that comparison. Until it has run --
+                // dialog cancelled, or Stage 10 refused -- the unsmoothed mesh
+                // stays on screen rather than the window going blank.
+                if (pipePhase_ == PipelinePhase::Smoothed && smoothMesh_.has_value())
+                    viewer::drawQuadMesh(*smoothMesh_, &*quadMesh_,
+                                         diskFill_.has_value() ? &*diskFill_ : nullptr,
+                                         1.0f, 2.5f, matFill);
+                else if (diskFill_.has_value())
                     viewer::drawQuadMesh(*diskFill_, &*quadMesh_, 1.0f, 2.5f, matFill);
                 else
                     viewer::drawQuadMesh(*quadMesh_, 1.0f, 2.5f, matFill);
@@ -5669,9 +6070,16 @@ void CrossGenWidget::renderNormal() {
                meridianLayout_.has_value()) {
         renderOverlay((meridianKeys + "press 'p' to swap psi_R / Psi\n"
                                       "press 'r' to restart\npress 'q' to quit").c_str());
+    } else if (inPipeline() && pipePhase_ == PipelinePhase::Smoothed) {
+        renderOverlay((meridianKeys +
+                       "press 'c' to smooth again at other TMOP settings\n"
+                       "press 'e' to mesh again at another target edge length\n"
+                       "press 'n' to change the connectivity settings and trace again\n"
+                       "press 'r' to restart\npress 'q' to quit").c_str());
     } else if (inPipeline() && pipePhase_ == PipelinePhase::Mesh) {
         renderOverlay((meridianKeys +
-                       "press 'c' to mesh again at another target edge length\n"
+                       "press 'c' to smooth the mesh with TMOP (Stage 12)\n"
+                       "press 'e' to mesh again at another target edge length\n"
                        "press 'n' to change the connectivity settings and trace again\n"
                        "press 'r' to restart\npress 'q' to quit").c_str());
     } else if (inPipeline() && pipePhase_ == PipelinePhase::Patches) {
