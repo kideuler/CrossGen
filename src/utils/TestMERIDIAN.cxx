@@ -25,6 +25,7 @@
 
 #include "MERIDIAN/MERIDIAN.hxx"
 #include "SIPG/SIPG.hxx"
+#include "mesh/QuadMesh.hxx"
 #include "TestHelper.hxx"
 
 namespace {
@@ -292,7 +293,8 @@ void usage(const char *argv0) {
               << "  --smooth-below <j> smooth blocks worse than this Jacobian (default 0)\n"
               << "  --chords <n>       list at most n chords                (default 0)\n"
               << "  --mesh <file.obj>  write the quadrilateral mesh\n"
-              << "  --mesh-vtu <f.vtu> write it as a VTK unstructured grid\n";
+              << "  --mesh-vtu <f.vtu> write it as a VTK unstructured grid\n"
+              << "  --mfem <f.mesh>   write it as an MFEM mesh, material id per element\n";
 }
 
 } // namespace
@@ -304,7 +306,7 @@ int main(int argc, char **argv) {
     const std::string path = argv[1];
     MERIDIAN::Options opts;
     std::string cutOut, psiOut, layoutOut, sepOut, sepUVOut;
-    std::string arcsOut, facesOut, fitOut, netOut, surfOut, meshOut, meshVTUOut;
+    std::string arcsOut, facesOut, fitOut, netOut, surfOut, meshOut, meshVTUOut, mfemOut;
     int coneListLimit = 20;
     int curveListLimit = 10;
     int chordListLimit = 0;
@@ -399,6 +401,7 @@ int main(int argc, char **argv) {
         else if (a == "--chords" && i + 1 < argc)  chordListLimit = std::stoi(argv[++i]);
         else if (a == "--mesh" && i + 1 < argc)    meshOut = argv[++i];
         else if (a == "--mesh-vtu" && i + 1 < argc) meshVTUOut = argv[++i];
+        else if (a == "--mfem" && i + 1 < argc)    mfemOut = argv[++i];
         else { std::cerr << "Unknown option: " << a << "\n"; usage(argv[0]); return 1; }
     }
 
@@ -1449,6 +1452,58 @@ int main(int argc, char **argv) {
         verdict(dr.cracks == 0, "Watertight: the templates share the rim rather than repeat it");
         verdict(dr.invertedQuads == 0, "No element of the merged mesh is inverted");
         for (const std::string &m : dr.messages) std::cout << "  " << kWarn << " " << m << "\n";
+    }
+
+    // ---------------------------------------------------------------------
+    // Whatever came last -- the Stage 10 mesh, or the matrix plus its filled
+    // inclusions -- is adopted into the standalone quad mesh class of
+    // src/mesh/QuadMesh.hxx. That is the form the .mesh writer and any
+    // smoother work on, and its topology is rebuilt from the elements alone,
+    // so what it reports here is a second opinion on the same mesh rather
+    // than a restatement of the pipeline's own bookkeeping.
+    heading("Final mesh (mesh::QuadMesh)");
+    const mesh::QuadMesh finalMesh = pipeline.hasDiskTemplate()
+                                         ? mesh::QuadMesh::from(pipeline.getDiskTemplate())
+                                         : mesh::QuadMesh::from(qm);
+    {
+        const mesh::QuadMesh::Quality &fq = finalMesh.quality;
+        std::cout << "  " << fq.vertices << " vertices, " << fq.quads
+                  << " quadrilateral(s), " << finalMesh.edges.size() << " edge(s)\n";
+        std::cout << "  Nodes: " << fq.freeNodes << " free, " << fq.slidingNodes
+                  << " sliding on a feature, " << fq.fixedNodes << " fixed\n";
+        std::cout << "  Scaled Jacobian: worst " << std::fixed << std::setprecision(3)
+                  << fq.minScaledJacobian << ", mean " << fq.meanScaledJacobian
+                  << std::defaultfloat << "\n";
+        std::cout << "  Boundary: " << fq.boundaryEdges << " edge(s) in " << fq.boundaryLoops
+                  << " loop(s)\n";
+        std::cout << "  Materials:";
+        for (const std::pair<int, int> &kv : finalMesh.materialCounts())
+            std::cout << " " << kv.first << " (" << kv.second << " element(s))";
+        std::cout << "\n";
+        verdict(fq.allCounterClockwise && fq.invertedQuads == 0,
+                "Every element is counter-clockwise with a positive Jacobian at every corner");
+        verdict(fq.nonManifoldEdges == 0, "Every edge is shared by at most two elements");
+    }
+
+    if (!mfemOut.empty()) {
+        mesh::QuadMesh::MFEMOptions mo;
+        mesh::QuadMesh::MFEMReport mr;
+        if (finalMesh.writeMFEM(mfemOut, mo, &mr)) {
+            std::cout << "  Wrote the MFEM mesh to " << mfemOut << ": " << mr.elements
+                      << " element(s), " << mr.boundaryElements << " boundary segment(s), "
+                      << mr.vertices << " vertices\n";
+            for (const std::pair<int, int> &kv : mr.attributeCounts)
+                std::cout << "    attribute " << kv.first << ": " << kv.second
+                          << " element(s)\n";
+            if (mr.attributesRemapped)
+                std::cout << "  " << kWarn
+                          << " material ids were shifted so the MFEM attribute is positive\n";
+            if (mr.unusedVertices > 0)
+                std::cout << "  " << kWarn << " " << mr.unusedVertices
+                          << " vertex/vertices no element uses were dropped\n";
+        } else {
+            std::cout << "  " << kWarn << " Failed to write " << mfemOut << "\n";
+        }
     }
 
     if (!meshOut.empty()) {

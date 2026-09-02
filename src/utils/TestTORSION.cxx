@@ -48,6 +48,7 @@
 #include "TORSION/ConeMetric.hxx"
 #include "TORSION/TORSION.hxx"
 #include "TestHelper.hxx"
+#include "mesh/QuadMesh.hxx"
 
 namespace {
 
@@ -780,7 +781,8 @@ void usage(const char *prog) {
               << "  --layout <file.obj> write Psi, the Stage 6 result\n"
               << "  --cut <file.obj>   write Omega\n"
               << "  --arr <file.obj>   write the Stage 8 arrangement, on the model\n"
-              << "  --quads <file.obj> write the Stage 10 quadrilateral mesh\n";
+              << "  --quads <file.obj> write the Stage 10 quadrilateral mesh\n"
+              << "  --mfem <f.mesh>    write the final mesh for MFEM, material id per element\n";
 }
 
 } // namespace
@@ -801,7 +803,7 @@ int main(int argc, char **argv) {
 
     const std::string path = first;
     TORSION::Options opts;
-    std::string psiOut, rawOut, tutteOut, layoutOut, cutOut, quadOut, arrOut;
+    std::string psiOut, rawOut, tutteOut, layoutOut, cutOut, quadOut, arrOut, mfemOut;
     int coneListLimit = 20;
 
     for (int i = 2; i < argc; ++i) {
@@ -863,6 +865,7 @@ int main(int argc, char **argv) {
         else if (a == "--layout" && i + 1 < argc)       layoutOut = argv[++i];
         else if (a == "--cut" && i + 1 < argc)          cutOut = argv[++i];
         else if (a == "--quads" && i + 1 < argc)        quadOut = argv[++i];
+        else if (a == "--mfem" && i + 1 < argc)         mfemOut = argv[++i];
         else if (a == "--arr" && i + 1 < argc)          arrOut = argv[++i];
         else { std::cerr << "Unknown option: " << a << "\n"; usage(argv[0]); return 1; }
     }
@@ -1347,6 +1350,55 @@ int main(int argc, char **argv) {
         verdict(dr.invertedQuads == 0, "No element of the merged mesh is inverted");
         stageMessages("Stage 11: ");
     }
+    // Whatever came last -- the Stage 10 mesh, or the matrix plus its filled
+    // inclusions -- adopted into the standalone quad mesh class of
+    // src/mesh/QuadMesh.hxx, the same conversion TestMERIDIAN does. Its
+    // topology is rebuilt from the elements alone, so this is a second opinion
+    // on the mesh rather than a restatement of the pipeline's own report.
+    if (st.quadMeshRan && pipeline.hasQuadMesh()) {
+        heading("Final mesh (mesh::QuadMesh)");
+        const mesh::QuadMesh finalMesh =
+            pipeline.hasDiskTemplate() ? mesh::QuadMesh::from(pipeline.getDiskTemplate())
+                                       : mesh::QuadMesh::from(pipeline.getQuadMesh());
+        const mesh::QuadMesh::Quality &fq = finalMesh.quality;
+        std::cout << "  " << fq.vertices << " vertices, " << fq.quads
+                  << " quadrilateral(s), " << finalMesh.edges.size() << " edge(s)\n";
+        std::cout << "  Nodes: " << fq.freeNodes << " free, " << fq.slidingNodes
+                  << " sliding on a feature, " << fq.fixedNodes << " fixed\n";
+        std::cout << "  Scaled Jacobian: worst " << std::fixed << std::setprecision(3)
+                  << fq.minScaledJacobian << ", mean " << fq.meanScaledJacobian
+                  << std::defaultfloat << "\n";
+        std::cout << "  Boundary: " << fq.boundaryEdges << " edge(s) in " << fq.boundaryLoops
+                  << " loop(s)\n";
+        std::cout << "  Materials:";
+        for (const std::pair<int, int> &kv : finalMesh.materialCounts())
+            std::cout << " " << kv.first << " (" << kv.second << " element(s))";
+        std::cout << "\n";
+        verdict(fq.allCounterClockwise && fq.invertedQuads == 0,
+                "Every element is counter-clockwise with a positive Jacobian at every corner");
+        verdict(fq.nonManifoldEdges == 0, "Every edge is shared by at most two elements");
+
+        if (!mfemOut.empty()) {
+            mesh::QuadMesh::MFEMOptions mo;
+            mesh::QuadMesh::MFEMReport mr;
+            if (finalMesh.writeMFEM(mfemOut, mo, &mr)) {
+                std::cout << "  Wrote the MFEM mesh to " << mfemOut << ": " << mr.elements
+                          << " element(s), " << mr.boundaryElements << " boundary segment(s), "
+                          << mr.vertices << " vertices\n";
+                for (const std::pair<int, int> &kv : mr.attributeCounts)
+                    std::cout << "    attribute " << kv.first << ": " << kv.second
+                              << " element(s)\n";
+                if (mr.attributesRemapped)
+                    warn("material ids were shifted so the MFEM attribute is positive");
+                if (mr.unusedVertices > 0)
+                    warn(std::to_string(mr.unusedVertices) +
+                         " vertex/vertices no element uses were dropped");
+            } else {
+                warn("Failed to write " + mfemOut);
+            }
+        }
+    }
+
     if (!quadOut.empty() && st.quadMeshRan) {
         const bool wrote = pipeline.hasDiskTemplate()
                                ? pipeline.getDiskTemplate().writeOBJ(quadOut)
