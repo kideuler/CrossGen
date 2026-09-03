@@ -1,6 +1,7 @@
 #ifndef __TORSION_HXX__
 #define __TORSION_HXX__
 
+#include <array>
 #include <functional>
 #include <memory>
 #include <string>
@@ -712,6 +713,42 @@ public:
     static std::vector<double> inducedLengths(const Mesh &mesh, const ConeCut &cut,
                                               const std::vector<Point> &psi);
 
+    // --- Stage 4R's three pieces, public for the same reason -------------
+    //
+    // Sec. 7.2a is a ladder rather than a single pass, and a caller that drives
+    // the stages itself has to climb the same one or it is not running Stage 4R
+    // at all -- it is running Sec. 7.2's Tutte pass on every model, which
+    // throws away the cone angles, the seam and Sec. 6.4's alignment on the
+    // models the local repair would have kept them on. That is a different
+    // psi_0, and every stage after it sees the difference.
+
+    // The Jacobian of a piecewise-linear map on Omega, one 2x2 row-major per
+    // face: row 0 is grad u, row 1 is grad v, which is the layout
+    // FieldIntegration::Options::targetJacobian is read in. A map's own
+    // Jacobian is a legal target for the fit that produced it, which is what
+    // makes Sec. 6.5's re-projection a swap of one argument.
+    static std::vector<std::array<double, 4>> jacobianOf(const Mesh &om,
+                                                         const std::vector<Point> &uv);
+
+    // Which coordinates each vertex of Omega may move in without undoing an
+    // equality Stage 4F imposed, at rung `level` of Sec. 7.2a's ladder: 0 holds
+    // the seam and the alignment, 1 frees the alignment, 2 frees both.
+    // `usedAxis` is the axis the integration was actually solved with -- empty
+    // when it was solved free. See TORSION.cxx.
+    static std::vector<unsigned char> vertexFreedom(const ConeCut &cut,
+                                                    const std::vector<int> &usedAxis,
+                                                    int level);
+
+    // Sec. 7.2a itself: move the interior vertices around each inverted face to
+    // the Chebyshev centre of their one-ring kernels, within `freedom`, for at
+    // most `sweeps` sweeps. `partner`/`partnerK` are Options::pairSeamInUntangle's
+    // seam pairing and may be empty. Returns the number of faces still
+    // inverted, or -1 if the arguments do not match the mesh.
+    static int relaxToKernel(const Mesh &om, std::vector<Point> &uv,
+                             const std::vector<unsigned char> &freedom,
+                             const std::vector<int> &partner,
+                             const std::vector<int> &partnerK, int sweeps);
+
     // The mesh the layout was computed on. With Options::diskTemplates this is
     // the *excised* mesh; getInputMesh() is what came in. See MERIDIAN.
     const Mesh& getMesh() const { return *mesh; }
@@ -730,9 +767,6 @@ private:
     // the cone set is inadmissible or the cut is not a disk, which are the two
     // things every route downstream depends on.
     bool runFront();
-    // Which coordinates each vertex of Omega may move in without undoing an
-    // equality Stage 4F imposed. See TORSION.cxx.
-    std::vector<unsigned char> vertexFreedom(int level) const;
     // The two children of each seam vertex of Omega and the quarter turn
     // between their displacements, so that Sec. 7.2a can move a tangle sitting
     // on the seam without letting go of Q4. See TORSION.cxx.

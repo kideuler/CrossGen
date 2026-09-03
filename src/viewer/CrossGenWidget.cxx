@@ -1505,7 +1505,17 @@ void CrossGenWidget::runMERIDIANCones() {
     // finishes the solve here rather than reading a field still in motion.
     if (!dualMBOConverged_) {
         auto t0 = Clock::now();
-        dualMBOField_->runMBO();
+        // The pipeline's own loop rather than DualMBO::runMBO(), which stops at
+        // a tolerance of its own (1e-7): what this finishes has to be the field
+        // TORSION::runField() would have handed Stage 1, or the cone indices
+        // read off it below are read off a different field.
+        const double ntris = static_cast<double>(mesh_->triangles.size());
+        const int cap = TORSION::Options().dualMBOMaxSteps;
+        for (int i = dualMBOStepCount_; i < cap; ++i) {
+            dualMBOField_->step();
+            ++dualMBOStepCount_;
+            if (dualMBOField_->error < 2.0 * ntris * DUALMBO_TOL) break;
+        }
         dualMBOConverged_ = true;
         auto t1 = Clock::now();
         std::ostringstream oss;
@@ -1947,7 +1957,10 @@ std::vector<Point> CrossGenWidget::runTORSIONUntangle() {
     if (!coneCut_.has_value() || !cones_.has_value() || !frames_.has_value()) return {};
     const Mesh &omega = coneCut_->getCutMesh();
 
+    const TORSION::Options defaults;
+
     TutteEmbedding::Options topts;
+    topts.targetEdge = defaults.targetEdge;
     tutte_.emplace(omega, topts);
     const TutteEmbedding::Report &tr = tutte_->getReport();
     for (const std::string &m : tr.messages) console_.log("[Untangle] " + m);
@@ -1978,18 +1991,27 @@ std::vector<Point> CrossGenWidget::runTORSIONUntangle() {
     SubdomainLabels::Options lopts;
     lopts.seedTopoConstraints = false;
     lopts.interfaceCorners = false;
-    SubdomainLabels startLabels(*start, lopts);
+    lopts.propagateInterfaceLabels = defaults.propagateInterfaceLabels;
+    // The interfaces go in: the labels are what E2 and E3 would carry across
+    // this pass, and on a multi-material model a chain of the network is a line
+    // the untangled map has to come back to in exactly the way a chain of dS
+    // is. Leaving them out here is what would make this pass on a multi-
+    // material model a different pass from the pipeline's.
+    SubdomainLabels startLabels(*start, lopts,
+                                interfaces_.has_value() ? &*interfaces_ : nullptr);
 
     LayoutEnergy::Options eopts;
     eopts.reference = LayoutEnergy::Reference::Induced;
-    eopts.referenceLengths =
-        coneMetric_.has_value()
-            ? coneMetric_->edgeLengths()
-            : TORSION::inducedLengths(*mesh_, *coneCut_, integratedMap_);
+    // The metric the *least-squares map* induces, not Sec. 4's flat cone
+    // metric. This is the one place the two differ on purpose: what this pass
+    // is fitting is the field's own answer, cone angles included (the seam
+    // constraints put them there exactly) and the shape the integration settled
+    // on everywhere else. Stage 6 is where the flat cone metric is the
+    // reference; see TORSION::untangle().
+    eopts.referenceLengths = TORSION::inducedLengths(*mesh_, *coneCut_, integratedMap_);
     // mu is E4's penalty and nothing else is switched on, so it is set through
     // lambdaFactor rather than through lambdaInit: run() floors lambda_4 at
     // lambda_1, and that floor would swallow a starting mu below 1.
-    const TORSION::Options defaults;
     eopts.lambdaInit = 1.0;
     eopts.lambdaFactor[4] = defaults.untangleSeamWeight;
     eopts.lambdaGrowth = defaults.lambdaGrowth;
@@ -1997,13 +2019,16 @@ std::vector<Point> CrossGenWidget::runTORSIONUntangle() {
     eopts.innerIterations = defaults.untangleInnerIterations;
     eopts.alternateReference = false;
     eopts.relabel = false;
-    // E1 and E4 only. Everything else is a statement about a layout and this
-    // pass is not producing one -- it is producing something injective with the
-    // field's directions in it, for Stage 6 to make a layout out of.
-    eopts.lambdaFactor[2] = 0.0;
-    eopts.lambdaFactor[3] = 0.0;
+    // E1, E4, and -- since Sec. 6.4 -- E2 and E3 at whatever
+    // Options::untangleAlignWeight is (zero, and measured: see TORSION.hxx).
+    // E5 and E6 stay off: both are statements about a layout and this pass is
+    // not producing one, it is producing something injective with the field's
+    // directions in it for Stage 6 to make a layout out of.
+    eopts.lambdaFactor[2] = defaults.untangleAlignWeight;
+    eopts.lambdaFactor[3] = defaults.untangleAlignWeight;
     eopts.lambdaFactor[5] = 0.0;
     eopts.lambdaFactor[6] = 0.0;
+    if (defaults.untangleAlignWeight > 0.0) startLabels.relabel(integratedMap_);
 
     auto t0 = Clock::now();
     LayoutEnergy fit(*start, startLabels, eopts);
@@ -2071,20 +2096,92 @@ void CrossGenWidget::runTORSIONIntegration() {
         return;
     }
 
+    const TORSION::Options defaults;
+
     auto t0 = Clock::now();
+    usedAxis_.clear();
     try {
         // Sec. 6.4: hold every chain of dS - G and every interface branch to
         // the axis the frame read for it, so that psi_0 satisfies Q3 -- and Q2
         // at every boundary vertex -- as the solve returns rather than after
         // Stage 6 has driven a residual there.
         FieldIntegration::Options iopts;
+        iopts.regularisation = defaults.integrationRegularisation;
         iopts.alignAxis = frames_->alignmentAxis();
+        usedAxis_ = iopts.alignAxis;
         integration_.emplace(*coneCut_, *frames_, *scaffold_, iopts);
     } catch (const std::exception &e) {
         integration_.reset();
+        usedAxis_.clear();
         console_.log(std::string("[psi_0] FAILED: ") + e.what());
         std::cerr << "[Viewer] FieldIntegration failed: " << e.what() << "\n";
         return;
+    }
+
+    // Sec. 6.4's three attempts (Options::alignmentFallback). Holding the
+    // boundary and the interfaces exactly is a constraint on the fit, and a
+    // constraint on a fit can invert a triangle the free fit would not have --
+    // the place it happens is a chain whose staircase was overridden, because a
+    // step is a right angle the map is being asked to unbend. So the alignment
+    // is tried in full, then on the chains that needed no overriding, then not
+    // at all, and the first solve that inverts nothing is kept. On the models
+    // where the first attempt already inverts nothing, which is most of them,
+    // the other two are never built.
+    if (defaults.alignmentFallback && integration_->getReport().alignedEdges > 0 &&
+        (!integration_->getReport().solved || integration_->getReport().flippedFaces > 0)) {
+        const int firstFlips = integration_->getReport().solved
+                                   ? integration_->getReport().flippedFaces
+                                   : std::numeric_limits<int>::max();
+        const double strain = integration_->getReport().alignmentStrain;
+
+        auto solveWith = [&](const std::vector<int> &axis) {
+            FieldIntegration::Options io;
+            io.regularisation = defaults.integrationRegularisation;
+            io.alignAxis = axis;
+            return std::make_unique<FieldIntegration>(*coneCut_, *frames_, *scaffold_, io);
+        };
+
+        int bestFlips = firstFlips;
+        const char *bestName = nullptr;
+        std::vector<int> bestAxis;
+        try {
+            if (frames_->getReport().alignmentSteppedChains > 0) {
+                auto strict = solveWith(frames_->strictAlignmentAxis());
+                if (strict->getReport().solved &&
+                    strict->getReport().flippedFaces < bestFlips) {
+                    bestFlips = strict->getReport().flippedFaces;
+                    bestName = "the alignment without the overridden chains";
+                    bestAxis = frames_->strictAlignmentAxis();
+                }
+            }
+            if (bestFlips > 0) {
+                auto freeSolve = solveWith(std::vector<int>());
+                if (freeSolve->getReport().solved &&
+                    freeSolve->getReport().flippedFaces < bestFlips) {
+                    bestFlips = freeSolve->getReport().flippedFaces;
+                    bestName = "no alignment at all";
+                    bestAxis.clear();
+                }
+            }
+            if (bestName) {
+                FieldIntegration::Options io;
+                io.regularisation = defaults.integrationRegularisation;
+                io.alignAxis = bestAxis;
+                integration_.emplace(*coneCut_, *frames_, *scaffold_, io);
+                usedAxis_ = bestAxis;
+                std::ostringstream oss;
+                oss << "[psi_0] Sec. 6.4: the full alignment inverted " << firstFlips
+                    << " face(s) at a strain of " << std::scientific << std::setprecision(2)
+                    << strain << " relative, so it fell back to " << bestName
+                    << ", which inverts " << bestFlips
+                    << ". The strain is the field disagreeing with the cone set about where "
+                       "the boundary turns; where it is large the remedy is in Stage 1";
+                console_.log(oss.str());
+            }
+        } catch (const std::exception &e) {
+            console_.log(std::string("[psi_0] Sec. 6.4's fallback could not be built: ") +
+                         e.what());
+        }
     }
     auto t1 = Clock::now();
 
@@ -2133,8 +2230,123 @@ void CrossGenWidget::runTORSIONIntegration() {
     // ── Stage 4R ─────────────────────────────────────────────────────────────
     std::vector<Point> psi0 = integratedMap_;
     if (ir.flippedFaces > 0) {
-        std::vector<Point> repaired = runTORSIONUntangle();
-        if (!repaired.empty()) psi0 = std::move(repaired);
+        // Sec. 6.5's projection, as a step rather than as a stage: fit a map's
+        // own Jacobian back under the seam and alignment equalities. Used after
+        // any repair that was allowed to break one of them.
+        auto reproject = [&](const std::vector<Point> &m,
+                             const std::vector<int> &axis) -> std::vector<Point> {
+            try {
+                FieldIntegration::Options po;
+                po.regularisation = defaults.integrationRegularisation;
+                po.alignAxis = axis;
+                po.targetJacobian = TORSION::jacobianOf(coneCut_->getCutMesh(), m);
+                FieldIntegration proj(*coneCut_, *frames_, *scaffold_, po);
+                if (!proj.getReport().solved || proj.getReport().flippedFaces > 0) return {};
+                return proj.getUV();
+            } catch (const std::exception &) {
+                return {};
+            }
+        };
+
+        // Sec. 7.2a, on a ladder, *before* Sec. 7.2's Tutte pass. The usual
+        // tangle is single figures of faces in one cone's one ring, and for
+        // that the map does not need rebuilding: the signed area of each
+        // triangle at one vertex is affine in that vertex, so "every triangle
+        // here is positive" is an intersection of half planes and its interior
+        // is the kernel of the one-ring polygon. A map the local pass clears
+        // keeps its cone angles, its seam and Sec. 6.4's alignment -- all three
+        // of which the Tutte pass throws away and Stage 6 then has to rebuild.
+        //
+        // Each rung frees one more of the things the integration fixed, and
+        // every rung above the first hands what it produced to the projection
+        // to put them back. Rung 1 with no alignment in play is rung 0 again,
+        // so it is skipped rather than run twice.
+        bool untangled = false;
+        int bestLeft = ir.flippedFaces;
+        int level = -1;
+        std::string howKept;
+        const std::vector<int> seamOnly;
+        if (defaults.localUntangle) {
+            for (int lv = 0; lv < 3 && !untangled; ++lv) {
+                if (lv == 1 && usedAxis_.empty()) continue;
+                std::vector<Point> local = integratedMap_;
+                const std::vector<int> noPairing;   // Options::pairSeamInUntangle is off
+                const int left = TORSION::relaxToKernel(
+                    coneCut_->getCutMesh(), local,
+                    TORSION::vertexFreedom(*coneCut_, usedAxis_, lv),
+                    noPairing, noPairing, defaults.localUntangleSweeps);
+                if (left >= 0) bestLeft = std::min(bestLeft, left);
+                if (left != 0) continue;
+
+                level = lv;
+                if (lv == 0) {
+                    psi0 = std::move(local);
+                    untangled = true;
+                    howKept = "with the seam and the alignment held throughout";
+                    break;
+                }
+                std::vector<Point> put = reproject(local, usedAxis_);
+                if (!put.empty()) {
+                    psi0 = std::move(put);
+                    untangled = true;
+                    howKept = "and Sec. 6.5's projection put the seam and the alignment back";
+                } else if (lv == 1) {
+                    // The seam was held throughout this rung, so the map is
+                    // legal as it stands; only Q3 is left for Stage 6.
+                    psi0 = std::move(local);
+                    untangled = true;
+                    howKept = "with Q3 left for Stage 6, the projection onto it having inverted";
+                } else if (!usedAxis_.empty()) {
+                    // Both were let go, so Q4 has to come back or the map is
+                    // not one Stage 4 can accept. Ask for the seam alone.
+                    put = reproject(local, seamOnly);
+                    if (!put.empty()) {
+                        psi0 = std::move(put);
+                        untangled = true;
+                        howKept = "and Sec. 6.5's projection put the seam back, Q3 with the "
+                                  "alignment having been too far to reach";
+                    }
+                }
+            }
+        }
+
+        if (untangled) {
+            std::ostringstream oss;
+            oss << "[Untangle] Sec. 7.2a: the " << ir.flippedFaces
+                << " inverted face(s) were a local tangle, cleared at rung " << level
+                << " of the ladder " << howKept
+                << ". psi_0 keeps the cone angles and the shape the integration gave it, and "
+                   "Sec. 7.2's Tutte pass was not needed";
+            console_.log(oss.str());
+            std::cerr << "[Viewer] " << oss.str() << "\n";
+        } else {
+            if (defaults.localUntangle) {
+                std::ostringstream oss;
+                oss << "[Untangle] Sec. 7.2a took the tangle from " << ir.flippedFaces
+                    << " face(s) to " << bestLeft
+                    << " at best, so Sec. 7.2's Tutte pass runs on the whole map -- and psi_0 "
+                       "loses the cone angles, the boundary and the shape the integration "
+                       "gave it";
+                console_.log(oss.str());
+            }
+            std::vector<Point> repaired = runTORSIONUntangle();
+            if (!repaired.empty()) {
+                psi0 = std::move(repaired);
+                if (defaults.reprojectAfterUntangle && !usedAxis_.empty()) {
+                    std::vector<Point> put = reproject(psi0, usedAxis_);
+                    if (!put.empty()) {
+                        psi0 = std::move(put);
+                        console_.log("[Untangle] Sec. 6.5 put the seam and the alignment back "
+                                     "on the untangled map as equalities, and nothing "
+                                     "inverted doing it");
+                    } else {
+                        console_.log("[Untangle] Sec. 6.5's projection onto the alignment "
+                                     "inverted, so the untangled map stands as it is and "
+                                     "Stage 6 has Q3 to reach rather than to hold");
+                    }
+                }
+            }
+        }
     } else {
         console_.log("[psi_0] the integration inverted nothing, so Sec. 7.2's untangling "
                      "was not needed. That happens on gently curved, well-aligned models "
@@ -3514,7 +3726,15 @@ void CrossGenWidget::runMERIDIANMesh() {
     qopts.maxIntervals     = meshSettings_.maxEdges;
     qopts.useSplines       = meshSettings_.useSplines;
     qopts.collapseSpan     = meshSettings_.collapseSpan;
-    qopts.smoothingPasses  = 0;   // the grid TFI gives, and nothing after it
+    // Stage 10's own selective smoothing, at the pipeline's setting. It is not
+    // Stage 12: this is the Winslow pass QuadMesh runs on the nodes it is
+    // allowed to move, and both pipelines and the paper_tests layout runs (E4,
+    // E5 Part 3) read their scaled Jacobian off the mesh *after* it. Zeroing it
+    // here would mean the element quality reported below, and the mesh Stage 12
+    // is then handed, are not the ones the experiments measure.
+    qopts.smoothingPasses    = TORSION::Options().quadSmoothingPasses;
+    qopts.smoothingThreshold = TORSION::Options().quadSmoothingThreshold;
+    qopts.featuresOnTracedArcs = TORSION::Options().quadFeaturesOnTracedArcs;
 
     // Which arcs lie on each excised rim. Wanted here rather than at Stage 11
     // because the interval assignment has to know: a rim with an odd number of
@@ -4622,7 +4842,12 @@ void CrossGenWidget::runComputations() {
     // ── DualMBO: Initialize ──────────────────────────────────────────────────────
     if (dualMBOStageWantsField() && !dualMBOField_.has_value()) {
         auto t0 = Clock::now();
-        dualMBOField_.emplace(mesh_);
+        // gamma and the step cap are the pipeline's, not DualMBO's constructor
+        // defaults: the cap in particular is 100 there and 500 in both
+        // pipelines, and it is the cap runMBO() below would otherwise stop at
+        // if the stepping phase were walked past before the field converged.
+        const TORSION::Options pipe;
+        dualMBOField_.emplace(mesh_, pipe.dualMBOMaxSteps, pipe.dualMBOGamma);
         // On a multi-material domain the interfaces are Dirichlet data for the
         // field in exactly the way dS is: a curve the layout has to keep needs
         // the field tangent to it, or neither region either side gets the
@@ -4651,10 +4876,11 @@ void CrossGenWidget::runComputations() {
     // ── DualMBO: Run 2 stepping iterations per frame ─────────────────────────────
     if (dualMBOStageIsStepping() && dualMBOSteppingStarted_ && !dualMBOConverged_) {
         double ntris = static_cast<double>(mesh_->triangles.size());
-        for (int i = 0; i < 2 && dualMBOStepCount_ < 500; ++i) {
+        const int cap = TORSION::Options().dualMBOMaxSteps;
+        for (int i = 0; i < 2 && dualMBOStepCount_ < cap; ++i) {
             dualMBOField_->step();
             ++dualMBOStepCount_;
-            if (dualMBOField_->error < 2.0 * ntris * 1e-8) {
+            if (dualMBOField_->error < 2.0 * ntris * DUALMBO_TOL) {
                 console_.log("[DualMBO] Converged at step " + std::to_string(dualMBOStepCount_) +
                              " error=" + std::to_string(dualMBOField_->error));
                 dualMBOConverged_ = true;

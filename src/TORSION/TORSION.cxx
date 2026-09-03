@@ -14,8 +14,6 @@
 
 #include "dualmbo/DualMBO.hxx"
 
-namespace {
-
 // The Jacobian of a piecewise-linear map on Omega, one 2x2 row-major per face,
 // in the layout FieldIntegration reads a target in: row 0 is grad u and row 1
 // is grad v, which is how J*_t is written too.
@@ -23,7 +21,11 @@ namespace {
 // This is what makes Sec. 6.5's re-projection a swap of one argument rather
 // than a second solver: a map's own Jacobian is a legal target for the fit that
 // produced it, and fitting it back under the constraints is a projection.
-std::vector<std::array<double, 4>> jacobianOf(const Mesh &om, const std::vector<Point> &uv) {
+//
+// A member rather than a file-local: the viewer drives Stage 4R itself and its
+// re-projection has to fit the same object. See TORSION.hxx.
+std::vector<std::array<double, 4>> TORSION::jacobianOf(const Mesh &om,
+                                                       const std::vector<Point> &uv) {
     const int nT = static_cast<int>(om.triangles.size());
     std::vector<std::array<double, 4>> J(nT, {1.0, 0.0, 0.0, 1.0});
     if (uv.size() != om.vertices.size()) return J;
@@ -98,10 +100,10 @@ enum : unsigned char { kFixed = 0, kFreeInU = 1, kFreeInV = 2, kFree = 3 };
 //
 // Returns the number of faces still inverted.
 // ---------------------------------------------------------------------------
-int relaxToKernel(const Mesh &om, std::vector<Point> &uv,
-                  const std::vector<unsigned char> &freedom,
-                  const std::vector<int> &partner, const std::vector<int> &partnerK,
-                  int sweeps) {
+int TORSION::relaxToKernel(const Mesh &om, std::vector<Point> &uv,
+                           const std::vector<unsigned char> &freedom,
+                           const std::vector<int> &partner, const std::vector<int> &partnerK,
+                           int sweeps) {
     const int nV = static_cast<int>(om.vertices.size());
     const int nT = static_cast<int>(om.triangles.size());
     if (uv.size() != static_cast<size_t>(nV)) return -1;
@@ -365,8 +367,6 @@ int relaxToKernel(const Mesh &om, std::vector<Point> &uv,
     }
     return countInverted();
 }
-
-} // namespace
 
 TORSION::TORSION(std::shared_ptr<Mesh> m) : TORSION(std::move(m), Options()) {}
 
@@ -672,10 +672,15 @@ std::vector<double> TORSION::inducedLengths(const Mesh &mesh, const ConeCut &cut
 // result to Sec. 6.5's projection to put back what it let go, which is what
 // makes letting go of an equality a step rather than a loss.
 // ---------------------------------------------------------------------------
-std::vector<unsigned char> TORSION::vertexFreedom(int level) const {
-    const Mesh &om = cutter->getCutMesh();
-    const Mesh &orig = cutter->getOriginalMesh();
-    const auto &c2o = cutter->getCutVertexToOriginal();
+// `usedAxis` is the axis the integration was solved with, empty when it was
+// solved free. Static, and taking the cut and the axis rather than reading them
+// off the object, because the viewer climbs this ladder too. See TORSION.hxx.
+std::vector<unsigned char> TORSION::vertexFreedom(const ConeCut &cut,
+                                                  const std::vector<int> &usedAxis,
+                                                  int level) {
+    const Mesh &om = cut.getCutMesh();
+    const Mesh &orig = cut.getOriginalMesh();
+    const auto &c2o = cut.getCutVertexToOriginal();
     const int nV = static_cast<int>(om.vertices.size());
     std::vector<unsigned char> freedom(nV, kFree);
 
@@ -1481,8 +1486,8 @@ bool TORSION::run() {
                 std::vector<int> mate, turn;
                 if (options.pairSeamInUntangle && level < 2) seamPairing(mate, turn);
                 const int left = relaxToKernel(cutter->getCutMesh(), local,
-                                               vertexFreedom(level), mate, turn,
-                                               options.localUntangleSweeps);
+                                               vertexFreedom(*cutter, usedAxis, level),
+                                               mate, turn, options.localUntangleSweeps);
                 status.localUntangleFlippedFaces =
                     std::min(status.localUntangleFlippedFaces, left);
                 if (left != 0) continue;

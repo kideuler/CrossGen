@@ -670,6 +670,12 @@ private:
     // phase, exactly as it swaps psi_R for Psi at the Layout one.
     std::vector<Point>               integratedMap_;
     bool                             showIntegrated_ = false;
+    // The alignment axis the integration was actually solved with -- Sec. 6.4's
+    // in full, the strict one, or none, whichever Stage 4F's fallback kept.
+    // Stage 4R reads it twice: it is what decides which coordinates a vertex
+    // may move in at rung 0 of Sec. 7.2a's ladder, and it is what Sec. 6.5's
+    // projection puts back afterwards. Empty means the solve was free.
+    std::vector<int>                 usedAxis_;
     // Stages 4 to 6. Each holds a reference to the one before it -- Immersion
     // to the cut, the flow and the cones, SubdomainLabels to the immersion,
     // LayoutEnergy to both -- so they are destroyed in the reverse order and
@@ -913,6 +919,13 @@ private:
     QTimer *timer_ = nullptr;
 
     static constexpr int MBO_MAX_STEPS = 500;
+
+    // The MBO convergence test both pipelines use, as `error < 2 N tol` with N
+    // the triangle count. 1e-5 is what TORSION::runField() and MERIDIAN's
+    // Stage 0 ship with, and it is what the paper_tests layout runs (E4, E5
+    // Part 3) measure the pipeline at; a tighter one here would mean the field
+    // on screen is not the field either of them lays out.
+    static constexpr double DUALMBO_TOL = 1e-5;
 
     // L-BFGS iteration cap per continuation stage of Eq. (1). The paper stops
     // on the gradient tolerance and so does every mesh in data/meshes at a few
