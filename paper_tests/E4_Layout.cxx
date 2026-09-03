@@ -77,6 +77,7 @@ int main(int argc, char **argv) {
     std::vector<std::string> only;
     double target = 0.05;
     bool diskTemplates = false;
+    bool b1Continuation = false;
     int limit = 0;
 
     for (int i = 1; i < argc; ++i) {
@@ -88,11 +89,12 @@ int main(int argc, char **argv) {
         else if (a == "--obj" && i + 1 < argc) objDir = argv[++i];
         else if (a == "--limit" && i + 1 < argc) limit = std::stoi(argv[++i]);
         else if (a == "--disk-templates") diskTemplates = true;
+        else if (a == "--b1-continuation") b1Continuation = true;
         else if (a == "--help") {
             std::cout << "Usage: " << argv[0]
                       << " [--out DIR] [--set singlemat|multimat] [--methods SIPG,B1,B2]\n"
-                         "       [--target EDGE] [--obj DIR] [--limit N] [--disk-templates]"
-                         " [model ...]\n";
+                         "       [--target EDGE] [--obj DIR] [--limit N] [--disk-templates]\n"
+                         "       [--b1-continuation] [model ...]\n";
             return 0;
         } else only.push_back(a);
     }
@@ -144,6 +146,10 @@ int main(int argc, char **argv) {
 
         for (const std::string &name : methods) {
             MethodOptions fo;   // the shipped tolerance: this measures the pipeline
+            // The tau-continuation is part of our method; --b1-continuation
+            // gives the baseline the same ladder, which is the fair-comparison
+            // variant the protocol paragraph has to report beside the headline.
+            fo.b1TauContinuation = b1Continuation;
             const FieldRun run = runMethod(name, mesh, fo);
 
             Outcome o;

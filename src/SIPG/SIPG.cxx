@@ -105,6 +105,10 @@ void SIPG::initialize() {
     // right thing to average: two edges that meet at a right angle carry the
     // same value and reinforce, and only edges genuinely off the same cross
     // pull against each other.
+    //
+    // The averaging is only *accumulated* here; what it becomes in K and b is
+    // decided below, once every edge incident on the triangle has been seen,
+    // because the strength of the pin has to depend on whether the edges agree.
     auto pinToEdge = [&](int edgeIdx, int ti) {
         if (ti < 0) return;
 
@@ -139,11 +143,6 @@ void SIPG::initialize() {
         double theta = std::atan2(dy, dx);
         std::complex<double> ge = std::exp(std::complex<double>(0.0, 4.0 * theta));
 
-        // K_ii += kappa,  b_i += kappa * g_e
-        stiffTrips.emplace_back(ti, ti, std::complex<double>(kappa, 0.0));
-        b[ti] += kappa * ge;
-
-        // Accumulate for hard BC map
         bcWeightedSum[ti] += kappa * ge;
         bcWeightTotal[ti] += kappa;
     };
@@ -188,21 +187,59 @@ void SIPG::initialize() {
             double kappa = gamma * eMax * eMax / (2.0 * area[tc]);
 
             const std::complex<double> gc(1.0, 0.0); // exp(4i*0): cross on the axes
-            stiffTrips.emplace_back(tc, tc, std::complex<double>(kappa, 0.0));
-            b[tc] += kappa * gc;
             bcWeightedSum[tc] += kappa * gc;
             bcWeightTotal[tc] += kappa;
             diskCenterTriangles.push_back(tc);
         }
     }
 
-    // Normalise each boundary triangle's BC to the unit circle.
+    // --- Emit the Dirichlet data into K and b, and decide what is pinnable ---
+    //
+    // A triangle with a single aligned edge is the ordinary case: one tangent,
+    // nothing to reconcile, and the pin is that tangent at full strength.
+    //
+    // A triangle carrying two of them is not, and the naive average is wrong in
+    // a way that is worth spelling out. The data is exp(4i theta) per edge, so
+    // two edges a multiple of 90 degrees apart carry the *same* value and
+    // reinforce -- that is the whole reason the spin-4 embedding is the right
+    // thing to average in. Two edges 45 degrees apart carry exp(4i*0) = +1 and
+    // exp(4i*pi/4) = -1 and cancel outright. The sum is then zero, its direction
+    // is whatever the arithmetic noise left, and the assembled system asks the
+    // triangle to be equal to nothing at all at full penalty -- it is pulled to
+    // the origin and normalisation turns that into noise. Measured at the apex
+    // of a 45-degree wedge: 41.8 degrees of boundary misalignment, on the one
+    // element where alignment is most visible.
+    //
+    // The honest reading is that a cross cannot be tangent to both edges, that
+    // the constraint set is inconsistent, and that the element is too coarse to
+    // resolve the turn. So weight the pin by how consistent its data actually is,
+    //
+    //     r = |sum_e kappa_e g_e| / sum_e kappa_e  in [0, 1],
+    //
+    // and impose  r * (sum kappa_e) * ghat  with ghat the unit average. Since
+    // r * (sum kappa) * ghat = sum kappa_e g_e, the right-hand side is exactly
+    // what it always was and only the diagonal changes: the penalty's minimiser
+    // becomes the *unit* vector ghat instead of the short vector r*ghat, so the
+    // pull toward the origin is gone. r = 1 at a consistent corner reproduces
+    // the old assembly exactly; r -> 0 at a 45-degree one withdraws the
+    // constraint and lets the triangle take the value its neighbours imply,
+    // which is the smoothest boundary-compatible answer available on this mesh.
+    //
+    // Below kCornerCoherenceMin the averaged direction carries no information
+    // worth pinning to, so such a triangle is left out of the hard-pin set and
+    // diffuses instead. Everything else is pinned exactly as before.
     boundaryTriangleBC.clear();
     for (const auto &[ti, wsum] : bcWeightedSum) {
-        double mag = std::abs(wsum);
-        if (mag > 1e-14) {
+        const double wtot = bcWeightTotal[ti];
+        if (wtot < 1e-30) continue;
+        const double mag = std::abs(wsum);
+        const double r = cornerCoherenceFix ? mag / wtot : 1.0;
+
+        stiffTrips.emplace_back(ti, ti, std::complex<double>(r * wtot, 0.0));
+        b[ti] += wsum;
+
+        if (mag > 1e-14 && r >= (cornerCoherenceFix ? kCornerCoherenceMin : 0.0))
             boundaryTriangleBC[ti] = wsum / mag;
-        }
     }
 
     // -----------------------------------------------------------------------

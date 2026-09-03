@@ -117,6 +117,24 @@ public:
     // both. Call before initialize().
     void setHardBoundaryConditions(bool on) { hardBoundary = on; }
 
+    // Weight a triangle's alignment pin by how consistent its edges' data is.
+    //
+    // The Dirichlet data of a triangle carrying two aligned edges is the
+    // kappa-weighted average of exp(4i theta) over them. That average is exact
+    // where the two tangents are a quarter turn apart -- both edges then ask for
+    // the same cross -- and *cancels* where they are an eighth turn apart, since
+    // exp(4i*0) and exp(4i*pi/4) are antipodal. At such a corner the assembled
+    // pin has no direction and full strength, which is the worst of both: see
+    // the long comment in initialize(). On is the default and scales the pin by
+    // the coherence r = |sum kappa g| / sum kappa, which is 1 in the ordinary
+    // one-edge case and so changes nothing there. Off restores the old
+    // assembly, which is the ablation. Call before initialize().
+    void setCornerCoherenceFix(bool on) { cornerCoherenceFix = on; }
+
+    // Coherence below which the averaged direction is not worth pinning to and
+    // the triangle is left to diffuse. 45 degrees of disagreement gives r = 0.
+    static constexpr double kCornerCoherenceMin = 0.2;
+
     // The Dirichlet data as initialize() computed it: triangle -> the unit
     // spin-4 value its incident boundary/interface edges ask for. Non-empty
     // whether or not the pin is hard, because it is the *data* and not the way
@@ -150,6 +168,7 @@ private:
     double gamma;        // SIPG penalty parameter
     int maxIterations;   // maximum number of iterations
     bool hardBoundary = true; // see setHardBoundaryConditions
+    bool cornerCoherenceFix = true; // see setCornerCoherenceFix
 
     // Interior edges promoted to aligned (Dirichlet) edges, per edge of the
     // mesh. Empty when there are none, which is the single-material case.

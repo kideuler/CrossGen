@@ -60,43 +60,115 @@ bool isMultiMaterial(const Mesh &m) {
     return false;
 }
 
+namespace {
+
+// The mean edge length, which is what the tau floor is measured in.
+double meanEdgeLength(const Mesh &m) {
+    double s = 0.0;
+    int n = 0;
+    for (std::size_t e = 0; e < m.edges.size(); ++e) {
+        s += normP(m.vertices[m.edges[e][1]] - m.vertices[m.edges[e][0]]);
+        ++n;
+    }
+    return n ? s / n : 0.0;
+}
+
+// The bounding-box diagonal, which is what tau is measured in.
+double boundingDiagonal(const Mesh &m) {
+    double mnx = 1e300, mxx = -1e300, mny = 1e300, mxy = -1e300;
+    for (const Point &p : m.vertices) {
+        mnx = std::min(mnx, p[0]); mxx = std::max(mxx, p[0]);
+        mny = std::min(mny, p[1]); mxy = std::max(mxy, p[1]);
+    }
+    return std::hypot(mxx - mnx, mxy - mny);
+}
+
+// The ladder of tau scales the continuation walks, largest first. The first
+// entry is always 1 -- the shipped tau -- so the continuation starts from the
+// field the single-tau scheme would have returned and only ever refines it.
+std::vector<double> tauLadder(const Mesh &m, const MethodOptions &o, bool enabled) {
+    std::vector<double> ladder{o.tauScale};
+    if (!enabled) return ladder;
+
+    const double D = boundingDiagonal(m);
+    const double h = meanEdgeLength(m);
+    if (D <= 0.0 || h <= 0.0 || o.tauRatio <= 0.0 || o.tauRatio >= 1.0) return ladder;
+
+    // ell = sqrt(8 gamma tau) <= tauFloorEdges * h  =>  tau <= (c h)^2 / (8 gamma)
+    const double tau0 = o.tauScale * D * D / 10.0;
+    const double tauMin = (o.tauFloorEdges * h) * (o.tauFloorEdges * h) / (8.0 * o.gamma);
+
+    double tau = tau0;
+    while (tau * o.tauRatio > tauMin && ladder.size() < 40) {
+        tau *= o.tauRatio;
+        ladder.push_back(ladder.back() * o.tauRatio);
+    }
+    return ladder;
+}
+
+} // namespace
+
 // ---------------------------------------------------------------------------
 FieldRun runSIPG(const std::shared_ptr<Mesh> &m, const MethodOptions &o) {
     FieldRun r;
     r.method = "SIPG";
     const Clock::time_point tAll = Clock::now();
     try {
-        SIPG solver(m, o.maxSteps, o.gamma);
-        solver.setPinDiskCenters(o.pinDiskCenters);
-        solver.setTauScale(o.tauScale);
-        solver.setHardBoundaryConditions(o.hardBoundary);
-        if (o.alignInterfaces && isMultiMaterial(*m)) solver.setAlignedInteriorEdges(interfaceEdges(*m));
-
-        const Clock::time_point tA = Clock::now();
-        solver.initialize();
-        r.assembleSeconds = since(tA);
-
         const metrics::EdgeWeights w = o.recordHistory ? metrics::edgeWeights(*m, o.gamma)
                                                        : metrics::EdgeWeights{};
         const std::vector<char> skip = o.recordHistory ? interfaceEdgeFlags(*m) : std::vector<char>{};
-
         const double nT = static_cast<double>(m->triangles.size());
-        const Clock::time_point tS = Clock::now();
-        for (int i = 0; i < o.maxSteps; ++i) {
-            solver.step();
-            ++r.iterations;
-            if (o.recordHistory) {
-                r.energyHistory.push_back(metrics::commonEnergy(*m, w, solver.u_k_prev, skip));
-                r.sipgEnergyHistory.push_back(metrics::sipgEnergy(*m, o.gamma, solver.u_k_prev, skip));
-                r.incrementHistory.push_back(solver.error);
+        const std::vector<double> ladder = tauLadder(*m, o, o.tauContinuation);
+
+        Eigen::VectorXcd carried;   // the previous level's field
+        for (std::size_t level = 0; level < ladder.size(); ++level) {
+            SIPG solver(m, o.maxSteps, o.gamma);
+            solver.setPinDiskCenters(o.pinDiskCenters);
+            solver.setTauScale(ladder[level]);
+            solver.setHardBoundaryConditions(o.hardBoundary);
+            if (o.alignInterfaces && isMultiMaterial(*m))
+                solver.setAlignedInteriorEdges(interfaceEdges(*m));
+
+            const Clock::time_point tA = Clock::now();
+            solver.initialize();
+            r.assembleSeconds += since(tA);
+
+            // Every level after the first starts from the one before it. The
+            // Dirichlet triangles keep the data this level assembled -- the
+            // constraint does not travel with the field, it is re-imposed.
+            if (carried.size() == solver.u_k_prev.size()) {
+                Eigen::VectorXcd start = carried;
+                for (const auto &[ti, bc] : solver.getBoundaryData()) start[ti] = bc;
+                solver.u_k_prev = start;
+                solver.u_k = start;
             }
-            if (solver.error < 2.0 * nT * o.convergenceTol) {
-                r.converged = true;
-                if (!o.forceSteps) break;
+
+            // Only the last level takes the convergence history: the earlier
+            // ones are a continuation path, not the answer.
+            const bool record = o.recordHistory && level + 1 == ladder.size();
+            const int cap = (ladder.size() == 1) ? o.maxSteps
+                                                 : std::min(o.maxSteps, o.tauLevelSteps);
+
+            const Clock::time_point tS = Clock::now();
+            bool converged = false;
+            for (int i = 0; i < cap; ++i) {
+                solver.step();
+                ++r.iterations;
+                if (record) {
+                    r.energyHistory.push_back(metrics::commonEnergy(*m, w, solver.u_k_prev, skip));
+                    r.sipgEnergyHistory.push_back(metrics::sipgEnergy(*m, o.gamma, solver.u_k_prev, skip));
+                    r.incrementHistory.push_back(solver.error);
+                }
+                if (solver.error < 2.0 * nT * o.convergenceTol) {
+                    converged = true;
+                    if (!o.forceSteps) break;
+                }
             }
+            r.solveSeconds += since(tS);
+            r.converged = converged;
+            carried = solver.u_k_prev;
         }
-        r.solveSeconds = since(tS);
-        r.u = solver.u_k_prev;
+        r.u = carried;
         r.ok = true;
     } catch (const std::exception &e) {
         r.error = e.what();
@@ -111,26 +183,54 @@ FieldRun runP1MBO(const std::shared_ptr<Mesh> &m, const MethodOptions &o) {
     r.method = "B1";
     const Clock::time_point tAll = Clock::now();
     try {
-        CrossField cf(m, o.maxSteps);
-        const Clock::time_point tA = Clock::now();
-        cf.initialize(1, o.seed ? o.seed : 1u);   // method 1: seeded random interior
-        const double assemble = since(tA);
-
+        // B1 is run as published by default: one tau = D^2/10, its own seeded
+        // random start. `b1TauContinuation` gives it the same ladder our method
+        // uses, which is what separates "the continuation" from "the
+        // discretisation" as the source of any gain -- see MethodOptions.
+        const std::vector<double> ladder = tauLadder(*m, o, o.b1TauContinuation);
         const double nV = static_cast<double>(m->vertices.size());
-        const Clock::time_point tS = Clock::now();
+        double assemble = 0.0, solve = 0.0;
         int iters = 0;
         bool conv = false;
-        for (int i = 0; i < o.maxSteps; ++i) {
-            cf.step();
-            ++iters;
-            if (cf.error < 2.0 * nV * o.convergenceTol) { conv = true; break; }
+        Eigen::VectorXcd carried;
+        std::vector<std::pair<int, double>> singular;   // from the last level
+
+        for (std::size_t level = 0; level < ladder.size(); ++level) {
+            CrossField cf(m, o.maxSteps);
+            cf.setTauScale(ladder[level]);
+            const Clock::time_point tA = Clock::now();
+            cf.initialize(1, o.seed ? o.seed : 1u);   // method 1: seeded random interior
+            assemble += since(tA);
+
+            if (carried.size() == cf.u_k_prev.size()) {
+                // Keep this level's Dirichlet data at the boundary vertices and
+                // take the previous level's field everywhere else.
+                Eigen::VectorXcd start = carried;
+                for (int v : m->boundaryVertices) start[v] = cf.u_k_prev[v];
+                cf.u_k_prev = start;
+                cf.u_k = start;
+            }
+
+            const int cap = (ladder.size() == 1) ? o.maxSteps
+                                                 : std::min(o.maxSteps, o.tauLevelSteps);
+            const Clock::time_point tS = Clock::now();
+            conv = false;
+            for (int i = 0; i < cap; ++i) {
+                cf.step();
+                ++iters;
+                if (cf.error < 2.0 * nV * o.convergenceTol) { conv = true; break; }
+            }
+            solve += since(tS);
+            carried = cf.u_k_prev;
+            if (level + 1 == ladder.size()) {
+                cf.computeSingularities();
+                singular = cf.singularTriangles;
+            }
         }
-        const double solve = since(tS);
-        cf.computeSingularities();
 
         // The conversion is a separate, documented step and returns a run of
         // its own; everything the solve knows is copied onto it here.
-        r = convertP1ToFaces(*m, cf.u_k_prev, cf.singularTriangles);
+        r = convertP1ToFaces(*m, carried, singular);
         r.method = "B1";
         r.converged = conv;
         r.iterations = iters;

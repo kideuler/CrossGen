@@ -222,7 +222,7 @@ void CrossField::initialize(int method, unsigned seed) {
         maxY = std::max(maxY, p[1]);
     }
     double D = std::sqrt((maxX - minX) * (maxX - minX) + (maxY - minY) * (maxY - minY));
-    tau = D * D / 10.0;
+    tau = tauScale * D * D / 10.0;
 
     // Compute system matrix A = M + tau * K
     A = M + tau * K;

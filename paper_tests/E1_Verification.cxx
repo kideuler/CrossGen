@@ -62,7 +62,17 @@ struct Solved {
 
 Solved solve(const std::shared_ptr<Mesh> &m, const MethodOptions &o) {
     Solved s;
-    s.run = runSIPG(m, o);
+    // E1 is the study of the *single-tau* operator, and every part of it means
+    // that: (a) and (b) sweep one tau, the product identity of (a/b) is a
+    // statement about one step -- A = M + (gamma tau) K_0 -- and (c) refines at
+    // fixed tau. The tau-continuation the other experiments run would make all
+    // three measure something else, and the product identity would simply be
+    // false under it, since the continuation's floor depends on gamma and on
+    // the mesh separately rather than on gamma*tau. So it is off here, and what
+    // the continuation buys is measured on its own in E1(e).
+    MethodOptions single = o;
+    single.tauContinuation = false;
+    s.run = runSIPG(m, single);
     if (!s.run.ok) return s;
     s.sing = metrics::singularities(*m, s.run.u);
     s.energy = metrics::commonEnergy(*m, metrics::edgeWeights(*m, kGammaEval), s.run.u,
@@ -372,6 +382,11 @@ int main(int argc, char **argv) {
             o.recordHistory = true;
             o.forceSteps = true;      // a fixed budget, so the curve has a shape
             o.maxSteps = 40;
+            // The single-tau convergence history, for the same reason `solve`
+            // forces it: a continuation restarts the increment at every level,
+            // so its history is a sawtooth of restarts and says nothing about
+            // whether one MBO iteration converges.
+            o.tauContinuation = false;
             const FieldRun r = runSIPG(c.mesh, o);
             if (!r.ok) { v.warn(c.name + ": " + r.error); continue; }
             if (r.energyHistory.empty()) continue;

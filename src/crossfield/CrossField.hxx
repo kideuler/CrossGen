@@ -29,6 +29,18 @@ public:
     // clock.
     void initialize(int method = 0, unsigned seed = 0);
 
+    // Multiply the tau = D^2/10 heuristic by this factor.
+    //
+    // The same knob SIPG::setTauScale is, and it exists for the same reason:
+    // D^2/10 makes one MBO step diffuse across several domain diameters, so the
+    // iteration reaches its fixed point almost at once and the threshold
+    // dynamics never runs. It is settable so that the *baseline* can be given
+    // the same tau-continuation our method uses and the comparison can say
+    // whether the gain is the continuation or the discretisation. 1 is the
+    // published heuristic and remains the default. Call before initialize().
+    void setTauScale(double s) { tauScale = s; }
+    double getTau() const { return tau; }
+
     void step();
 
     void computeSingularities();
@@ -49,6 +61,7 @@ private:
     Eigen::BiCGSTAB<Eigen::SparseMatrix<std::complex<double>>> solverBiCGSTAB; // sparse iterative solver (fallback)
     bool useBiCGSTAB = false; // flag to indicate which solver to use
     double tau; // time step size
+    double tauScale = 1.0; // multiplier on the D^2/10 heuristic, see setTauScale
     int maxIterations; // maximum number of iterations
 };
 
