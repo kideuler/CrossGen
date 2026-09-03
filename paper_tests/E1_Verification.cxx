@@ -51,7 +51,7 @@ using namespace paper;
 namespace {
 
 // The weight every energy in this file is evaluated at, whatever the solver ran
-// at. Sec. 5: "SIPG weights fixed for all methods".
+// at. Sec. 5: "DualMBO weights fixed for all methods".
 constexpr double kGammaEval = 10.0;
 
 struct Solved {
@@ -72,7 +72,7 @@ Solved solve(const std::shared_ptr<Mesh> &m, const MethodOptions &o) {
     // the continuation buys is measured on its own in E1(e).
     MethodOptions single = o;
     single.tauContinuation = false;
-    s.run = runSIPG(m, single);
+    s.run = runDualMBO(m, single);
     if (!s.run.ok) return s;
     s.sing = metrics::singularities(*m, s.run.u);
     s.energy = metrics::commonEnergy(*m, metrics::edgeWeights(*m, kGammaEval), s.run.u,
@@ -373,9 +373,9 @@ int main(int argc, char **argv) {
     heading("E1(d)  MBO convergence and the Lyapunov energy");
     {
         Csv csv(outDir + "/E1_convergence.csv",
-                {"domain", "iteration", "increment", "energy", "sipg_energy"});
+                {"domain", "iteration", "increment", "energy", "dualmbo_energy"});
         Table t({"domain", "steps", "increment first -> last", "E_common first -> last",
-                 "worst rise (rel)", "E_SIPG first -> last", "worst rise (rel)"});
+                 "worst rise (rel)", "E_DualMBO first -> last", "worst rise (rel)"});
 
         for (const Case &c : cases) {
             MethodOptions o;
@@ -387,7 +387,7 @@ int main(int argc, char **argv) {
             // so its history is a sawtooth of restarts and says nothing about
             // whether one MBO iteration converges.
             o.tauContinuation = false;
-            const FieldRun r = runSIPG(c.mesh, o);
+            const FieldRun r = runDualMBO(c.mesh, o);
             if (!r.ok) { v.warn(c.name + ": " + r.error); continue; }
             if (r.energyHistory.empty()) continue;
 
@@ -395,7 +395,7 @@ int main(int argc, char **argv) {
                 csv.row({{"domain", c.name}, {"iteration", num((int)k + 1)},
                          {"increment", num(r.incrementHistory[k], 10)},
                          {"energy", num(r.energyHistory[k], 10)},
-                         {"sipg_energy", num(r.sipgEnergyHistory[k], 10)}});
+                         {"dualmbo_energy", num(r.dualMBOEnergyHistory[k], 10)}});
             }
 
             // The three monotonicity questions, answered rather than assumed.
@@ -405,15 +405,15 @@ int main(int argc, char **argv) {
                 return w;
             };
             const double scaleC = std::max(1e-30, std::fabs(r.energyHistory.front()));
-            const double scaleS = std::max(1e-30, std::fabs(r.sipgEnergyHistory.front()));
+            const double scaleS = std::max(1e-30, std::fabs(r.dualMBOEnergyHistory.front()));
             const double riseC = worstRise(r.energyHistory) / scaleC;
-            const double riseS = worstRise(r.sipgEnergyHistory) / scaleS;
+            const double riseS = worstRise(r.dualMBOEnergyHistory) / scaleS;
 
             t.row({c.name, num((int)r.energyHistory.size()),
                    num(r.incrementHistory.front(), 3) + " -> " + num(r.incrementHistory.back(), 3),
                    num(r.energyHistory.front(), 6) + " -> " + num(r.energyHistory.back(), 6),
                    num(riseC, 3),
-                   num(r.sipgEnergyHistory.front(), 6) + " -> " + num(r.sipgEnergyHistory.back(), 6),
+                   num(r.dualMBOEnergyHistory.front(), 6) + " -> " + num(r.dualMBOEnergyHistory.back(), 6),
                    num(riseS, 3)});
 
             // What is asserted is the thing the scheme is actually run on: the

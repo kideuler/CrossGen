@@ -162,8 +162,8 @@ const char *mboPhaseName(MBOPhase p) {
 const char *umberPhaseName(UMBERPhase p) {
     switch (p) {
         case UMBERPhase::MeshOnly:   return "1) mesh";
-        case UMBERPhase::CrossField: return "2) SIPG crossfield";
-        case UMBERPhase::Stepping:   return "3) SIPG stepping";
+        case UMBERPhase::CrossField: return "2) DualMBO crossfield";
+        case UMBERPhase::Stepping:   return "3) DualMBO stepping";
         case UMBERPhase::Frames:     return "4) UMBER frame field";
         case UMBERPhase::Polysquare: return "5) polysquare (Sec. 4.3)";
         case UMBERPhase::Blocks:     return "6) block structure (Sec. 5)";
@@ -179,8 +179,8 @@ const char *pipelinePhaseName(PipelinePhase p, Mode m) {
     const bool field = (m == Mode::TORSION);
     switch (p) {
         case PipelinePhase::MeshOnly:   return "1) mesh";
-        case PipelinePhase::CrossField: return "2) SIPG crossfield";
-        case PipelinePhase::Stepping:   return "3) SIPG stepping";
+        case PipelinePhase::CrossField: return "2) DualMBO crossfield";
+        case PipelinePhase::Stepping:   return "3) DualMBO stepping";
         case PipelinePhase::Cones:      return "4) cone singularities (Sec. 3.1)";
         case PipelinePhase::Cut:        return "5) cutting graph (Sec. 3.2.2)";
         case PipelinePhase::Flow:
@@ -322,9 +322,9 @@ void CrossGenWidget::paintGL() {
                           mboStepCount_ < MBO_MAX_STEPS &&
                           !mboConverged_);
 
-    bool isSIPGStepping = (sipgStageIsStepping() &&
-                           sipgSteppingStarted_ &&
-                           !sipgConverged_);
+    bool isDualMBOStepping = (dualMBOStageIsStepping() &&
+                           dualMBOSteppingStarted_ &&
+                           !dualMBOConverged_);
 
     bool isTracing = (mode_ == Mode::MBO &&
                       mboPhase_ == MBOPhase::Trace &&
@@ -333,8 +333,8 @@ void CrossGenWidget::paintGL() {
 
     if (isMBOStepping) {
         renderMBOAnimation();
-    } else if (isSIPGStepping) {
-        renderSIPGAnimation();
+    } else if (isDualMBOStepping) {
+        renderDualMBOAnimation();
     } else if (isTracing) {
         renderTraceAnimation();
     } else {
@@ -634,7 +634,7 @@ void CrossGenWidget::doReset() {
     miqSolver_.reset();
 #endif
     crossField_.reset();
-    sipgField_.reset();
+    dualMBOField_.reset();
     separatrixTrace_.reset();
     quadLayout_.reset();
     simplified_.reset();
@@ -714,9 +714,9 @@ void CrossGenWidget::doReset() {
     mboTracingStarted_    = false;
     mboTracingFinished_   = false;
     mboStepCount_         = 0;
-    sipgSteppingStarted_  = false;
-    sipgConverged_        = false;
-    sipgStepCount_        = 0;
+    dualMBOSteppingStarted_  = false;
+    dualMBOConverged_        = false;
+    dualMBOStepCount_        = 0;
     umberAnnounced_       = false;
     umberAttempted_       = false;
     polysquareAnnounced_  = false;
@@ -1032,22 +1032,22 @@ void CrossGenWidget::runOASIS() {
 // and an intermediate iterate of a quartic energy is not a field worth drawing.
 void CrossGenWidget::runUMBER() {
     umberAttempted_ = true;
-    if (!sipgField_.has_value()) return;
+    if (!dualMBOField_.has_value()) return;
 
     // Eq. (1) starts from a *converged* cross field: the comb in initialize()
     // assumes neighbouring triangles already agree up to a k*90-degree turn,
     // which a half-solved MBO field does not. Advancing out of the stepping
     // phase early therefore finishes the solve here rather than optimizing a
     // field that is still moving.
-    if (!sipgConverged_) {
+    if (!dualMBOConverged_) {
         auto t0 = Clock::now();
-        sipgField_->runMBO();
-        sipgField_->computeSingularities();
-        sipgConverged_ = true;
+        dualMBOField_->runMBO();
+        dualMBOField_->computeSingularities();
+        dualMBOConverged_ = true;
         auto t1 = Clock::now();
         std::ostringstream oss;
-        oss << "[UMBER] finished the SIPG solve first, error " << std::scientific
-            << std::setprecision(3) << sipgField_->error << ", "
+        oss << "[UMBER] finished the DualMBO solve first, error " << std::scientific
+            << std::setprecision(3) << dualMBOField_->error << ", "
             << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
         console_.log(oss.str());
     }
@@ -1078,7 +1078,7 @@ void CrossGenWidget::runUMBER() {
     size_t internalBefore = 0;
     auto t0 = Clock::now();
     try {
-        umber_.emplace(*sipgField_, *umberCut_);
+        umber_.emplace(*dualMBOField_, *umberCut_);
         umber_->setMaxIterations(UMBER_LBFGS_ITERATIONS);
         umber_->initialize();
         before = umber_->energy();
@@ -1485,7 +1485,7 @@ void CrossGenWidget::runMERIDIANInterfaces() {
                  "the triangles by material");
 }
 
-// Stage 1, Sec. 3.1. Interior indices are the SIPG field's winding numbers,
+// Stage 1, Sec. 3.1. Interior indices are the DualMBO field's winding numbers,
 // boundary ones come from the field's rotation across each boundary star
 // against the interior angle there; then Eq. (4) is checked, and repaired from
 // the boundary cones if the rounding on them cost it.
@@ -1495,7 +1495,7 @@ void CrossGenWidget::runMERIDIANInterfaces() {
 // kernel is the constants, so the residual has to be orthogonal to them -- and
 // an inadmissible set does not converge slowly, it has no solution at all.
 void CrossGenWidget::runMERIDIANCones() {
-    if (!sipgField_.has_value()) return;   // called before the field: not an attempt
+    if (!dualMBOField_.has_value()) return;   // called before the field: not an attempt
     conesAttempted_ = true;
 
     // Cone indices are read off a *converged* field: an interior winding number
@@ -1503,21 +1503,21 @@ void CrossGenWidget::runMERIDIANCones() {
     // boundary one is measured against a field that is supposed to be aligned
     // with the boundary. Advancing past the stepping phase early therefore
     // finishes the solve here rather than reading a field still in motion.
-    if (!sipgConverged_) {
+    if (!dualMBOConverged_) {
         auto t0 = Clock::now();
-        sipgField_->runMBO();
-        sipgConverged_ = true;
+        dualMBOField_->runMBO();
+        dualMBOConverged_ = true;
         auto t1 = Clock::now();
         std::ostringstream oss;
-        oss << "[MERIDIAN] finished the SIPG solve first, error " << std::scientific
-            << std::setprecision(3) << sipgField_->error << ", "
+        oss << "[MERIDIAN] finished the DualMBO solve first, error " << std::scientific
+            << std::setprecision(3) << dualMBOField_->error << ", "
             << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
         console_.log(oss.str());
     }
 
     auto t0 = Clock::now();
     try {
-        cones_.emplace(*sipgField_);
+        cones_.emplace(*dualMBOField_);
     } catch (const std::exception &e) {
         cones_.reset();
         console_.log(std::string("[Cones] FAILED: ") + e.what());
@@ -1793,7 +1793,7 @@ void CrossGenWidget::runRicciFlow() {
 // ── TORSION Stage 3F, Sec. 5: the combed field ───────────────────────────────
 //
 // The phase Pipeline A runs the flow in, doing the same job by other means:
-// turning the field into the structure the layout will have. SIPG stores
+// turning the field into the structure the layout will have. DualMBO stores
 // u_k[t] = exp(4 i theta_t) in the global frame, so on a planar model parallel
 // transport is identically zero, the matching across an interior edge is the
 // integer p_fg the two representatives differ by, and combing is a BFS over the
@@ -1805,7 +1805,7 @@ void CrossGenWidget::runRicciFlow() {
 // frames either side of it, which is what makes C2 hold by construction instead
 // of by a fit and a rounding.
 void CrossGenWidget::runTORSIONFrames() {
-    if (!sipgField_.has_value() || !coneCut_.has_value() || !cones_.has_value()) return;
+    if (!dualMBOField_.has_value() || !coneCut_.has_value() || !cones_.has_value()) return;
     framesAttempted_ = true;
 
     // Sec. 4, and C4. The frame the plan first wrote down was (1/h) R(-theta),
@@ -1852,7 +1852,7 @@ void CrossGenWidget::runTORSIONFrames() {
         // The interfaces go in for Sec. 6.4's alignment: an interface branch is
         // a curve of the layout in exactly the way a chain of dS is, and the
         // field is pinned tangent to it in the same way.
-        frames_.emplace(*sipgField_, *coneCut_, *cones_, fopts,
+        frames_.emplace(*dualMBOField_, *coneCut_, *cones_, fopts,
                         interfaces_.has_value() ? &*interfaces_ : nullptr);
     } catch (const std::exception &e) {
         frames_.reset();
@@ -4046,7 +4046,7 @@ void CrossGenWidget::runDiskExcision() {
     coneCut_.reset();
     cones_.reset();
     interfaces_.reset();
-    sipgField_.reset();
+    dualMBOField_.reset();
     flatMetric_ = viewer::FlatMetric{};
     coneFans_.clear();
     ricciU_.resize(0);
@@ -4061,8 +4061,8 @@ void CrossGenWidget::runDiskExcision() {
     separatricesAttempted_ = separatricesAnnounced_ = false;
     patchesAttempted_ = patchesAnnounced_ = false;
     meshAttempted_ = tmopAttempted_ = false;
-    sipgSteppingStarted_ = sipgConverged_ = false;
-    sipgStepCount_ = 0;
+    dualMBOSteppingStarted_ = dualMBOConverged_ = false;
+    dualMBOStepCount_ = 0;
 
     {
         std::ostringstream oss;
@@ -4355,19 +4355,19 @@ void CrossGenWidget::advancePhase() {
     }
 }
 
-// ── the SIPG solve, which three modes share ──────────────────────────────────
+// ── the DualMBO solve, which three modes share ──────────────────────────────────
 //
-// UMBER's input is a converged SIPG field, and so is either pipeline's: Sec.
+// UMBER's input is a converged DualMBO field, and so is either pipeline's: Sec.
 // 3.1 reads the cone indices off a field's holonomy, and TORSION goes on to
 // integrate the very same field. So the guards ask about the stage rather than
 // the mode.
 
-bool CrossGenWidget::sipgStageWantsField() const {
+bool CrossGenWidget::dualMBOStageWantsField() const {
     return (mode_ == Mode::UMBER && umberPhase_ >= UMBERPhase::CrossField) ||
            (inPipeline() && pipePhase_ >= PipelinePhase::CrossField);
 }
 
-bool CrossGenWidget::sipgStageIsStepping() const {
+bool CrossGenWidget::dualMBOStageIsStepping() const {
     return (mode_ == Mode::UMBER && umberPhase_ == UMBERPhase::Stepping) ||
            (inPipeline() && pipePhase_ == PipelinePhase::Stepping);
 }
@@ -4619,10 +4619,10 @@ void CrossGenWidget::runComputations() {
         }
     }
 
-    // ── SIPG: Initialize ──────────────────────────────────────────────────────
-    if (sipgStageWantsField() && !sipgField_.has_value()) {
+    // ── DualMBO: Initialize ──────────────────────────────────────────────────────
+    if (dualMBOStageWantsField() && !dualMBOField_.has_value()) {
         auto t0 = Clock::now();
-        sipgField_.emplace(mesh_);
+        dualMBOField_.emplace(mesh_);
         // On a multi-material domain the interfaces are Dirichlet data for the
         // field in exactly the way dS is: a curve the layout has to keep needs
         // the field tangent to it, or neither region either side gets the
@@ -4632,46 +4632,46 @@ void CrossGenWidget::runComputations() {
         // integrates the field, so an interface the field ran straight through
         // is an interface the *map* runs straight through.
         if (inPipeline() && interfaces_.has_value() && interfaces_->multiMaterial()) {
-            sipgField_->setAlignedInteriorEdges(interfaces_->interfaceEdges());
+            dualMBOField_->setAlignedInteriorEdges(interfaces_->interfaceEdges());
         }
-        sipgField_->initialize();
+        dualMBOField_->initialize();
         auto t1 = Clock::now();
-        console_.log("[SIPG] Initialized: " +
+        console_.log("[DualMBO] Initialized: " +
                      formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count()));
     }
 
-    // ── SIPG: Kick off stepping ───────────────────────────────────────────────
-    if (sipgStageIsStepping() && sipgField_.has_value() && !sipgSteppingStarted_) {
-        sipgSteppingStarted_ = true;
-        sipgStepCount_       = 0;
-        console_.log("[SIPG] Starting MBO iterations (" +
-                     std::to_string(sipgField_->getMesh().triangles.size()) + " tris)...");
+    // ── DualMBO: Kick off stepping ───────────────────────────────────────────────
+    if (dualMBOStageIsStepping() && dualMBOField_.has_value() && !dualMBOSteppingStarted_) {
+        dualMBOSteppingStarted_ = true;
+        dualMBOStepCount_       = 0;
+        console_.log("[DualMBO] Starting MBO iterations (" +
+                     std::to_string(dualMBOField_->getMesh().triangles.size()) + " tris)...");
     }
 
-    // ── SIPG: Run 2 stepping iterations per frame ─────────────────────────────
-    if (sipgStageIsStepping() && sipgSteppingStarted_ && !sipgConverged_) {
+    // ── DualMBO: Run 2 stepping iterations per frame ─────────────────────────────
+    if (dualMBOStageIsStepping() && dualMBOSteppingStarted_ && !dualMBOConverged_) {
         double ntris = static_cast<double>(mesh_->triangles.size());
-        for (int i = 0; i < 2 && sipgStepCount_ < 500; ++i) {
-            sipgField_->step();
-            ++sipgStepCount_;
-            if (sipgField_->error < 2.0 * ntris * 1e-8) {
-                console_.log("[SIPG] Converged at step " + std::to_string(sipgStepCount_) +
-                             " error=" + std::to_string(sipgField_->error));
-                sipgConverged_ = true;
+        for (int i = 0; i < 2 && dualMBOStepCount_ < 500; ++i) {
+            dualMBOField_->step();
+            ++dualMBOStepCount_;
+            if (dualMBOField_->error < 2.0 * ntris * 1e-8) {
+                console_.log("[DualMBO] Converged at step " + std::to_string(dualMBOStepCount_) +
+                             " error=" + std::to_string(dualMBOField_->error));
+                dualMBOConverged_ = true;
                 break;
             }
         }
-        sipgField_->computeSingularities();
+        dualMBOField_->computeSingularities();
 
         std::ostringstream stepMsg;
-        stepMsg << "[SIPG] Step " << sipgStepCount_ << "  error=" << std::scientific
-                << std::setprecision(3) << sipgField_->error;
+        stepMsg << "[DualMBO] Step " << dualMBOStepCount_ << "  error=" << std::scientific
+                << std::setprecision(3) << dualMBOField_->error;
         console_.log(stepMsg.str());
     }
 
-    // ── UMBER: cuts + Eq. (1) on top of the SIPG field ────────────────────────
+    // ── UMBER: cuts + Eq. (1) on top of the DualMBO field ────────────────────────
     if (mode_ == Mode::UMBER && umberPhase_ >= UMBERPhase::Frames &&
-        sipgField_.has_value() && !umberAttempted_) {
+        dualMBOField_.has_value() && !umberAttempted_) {
         if (!umberAnnounced_) {
             // runComputations() runs at the top of paintGL, so returning here
             // lets this frame draw the notice; the solve, which holds the GUI
@@ -4711,7 +4711,7 @@ void CrossGenWidget::runComputations() {
 
     // ── Both pipelines: Stage 1, the cones and Eq. (4) ───────────────────────
     if (inPipeline() && pipePhase_ >= PipelinePhase::Cones &&
-        sipgField_.has_value() && !conesAttempted_) {
+        dualMBOField_.has_value() && !conesAttempted_) {
         runMERIDIANCones();
     }
 
@@ -5211,13 +5211,13 @@ void CrossGenWidget::renderMBOAnimation() {
     renderOverlay("MBO stepping in progress...\npress 'q' to quit");
 }
 
-void CrossGenWidget::renderSIPGAnimation() {
+void CrossGenWidget::renderDualMBOAnimation() {
     viewer::drawAxis(view_);
     viewer::drawMesh(*mesh_);
-    viewer::drawTriangleCrossField(*mesh_, *sipgField_, scale_);
+    viewer::drawTriangleCrossField(*mesh_, *dualMBOField_, scale_);
 
     double ballRadius = 0.5 * avgEdge_;
-    for (const auto &[vertIdx, crossIndex] : sipgField_->singularVertices) {
+    for (const auto &[vertIdx, crossIndex] : dualMBOField_->singularVertices) {
         if (vertIdx < 0 || vertIdx >= static_cast<int>(mesh_->vertices.size())) continue;
         const Point &c = mesh_->vertices[vertIdx];
         if (crossIndex > 0)
@@ -5226,7 +5226,7 @@ void CrossGenWidget::renderSIPGAnimation() {
             viewer::drawDisk3D(c, ballRadius, 0.95f, 0.2f, 0.2f);
     }
 
-    renderOverlay("SIPG stepping...\npress 'q' to quit");
+    renderOverlay("DualMBO stepping...\npress 'q' to quit");
 }
 
 void CrossGenWidget::renderTraceAnimation() {
@@ -5407,8 +5407,8 @@ void CrossGenWidget::renderMERIDIANModel() {
     // holonomy, and a cone sitting where the field turns is the whole argument
     // for putting one there. It goes once the cutting graph arrives, which
     // would otherwise be lost among the arrows.
-    if (pipePhase_ == PipelinePhase::Cones && sipgField_.has_value())
-        viewer::drawTriangleCrossField(*mesh_, *sipgField_, scale_);
+    if (pipePhase_ == PipelinePhase::Cones && dualMBOField_.has_value())
+        viewer::drawTriangleCrossField(*mesh_, *dualMBOField_, scale_);
 
     // ... and comes back one phase later on the field route, as one branch of
     // itself rather than as four indistinguishable arms. The cutting graph is
@@ -5684,12 +5684,12 @@ void CrossGenWidget::renderNormal() {
         viewer::drawAxis(view_);
         if (umberPhase_ < UMBERPhase::Frames || !umber_.has_value()) {
             viewer::drawMesh(*mesh_);
-            // The three SIPG stages UMBER shares with both layout pipelines:
+            // The three DualMBO stages UMBER shares with both layout pipelines:
             // the input field and the singularities Sec. 4.2 is about to move.
-            if (umberPhase_ >= UMBERPhase::CrossField && sipgField_.has_value()) {
-                viewer::drawTriangleCrossField(*mesh_, *sipgField_, scale_);
+            if (umberPhase_ >= UMBERPhase::CrossField && dualMBOField_.has_value()) {
+                viewer::drawTriangleCrossField(*mesh_, *dualMBOField_, scale_);
                 double ballRadius = 0.5 * avgEdge_;
-                for (const auto &[vertIdx, crossIndex] : sipgField_->singularVertices) {
+                for (const auto &[vertIdx, crossIndex] : dualMBOField_->singularVertices) {
                     if (vertIdx < 0 || vertIdx >= static_cast<int>(mesh_->vertices.size())) continue;
                     const Point &c = mesh_->vertices[vertIdx];
                     if (crossIndex > 0)
@@ -5829,7 +5829,7 @@ void CrossGenWidget::renderNormal() {
     } else if (inPipeline()) {
         viewer::drawAxis(view_);
         if (pipePhase_ < PipelinePhase::Cones || !cones_.has_value()) {
-            // The three SIPG stages both pipelines start from: the field whose
+            // The three DualMBO stages both pipelines start from: the field whose
             // holonomy Sec. 3.1 is about to turn into cone indices, and the
             // interior singularities it already found.
             if (showMaterialFill_ && interfaces_.has_value() && interfaces_->multiMaterial())
@@ -5842,10 +5842,10 @@ void CrossGenWidget::renderNormal() {
             // read as something taken out on purpose rather than as a gap in
             // the input.
             viewer::drawInclusionCircles(inclusions_, 1.5f);
-            if (pipePhase_ >= PipelinePhase::CrossField && sipgField_.has_value()) {
-                viewer::drawTriangleCrossField(*mesh_, *sipgField_, scale_);
+            if (pipePhase_ >= PipelinePhase::CrossField && dualMBOField_.has_value()) {
+                viewer::drawTriangleCrossField(*mesh_, *dualMBOField_, scale_);
                 const double ballRadius = 0.5 * avgEdge_;
-                for (const auto &[vertIdx, crossIndex] : sipgField_->singularVertices) {
+                for (const auto &[vertIdx, crossIndex] : dualMBOField_->singularVertices) {
                     if (vertIdx < 0 || vertIdx >= static_cast<int>(mesh_->vertices.size())) continue;
                     const Point &c = mesh_->vertices[vertIdx];
                     if (crossIndex > 0)

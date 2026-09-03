@@ -1,4 +1,4 @@
-// Utility to load a mesh, run the p=0 DG/SIPG MBO cross-field solver,
+// Utility to load a mesh, run the p=0 dual-mesh MBO cross-field solver,
 // and print singularities and per-triangle field values.
 #include <iostream>
 #include <iomanip>
@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-#include "sipg/SIPG.hxx"
+#include "dualMBO/DualMBO.hxx"
 #include "MERIDIAN/Interfaces.hxx"
 #include "Parameterization/CutMesh.hxx"
 #include "Parameterization/UVGParam.hxx"
@@ -23,7 +23,7 @@ int main(int argc, char **argv) {
     // in the way dS is, and a field that has not been told about them runs
     // straight through them and carries none of the cones the regions either
     // side of it need. MERIDIAN, TORSION and the viewer all set them; this
-    // switch is how TestSIPG gets at the same field, and it is what makes a
+    // switch is how TestDualMBO gets at the same field, and it is what makes a
     // model whose disks are inclusions rather than the domain itself -- e.g.
     // multimat/bubbles -- show any cones inside those disks at all.
     bool alignInterfaces = false;
@@ -37,7 +37,7 @@ int main(int argc, char **argv) {
 
     if (pos.empty()) {
         std::cerr << "Usage: " << argv[0] << " <mesh.obj> [gamma] [max_steps] [--no-pin]\n";
-        std::cerr << "  gamma     : SIPG penalty parameter (default 20.0)\n";
+        std::cerr << "  gamma     : edge penalty parameter (default 20.0)\n";
         std::cerr << "  max_steps : max MBO iterations   (default " << MBO_MAX_STEPS << ")\n";
         std::cerr << "  --no-pin  : do not pin disk centers (leaves the rotation free)\n";
         std::cerr << "  --align-interfaces : make material interfaces Dirichlet data too\n";
@@ -60,22 +60,22 @@ int main(int argc, char **argv) {
     }
 
     // ------------------------------------------------------------------
-    // Initialize SIPG solver (assembles M, K, b and factorises A = M + tau*K)
+    // Initialize DualMBO solver (assembles M, K, b and factorises A = M + tau*K)
     // ------------------------------------------------------------------
-    SIPG sipg(mesh, maxSteps, gamma);
-    sipg.setPinDiskCenters(pinDiskCenters);
+    DualMBO dualMBO(mesh, maxSteps, gamma);
+    dualMBO.setPinDiskCenters(pinDiskCenters);
 
     std::unique_ptr<Interfaces> interfaces;
     if (alignInterfaces) {
         interfaces = std::make_unique<Interfaces>(mesh);
         if (interfaces->multiMaterial()) {
-            sipg.setAlignedInteriorEdges(interfaces->interfaceEdges());
+            dualMBO.setAlignedInteriorEdges(interfaces->interfaceEdges());
             std::cout << "Aligned to " << interfaces->interfaceEdges().size()
                       << " interface edge(s).\n";
         }
     }
 
-    sipg.initialize();
+    dualMBO.initialize();
 
     // ------------------------------------------------------------------
     // MBO iteration loop
@@ -85,9 +85,9 @@ int main(int argc, char **argv) {
     double ntris   = static_cast<double>(mesh->triangles.size());
 
     for (int i = 0; i < maxSteps; ++i) {
-        sipg.step();
+        dualMBO.step();
         ++stepCount;
-        if (sipg.error < 2.0 * ntris * 1e-5) {
+        if (dualMBO.error < 2.0 * ntris * 1e-5) {
             converged = true;
             break;
         }
@@ -96,7 +96,7 @@ int main(int argc, char **argv) {
     // ------------------------------------------------------------------
     // Detect singularities
     // ------------------------------------------------------------------
-    sipg.computeSingularities();
+    dualMBO.computeSingularities();
 
     // ------------------------------------------------------------------
     // Disk report
@@ -110,7 +110,7 @@ int main(int argc, char **argv) {
     // 45 + k*90 degrees, so every one of them should read close to 45.
     // ------------------------------------------------------------------
     {
-        const auto &pinned = sipg.getDiskCenterTriangles();
+        const auto &pinned = dualMBO.getDiskCenterTriangles();
         int nDisks = 0;
         for (const auto &c : mesh->materialComponents) if (c.circle.isCircle) ++nDisks;
 
@@ -130,7 +130,7 @@ int main(int argc, char **argv) {
 
             double sumIdx = 0.0;
             int nCones = 0;
-            for (const auto &[v, idx] : sipg.singularVertices) {
+            for (const auto &[v, idx] : dualMBO.singularVertices) {
                 // a cone belongs to this disk if any incident triangle is in it
                 const auto &vt = mesh->vertexTriangles;
                 bool inside = false;
@@ -158,9 +158,9 @@ int main(int argc, char **argv) {
     }
 
     // ------------------------------------------------------------------
-    // Cut mesh from SIPG field
+    // Cut mesh from DualMBO field
     // ------------------------------------------------------------------
-    CutMesh cm(sipg);
+    CutMesh cm(dualMBO);
     const auto &rep = cm.sanityCheck();
 
     if (rep.looksLikeDisk && rep.allSingularitiesOnBoundary)

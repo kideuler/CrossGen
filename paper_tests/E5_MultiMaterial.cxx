@@ -195,7 +195,7 @@ struct Case {
 int main(int argc, char **argv) {
     std::string outDir = "results";
     std::string objDir, vtkDir;
-    std::vector<std::string> methods{"SIPG", "B1"};
+    std::vector<std::string> methods{"DualMBO", "B1"};
     std::vector<std::string> only;
     double target = 0.05;
     double h = 0.04;
@@ -218,7 +218,7 @@ int main(int argc, char **argv) {
         else if (a == "--disk-templates") diskTemplates = true;
         else if (a == "--help") {
             std::cout << "Usage: " << argv[0]
-                      << " [--out DIR] [--methods SIPG,B1,B2] [--target EDGE] [--h SIZE]\n"
+                      << " [--out DIR] [--methods DualMBO,B1,B2] [--target EDGE] [--h SIZE]\n"
                          "       [--obj DIR] [--vtk DIR] [--limit N] [--no-layout]\n"
                          "       [--no-junction-domains] [--disk-templates] [model ...]\n";
             return 0;
@@ -367,7 +367,7 @@ int main(int argc, char **argv) {
             if (!vtkDir.empty())
                 writeFieldVTK(vtkDir + "/E5_" + c.name + "_" + name + ".vtk", *c.mesh, run.u);
 
-            if (name == "SIPG") {
+            if (name == "DualMBO") {
                 // The 95th percentile rather than the max, and the max reported
                 // beside it. A triangle carrying two interface edges that are
                 // not parallel -- a corner of the interface network, or a
@@ -388,13 +388,13 @@ int main(int argc, char **argv) {
                     }
                 }
                 v.check(deg(ia.p95Angle) < 1e-6,
-                        c.name + "/SIPG: 95% of interface edges are a cross axis to rounding");
+                        c.name + "/DualMBO: 95% of interface edges are a cross axis to rounding");
                 if (over > 0)
-                    v.warn(c.name + "/SIPG: " + num(over) + " of " + num(2 * (int)ie.size())
+                    v.warn(c.name + "/DualMBO: " + num(over) + " of " + num(2 * (int)ie.size())
                            + " interface-edge sides are more than 1 degree off, worst "
                            + num(deg(ia.maxAngle), 3)
                            + " deg -- corner triangles carrying two non-parallel interface edges");
-                v.check(sr.poincareHopfResidual == 0, c.name + "/SIPG: Poincare-Hopf holds");
+                v.check(sr.poincareHopfResidual == 0, c.name + "/DualMBO: Poincare-Hopf holds");
             }
         }
         t.print();
@@ -493,12 +493,12 @@ int main(int argc, char **argv) {
                 // Stage 0c's disk templates leaves more than half of itself
                 // unmeshed -- has mixed elements because it has holes in it,
                 // which is a different failure and is reported as one.
-                if (name == "SIPG" && Q.quads > 0) {
+                if (name == "DualMBO" && Q.quads > 0) {
                     if (L.valid && L.unmeshedPatches == 0)
                         v.check(L.pipelineMixedQuads == 0,
-                                c.name + "/SIPG: no element straddles a material interface (R1)");
+                                c.name + "/DualMBO: no element straddles a material interface (R1)");
                     else if (L.pipelineMixedQuads > 0)
-                        v.warn(c.name + "/SIPG: " + num(L.pipelineMixedQuads)
+                        v.warn(c.name + "/DualMBO: " + num(L.pipelineMixedQuads)
                                + " mixed element(s), on a layout that stopped at "
                                + L.reachedStage + " with " + num(L.unmeshedPatches)
                                + " unmeshed patch(es) -- R1 is not measurable here");
@@ -534,7 +534,7 @@ int main(int argc, char **argv) {
                 MethodOptions o;
                 o.convergenceTol = kTol;
                 o.hardBoundary = (hard != 0);
-                const FieldRun run = runSIPG(c.mesh, o);
+                const FieldRun run = runDualMBO(c.mesh, o);
                 if (!run.ok) { v.warn(c.name + " BC ablation: " + run.error); continue; }
                 const metrics::SingularityReport sr = metrics::singularities(*c.mesh, run.u);
                 const double energy = metrics::commonEnergy(

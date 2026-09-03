@@ -11,7 +11,7 @@
 
 #include "mesh/Mesh.hxx"
 
-class SIPG;
+class DualMBO;
 
 // Stage 1 of
 //   Shepherd, Gu and Hughes, "Isogeometric model reconstruction of open shells
@@ -28,12 +28,12 @@ class SIPG;
 //     I(v) = (2/pi) (  pi - sum_T angle(v, Psi(T)) )   v on the boundary
 //
 // so in practice it is read off a cross field instead, which is what Sec. 3.1
-// does with the frame field of [14]. Here the field is the p=0 DG/SIPG MBO
-// field of SIPG, and the two halves of Eq. (3) are recovered as follows.
+// does with the frame field of [14]. Here the field is the p=0 dual-mesh MBO
+// field of DualMBO, and the two halves of Eq. (3) are recovered as follows.
 //
 // Interior vertices. The mesh is planar, so sum_T angle(v, T) is exactly 2pi
 // and the whole of the index sits in the field's holonomy: the cross turns by
-// (pi/2) I(v) over the vertex star. SIPG::computeSingularities already
+// (pi/2) I(v) over the vertex star. DualMBO::computeSingularities already
 // measures that as a winding number of exp(4 i theta), and I(v) is that
 // winding number -- integer by construction, with no rounding anywhere.
 //
@@ -109,18 +109,18 @@ public:
         std::vector<std::string> messages;
     };
 
-    // From a converged SIPG field. Run sipg.initialize() and step it (or
+    // From a converged DualMBO field. Run dualMBO.initialize() and step it (or
     // runMBO()) before constructing this: the field is read from
-    // SIPG::u_k_prev, which is what computeSingularities() also uses, and an
+    // DualMBO::u_k_prev, which is what computeSingularities() also uses, and an
     // unconverged field simply gives cones in the wrong places.
     //
-    // SIPG::computeSingularities() is refreshed from the same field on the way
-    // through, so anything downstream reading SIPG::singularVertices sees the
+    // DualMBO::computeSingularities() is refreshed from the same field on the way
+    // through, so anything downstream reading DualMBO::singularVertices sees the
     // same interior windings that became cones here.
-    explicit ConeSingularities(SIPG &sipg);
+    explicit ConeSingularities(DualMBO &dualMBO);
 
-    // Direct form, for a field that did not come from SIPG: one exp(4 i theta)
-    // per triangle, in the same convention as SIPG::u_k.
+    // Direct form, for a field that did not come from DualMBO: one exp(4 i theta)
+    // per triangle, in the same convention as DualMBO::u_k.
     ConeSingularities(std::shared_ptr<Mesh> mesh, const Eigen::VectorXcd &crossField);
 
     // Overwrite I(v) at vertices whose index the geometry fixes rather than the
@@ -223,7 +223,7 @@ public:
     // reason (an isolated vertex contributes an all-zero Laplacian row).
     const std::vector<char>& getActiveVertices() const { return active; }
 
-    // Just the interior ones, as SIPG reports them.
+    // Just the interior ones, as DualMBO reports them.
     std::vector<Cone> interiorCones() const;
     std::vector<Cone> boundaryCones() const;
 

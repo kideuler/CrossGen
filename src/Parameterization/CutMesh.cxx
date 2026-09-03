@@ -12,7 +12,7 @@
 #include <sstream>
 
 #include "polyvector/PolyVectors.hxx" // PolyField
-#include "SIPG/SIPG.hxx"              // SIPG
+#include "dualmbo/DualMBO.hxx"              // DualMBO
 
 namespace {
 
@@ -125,12 +125,12 @@ CutMesh::CutMesh(const PolyField &field) {
     makeVFieldFromUField();
 }
 
-CutMesh::CutMesh(const SIPG &sipg) {
-    orig = sipg.getMeshPtr();
+CutMesh::CutMesh(const DualMBO &dualMBO) {
+    orig = dualMBO.getMeshPtr();
 
-    // Convert SIPG singularVertices (double crossIndex) to CutMesh singularities (int index).
-    singularities.reserve(sipg.singularVertices.size());
-    for (const auto &sv : sipg.singularVertices) {
+    // Convert DualMBO singularVertices (double crossIndex) to CutMesh singularities (int index).
+    singularities.reserve(dualMBO.singularVertices.size());
+    for (const auto &sv : dualMBO.singularVertices) {
         singularities.emplace_back(sv.first, static_cast<int>(std::round(sv.second)));
     }
 
@@ -139,7 +139,7 @@ CutMesh::CutMesh(const SIPG &sipg) {
     const int nT = static_cast<int>(orig->triangles.size());
     uField.resize(nT);
     for (int t = 0; t < nT; ++t) {
-        const double theta = std::arg(sipg.u_k[t]) / 4.0;
+        const double theta = std::arg(dualMBO.u_k[t]) / 4.0;
         uField[t] = Point{std::cos(theta), std::sin(theta)};
     }
 

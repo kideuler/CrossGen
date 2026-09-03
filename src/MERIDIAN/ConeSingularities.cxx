@@ -7,7 +7,7 @@
 #include <sstream>
 #include <stdexcept>
 
-#include "SIPG/SIPG.hxx"
+#include "dualmbo/DualMBO.hxx"
 
 namespace {
 
@@ -34,12 +34,12 @@ inline double cornerAngle(const Mesh &m, int t, int v) {
 // ---------------------------------------------------------------------------
 // Construction
 // ---------------------------------------------------------------------------
-ConeSingularities::ConeSingularities(SIPG &sipg)
-    : ConeSingularities(sipg.getMeshPtr(), sipg.u_k_prev) {
+ConeSingularities::ConeSingularities(DualMBO &dualMBO)
+    : ConeSingularities(dualMBO.getMeshPtr(), dualMBO.u_k_prev) {
     // Populate the solver's own singularity list from the same field, so that
-    // anything else reading SIPG::singularVertices later agrees with the cones
+    // anything else reading DualMBO::singularVertices later agrees with the cones
     // prescribed here.
-    sipg.computeSingularities();
+    dualMBO.computeSingularities();
 }
 
 ConeSingularities::ConeSingularities(std::shared_ptr<Mesh> m, const Eigen::VectorXcd &crossField)
@@ -101,7 +101,7 @@ void ConeSingularities::computeInputCurvature() {
 // ---------------------------------------------------------------------------
 // computeInteriorIndices()
 //
-// The same winding number SIPG::computeSingularities() reports, kept here in
+// The same winding number DualMBO::computeSingularities() reports, kept here in
 // its integer form: sum of the wrapped cross rotations around a closed star is
 // an exact multiple of pi/2, so I(v) = (2/pi) * that sum needs no rounding.
 // ---------------------------------------------------------------------------

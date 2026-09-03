@@ -13,7 +13,7 @@
 
 // Forward declarations
 class PolyField;
-class SIPG;
+class DualMBO;
 
 // Cut a triangle mesh (represented by PolyField::getMesh()) into a topological disk.
 //
@@ -44,10 +44,10 @@ public:
 
     explicit CutMesh(const PolyField &field);
 
-    // Construct from a converged SIPG cross-field.
+    // Construct from a converged DualMBO cross-field.
     // u_k[t] = exp(4i*theta_t) encodes the per-triangle cross-field direction;
-    // singularVertices carries (vertex_index, crossIndex) detected by SIPG.
-    explicit CutMesh(const SIPG &sipg);
+    // singularVertices carries (vertex_index, crossIndex) detected by DualMBO.
+    explicit CutMesh(const DualMBO &dualMBO);
 
     const Mesh& getOriginalMesh() const { return *orig; }
     std::shared_ptr<Mesh> getOriginalMeshPtr() const { return orig; }

@@ -99,8 +99,8 @@ add_library(PolyVector SHARED
     src/mesh/TMOP.hxx
     src/polyvector/PolyVectors.hxx
     src/polyvector/PolyVectors.cxx
-    src/SIPG/SIPG.hxx
-    src/SIPG/SIPG.cxx
+    src/dualmbo/DualMBO.hxx
+    src/dualmbo/DualMBO.cxx
     src/Parameterization/CutMesh.hxx
     src/Parameterization/CutMesh.cxx
     src/Parameterization/HarmonicCut.hxx
@@ -231,9 +231,9 @@ target_link_libraries(GenerateCircleTopologies PRIVATE PolyVector)
 add_executable(TestOasis src/utils/TestOasis.cxx)
 target_link_libraries(TestOasis PRIVATE PolyVector)
 
-# Test p=0 DG/SIPG MBO cross-field solver
-add_executable(TestSIPG src/utils/TestSIPG.cxx)
-target_link_libraries(TestSIPG PRIVATE PolyVector)
+# Test p=0 dual-mesh MBO cross-field solver
+add_executable(TestDualMBO src/utils/TestDualMBO.cxx)
+target_link_libraries(TestDualMBO PRIVATE PolyVector)
 
 # Smooth a quadrilateral mesh with the in-house TMOP optimizer of
 # src/mesh/TMOP.hxx, and self-test it together with the node-mobility layer of
@@ -254,7 +254,7 @@ add_executable(TestMERIDIAN src/utils/TestMERIDIAN.cxx)
 target_link_libraries(TestMERIDIAN PRIVATE PolyVector)
 
 # Test TORSION, Pipeline B of docs/cf_flow_pipeline.md: the same Stages 1-10 as
-# MERIDIAN with psi_0 built by integrating the SIPG cross field instead of by
+# MERIDIAN with psi_0 built by integrating the DualMBO cross field instead of by
 # unfolding a Ricci metric. --selftest exercises the four new pieces -- the
 # combing and its matchings, the Tutte embedding, the constrained integration
 # and Reference::Field -- on meshes whose answers are known in closed form.
@@ -307,20 +307,20 @@ if (CROSSGEN_ENABLE_COMISO)
     )
 endif()
 
-# Custom target to run TestSIPG on all meshes
-set(SIPG_COMMANDS "")
+# Custom target to run TestDualMBO on all meshes
+set(DualMBO_COMMANDS "")
 foreach(MESH_FILE ${MESH_OBJ_FILES})
     get_filename_component(MESH_NAME ${MESH_FILE} NAME)
-    list(APPEND SIPG_COMMANDS 
+    list(APPEND DualMBO_COMMANDS 
         COMMAND ${CMAKE_COMMAND} -E echo "Processing ${MESH_NAME}..."
-        COMMAND $<TARGET_FILE:TestSIPG> ${MESH_FILE} || ${CMAKE_COMMAND} -E true
+        COMMAND $<TARGET_FILE:TestDualMBO> ${MESH_FILE} || ${CMAKE_COMMAND} -E true
     )
 endforeach()
 
-add_custom_target(sipg
-    ${SIPG_COMMANDS}
-    DEPENDS TestSIPG
-    COMMENT "Running TestSIPG on all meshes in data/meshes"
+add_custom_target(dualmbo
+    ${DualMBO_COMMANDS}
+    DEPENDS TestDualMBO
+    COMMENT "Running TestDualMBO on all meshes in data/meshes"
     VERBATIM
 )
 

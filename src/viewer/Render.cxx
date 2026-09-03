@@ -333,11 +333,11 @@ void drawVertexCrossFieldUK(const Mesh &m, const CrossField &cf, double scale) {
     }
 }
 
-void drawTriangleCrossField(const Mesh &m, const SIPG &sipg, double scale) {
+void drawTriangleCrossField(const Mesh &m, const DualMBO &dualMBO, double scale) {
     glLineWidth(2.5f);
     const float br = 0.45f, bg = 0.05f, bb = 0.55f; // dark purple
 
-    const Eigen::VectorXcd &u_k = sipg.u_k;
+    const Eigen::VectorXcd &u_k = dualMBO.u_k;
 
     for (int t = 0; t < static_cast<int>(m.triangles.size()); ++t) {
         if (t >= u_k.size()) continue;

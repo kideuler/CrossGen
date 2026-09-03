@@ -17,10 +17,10 @@
 namespace paper {
 namespace metrics {
 
-// --- the SIPG edge weights, which every energy is measured with -------------
+// --- the DualMBO edge weights, which every energy is measured with -------------
 
 // kappa_e = gamma |e| / h_e with h_e = min_K 2|K| / |e|, exactly as
-// SIPG::initialize assembles it. Zero on boundary edges, which carry no
+// DualMBO::initialize assembles it. Zero on boundary edges, which carry no
 // coupling term.
 struct EdgeWeights {
     std::vector<double> kappa;  // per edge
@@ -32,12 +32,12 @@ EdgeWeights edgeWeights(const Mesh &m, double gamma = 10.0);
 // E_face(u) = 1/2 sum_{e interior} kappa_e |u_i - P_e u_j|^2, P_e = 1 in the
 // plane. `skipEdge`, when non-empty, drops the edges flagged in it -- that is
 // how a multi-material energy is compared fairly, since the interface edges
-// carry no coupling in the SIPG operator and counting them would charge the
+// carry no coupling in the DualMBO operator and counting them would charge the
 // method for a jump it deliberately allows.
 double commonEnergy(const Mesh &m, const EdgeWeights &w, const Eigen::VectorXcd &u,
                     const std::vector<char> &skipEdge = {});
 
-// The *whole* discrete energy the SIPG-MBO scheme descends, Dirichlet data
+// The *whole* discrete energy the DualMBO-MBO scheme descends, Dirichlet data
 // included:
 //
 //   E(u) = 1/2 sum_{e interior, not aligned} kappa_e |u_i - u_j|^2
@@ -46,7 +46,7 @@ double commonEnergy(const Mesh &m, const EdgeWeights &w, const Eigen::VectorXcd 
 //
 // with g_e = exp(4 i theta_e) the edge tangent's spin-4 value, kappa_e =
 // gamma |e| / min_K h_{K,e} on a coupled edge and kappa_e^1 = gamma |e| / h_{K,e}
-// on a one-sided one -- which is exactly what SIPG::initialize assembles into K
+// on a one-sided one -- which is exactly what DualMBO::initialize assembles into K
 // and b, since |u| = |g_e| = 1 makes 1/2<u,Ku> - Re<u,b> this sum less a
 // constant.
 //
@@ -54,7 +54,7 @@ double commonEnergy(const Mesh &m, const EdgeWeights &w, const Eigen::VectorXcd 
 // omits the boundary terms, because a method that does not impose boundary data
 // the same way should not be charged for it. This one is the energy of the
 // method itself, and it is what E1(d) watches along the MBO.
-double sipgEnergy(const Mesh &m, double gamma, const Eigen::VectorXcd &u,
+double dualMBOEnergy(const Mesh &m, double gamma, const Eigen::VectorXcd &u,
                   const std::vector<char> &alignedEdge = {});
 
 // --- singularities ---------------------------------------------------------

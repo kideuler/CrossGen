@@ -8,7 +8,7 @@
 #include <Eigen/Dense>
 
 #include "Metrics.hxx"
-#include "SIPG/SIPG.hxx"
+#include "dualmbo/DualMBO.hxx"
 #include "mesh/Mesh.hxx"
 
 // The three methods E2 to E5 compare, behind one interface.
@@ -19,7 +19,7 @@
 // same representation by the same code, and the only thing that differs between
 // the rows of a table is what put the numbers in the vector.
 //
-//   SIPG   ours. Face DOFs natively; nothing is converted.
+//   DualMBO   ours. Face DOFs natively; nothing is converted.
 //   B1     P1-MBO (`CrossField`): vertex crosses and face singularities,
 //          followed by the documented, best-effort conversion to faces that
 //          Sec. 6 requires us to describe and to be fair about. What the
@@ -31,10 +31,10 @@
 namespace paper {
 
 struct MethodOptions {
-    // SIPG and the common energy alike. The outline picks 10 after E1's sweep.
+    // DualMBO and the common energy alike. The outline picks 10 after E1's sweep.
     double gamma = 10.0;
     int maxSteps = 500;
-    // Multiplier on SIPG's tau = D^2/10. E1(b) is the only caller that moves it.
+    // Multiplier on DualMBO's tau = D^2/10. E1(b) is the only caller that moves it.
     double tauScale = 1.0;
     bool pinDiskCenters = true;
     // E5(a)'s ablation: hard-pinned Dirichlet rows, or the weak Nitsche form.
@@ -56,7 +56,7 @@ struct MethodOptions {
     // which is a convergence history with nothing in it to look at.
     bool forceSteps = false;
     // The convergence test both MBO methods use, as `error < 2 N tol` with N the
-    // number of degrees of freedom -- triangles for SIPG, vertices for B1. 1e-5
+    // number of degrees of freedom -- triangles for DualMBO, vertices for B1. 1e-5
     // is what the pipeline ships and is the right number for a layout, which
     // only needs the singularities. It is *not* tight enough for an energy: on
     // the unit disk it stops after three steps at an energy 5% above the fixed
@@ -99,15 +99,15 @@ struct MethodOptions {
     // Per-level iteration cap.
     int tauLevelSteps = 2000;
 
-    // Which penalty weight SIPG assembles. At p=0 this is not a stabilisation
+    // Which penalty weight DualMBO assembles. At p=0 this is not a stabilisation
     // parameter but the discrete Laplacian itself, so it is the discretisation's
-    // one real degree of freedom -- see SIPG::PenaltyWeight for why the textbook
+    // one real degree of freedom -- see DualMBO::PenaltyWeight for why the textbook
     // choice is not a consistent one and what the two-point weight repairs.
-    SIPG::PenaltyWeight penaltyWeight = SIPG::PenaltyWeight::MinHeight;
+    DualMBO::PenaltyWeight penaltyWeight = DualMBO::PenaltyWeight::MinHeight;
 
     // Backward-Euler substeps inside one MBO diffusion step. 1 is the shipped
     // single solve; larger is a closer approximation of the semigroup the
-    // scheme is defined with -- see SIPG::setDiffusionSubsteps.
+    // scheme is defined with -- see DualMBO::setDiffusionSubsteps.
     int diffusionSubsteps = 1;
 
     // Give B1 the same ladder. Off by default, because the baseline belongs in
@@ -134,7 +134,7 @@ struct FieldRun {
     // comparison energy of Sec. 5, the method's own energy with the Dirichlet
     // terms in it, and the MBO increment ||u^{k+1} - u^k||.
     std::vector<double> energyHistory;
-    std::vector<double> sipgEnergyHistory;
+    std::vector<double> dualMBOEnergyHistory;
     std::vector<double> incrementHistory;
 
     // B1 only.
@@ -146,7 +146,7 @@ struct FieldRun {
 };
 
 // Interior edges whose two triangles carry different material ids. This is what
-// SIPG::setAlignedInteriorEdges is handed and what the interface metrics are
+// DualMBO::setAlignedInteriorEdges is handed and what the interface metrics are
 // measured over; it is computed here directly from the material ids rather than
 // through `Interfaces` so that the harness depends on the field code and on
 // nothing downstream of it.
@@ -154,7 +154,7 @@ std::vector<int> interfaceEdges(const Mesh &m);
 std::vector<char> interfaceEdgeFlags(const Mesh &m);
 bool isMultiMaterial(const Mesh &m);
 
-FieldRun runSIPG(const std::shared_ptr<Mesh> &m, const MethodOptions &o);
+FieldRun runDualMBO(const std::shared_ptr<Mesh> &m, const MethodOptions &o);
 FieldRun runP1MBO(const std::shared_ptr<Mesh> &m, const MethodOptions &o);
 FieldRun runPolyVector(const std::shared_ptr<Mesh> &m, const MethodOptions &o);
 

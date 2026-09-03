@@ -1,6 +1,6 @@
 // Utility to run TORSION -- Pipeline B of docs/cf_flow_pipeline.md -- on a
 // mesh: the same Stages 1 to 10 as MERIDIAN, with the initial map psi_0 built
-// by integrating the SIPG cross field instead of by unfolding a Ricci metric.
+// by integrating the DualMBO cross field instead of by unfolding a Ricci metric.
 //
 //   TestTORSION <mesh.obj> [options]
 //   TestTORSION --selftest
@@ -25,7 +25,7 @@
 //                error before the integration exists to be blamed for it.
 //
 //   --census     Sec. 7.1's flip census, which sizes the untangling before a
-//                line of it is written: MIQ from the same SIPG field with
+//                line of it is written: MIQ from the same DualMBO field with
 //                doRound = false, which is precisely the seamless,
 //                non-integer-grid map Sec. 6 asks for, and its flip count.
 
@@ -46,7 +46,7 @@
 #ifdef CROSSGEN_WITH_COMISO
 #include "Parameterization/MIQ.hxx"
 #endif
-#include "SIPG/SIPG.hxx"
+#include "dualmbo/DualMBO.hxx"
 #include "TORSION/ConeMetric.hxx"
 #include "TORSION/TORSION.hxx"
 #include "TestHelper.hxx"
@@ -84,7 +84,7 @@ void warn(const std::string &what) {
 // the code runs.
 //
 // The square is the whole point of the first case. Its boundary is axis
-// aligned, so the SIPG field's Dirichlet data is the same cross on every
+// aligned, so the DualMBO field's Dirichlet data is the same cross on every
 // boundary triangle and the smoothest field satisfying it is *constant*; a
 // constant cross field is integrable exactly, its four corners take +1 each so
 // sum I = 4 = 4 chi with no interior cone at all, and G is therefore empty and
@@ -322,7 +322,7 @@ int selfTest() {
             {"disk", TestHelper::createCircle(0.0, 0.0, 1.0, 0.05), false},
         };
         for (Case &c : cases) {
-            SIPG field(c.mesh, 500, 10.0);
+            DualMBO field(c.mesh, 500, 10.0);
             field.initialize();
             const double nTris = static_cast<double>(c.mesh->triangles.size());
             for (int i = 0; i < 500; ++i) {
@@ -652,7 +652,7 @@ int referenceTest(const std::string &path) {
 // census()  --  Sec. 7.1, step 2 of Sec. 9's order of work
 //
 // "The census is available for free, today." MIQSolver already implements the
-// whole of this stage -- from a SIPG field, via CutMesh(const SIPG&), with a
+// whole of this stage -- from a DualMBO field, via CutMesh(const DualMBO&), with a
 // per-seam mismatch in {0,1,2,3} -- and it already counts flips. Run with
 // doRound = false, which is precisely the seamless, non-integer-grid map Sec. 6
 // wants, and record flips per model. That number sizes the untangling before a
@@ -666,7 +666,7 @@ int referenceTest(const std::string &path) {
 // ---------------------------------------------------------------------------
 #ifdef CROSSGEN_WITH_COMISO
 int census(const std::vector<std::string> &paths) {
-    std::cout << "Sec. 7.1 flip census: MIQ from the SIPG field, doRound = false\n\n";
+    std::cout << "Sec. 7.1 flip census: MIQ from the DualMBO field, doRound = false\n\n";
     std::cout << std::left << std::setw(34) << "model" << std::right
               << std::setw(9) << "tris" << std::setw(9) << "cones"
               << std::setw(9) << "flips" << std::setw(11) << "flips %" << "\n";
@@ -683,7 +683,7 @@ int census(const std::vector<std::string> &paths) {
             continue;
         }
         try {
-            SIPG field(mesh, 500, 10.0);
+            DualMBO field(mesh, 500, 10.0);
             field.initialize();
             const double nTris = static_cast<double>(mesh->triangles.size());
             for (int i = 0; i < 500; ++i) {
@@ -745,8 +745,8 @@ void usage(const char *prog) {
               << "                       ricci     Pipeline A's flat cone metric, computed for\n"
               << "                                 the reference alone; the known-good yardstick\n\n"
               << "Stages 5 to 10 (MERIDIAN's, unchanged)\n"
-              << "  --gamma <g>        SIPG penalty                          (default 10)\n"
-              << "  --steps <n>        SIPG MBO steps                        (default 500)\n"
+              << "  --gamma <g>        edge penalty                          (default 10)\n"
+              << "  --steps <n>        dual-mesh MBO steps                        (default 500)\n"
               << "  --cut-to-graph     let a cone arc stop on an earlier arc\n"
               << "  --no-interfaces    ignore the material tags\n"
               << "  --no-field-interfaces  do not align the field to the interfaces\n"
@@ -840,8 +840,8 @@ int main(int argc, char **argv) {
             else if (r == "ricci")     opts.reference = TORSION::Options::Reference::Ricci;
             else { std::cerr << "Unknown reference: " << r << "\n"; return 1; }
         }
-        else if (a == "--gamma" && i + 1 < argc)        opts.sipgGamma = std::stod(argv[++i]);
-        else if (a == "--steps" && i + 1 < argc)        opts.sipgMaxSteps = std::stoi(argv[++i]);
+        else if (a == "--gamma" && i + 1 < argc)        opts.dualMBOGamma = std::stod(argv[++i]);
+        else if (a == "--steps" && i + 1 < argc)        opts.dualMBOMaxSteps = std::stoi(argv[++i]);
         else if (a == "--cut-to-graph")                 opts.coneCutsToBoundary = false;
         else if (a == "--no-interfaces")                opts.materialInterfaces = false;
         else if (a == "--no-field-interfaces")          opts.alignFieldToInterfaces = false;
@@ -894,7 +894,7 @@ int main(int argc, char **argv) {
     }
 
     std::cout << "TORSION -- Pipeline B: the layout of Shepherd, Gu and Hughes (2022) with\n"
-              << "psi_0 integrated from the SIPG cross field (docs/cf_flow_pipeline.md)\n";
+              << "psi_0 integrated from the DualMBO cross field (docs/cf_flow_pipeline.md)\n";
     std::cout << "Mesh: " << path << "\n";
     std::cout << "  " << mesh->vertices.size() << " vertices, "
               << mesh->edges.size() << " edges, "
@@ -918,7 +918,7 @@ int main(int argc, char **argv) {
     };
 
     // ---------------------------------------------------------------------
-    heading("Stage 0  Cross field (p=0 DG/SIPG MBO)");
+    heading("Stage 0  Cross field (p=0 dual-mesh MBO)");
     std::cout << "  MBO steps: " << st.mboSteps << ", residual " << std::scientific
               << std::setprecision(3) << pipeline.getField().error << std::defaultfloat << "\n";
     verdict(st.fieldConverged, "Field converged");

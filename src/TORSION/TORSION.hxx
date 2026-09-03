@@ -26,11 +26,11 @@
 #include "TORSION/TutteEmbedding.hxx"
 #include "mesh/Mesh.hxx"
 
-class SIPG;
+class DualMBO;
 
 // Pipeline B of docs/cf_flow_pipeline.md: the quadrilateral layout of Shepherd,
 // Gu and Hughes (2022) with the initial map psi_0 built by **integrating the
-// SIPG cross field** instead of by unfolding a Ricci metric.
+// DualMBO cross field** instead of by unfolding a Ricci metric.
 //
 // The paper's Stages 1 to 10 are MERIDIAN's and they are used here verbatim.
 // What changes is one thing, and everything in this class is either that thing
@@ -187,13 +187,13 @@ class TORSION {
 public:
     struct Options {
         // --- Stage 0 and 0b, identical to MERIDIAN's -----------------------
-        double sipgGamma = 10.0;
-        int sipgMaxSteps = 500;
+        double dualMBOGamma = 10.0;
+        int dualMBOMaxSteps = 500;
 
         // Stage 0 override: one unit spin-4 value per triangle of the mesh the
         // layout is computed on, used instead of running the MBO solve.
         //
-        // Every stage after Stage 0 reads the field through `SIPG::u_k_prev`
+        // Every stage after Stage 0 reads the field through `DualMBO::u_k_prev`
         // and through nothing else -- ConeSingularities takes it in its
         // constructor and FieldFrames combs it -- so substituting the vector is
         // the whole of substituting the field. That is what makes a controlled
@@ -656,7 +656,7 @@ public:
     // front of it.
     bool run();
 
-    const SIPG& getField() const { return *field; }
+    const DualMBO& getField() const { return *field; }
     const Interfaces& getInterfaces() const { return *interfaces; }
     const ConeSingularities& getCones() const { return *cones; }
     const ConeCut& getCut() const { return *cutter; }
@@ -747,7 +747,7 @@ private:
     Options options;
     Status status;
 
-    std::unique_ptr<SIPG> field;
+    std::unique_ptr<DualMBO> field;
     std::unique_ptr<Interfaces> interfaces;
     std::unique_ptr<ConeSingularities> cones;
     std::unique_ptr<ConeCut> cutter;

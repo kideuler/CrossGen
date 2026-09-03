@@ -20,7 +20,7 @@
 #include "MERIDIAN/SubdomainLabels.hxx"
 #include "mesh/Mesh.hxx"
 
-class SIPG;
+class DualMBO;
 
 // Stages 1 to 9 of
 //   Shepherd, Gu and Hughes, "Isogeometric model reconstruction of open shells
@@ -190,9 +190,9 @@ class MERIDIAN {
 public:
     struct Options {
         // Stage 0: the cross field the cones are read off. The defaults match
-        // TestSIPG.
-        double sipgGamma = 10.0;
-        int sipgMaxSteps = 500;
+        // TestDualMBO.
+        double dualMBOGamma = 10.0;
+        int dualMBOMaxSteps = 500;
 
         // Stage 0b: the material interface network. No effect on a
         // single-material mesh, where there are no interfaces to find, so this
@@ -245,7 +245,7 @@ public:
         // its *interior* are never read off at all -- and Stage 0b then has to
         // put the missing turn somewhere, which means a corner in the middle of
         // an interface that does not turn. See Interfaces::balance and
-        // SIPG::setAlignedInteriorEdges. Off is the behaviour before this,
+        // DualMBO::setAlignedInteriorEdges. Off is the behaviour before this,
         // which is what the --no-field-interfaces flag measures against.
         bool alignFieldToInterfaces = true;
         // Annihilate the +1/-1 cone pairs an interface-aligned field puts on the
@@ -669,7 +669,7 @@ public:
     // the failure is still worth reporting).
     bool run();
 
-    const SIPG& getField() const { return *field; }
+    const DualMBO& getField() const { return *field; }
     const Interfaces& getInterfaces() const { return *interfaces; }
     const ConeSingularities& getCones() const { return *cones; }
     const ConeCut& getCut() const { return *cutter; }
@@ -722,7 +722,7 @@ private:
     Options options;
     Status status;
 
-    std::unique_ptr<SIPG> field;
+    std::unique_ptr<DualMBO> field;
     std::unique_ptr<Interfaces> interfaces;
     std::unique_ptr<ConeSingularities> cones;
     std::unique_ptr<ConeCut> cutter;

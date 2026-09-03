@@ -31,7 +31,7 @@ public:
 
     // Multiply the tau = D^2/10 heuristic by this factor.
     //
-    // The same knob SIPG::setTauScale is, and it exists for the same reason:
+    // The same knob DualMBO::setTauScale is, and it exists for the same reason:
     // D^2/10 makes one MBO step diffuse across several domain diameters, so the
     // iteration reaches its fixed point almost at once and the threshold
     // dynamics never runs. It is settable so that the *baseline* can be given

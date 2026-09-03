@@ -36,7 +36,7 @@
 #include "Parameterization/UVGParam.hxx"
 #include "polyvector/PolyVectors.hxx"
 #include "crossfield/CrossField.hxx"
-#include "sipg/SIPG.hxx"
+#include "dualMBO/DualMBO.hxx"
 #include "tracing/PartitionSimplify.hxx"
 #include "tracing/QuadLayout.hxx"
 #include "tracing/SeparatrixTrace.hxx"
@@ -96,12 +96,12 @@ enum class MBOPhase {
     Quantized   = 9,
 };
 
-// UMBER borrows the first three SIPG stages verbatim -- its input *is* a
-// converged SIPG cross field -- and then adds the two solves of the paper:
+// UMBER borrows the first three DualMBO stages verbatim -- its input *is* a
+// converged DualMBO cross field -- and then adds the two solves of the paper:
 // the frame field of Sec. 4.2 and the polysquare of Sec. 4.3. Neither is
 // animated; both are one blocking L-BFGS run with nothing worth drawing in
 // between. The two middle phases split the window, model on the left and
-// parameter domain on the right, the way PolyVector and SIPG show their UV
+// parameter domain on the right, the way PolyVector and DualMBO show their UV
 // meshes.
 //
 // Simplified is the odd one out in two ways. It is driven by a dialog rather
@@ -125,7 +125,7 @@ enum class UMBERPhase {
 
 // The phase sequence shared by the two quadrilateral-layout pipelines, MERIDIAN
 // (mode 7) and TORSION (mode 4). They are Stages 1 to 10 of Shepherd, Gu and
-// Hughes (2022) either way, they take the same input -- a converged SIPG cross
+// Hughes (2022) either way, they take the same input -- a converged DualMBO cross
 // field, whose holonomy Sec. 3.1 reads the cone indices off -- and they differ
 // in exactly two of the eleven phases, which is why they share one enum:
 //
@@ -333,7 +333,7 @@ private:
     bool buildOASISGuidingField();
 
     // Cut the mesh with HarmonicCut (Sec. 4.1) and optimize Eq. (1) on top of
-    // the SIPG field with L-BFGS. Blocking, like runOASIS: there is nothing to
+    // the DualMBO field with L-BFGS. Blocking, like runOASIS: there is nothing to
     // draw between the continuation stages.
     void runUMBER();
 
@@ -370,7 +370,7 @@ private:
     // first. On a single-material mesh it finds nothing and says so once.
     void runMERIDIANInterfaces();
 
-    // Stage 1 of Shepherd et al.: read the cone indices off the SIPG field,
+    // Stage 1 of Shepherd et al.: read the cone indices off the DualMBO field,
     // check Eq. (4), and rebalance the boundary cones if it does not hold.
     // Cheap; unlike the two below it needs no announcement.
     void runMERIDIANCones();
@@ -380,7 +380,7 @@ private:
     void runMERIDIANCut();
 
     // TORSION Stage 3F (docs/cf_flow_pipeline.md Sec. 5), which sits in the
-    // phase Pipeline A runs the flow in: comb the SIPG field to one branch over
+    // phase Pipeline A runs the flow in: comb the DualMBO field to one branch over
     // Omega, read the matchings off it, and audit the indices they imply
     // against the ones the field itself read. Cheap -- one BFS and one pass
     // over the vertices -- so unlike the flow it needs no announcement.
@@ -530,10 +530,10 @@ private:
     void drawSplitDivider(int halfW) const;
 
     // UMBER mode and both layout pipelines share their first three stages, so
-    // the guards that drive the SIPG solve ask about the stage rather than the
+    // the guards that drive the DualMBO solve ask about the stage rather than the
     // mode.
-    bool sipgStageWantsField() const;
-    bool sipgStageIsStepping() const;
+    bool dualMBOStageWantsField() const;
+    bool dualMBOStageIsStepping() const;
 
     // Whether the current mode is one of the two quadrilateral-layout
     // pipelines. Nine of the eleven phases are shared between them and are
@@ -556,7 +556,7 @@ private:
 
     // rendering sub-routines called from paintGL
     void renderMBOAnimation();
-    void renderSIPGAnimation();
+    void renderDualMBOAnimation();
     void renderTraceAnimation();
     void renderNormal();
     void renderOverlay(const char *helpText);
@@ -577,7 +577,7 @@ private:
     std::optional<MIQSolver>   miqSolver_;
 #endif
     std::optional<CrossField>  crossField_;
-    std::optional<SIPG>        sipgField_;
+    std::optional<DualMBO>        dualMBOField_;
     std::shared_ptr<SeparatrixTrace> separatrixTrace_;
     // Holds a pointer to the trace above, so it must not outlive it: both are
     // cleared together in reset().
@@ -605,7 +605,7 @@ private:
     std::optional<BlockQuant> blockQuant_;
     TMeshQuantizer::Report quantReport_;
     std::optional<OASIS>       oasis_;
-    // UMBER runs on the SIPG field held in sipgField_, so it needs no field of
+    // UMBER runs on the DualMBO field held in dualMBOField_, so it needs no field of
     // its own; the cuts and the optimized frames are all that is added.
     std::optional<HarmonicCut>  umberCut_;
     std::optional<UMBER>        umber_;
@@ -620,7 +620,7 @@ private:
     // vertex star for nothing.
     std::vector<std::pair<int, int>>    umberCorners_;   // (vertex, quarter turns)
     std::vector<std::pair<int, double>> umberInternal_;  // what failed to reach the boundary
-    // MERIDIAN runs on the SIPG field in sipgField_, like UMBER. Each stage
+    // MERIDIAN runs on the DualMBO field in dualMBOField_, like UMBER. Each stage
     // holds a reference to the one before -- ConeCut and RicciFlow both read
     // cones_, and ConeCut checks it was measured on this very mesh -- so cones_
     // is never rebuilt without clearing the two below it first.
@@ -744,9 +744,9 @@ private:
     bool mboTracingStarted_    = false;
     bool mboTracingFinished_   = false;
     int  mboStepCount_         = 0;
-    bool sipgSteppingStarted_  = false;
-    bool sipgConverged_        = false;
-    int  sipgStepCount_        = 0;
+    bool dualMBOSteppingStarted_  = false;
+    bool dualMBOConverged_        = false;
+    int  dualMBOStepCount_        = 0;
     // The Eq. (1) solve is attempted once per run: a failure leaves umber_
     // empty, and retrying it every frame would only stall the viewer again.
     // It is announced one frame ahead so the notice is on screen while the
@@ -759,7 +759,7 @@ private:
     // One-shot discipline for the three MERIDIAN stages. Each is attempted once
     // per run and not retried: a failure leaves its optional empty, and keying
     // off the optional alone would run the whole stage again on every frame --
-    // which for the cones means re-running the SIPG solve sixty times a second.
+    // which for the cones means re-running the DualMBO solve sixty times a second.
     // The Ricci solve is additionally announced a frame early, so the notice is
     // on screen while the GUI thread is inside the Newton loop.
     bool interfacesAttempted_  = false;

@@ -15,7 +15,7 @@
 // and the two at the bottom of the keyway at 270. Thirty at +1/4 against thirty
 // at -1/4 is zero, the bore makes the model an annulus so the Euler
 // characteristic is zero too, and the field therefore has no index to place
-// anywhere. It does not place any: SIPG finds no singularities to begin with
+// anywhere. It does not place any: DualMBO finds no singularities to begin with
 // and UMBER ends with none, at every mesh size tried. Nothing else in the set
 // combines that many corners with that little to do.
 //

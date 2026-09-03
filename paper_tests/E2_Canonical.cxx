@@ -15,7 +15,7 @@
 //
 // Robustness: ten seeded runs of B1 -- which starts from a random interior and
 // so has a distribution rather than an answer -- and five 10%-jitter remeshes
-// for all three. The claim is that the MBO methods are stable and that SIPG is
+// for all three. The claim is that the MBO methods are stable and that DualMBO is
 // stable *without* paying the conversion's noise; the way to be wrong about
 // that is not to measure it, so the variance is a column.
 
@@ -194,9 +194,9 @@ int main(int argc, char **argv) {
                      {"conv_topology_changed",
                       x.hasConversion ? num(x.conversion.topologyChanged) : ""}});
 
-            if (name == "SIPG") {
+            if (name == "DualMBO") {
                 v.check(x.sing.poincareHopfResidual == 0,
-                        d.name + "/SIPG: Poincare-Hopf holds");
+                        d.name + "/DualMBO: Poincare-Hopf holds");
                 // The geometric prediction is only a prediction where the corner
                 // rounding is unambiguous. A 45-degree apex asks the boundary
                 // for exactly one and a half quarter turns, and which way that
@@ -207,10 +207,10 @@ int main(int argc, char **argv) {
                 // that still has to hold is the one above.
                 if (x.sing.ambiguousCorners == 0)
                     v.check(x.sing.interiorIndex4Sum == predicted,
-                            d.name + "/SIPG: the interior index total is the predicted "
+                            d.name + "/DualMBO: the interior index total is the predicted "
                             + num(predicted));
                 else if (x.sing.interiorIndex4Sum != predicted)
-                    v.warn(d.name + "/SIPG: interior total " + num(x.sing.interiorIndex4Sum)
+                    v.warn(d.name + "/DualMBO: interior total " + num(x.sing.interiorIndex4Sum)
                            + " against a geometric prediction of " + num(predicted)
                            + ", on a domain with " + num(x.sing.ambiguousCorners)
                            + " corner(s) within 9 degrees of a rounding tie");
@@ -285,9 +285,9 @@ int main(int argc, char **argv) {
                 if (counts.empty()) continue;
                 jt.row({d.name, name, num(mean(counts), 4), num(stdev(counts), 4),
                         num((int)sums.size()), num(phFail)});
-                if (name == "SIPG")
+                if (name == "DualMBO")
                     v.check(sums.size() == 1,
-                            d.name + "/SIPG: the index total is the same on every remesh");
+                            d.name + "/DualMBO: the index total is the same on every remesh");
             }
         }
         jt.print();

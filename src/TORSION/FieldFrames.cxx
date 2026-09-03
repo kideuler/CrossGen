@@ -11,7 +11,7 @@
 #include <Eigen/Sparse>
 #include <Eigen/SparseCholesky>
 
-#include "SIPG/SIPG.hxx"
+#include "dualmbo/DualMBO.hxx"
 
 namespace {
 
@@ -28,7 +28,7 @@ inline double wrapQuarter(double d) {
 
 } // namespace
 
-FieldFrames::FieldFrames(const SIPG &field, const ConeCut &cut,
+FieldFrames::FieldFrames(const DualMBO &field, const ConeCut &cut,
                          const ConeSingularities &cones, const Options &options,
                          const Interfaces *interfaces)
     : mesh(&cut.getOriginalMesh()), opts(options) {
@@ -69,7 +69,7 @@ FieldFrames::FieldFrames(const SIPG &field, const ConeCut &cut,
 // cut, no branch -- which is why they are taken first and why the comb below
 // has nothing left to decide except which faces to visit.
 // ---------------------------------------------------------------------------
-void FieldFrames::readField(const SIPG &field) {
+void FieldFrames::readField(const DualMBO &field) {
     const int nT = static_cast<int>(mesh->triangles.size());
     const int nE = static_cast<int>(mesh->edges.size());
     report.faces = nT;

@@ -17,7 +17,7 @@
 // TORSION runs Stages 0b to 11 -- the interface network, the cone set, the cut,
 // the frames, the integration, the layout energies, the separatrices, the
 // arrangement, the spline fit and the meshing -- and every one of them reads
-// the field through `SIPG::u_k_prev` and through nothing else. So the
+// the field through `DualMBO::u_k_prev` and through nothing else. So the
 // experiment hands TORSION a field through Options::externalField and changes
 // nothing else at all: same mesh, same target edge length, same seeding
 // tolerance, same everything. A difference in the layout is then a difference
@@ -41,8 +41,8 @@ struct LayoutOptions {
     bool diskTemplates = false;
     double topoNearMiss = 0.15;
     double topoNearMissRetry = 0.04;
-    int sipgMaxSteps = 500;
-    double sipgGamma = 10.0;
+    int dualMBOMaxSteps = 500;
+    double dualMBOGamma = 10.0;
     // Seconds after which a model is abandoned. Zero is no limit. (Advisory:
     // it is checked between stages, so a stage that runs long overruns it.)
     double timeLimit = 0.0;
@@ -98,7 +98,7 @@ struct LayoutResult {
     std::vector<int> quadMaterials;
 };
 
-// `field` empty runs TORSION's own SIPG solve, which is the pipeline as it
+// `field` empty runs TORSION's own DualMBO solve, which is the pipeline as it
 // ships. Non-empty substitutes it. The mesh is deep-copied first, so the caller
 // can run several fields against the same domain without one run's Stage 0c
 // excision or circle refit reaching the next.

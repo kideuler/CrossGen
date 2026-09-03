@@ -11,7 +11,7 @@
 #include "Parameterization/HarmonicCut.hxx"
 #include "mesh/Mesh.hxx"
 
-class SIPG;
+class DualMBO;
 
 // Frame field generation of
 //   Wang, Ren, Fang, Lin, Xu, Bao and Huang, "IGA-suitable planar
@@ -22,7 +22,7 @@ class SIPG;
 // The polysquare pipeline needs a frame field that is smooth, boundary
 // aligned, and -- unlike the field a quadrangulation method would produce --
 // free of *internal* singularities, because a polysquare structure has none.
-// Methods that carry the 4-symmetry in their unknowns (MIQ, MBO/SIPG,
+// Methods that carry the 4-symmetry in their unknowns (MIQ, MBO/DualMBO,
 // polyvectors) cannot express that requirement: the symmetry is exactly what
 // lets a singularity form at no cost. Sec. 4.2 therefore drops the symmetry
 // and optimizes a *non-symmetric* field, one plain 2D vector v per triangle
@@ -81,7 +81,7 @@ public:
         double total = 0.0;
     };
 
-    // Take the initial field from a converged SIPG cross field and the cuts
+    // Take the initial field from a converged DualMBO cross field and the cuts
     // from a HarmonicCut built on the same mesh. C is exactly the beta cuts of
     // Sec. 4.1 -- one per void, disjoint, meeting the boundary only at their
     // endpoints -- so the free transitions in E_smooth match the harmonic
@@ -92,7 +92,7 @@ public:
     // that stayed closed contribute no harmonic form: their frames are pinned
     // to an exact form, which is the common polysquare behaviour with its
     // forced corners.
-    UMBER(const SIPG &sipg, const HarmonicCut &harmonicCut);
+    UMBER(const DualMBO &dualMBO, const HarmonicCut &harmonicCut);
 
     // Direct form: per-triangle initial directions (any representative of the
     // cross is fine, the comb in initialize() fixes the branch) and the cut
@@ -175,7 +175,7 @@ public:
     const std::vector<Point>& getVField() const { return vField; }
 
     // The same field as exp(4 i theta) per triangle, i.e. in the convention of
-    // SIPG::u_k, for the parts of the pipeline that consume a cross field
+    // DualMBO::u_k, for the parts of the pipeline that consume a cross field
     // symmetrically (CutMesh, tracing). Reducing to it discards the branch the
     // optimization just fixed, so prefer getUField() where the branch matters.
     Eigen::VectorXcd crossFieldRepresentation() const;
@@ -191,7 +191,7 @@ public:
     // magnitude. The free k*90-degree transitions on the cuts are undone
     // first; they carry the harmonic part of the field, not a defect.
     //
-    // Empty is the goal but not a guarantee. Measured on data/meshes, SIPG
+    // Empty is the goal but not a guarantee. Measured on data/meshes, DualMBO
     // field in, Sec. 4.1 cuts, defaults throughout: all sixteen models come
     // out with none, E_smooth falls by roughly an order of magnitude
     // everywhere, and no interior edge anywhere turns past 45 degrees (see
@@ -283,7 +283,7 @@ public:
     // resolve a boundary feature the alignment term is trying to follow.
     //
     // Second, they are landmines for anything downstream that measures the
-    // field 4-symmetrically -- SIPG::computeSingularities, cross-field tracing
+    // field 4-symmetrically -- DualMBO::computeSingularities, cross-field tracing
     // -- because past 45 degrees the spin-4 winding cannot tell which way the
     // frame turned and will report a singularity that is not there. If such a
     // tool disagrees with internalSingularities(), compare its count against

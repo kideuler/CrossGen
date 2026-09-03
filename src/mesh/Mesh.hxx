@@ -176,7 +176,7 @@ class Mesh {
 
     // Connected components of same-material triangles, each with the circle
     // fitted to its own boundary. Filled by every constructor that builds
-    // mesh topology; SIPG (or anyone else holding a Mesh) reads it straight
+    // mesh topology; DualMBO (or anyone else holding a Mesh) reads it straight
     // off the mesh. This -- not materialCircle -- is what a caller wanting
     // "which regions of this mesh are disks" should read.
     std::vector<MaterialComponent> materialComponents;

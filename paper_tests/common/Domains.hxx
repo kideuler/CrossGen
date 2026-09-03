@@ -62,8 +62,8 @@ struct Domain {
 std::shared_ptr<Mesh> squareDomain(double h);
 
 // The unit disk. No corner carries anything, so the whole of 4 chi = 4 sits in
-// the interior: four +1/4 cones, and with SIPG's disk-centre pin they sit at
-// 45 + k*90 degrees (SIPG::setPinDiskCenters).
+// the interior: four +1/4 cones, and with DualMBO's disk-centre pin they sit at
+// 45 + k*90 degrees (DualMBO::setPinDiskCenters).
 std::shared_ptr<Mesh> diskDomain(double h);
 
 // An annulus, r in [rIn, rOut]. chi = 0 and neither rim has a corner, so a

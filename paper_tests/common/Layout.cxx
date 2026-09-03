@@ -44,8 +44,8 @@ LayoutResult runLayout(const std::shared_ptr<Mesh> &m, const Eigen::VectorXcd &f
 
     try {
         TORSION::Options opts;
-        opts.sipgGamma = o.sipgGamma;
-        opts.sipgMaxSteps = o.sipgMaxSteps;
+        opts.dualMBOGamma = o.dualMBOGamma;
+        opts.dualMBOMaxSteps = o.dualMBOMaxSteps;
         opts.diskTemplates = o.diskTemplates;
         opts.topoNearMiss = o.topoNearMiss;
         opts.topoNearMissRetry = o.topoNearMissRetry;

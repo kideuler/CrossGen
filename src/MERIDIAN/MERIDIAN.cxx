@@ -9,7 +9,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "SIPG/SIPG.hxx"
+#include "dualmbo/DualMBO.hxx"
 
 MERIDIAN::MERIDIAN(std::shared_ptr<Mesh> m) : MERIDIAN(std::move(m), Options()) {}
 
@@ -27,14 +27,14 @@ MERIDIAN::~MERIDIAN() = default;
 // Stage 0 in the paper's terms is the feature-aware triangulation; here the
 // mesh arrives already triangulated, so what is left before Sec. 3.1 is the
 // cross field the cone indices are read off. Sec. 3.1 uses the frame field of
-// [14]; this uses the p=0 DG/SIPG MBO solver, which plays the same role -- a
+// [14]; this uses the p=0 dual-mesh MBO solver, which plays the same role -- a
 // boundary-aligned 4-symmetry field whose holonomy is the index.
 //
-// The same convergence test as TestSIPG: the MBO error is a sum over triangles,
+// The same convergence test as TestDualMBO: the MBO error is a sum over triangles,
 // so the threshold scales with the triangle count.
 // ---------------------------------------------------------------------------
 void MERIDIAN::runField() {
-    field = std::make_unique<SIPG>(mesh, options.sipgMaxSteps, options.sipgGamma);
+    field = std::make_unique<DualMBO>(mesh, options.dualMBOMaxSteps, options.dualMBOGamma);
     // On a multi-material domain the interfaces are Dirichlet data for the field
     // in exactly the way dS is. This is why runField() runs after Stage 0b and
     // not before it: an interface is a curve the layout has to keep, so the
@@ -51,14 +51,14 @@ void MERIDIAN::runField() {
     field->initialize();
 
     const double nTris = static_cast<double>(mesh->triangles.size());
-    for (int i = 0; i < options.sipgMaxSteps; ++i) {
+    for (int i = 0; i < options.dualMBOMaxSteps; ++i) {
         field->step();
         ++status.mboSteps;
         if (field->error < 2.0 * nTris * 1e-5) { status.fieldConverged = true; break; }
     }
     if (!status.fieldConverged) {
         std::ostringstream oss;
-        oss << "Cross field did not converge in " << options.sipgMaxSteps
+        oss << "Cross field did not converge in " << options.dualMBOMaxSteps
             << " MBO steps (error " << field->error << "); cone placement is unreliable.";
         status.messages.push_back(oss.str());
     }

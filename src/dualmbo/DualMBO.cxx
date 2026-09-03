@@ -1,4 +1,4 @@
-#include "SIPG.hxx"
+#include "DualMBO.hxx"
 #include <algorithm>
 #include <cmath>
 #include <iostream>
@@ -7,7 +7,7 @@
 #include <unordered_set>
 
 // ---------------------------------------------------------------------------
-void SIPG::setAlignedInteriorEdges(const std::vector<int> &edges) {
+void DualMBO::setAlignedInteriorEdges(const std::vector<int> &edges) {
     edgeAligned.assign(mesh->edges.size(), 0);
     for (int e : edges) {
         if (e >= 0 && e < static_cast<int>(edgeAligned.size())) edgeAligned[e] = 1;
@@ -17,12 +17,12 @@ void SIPG::setAlignedInteriorEdges(const std::vector<int> &edges) {
 // ---------------------------------------------------------------------------
 // initialize()  --  Algorithm 1 from Section 10 of the paper
 //
-// Assembles the p=0 DG/SIPG matrices M, K and boundary RHS b, then
+// Assembles the p=0 dual-mesh MBO matrices M, K and boundary RHS b, then
 // factorises the system matrix A = M + tau*K and sets the initial field.
 //
 // DOFs are one complex number per triangle (not per vertex).
 // ---------------------------------------------------------------------------
-void SIPG::initialize() {
+void DualMBO::initialize() {
     const int NT = static_cast<int>(mesh->triangles.size());
 
     // -----------------------------------------------------------------------
@@ -88,7 +88,7 @@ void SIPG::initialize() {
     }
 
     // The penalty weight of an interior edge: the whole discretisation, for the
-    // reason set out at SIPG::PenaltyWeight.
+    // reason set out at DualMBO::PenaltyWeight.
     auto interiorKappa = [&](int edgeIdx, int ti, int tj, double edgeLen) {
         const double hi = 2.0 * area[ti] / edgeLen;
         const double hj = 2.0 * area[tj] / edgeLen;
@@ -134,7 +134,7 @@ void SIPG::initialize() {
         double edgeLen = std::sqrt(dx * dx + dy * dy);
         if (edgeLen < 1e-14) continue;
 
-        // Penalty weight: the discretisation itself, see SIPG::PenaltyWeight.
+        // Penalty weight: the discretisation itself, see DualMBO::PenaltyWeight.
         double kappa = interiorKappa(edgeIdx, ti, tj, edgeLen);
 
         kdiag[ti] += kappa;
@@ -219,7 +219,7 @@ void SIPG::initialize() {
     //
     // One more Dirichlet triangle per disk, pinned to u = 1, which is what
     // fixes the rotation the disk's symmetry otherwise leaves free -- see
-    // SIPG::setPinDiskCenters for why that value and where the cones then go.
+    // DualMBO::setPinDiskCenters for why that value and where the cones then go.
     // It is the same kind of pin as a boundary one, just prescribed by a point
     // rather than read off an edge tangent, so it goes through the same
     // bcWeightedSum/K/b path and gets eliminated with the rest in Step 6.
@@ -382,13 +382,13 @@ void SIPG::initialize() {
     // -----------------------------------------------------------------------
     solverLU.compute(A);
     if (solverLU.info() != Eigen::Success) {
-        std::cerr << "SIPG: SparseLU factorization failed, falling back to BiCGSTAB" << std::endl;
+        std::cerr << "DualMBO: SparseLU factorization failed, falling back to BiCGSTAB" << std::endl;
         useBiCGSTAB = true;
         solverBiCGSTAB.setTolerance(1e-10);
         solverBiCGSTAB.setMaxIterations(1000);
         solverBiCGSTAB.compute(A);
         if (solverBiCGSTAB.info() != Eigen::Success) {
-            throw std::runtime_error("SIPG: Both SparseLU and BiCGSTAB factorization failed");
+            throw std::runtime_error("DualMBO: Both SparseLU and BiCGSTAB factorization failed");
         }
     } else {
         useBiCGSTAB = false;
@@ -411,12 +411,12 @@ void SIPG::initialize() {
 // ---------------------------------------------------------------------------
 // step()  --  one MBO iteration (Algorithm 2 from Section 10)
 // ---------------------------------------------------------------------------
-void SIPG::step() {
+void DualMBO::step() {
     // The diffusion half of the MBO step: advance by tau, as `diffusionSubsteps`
     // backward-Euler solves of tau/n against the one factorisation of
     // A = M + (tau/n) K. n = 1 is the single Euler step; larger n is closer to
     // the semigroup exp(-tau L) the scheme is defined with, see
-    // SIPG::setDiffusionSubsteps.
+    // DualMBO::setDiffusionSubsteps.
     //
     // A pinned row of A is the identity and its entry of b is parallel to the
     // value the row is pinned to, so a Dirichlet triangle is carried through
@@ -428,12 +428,12 @@ void SIPG::step() {
         if (useBiCGSTAB) {
             u_tilde = solverBiCGSTAB.solve(rhs);
             if (solverBiCGSTAB.info() != Eigen::Success) {
-                throw std::runtime_error("SIPG: BiCGSTAB solve failed");
+                throw std::runtime_error("DualMBO: BiCGSTAB solve failed");
             }
         } else {
             u_tilde = solverLU.solve(rhs);
             if (solverLU.info() != Eigen::Success) {
-                throw std::runtime_error("SIPG: SparseLU solve failed");
+                throw std::runtime_error("DualMBO: SparseLU solve failed");
             }
         }
     }
@@ -464,7 +464,7 @@ void SIPG::step() {
 // sum the angle differences of the four adjacent triangle values and check
 // for non-zero winding number.
 // ---------------------------------------------------------------------------
-void SIPG::computeSingularities() {
+void DualMBO::computeSingularities() {
     singularVertices.clear();
 
     // Helper: smallest-angle difference between two unit complex numbers in (-pi, pi]
@@ -503,7 +503,7 @@ void SIPG::computeSingularities() {
 // ---------------------------------------------------------------------------
 // runMBO()
 // ---------------------------------------------------------------------------
-void SIPG::runMBO() {
+void DualMBO::runMBO() {
     int iteration = 0;
     double ntris = static_cast<double>(mesh->triangles.size());
     while (iteration < maxIterations && error > 2.0 * ntris * 1e-7) {

@@ -67,7 +67,7 @@ double commonEnergy(const Mesh &m, const EdgeWeights &w, const Eigen::VectorXcd 
     return 0.5 * E;
 }
 
-double sipgEnergy(const Mesh &m, double gamma, const Eigen::VectorXcd &u,
+double dualMBOEnergy(const Mesh &m, double gamma, const Eigen::VectorXcd &u,
                   const std::vector<char> &alignedEdge) {
     std::vector<double> area(m.triangles.size());
     for (std::size_t t = 0; t < m.triangles.size(); ++t) area[t] = triangleArea(m, static_cast<int>(t));
@@ -167,7 +167,7 @@ SingularityReport singularities(const Mesh &m, const Eigen::VectorXcd &u) {
     const std::vector<double> hLocal = localEdgeLength(m);
 
     // Interior vertices: the winding of the spin-4 value around the star,
-    // exactly as SIPG::computeSingularities reads it.
+    // exactly as DualMBO::computeSingularities reads it.
     for (int v = 0; v < nV; ++v) {
         const int begin = vt.rowPtr[v], end = vt.rowPtr[v + 1];
         const int star = end - begin;

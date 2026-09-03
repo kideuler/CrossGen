@@ -73,13 +73,13 @@ int main(int argc, char **argv) {
     std::string outDir = "results";
     std::string sub = "singlemat";
     std::string objDir;
-    std::vector<std::string> methods{"SIPG", "B1"};
+    std::vector<std::string> methods{"DualMBO", "B1"};
     std::vector<std::string> only;
     double target = 0.05;
     bool diskTemplates = false;
     bool b1Continuation = false;
     // The p=0 penalty weight, which at this order *is* the discrete Laplacian.
-    // "orth" is the two-point/finite-volume weight; see SIPG::PenaltyWeight.
+    // "orth" is the two-point/finite-volume weight; see DualMBO::PenaltyWeight.
     std::string weight = "min";
     int limit = 0;
 
@@ -96,7 +96,7 @@ int main(int argc, char **argv) {
         else if (a == "--weight" && i + 1 < argc) weight = argv[++i];
         else if (a == "--help") {
             std::cout << "Usage: " << argv[0]
-                      << " [--out DIR] [--set singlemat|multimat] [--methods SIPG,B1,B2]\n"
+                      << " [--out DIR] [--set singlemat|multimat] [--methods DualMBO,B1,B2]\n"
                          "       [--target EDGE] [--obj DIR] [--limit N] [--disk-templates]\n"
                          "       [--b1-continuation] [--weight min|harm|orth] [model ...]\n";
             return 0;
@@ -154,9 +154,9 @@ int main(int argc, char **argv) {
             // gives the baseline the same ladder, which is the fair-comparison
             // variant the protocol paragraph has to report beside the headline.
             fo.b1TauContinuation = b1Continuation;
-            fo.penaltyWeight = weight == "orth" ? SIPG::PenaltyWeight::Orthogonal
-                             : weight == "harm" ? SIPG::PenaltyWeight::HarmonicHeight
-                                                : SIPG::PenaltyWeight::MinHeight;
+            fo.penaltyWeight = weight == "orth" ? DualMBO::PenaltyWeight::Orthogonal
+                             : weight == "harm" ? DualMBO::PenaltyWeight::HarmonicHeight
+                                                : DualMBO::PenaltyWeight::MinHeight;
             const FieldRun run = runMethod(name, mesh, fo);
 
             Outcome o;

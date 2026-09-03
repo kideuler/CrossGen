@@ -1,4 +1,4 @@
-// Utility to load a mesh, solve a cross field with SIPG, cut it open along the
+// Utility to load a mesh, solve a cross field with DualMBO, cut it open along the
 // Sec. 4.1 cuts, and run the UMBER frame field optimization (Sec. 4.2 of
 // Wang et al. 2022) on top, reporting the cut report, the energy split and the
 // internal singularities before and after.
@@ -8,7 +8,7 @@
 #include <string>
 
 #include "Parameterization/HarmonicCut.hxx"
-#include "SIPG/SIPG.hxx"
+#include "dualmbo/DualMBO.hxx"
 #include "UMBER/BlockLayout.hxx"
 #include "UMBER/ChordCollapse.hxx"
 #include "UMBER/MotorcycleGraph.hxx"
@@ -54,14 +54,14 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    // --- Initial cross field: p=0 DG/SIPG MBO --------------------------------
-    SIPG sipg(mesh, maxSteps, gamma);
-    sipg.initialize();
-    sipg.runMBO();
-    sipg.computeSingularities();
+    // --- Initial cross field: p=0 dual-mesh MBO --------------------------------
+    DualMBO dualMBO(mesh, maxSteps, gamma);
+    dualMBO.initialize();
+    dualMBO.runMBO();
+    dualMBO.computeSingularities();
 
     std::cout << path << ": " << mesh->triangles.size() << " triangles, "
-              << sipg.singularVertices.size() << " SIPG singularities\n";
+              << dualMBO.singularVertices.size() << " DualMBO singularities\n";
 
     // --- Cuts, Sec. 4.1 ------------------------------------------------------
     HarmonicCut hc(mesh);
@@ -77,7 +77,7 @@ int main(int argc, char **argv) {
 
     // --- Frame field optimization, Eq. (1) -----------------------------------
     try {
-        UMBER umber(sipg, hc);
+        UMBER umber(dualMBO, hc);
         if (lbfgsIters > 0) umber.setMaxIterations(lbfgsIters);
         umber.initialize();
 

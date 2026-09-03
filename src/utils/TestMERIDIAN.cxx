@@ -1,5 +1,5 @@
 // Utility to run Stages 1-9 of Shepherd, Gu and Hughes (2022) on a mesh: cone
-// singularities from the SIPG cross field, the cutting graph and the cut disk,
+// singularities from the DualMBO cross field, the cutting graph and the cut disk,
 // the discrete Gauss-Bonnet check, discrete surface Ricci flow, the metric
 // immersion psi_R, the subdomain labelling, the penalty continuation against
 // the layout-inducing energies, the separatrices of the layout that comes out,
@@ -24,7 +24,7 @@
 #include <vector>
 
 #include "MERIDIAN/MERIDIAN.hxx"
-#include "SIPG/SIPG.hxx"
+#include "dualmbo/DualMBO.hxx"
 #include "mesh/QuadMesh.hxx"
 #include "mesh/TMOP.hxx"
 #include "TestHelper.hxx"
@@ -202,7 +202,7 @@ void usage(const char *argv0) {
     std::cerr << "Usage: " << argv0 << " <mesh.obj> [options]\n"
               << "       " << argv0 << " --selftest\n"
               << "Options:\n"
-              << "  --gamma <g>        SIPG penalty parameter        (default 10)\n"
+              << "  --gamma <g>        edge penalty parameter        (default 10)\n"
               << "  --steps <n>        max MBO iterations            (default 500)\n"
               << "  --tol <t>          Ricci ||K - Kbar||_inf target (default 1e-8)\n"
               << "  --newton <n>       max Newton iterations         (default 100)\n"
@@ -323,8 +323,8 @@ int main(int argc, char **argv) {
 
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
-        if (a == "--gamma" && i + 1 < argc)        opts.sipgGamma = std::stod(argv[++i]);
-        else if (a == "--steps" && i + 1 < argc)   opts.sipgMaxSteps = std::stoi(argv[++i]);
+        if (a == "--gamma" && i + 1 < argc)        opts.dualMBOGamma = std::stod(argv[++i]);
+        else if (a == "--steps" && i + 1 < argc)   opts.dualMBOMaxSteps = std::stoi(argv[++i]);
         else if (a == "--tol" && i + 1 < argc)     opts.ricciTolerance = std::stod(argv[++i]);
         else if (a == "--newton" && i + 1 < argc)  opts.ricciMaxIterations = std::stoi(argv[++i]);
         else if (a == "--no-flips")                opts.delaunayFlips = false;
@@ -444,7 +444,7 @@ int main(int argc, char **argv) {
     // ---------------------------------------------------------------------
     // Stage 0 -- cross field
     // ---------------------------------------------------------------------
-    heading("Stage 0  Cross field (p=0 DG/SIPG MBO)");
+    heading("Stage 0  Cross field (p=0 dual-mesh MBO)");
     std::cout << "  MBO steps: " << st.mboSteps
               << ", residual " << std::scientific << std::setprecision(3)
               << pipeline.getField().error << std::defaultfloat << "\n";

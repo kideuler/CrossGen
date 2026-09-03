@@ -232,16 +232,16 @@ int main(int argc, char **argv) {
     Csv agg(outDir + "/E3_" + sub + "_aggregate.csv",
             {"method", "models", "solved", "ph_ok", "singularities_mean",
              "ph_geom_ok", "boundary_adjacent_total", "close_pairs_total",
-             "energy_ratio_vs_sipg_mean", "energy_ratio_vs_sipg_median",
+             "energy_ratio_vs_dualmbo_mean", "energy_ratio_vs_dualmbo_median",
              "boundary_align_max_deg_worst", "iterations_mean", "total_s_mean"});
 
     // The energy ratio is per model, so a model nobody solved drops out of all
     // three rather than out of one.
-    std::map<std::string, double> sipgEnergy;
-    for (const Row &r : rows) if (r.ok && r.method == "SIPG") sipgEnergy[r.model] = r.energy;
+    std::map<std::string, double> dualMBOEnergy;
+    for (const Row &r : rows) if (r.ok && r.method == "DualMBO") dualMBOEnergy[r.model] = r.energy;
 
     Table at({"method", "solved", "PH ok", "PH geom ok", "#sing mean", "near-dS total", "pairs<2h total",
-              "E/E_SIPG mean", "median", "worst dS align", "iters mean", "s mean"});
+              "E/E_DualMBO mean", "median", "worst dS align", "iters mean", "s mean"});
 
     for (const std::string &name : methodNames()) {
         int solved = 0, phOk = 0, phGeomOk = 0, nearTotal = 0, pairTotal = 0;
@@ -258,8 +258,8 @@ int main(int argc, char **argv) {
             iters.push_back(r.iterations);
             secs.push_back(r.totalSeconds);
             worstAlign = std::max(worstAlign, r.boundaryAlignMaxDeg);
-            auto it = sipgEnergy.find(r.model);
-            if (it != sipgEnergy.end() && it->second > 1e-12)
+            auto it = dualMBOEnergy.find(r.model);
+            if (it != dualMBOEnergy.end() && it->second > 1e-12)
                 ratios.push_back(r.energy / it->second);
         }
         at.row({name, num(solved), num(phOk), num(phGeomOk), num(mean(sings), 4), num(nearTotal),
@@ -270,8 +270,8 @@ int main(int argc, char **argv) {
                  {"singularities_mean", num(mean(sings), 6)},
                  {"boundary_adjacent_total", num(nearTotal)},
                  {"close_pairs_total", num(pairTotal)},
-                 {"energy_ratio_vs_sipg_mean", num(mean(ratios), 6)},
-                 {"energy_ratio_vs_sipg_median", num(median(ratios), 6)},
+                 {"energy_ratio_vs_dualmbo_mean", num(mean(ratios), 6)},
+                 {"energy_ratio_vs_dualmbo_median", num(median(ratios), 6)},
                  {"boundary_align_max_deg_worst", num(worstAlign, 6)},
                  {"iterations_mean", num(mean(iters), 6)},
                  {"total_s_mean", num(mean(secs), 6)}});
@@ -328,14 +328,14 @@ int main(int argc, char **argv) {
     }
 
     // -----------------------------------------------------------------------
-    // Verdicts. Only SIPG is asserted about: it is our method and Prop. 3 is
+    // Verdicts. Only DualMBO is asserted about: it is our method and Prop. 3 is
     // ours to hold. The baselines are reported.
     // -----------------------------------------------------------------------
     heading("Verdicts");
     for (const Row &r : rows) {
-        if (r.method != "SIPG") continue;
-        v.check(r.ok, r.model + ": SIPG produced a field");
-        if (r.ok) v.check(r.phResidual == 0, r.model + ": Poincare-Hopf holds for SIPG");
+        if (r.method != "DualMBO") continue;
+        v.check(r.ok, r.model + ": DualMBO produced a field");
+        if (r.ok) v.check(r.phResidual == 0, r.model + ": Poincare-Hopf holds for DualMBO");
     }
     {
         int b1Bad = 0, b2Bad = 0;

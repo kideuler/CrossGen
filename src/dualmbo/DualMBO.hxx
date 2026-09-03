@@ -1,5 +1,5 @@
-#ifndef __SIPG_HXX__
-#define __SIPG_HXX__
+#ifndef __DUALMBO_HXX__
+#define __DUALMBO_HXX__
 
 #include <complex>
 #include <cmath>
@@ -15,7 +15,7 @@
 
 #include "mesh/Mesh.hxx"
 
-class SIPG {
+class DualMBO {
 public:
     Eigen::VectorXcd u_k;      // current solution vector (per triangle)
     Eigen::VectorXcd u_k_prev; // previous solution vector (per triangle)
@@ -23,7 +23,7 @@ public:
     std::vector<std::pair<int, double>> singularVertices; // (vertex index, cross-field index) pairs
     std::shared_ptr<Mesh> mesh;
 
-    SIPG(std::shared_ptr<Mesh> mesh, int maxIterations = 100, double gamma = 10.0)
+    DualMBO(std::shared_ptr<Mesh> mesh, int maxIterations = 100, double gamma = 10.0)
         : mesh(mesh), maxIterations(maxIterations), gamma(gamma) {}
 
     void initialize();
@@ -46,7 +46,7 @@ public:
     // behaviour and is what a single-material mesh gives.
     // The two triangles on such an edge are pinned outright, the way a boundary
     // triangle is. Leaving them in the diffusion instead, so that the alignment
-    // only competes with smoothness at the SIPG penalty weight, was measured
+    // only competes with smoothness at the edge penalty weight, was measured
     // and is worse: on a strongly curved interface it drops the +1/-1 pairs
     // that a smoothest aligned field carries (which is what is wanted) but it
     // also collapses the pair a *material* boundary genuinely needs onto the
@@ -112,7 +112,7 @@ public:
     // Hard is the default and is what the pipeline runs. Off leaves the
     // elimination out and solves the weak form as assembled, which is the
     // ablation the paper reports: the two differ only in how much the field is
-    // allowed to trade alignment against the SIPG penalty at the boundary, and
+    // allowed to trade alignment against the edge penalty at the boundary, and
     // the honest way to say which one the results use is to be able to run
     // both. Call before initialize().
     void setHardBoundaryConditions(bool on) { hardBoundary = on; }
@@ -137,7 +137,7 @@ public:
 
     // How the two elements on an interior edge combine into one penalty weight.
     //
-    // At p=0 the volume, consistency and symmetry terms of the SIPG form all
+    // At p=0 the volume, consistency and symmetry terms of the interior-penalty form all
     // carry grad u_h and so vanish identically on a piecewise constant. What is
     // left is a(u,v) = sum_e kappa_e [u][v], which means kappa_e is not a free
     // stabilisation parameter here: it *is* the discrete Laplacian, and it has
@@ -247,7 +247,7 @@ public:
 private:
     // sparse complex matrices for the linear system
     Eigen::SparseMatrix<std::complex<double>> M; // Mass matrix (diagonal, real)
-    Eigen::SparseMatrix<std::complex<double>> K; // Stiffness matrix (SIPG edge penalty)
+    Eigen::SparseMatrix<std::complex<double>> K; // Stiffness matrix (DualMBO edge penalty)
     Eigen::SparseMatrix<std::complex<double>> A; // System matrix (M + tau*K)
     Eigen::VectorXcd b;                          // Boundary right-hand side vector
     Eigen::SparseLU<Eigen::SparseMatrix<std::complex<double>>> solverLU;      // sparse direct solver
@@ -256,7 +256,7 @@ private:
 
     double tau;          // time step size
     double tauScale = 1.0; // multiplier on the D^2/10 heuristic, see setTauScale
-    double gamma;        // SIPG penalty parameter
+    double gamma;        // edge penalty parameter
     int maxIterations;   // maximum number of iterations
     bool hardBoundary = true; // see setHardBoundaryConditions
     bool cornerCoherenceFix = true; // see setCornerCoherenceFix
@@ -281,4 +281,4 @@ private:
     }
 };
 
-#endif // __SIPG_HXX__
+#endif // __DUALMBO_HXX__

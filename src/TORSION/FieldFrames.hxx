@@ -11,14 +11,14 @@
 #include "MERIDIAN/Interfaces.hxx"
 #include "mesh/Mesh.hxx"
 
-class SIPG;
+class DualMBO;
 
 // Pipeline B, work item 2 -- docs/cf_flow_pipeline.md Sec. 5: the matchings of
-// the SIPG cross field, the branch they select over Omega, and the per-triangle
+// the DualMBO cross field, the branch they select over Omega, and the per-triangle
 // target Jacobian that branch defines.
 //
 // This is the whole of what the field route has to add before an integration
-// can be written, and it is small because the setting is planar. SIPG stores
+// can be written, and it is small because the setting is planar. DualMBO stores
 // u_k[t] = exp(4 i theta_t) with theta in the *global* frame -- initialize()
 // reads boundary tangents as atan2(dy, dx) and never introduces a per-face
 // reference edge -- so parallel transport is identically zero and there is no
@@ -247,9 +247,9 @@ public:
     // branch is a curve of the layout in exactly the way a chain of dS is, and
     // the field is pinned tangent to it in exactly the same way, so it takes
     // the same treatment. Null, or single-material, aligns dS alone.
-    FieldFrames(const SIPG &field, const ConeCut &cut, const ConeSingularities &cones,
+    FieldFrames(const DualMBO &field, const ConeCut &cut, const ConeSingularities &cones,
                 const Options &opts, const Interfaces *interfaces = nullptr);
-    FieldFrames(const SIPG &field, const ConeCut &cut, const ConeSingularities &cones)
+    FieldFrames(const DualMBO &field, const ConeCut &cut, const ConeSingularities &cones)
         : FieldFrames(field, cut, cones, Options()) {}
 
     // theta_f = arg(u_k[f]) / 4, one per face of S, in (-pi/4, pi/4].
@@ -323,7 +323,7 @@ public:
     const Report& getReport() const { return report; }
 
 private:
-    void readField(const SIPG &field);
+    void readField(const DualMBO &field);
     void comb(const ConeCut &cut);
     void buildFrames();
     // The index each interior vertex's one ring of matchings carries, and the

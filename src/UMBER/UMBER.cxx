@@ -9,29 +9,29 @@
 #include <queue>
 #include <stdexcept>
 
-#include "SIPG/SIPG.hxx"
+#include "dualmbo/DualMBO.hxx"
 
 // ---------------------------------------------------------------------------
 // Construction
 // ---------------------------------------------------------------------------
-UMBER::UMBER(const SIPG &sipg, const HarmonicCut &harmonicCut) {
-    mesh = sipg.getMeshPtr();
-    if (!mesh) throw std::runtime_error("UMBER: SIPG carries no mesh");
+UMBER::UMBER(const DualMBO &dualMBO, const HarmonicCut &harmonicCut) {
+    mesh = dualMBO.getMeshPtr();
+    if (!mesh) throw std::runtime_error("UMBER: DualMBO carries no mesh");
 
     if (harmonicCut.getOriginalMeshPtr() != mesh) {
-        throw std::runtime_error("UMBER: the HarmonicCut was not built on the SIPG mesh");
+        throw std::runtime_error("UMBER: the HarmonicCut was not built on the DualMBO mesh");
     }
 
     const int nT = static_cast<int>(mesh->triangles.size());
-    if (static_cast<int>(sipg.u_k.size()) != nT) {
-        throw std::runtime_error("UMBER: the SIPG field does not match the mesh");
+    if (static_cast<int>(dualMBO.u_k.size()) != nT) {
+        throw std::runtime_error("UMBER: the DualMBO field does not match the mesh");
     }
 
     // u_k[t] = exp(4 i theta_t): any of the four directions is a valid start,
     // combInitialField() picks the branch.
     initialDirections.resize(nT);
     for (int t = 0; t < nT; ++t) {
-        const double theta = std::arg(sipg.u_k[t]) / 4.0;
+        const double theta = std::arg(dualMBO.u_k[t]) / 4.0;
         initialDirections[t] = Point{std::cos(theta), std::sin(theta)};
     }
 
@@ -177,7 +177,7 @@ void UMBER::initialize() {
 //
 // The spin-4 winding of the *input* directions, before any combing: the
 // quarter singularities the cross field carries, as (vertex, quarter turns).
-// Measured the way SIPG::computeSingularities does, on the 4-symmetric
+// Measured the way DualMBO::computeSingularities does, on the 4-symmetric
 // representation, because that is the only one in which a quarter turn exists.
 // ---------------------------------------------------------------------------
 std::vector<std::pair<int, int>> UMBER::inputSingularities() const {
@@ -226,7 +226,7 @@ std::vector<std::pair<int, int>> UMBER::inputSingularities() const {
 // Which is why the curve cannot be left to the traversal to place. A plain
 // breadth-first comb puts it where its wavefronts happen to collide, which is
 // decided by the seed triangle and not by the field. On the half disk in
-// data/meshes the SIPG field carries one quarter singularity either side of
+// data/meshes the DualMBO field carries one quarter singularity either side of
 // the centre, symmetrically; the seed lands one branch cut across the whole
 // model, from the left singularity through the right one and out of the right
 // side of the arc, so both quarter turns leave through that single exit and
@@ -636,7 +636,7 @@ int UMBER::sharedEdge(int ta, int tb) const {
 //
 // That distinction is the whole point of Sec. 4.2 and it is easy to get wrong.
 // A cross field carries its singularities in the 4-symmetry: the natural test
-// is the spin-4 winding, which is what SIPG::computeSingularities does and
+// is the spin-4 winding, which is what DualMBO::computeSingularities does and
 // what the input field needs. But Eq. (1) does not optimize a cross field --
 // it optimizes a plain vector field, precisely so that a singularity has
 // nowhere to hide. A continuous, non-vanishing v has winding 0 around every

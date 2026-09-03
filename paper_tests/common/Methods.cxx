@@ -7,7 +7,7 @@
 #include <limits>
 #include <stdexcept>
 
-#include "SIPG/SIPG.hxx"
+#include "dualmbo/DualMBO.hxx"
 #include "crossfield/CrossField.hxx"
 #include "polyvector/PolyVectors.hxx"
 
@@ -87,7 +87,7 @@ double boundingDiagonal(const Mesh &m) {
 // entry is always 1 -- the shipped tau -- so the continuation starts from the
 // field the single-tau scheme would have returned and only ever refines it.
 //
-// `rate` is the operator's own diffusion rate, SIPG::medianDiffusionRate(), and
+// `rate` is the operator's own diffusion rate, DualMBO::medianDiffusionRate(), and
 // the floor is where one step stops resolving anything the mesh can carry:
 //
 //     ell = h sqrt(tau * rate) <= tauFloorEdges * h   =>   tau <= c^2 / rate.
@@ -125,9 +125,9 @@ std::vector<double> tauLadder(const Mesh &m, const MethodOptions &o, bool enable
 } // namespace
 
 // ---------------------------------------------------------------------------
-FieldRun runSIPG(const std::shared_ptr<Mesh> &m, const MethodOptions &o) {
+FieldRun runDualMBO(const std::shared_ptr<Mesh> &m, const MethodOptions &o) {
     FieldRun r;
-    r.method = "SIPG";
+    r.method = "DualMBO";
     const Clock::time_point tAll = Clock::now();
     try {
         const metrics::EdgeWeights w = o.recordHistory ? metrics::edgeWeights(*m, o.gamma)
@@ -144,7 +144,7 @@ FieldRun runSIPG(const std::shared_ptr<Mesh> &m, const MethodOptions &o) {
 
         Eigen::VectorXcd carried;   // the previous level's field
         for (std::size_t level = 0; level < ladder.size(); ++level) {
-            SIPG solver(m, o.maxSteps, o.gamma);
+            DualMBO solver(m, o.maxSteps, o.gamma);
             solver.setPinDiskCenters(o.pinDiskCenters);
             solver.setTauScale(ladder[level]);
             solver.setHardBoundaryConditions(o.hardBoundary);
@@ -183,7 +183,7 @@ FieldRun runSIPG(const std::shared_ptr<Mesh> &m, const MethodOptions &o) {
                 ++r.iterations;
                 if (record) {
                     r.energyHistory.push_back(metrics::commonEnergy(*m, w, solver.u_k_prev, skip));
-                    r.sipgEnergyHistory.push_back(metrics::sipgEnergy(*m, o.gamma, solver.u_k_prev, skip));
+                    r.dualMBOEnergyHistory.push_back(metrics::dualMBOEnergy(*m, o.gamma, solver.u_k_prev, skip));
                     r.incrementHistory.push_back(solver.error);
                 }
                 if (solver.error < 2.0 * nT * o.convergenceTol) {
@@ -427,10 +427,10 @@ FieldRun convertP1ToFaces(const Mesh &m, const Eigen::VectorXcd &uVertex,
 }
 
 // ---------------------------------------------------------------------------
-std::vector<std::string> methodNames() { return {"SIPG", "B1", "B2"}; }
+std::vector<std::string> methodNames() { return {"DualMBO", "B1", "B2"}; }
 
 FieldRun runMethod(const std::string &name, const std::shared_ptr<Mesh> &m, const MethodOptions &o) {
-    if (name == "SIPG") return runSIPG(m, o);
+    if (name == "DualMBO") return runDualMBO(m, o);
     if (name == "B1")   return runP1MBO(m, o);
     if (name == "B2")   return runPolyVector(m, o);
     FieldRun r;

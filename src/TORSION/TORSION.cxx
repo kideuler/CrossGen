@@ -12,7 +12,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "SIPG/SIPG.hxx"
+#include "dualmbo/DualMBO.hxx"
 
 namespace {
 
@@ -382,12 +382,12 @@ TORSION::~TORSION() = default;
 // runField()  --  Stage 0, MERIDIAN's unchanged
 // ---------------------------------------------------------------------------
 void TORSION::runField() {
-    field = std::make_unique<SIPG>(mesh, options.sipgMaxSteps, options.sipgGamma);
+    field = std::make_unique<DualMBO>(mesh, options.dualMBOMaxSteps, options.dualMBOGamma);
     // On a multi-material domain the interfaces are Dirichlet data for the
     // field in exactly the way dS is, and that matters more here than in
     // Pipeline A rather than less: this pipeline integrates the field, so an
     // interface the field ran straight through is an interface the *map* runs
-    // straight through. See SIPG::setAlignedInteriorEdges for why the hard pin
+    // straight through. See DualMBO::setAlignedInteriorEdges for why the hard pin
     // and not a penalty.
     if (interfaces && interfaces->multiMaterial() && options.alignFieldToInterfaces) {
         field->setAlignedInteriorEdges(interfaces->interfaceEdges());
@@ -417,14 +417,14 @@ void TORSION::runField() {
     }
 
     const double nTris = static_cast<double>(mesh->triangles.size());
-    for (int i = 0; i < options.sipgMaxSteps; ++i) {
+    for (int i = 0; i < options.dualMBOMaxSteps; ++i) {
         field->step();
         ++status.mboSteps;
         if (field->error < 2.0 * nTris * 1e-5) { status.fieldConverged = true; break; }
     }
     if (!status.fieldConverged) {
         std::ostringstream oss;
-        oss << "Cross field did not converge in " << options.sipgMaxSteps
+        oss << "Cross field did not converge in " << options.dualMBOMaxSteps
             << " MBO steps (error " << field->error
             << "); every stage of this pipeline is downstream of it.";
         status.messages.push_back("Stage 0: " + oss.str());

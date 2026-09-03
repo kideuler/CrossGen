@@ -193,7 +193,7 @@ public:
         // face inside it would have no corners. A disk is the one inclusion
         // for which that is already false before this stage runs. Its four
         // corners come from the field: a cross field tangent to the rim has
-        // index +1 inside, which SIPG splits into four +1/4 cones and
+        // index +1 inside, which DualMBO splits into four +1/4 cones and
         // setPinDiskCenters puts on the diagonals, and the separatrix out of
         // each of them crosses the rim. Four crossings, four arcs, corners
         // where the layout actually turns -- which is exactly what splitting

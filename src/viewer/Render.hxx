@@ -28,7 +28,7 @@
 #include "Parameterization/UVGParam.hxx"
 #include "polyvector/PolyVectors.hxx"
 #include "crossfield/CrossField.hxx"
-#include "sipg/SIPG.hxx"
+#include "dualMBO/DualMBO.hxx"
 #include "medialaxis/MedialAxis.hxx"
 #include "medialaxis/MedialAxisTMesh.hxx"
 #include "quantization/QuantTMeshConvert.hxx"
@@ -90,8 +90,8 @@ void drawVertexCrossField(const Mesh &m, const CrossField &cf, double scale);
 // Each cross direction is (u_k[i])^(1/4)
 void drawVertexCrossFieldUK(const Mesh &m, const CrossField &cf, double scale);
 
-// Draw SIPG p=0 cross field: one cross per triangle centroid from SIPG u_k.
-void drawTriangleCrossField(const Mesh &m, const SIPG &sipg, double scale);
+// Draw DualMBO p=0 cross field: one cross per triangle centroid from DualMBO u_k.
+void drawTriangleCrossField(const Mesh &m, const DualMBO &dualMBO, double scale);
 
 void drawDisk3D(const Point &center, double radius, float baseR, float baseG, float baseB, int segments = 96);
 
@@ -172,8 +172,8 @@ void computeUVGParamBounds(const UVGParam &uvp, double &cx, double &cy, double &
 void drawUVGParam(const UVGParam &uvp);
 void drawFlippedUVTriangles(const UVGParam &uvp);
 
-// Draw SIPG singularities on the UVGParam view.
-// singularVertices: (original-mesh vertex index, cross-index) pairs from SIPG.
+// Draw DualMBO singularities on the UVGParam view.
+// singularVertices: (original-mesh vertex index, cross-index) pairs from DualMBO.
 void drawSingularitiesOnUVG(const UVGParam &uvp,
                              const std::vector<std::pair<int, double>> &singularVertices,
                              double radius);
