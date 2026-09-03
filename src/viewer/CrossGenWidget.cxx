@@ -2,6 +2,7 @@
 // Replaces the old GLFW-based ViewerMain render loop with Qt event-driven rendering.
 
 #include "viewer/CrossGenWidget.hxx"
+#include "viewer/Export.hxx"
 #include "viewer/GL.hxx"
 #include "viewer/Interaction.hxx"
 #include "viewer/Render.hxx"
@@ -10,9 +11,15 @@
 #include <QComboBox>
 #include <QDialog>
 #include <QDialogButtonBox>
+#include <QDir>
 #include <QDoubleSpinBox>
+#include <QFileInfo>
 #include <QFormLayout>
+#include <QImage>
 #include <QKeyEvent>
+#include <QOpenGLContext>
+#include <QOpenGLFramebufferObject>
+#include <QOpenGLFunctions>
 #include <QLabel>
 #include <QPushButton>
 #include <QScreen>
@@ -248,6 +255,16 @@ CrossGenWidget::CrossGenWidget(const std::string &meshPath, QWidget *parent)
 {
     mesh_ = std::make_shared<Mesh>(meshPath);
 
+    // Where the figures go, and what they are called. The directory is only
+    // created when the first one is written, so a session that never presses
+    // 's' leaves nothing behind.
+    modelName_ = QFileInfo(QString::fromStdString(meshPath)).completeBaseName()
+                     .toStdString();
+    if (modelName_.empty()) modelName_ = "model";
+    figureDir_ = qEnvironmentVariableIsSet("CROSSGEN_FIGURE_DIR")
+                     ? qEnvironmentVariable("CROSSGEN_FIGURE_DIR")
+                     : QStringLiteral("figures");
+
     // Compute view bounds
     bounds_  = viewer::computeBounds(*mesh_);
     avgEdge_ = viewer::averageTriangleEdgeLength(*mesh_);
@@ -308,13 +325,21 @@ void CrossGenWidget::paintGL() {
     viewer::applyOrtho(view_);
 
     // Run any lazy computations that are triggered by the current phase/mode.
+    // Deliberately outside drawScene(): an export re-draws the scene, and a
+    // stage must not be advanced or re-solved by having its picture saved.
     runComputations();
 
-    // Clear
-    glClearColor(0.1f, 0.1f, 0.12f, 1.0f);
+    // Clear, in whichever background the theme is on. White is the default,
+    // because the figures are what this is for.
+    const auto bg = viewer::backgroundColor();
+    glClearColor(bg[0], bg[1], bg[2], 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     glDisable(GL_DEPTH_TEST);
 
+    drawScene();
+}
+
+void CrossGenWidget::drawScene() {
     // Choose render path
     bool isMBOStepping = (mode_ == Mode::MBO &&
                           mboPhase_ == MBOPhase::Stepping &&
@@ -481,6 +506,43 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
                                    : "[Layout] right panel: Psi, the Stage 6 layout");
             update();
         }
+        break;
+
+    case Qt::Key_S:
+        // The figure keys. 's' is the vector one and the one to reach for: a
+        // wireframe, a cut graph, a quad mesh -- everything this viewer draws
+        // is lines and flat polygons, which is exactly what SVG is for, and a
+        // paper renders it at whatever resolution the press is.
+        //
+        // 'S' is the raster fallback at 3x the framebuffer, for the phases
+        // whose picture is a filled scalar field over every triangle: those
+        // are vector files of a hundred thousand paths that no viewer wants to
+        // open and that gain nothing over pixels.
+        if (event->modifiers() & Qt::ShiftModifier) exportPng(3);
+        else                                        exportSvg();
+        break;
+
+    case Qt::Key_H:
+        // Everything on screen that belongs to the viewer rather than to the
+        // model: the console, the key help, and the coordinate axis. One key
+        // for the three of them, because a figure wants none of them and a
+        // working session wants all three.
+        showHUD_ = !showHUD_;
+        viewer::setAxisVisible(showHUD_);
+        console_.log(showHUD_ ? "[Figure] console, key help and axis shown"
+                              : "[Figure] console, key help and axis hidden");
+        update();
+        break;
+
+    case Qt::Key_B:
+        // White or the dark background the viewer was written against. White is
+        // the default; this is here because the dark one is easier to work
+        // against for long stretches, and because a figure ought to be
+        // checkable against it.
+        viewer::setLightBackground(!viewer::lightBackground());
+        console_.log(viewer::lightBackground() ? "[Figure] white background"
+                                               : "[Figure] dark background");
+        update();
         break;
 
     case Qt::Key_1:
@@ -5459,19 +5521,19 @@ void CrossGenWidget::renderTraceAnimation() {
     viewer::drawAxis(view_);
     viewer::drawMesh(*mesh_);
 
-    glLineWidth(3.0f);
+    viewer::lineWidth(3.0f);
     for (const auto &sep : separatrixTrace_->separatrices) {
         if (sep.path.size() < 2) continue;
         if (sep.active)
-            glColor3f(0.95f, 0.1f, 0.1f);
+            viewer::color3f(0.95f, 0.1f, 0.1f);
         else
-            glColor3f(0.1f, 0.9f, 0.2f);
+            viewer::color3f(0.1f, 0.9f, 0.2f);
         glBegin(GL_LINE_STRIP);
         for (const auto &tp : sep.path)
             glVertex2d(tp.global_pos[0], tp.global_pos[1]);
         glEnd();
     }
-    glLineWidth(1.0f);
+    viewer::lineWidth(1.0f);
 
     renderOverlay("Tracing separatrices...\npress 'q' to quit");
 }
@@ -5533,13 +5595,13 @@ void CrossGenWidget::drawSplitDivider(int halfW) const {
     glOrtho(0.0, static_cast<double>(w), 0.0, static_cast<double>(h), -1, 1);
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
-    glLineWidth(2.0f);
-    glColor3f(0.55f, 0.55f, 0.55f);
+    viewer::lineWidth(2.0f);
+    viewer::color3f(0.55f, 0.55f, 0.55f);
     glBegin(GL_LINES);
     glVertex2f(static_cast<float>(halfW), 0.0f);
     glVertex2f(static_cast<float>(halfW), static_cast<float>(h));
     glEnd();
-    glLineWidth(1.0f);
+    viewer::lineWidth(1.0f);
     glViewport(0, 0, w, h);
 }
 
@@ -5786,19 +5848,19 @@ void CrossGenWidget::renderNormal() {
         } else if (mboPhase_ >= MBOPhase::Layout && quadLayout_.has_value()) {
             viewer::drawQuadLayoutArcs(*quadLayout_, 3.0f, 0.95f, 0.2f, 0.2f);
         } else if (mboPhase_ >= MBOPhase::Separatrices && separatrixTrace_) {
-            glLineWidth(3.0f);
+            viewer::lineWidth(3.0f);
             for (const auto &sep : separatrixTrace_->separatrices) {
                 if (sep.path.size() < 2) continue;
                 if (sep.active)
-                    glColor3f(0.95f, 0.1f, 0.1f);
+                    viewer::color3f(0.95f, 0.1f, 0.1f);
                 else
-                    glColor3f(0.1f, 0.9f, 0.2f);
+                    viewer::color3f(0.1f, 0.9f, 0.2f);
                 glBegin(GL_LINE_STRIP);
                 for (const auto &tp : sep.path)
                     glVertex2d(tp.global_pos[0], tp.global_pos[1]);
                 glEnd();
             }
-            glLineWidth(1.0f);
+            viewer::lineWidth(1.0f);
         }
     } else if (mode_ == Mode::OASIS) {
         viewer::drawAxis(view_);
@@ -6167,13 +6229,13 @@ void CrossGenWidget::renderNormal() {
                 // the bijective sections; magenta ones belong to a polar
                 // section, where a run of boundary collapses onto a single
                 // medial vertex (a discrete axis endpoint).
-                glLineWidth(1.0f);
+                viewer::lineWidth(1.0f);
                 glBegin(GL_LINES);
                 for (const auto &s : medialAxisMap_->spokes()) {
                     if (s.collapsed)
-                        glColor4f(0.9f, 0.25f, 0.9f, 0.85f);
+                        viewer::color4f(0.9f, 0.25f, 0.9f, 0.85f);
                     else
-                        glColor4f(0.35f, 0.55f, 0.95f, 0.55f);
+                        viewer::color4f(0.35f, 0.55f, 0.95f, 0.55f);
                     glVertex2d(s.boundary[0], s.boundary[1]);
                     glVertex2d(s.medial[0], s.medial[1]);
                 }
@@ -6324,7 +6386,206 @@ void CrossGenWidget::renderNormal() {
 // ── overlay helper ────────────────────────────────────────────────────────────
 
 void CrossGenWidget::renderOverlay(const char *helpText) {
+    // The console and the key help are the viewer talking about itself, so a
+    // figure does without them; 'h' is the switch. Everything else on screen
+    // belongs to the model and is exported as it stands.
+    if (!showHUD_) return;
     int w = fbw(), h = fbh();
     console_.draw(w, h, 55.0f);
-    viewer::drawTextOverlay(w, h, helpText, 10.0f, 20.0f, 0.8f, 0.8f, 0.8f);
+
+    // The figure keys go here rather than into each phase's own help string,
+    // for the reason the interface toggles are appended to it: they apply at
+    // every phase of every mode, so eleven copies of them would be eleven
+    // things to keep in step.
+    const std::string help =
+        std::string(helpText) +
+        "\npress 's' to save an SVG figure, 'S' for a 3x PNG\n"
+        "press 'h' to hide this text, 'b' for a " +
+        (viewer::lightBackground() ? "dark" : "white") + " background";
+    viewer::drawTextOverlay(w, h, help.c_str(), 10.0f, 20.0f, 0.8f, 0.8f, 0.8f);
+}
+
+// ── figure export ─────────────────────────────────────────────────────────────
+
+QString CrossGenWidget::nextFigurePath(const char *extension) const {
+    // <model>_<mode>_<phase>_<nn>.<ext>, lowercased and with the spaces of the
+    // phase names squeezed out, so the files sort into the order the pipeline
+    // ran and a caption can be read off the name.
+    auto slug = [](QString s, int limit) {
+        s = s.toLower();
+        QString out;
+        for (const QChar c : s) {
+            if (c.isLetterOrNumber()) out += c;
+            else if (!out.isEmpty() && out.back() != QLatin1Char('-')) out += QLatin1Char('-');
+        }
+        // The phase names carry their section numbers, which is what makes them
+        // worth having in the filename; the prose after them is not, past the
+        // first few words. Cut at a word boundary so the result still reads.
+        if (out.size() > limit) {
+            const int cut = out.lastIndexOf(QLatin1Char('-'), limit);
+            out.truncate(cut > 0 ? cut : limit);
+        }
+        while (out.endsWith(QLatin1Char('-'))) out.chop(1);
+        return out;
+    };
+
+    const char *phase = "";
+    switch (mode_) {
+    case Mode::TORSION:
+    case Mode::MERIDIAN:   phase = pipelinePhaseName(pipePhase_, mode_); break;
+    case Mode::MBO:        phase = mboPhaseName(mboPhase_);              break;
+    case Mode::MedialAxis: phase = medialAxisPhaseName(maPhase_);        break;
+    case Mode::OASIS:      phase = oasisPhaseName(oasisPhase_);          break;
+    case Mode::UMBER:      phase = umberPhaseName(umberPhase_);          break;
+    case Mode::PolyVector:
+    case Mode::Unselected:  phase = phaseName(phase_);                   break;
+    }
+
+    QString stage = slug(QString::fromLatin1(modeName(mode_)), 24);
+    const QString ph = slug(QString::fromLatin1(phase), 28);
+    if (!ph.isEmpty()) stage += QLatin1Char('_') + ph;
+
+    return QDir(figureDir_).filePath(
+        QStringLiteral("%1_%2_%3.%4")
+            .arg(QString::fromStdString(modelName_))
+            .arg(stage)
+            .arg(figureCounter_, 2, 10, QLatin1Char('0'))
+            .arg(QString::fromLatin1(extension)));
+}
+
+void CrossGenWidget::exportSvg() {
+    if (!QDir().mkpath(figureDir_)) {
+        console_.log("[Figure] could not create " + figureDir_.toStdString());
+        return;
+    }
+    const QString path = nextFigurePath("svg");
+
+    makeCurrent();
+
+    // Feedback mode does not rasterise, so by the specification it should not
+    // need a draw target -- but on this platform's GL (2.1 over Metal) it does:
+    // with no complete framebuffer bound it returns the passthrough tokens and
+    // silently drops every primitive, which reads as an empty scene rather than
+    // as an error. QOpenGLWidget::makeCurrent() binds the widget's own FBO, so
+    // the line above is normally enough; this is here because the failure is
+    // invisible if it ever stops being.
+    if (QOpenGLContext *ctx = QOpenGLContext::currentContext()) {
+        GLint bound = 0;
+        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &bound);
+        if (bound == 0)
+            ctx->functions()->glBindFramebuffer(GL_FRAMEBUFFER, defaultFramebufferObject());
+    }
+
+    // The capture has to see exactly the state paintGL leaves before it draws:
+    // the same projection, the same viewport, depth testing off.
+    viewer::applyOrtho(view_);
+    glDisable(GL_DEPTH_TEST);
+
+    // The primitive count is not known until the scene has been drawn, and the
+    // feedback buffer cannot be grown once the primitives have gone through it,
+    // so on overflow there is nothing to do but draw it again into a bigger
+    // one. Four attempts covers 4M to 256M floats, which is about 9M triangles.
+    viewer::CaptureResult result = viewer::CaptureResult::Overflow;
+    for (std::size_t capacity = 4u << 20; capacity <= (256u << 20); capacity *= 4) {
+        if (!viewer::beginVectorCapture(capacity)) break;
+        drawScene();
+        result = viewer::writeVectorCapture(path.toStdString(), fbw(), fbh());
+        if (result != viewer::CaptureResult::Overflow) break;
+    }
+
+    doneCurrent();
+
+    switch (result) {
+    case viewer::CaptureResult::Ok: {
+        const auto &st = viewer::lastCaptureStats();
+        std::ostringstream oss;
+        oss << "[Figure] " << path.toStdString() << " -- " << st.polygons
+            << " faces, " << st.lines << " segments, " << st.points
+            << " points in " << st.elements << " SVG elements";
+        console_.log(oss.str());
+        std::cerr << oss.str() << "\n";
+        ++figureCounter_;
+        break;
+    }
+    case viewer::CaptureResult::Overflow:
+        console_.log("[Figure] scene too large for the feedback buffer; "
+                     "press 'S' for a raster figure instead");
+        break;
+    case viewer::CaptureResult::Empty:
+        console_.log("[Figure] nothing was drawn, so nothing was written");
+        break;
+    case viewer::CaptureResult::WriteFailed:
+        console_.log("[Figure] could not write " + path.toStdString());
+        break;
+    }
+    update();
+}
+
+void CrossGenWidget::exportPng(int scale) {
+    if (!QDir().mkpath(figureDir_)) {
+        console_.log("[Figure] could not create " + figureDir_.toStdString());
+        return;
+    }
+    const QString path = nextFigurePath("png");
+
+    makeCurrent();
+
+    const int w = static_cast<int>(width()  * devicePixelRatio()) * scale;
+    const int h = static_cast<int>(height() * devicePixelRatio()) * scale;
+
+    QOpenGLFramebufferObjectFormat fmt;
+    fmt.setAttachment(QOpenGLFramebufferObject::CombinedDepthStencil);
+    fmt.setSamples(4);
+    QOpenGLFramebufferObject fbo(w, h, fmt);
+    if (!fbo.isValid()) {
+        console_.log("[Figure] could not allocate a framebuffer that large; "
+                     "try a smaller scale");
+        doneCurrent();
+        return;
+    }
+
+    // Everything the viewer draws in screen space is derived from fbw()/fbh(),
+    // and every line width and glyph is in pixels. Scaling both together is
+    // what makes the export a bigger picture of the same thing rather than the
+    // same picture with hairlines in it.
+    exportScale_ = scale;
+    viewer::setRenderScale(static_cast<float>(scale));
+
+    fbo.bind();
+    viewer::applyOrtho(view_);
+    const auto bg = viewer::backgroundColor();
+    glClearColor(bg[0], bg[1], bg[2], 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glDisable(GL_DEPTH_TEST);
+    drawScene();
+    const QImage image = fbo.toImage();
+    fbo.release();
+
+    exportScale_ = 1;
+    viewer::setRenderScale(1.0f);
+
+    // QOpenGLFramebufferObject::release() binds framebuffer 0, which is not
+    // the one a QOpenGLWidget paints into; restore it before handing the
+    // context back or the next frame goes to the window system's buffer.
+    // Through Qt's loader rather than the GL header, which on this platform is
+    // the 2.1 one and does not declare the FBO entry points unsuffixed.
+    if (QOpenGLContext *ctx = QOpenGLContext::currentContext())
+        ctx->functions()->glBindFramebuffer(GL_FRAMEBUFFER, defaultFramebufferObject());
+    viewer::resizeAndApplyOrtho(view_, fbw(), fbh());
+    uvView_.fbw = view_.fbw;
+    uvView_.fbh = view_.fbh;
+
+    doneCurrent();
+
+    if (image.isNull() || !image.save(path)) {
+        console_.log("[Figure] could not write " + path.toStdString());
+    } else {
+        std::ostringstream oss;
+        oss << "[Figure] " << path.toStdString() << " -- " << w << "x" << h
+            << " (" << scale << "x)";
+        console_.log(oss.str());
+        std::cerr << oss.str() << "\n";
+        ++figureCounter_;
+    }
+    update();
 }

@@ -3,6 +3,7 @@
 #include <QOpenGLWidget>
 #include <QTimer>
 #include <QPoint>
+#include <QString>
 
 #include <memory>
 #include <optional>
@@ -561,12 +562,39 @@ private:
     void renderNormal();
     void renderOverlay(const char *helpText);
 
+    // Everything paintGL does after the clear, factored out so an export can
+    // draw the identical scene: the SVG capture has to run the same draw calls
+    // a second time, and a raster export runs them into a different
+    // framebuffer. A figure that came from a second, export-only drawing path
+    // would be a picture of something that was never on screen.
+    void drawScene();
+
+    // ── figure export ────────────────────────────────────────────────────────
+    // Both write into figureDir_ under a name built from the model, the mode
+    // and the phase, so a walk through the pipeline pressing 's' at each stage
+    // comes out as a numbered set rather than a pile of overwrites.
+    QString nextFigurePath(const char *extension) const;
+
+    // The vector one, and the one to prefer: the scene through the GL feedback
+    // buffer, written as SVG. Sizes the feedback buffer by trying and growing,
+    // since the primitive count is not known until it has been drawn.
+    void exportSvg();
+
+    // The raster fallback, at `scale` times the on-screen framebuffer. For a
+    // wireframe figure the SVG is better in every way; this is here for the
+    // phases whose picture is a filled field, where a vector file is enormous
+    // and gains nothing.
+    void exportPng(int scale);
+
     // per-frame computation (lazy, guarded by has_value / pointer checks)
     void runComputations();
 
-    // convenience
-    int fbw() const { return static_cast<int>(width()  * devicePixelRatio()); }
-    int fbh() const { return static_cast<int>(height() * devicePixelRatio()); }
+    // convenience. exportScale_ is 1 except while a supersampled raster export
+    // is running, and it multiplies here rather than at the call sites because
+    // every screen-space thing the viewer draws -- the ortho box, the split
+    // divider, the HUD -- is derived from these two.
+    int fbw() const { return static_cast<int>(width()  * devicePixelRatio()) * exportScale_; }
+    int fbh() const { return static_cast<int>(height() * devicePixelRatio()) * exportScale_; }
 
     // ── data ─────────────────────────────────────────────────────────────────
     std::shared_ptr<Mesh> mesh_;
@@ -821,6 +849,25 @@ private:
     // and because on a single-material model it says nothing at all.
     bool showInterfaces_    = true;
     bool showMaterialFill_  = false;
+
+    // ── figure state ─────────────────────────────────────────────────────────
+    // The console and the key-help line, which are the two things on screen
+    // that belong to the viewer rather than to the model. On by default and off
+    // in a figure: a paper wants the picture, not the legend of shortcuts that
+    // produced it. 'h' toggles them, and the exports honour whatever it is set
+    // to, so a figure with the console left on is a deliberate one.
+    bool showHUD_ = true;
+
+    // Where 's' and 'S' write, and the counter that keeps a walk through the
+    // pipeline from overwriting itself.
+    QString figureDir_;
+    std::string modelName_;
+    int figureCounter_ = 0;
+
+    // 1 on screen; the supersampling factor while a raster export is drawing.
+    // fbw()/fbh() multiply by it, and viewer::setRenderScale() matches it so
+    // line widths and the bitmap font keep their on-screen weight.
+    int exportScale_ = 1;
 
     // Stage 10 settings, surviving a reset the way the connectivity ones do so
     // that the dialog opens on whatever was last tried. The defaults are

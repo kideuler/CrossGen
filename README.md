@@ -27,7 +27,8 @@ A purely 2D implementation of Cross-fields along with block decomposition
 - [X] Get bubble working correctly (`--disk-templates --near-miss 0.04`, both pipelines)
 - [X] Create a QuadMesh class and do TMOP (`src/mesh/QuadMesh.hxx`, `src/mesh/TMOP.hxx`; `TestTMOP --selftest`, or `TestMERIDIAN <mesh> --tmop <sweeps>`).
 - [X] Get tests ready.
-- [ ] Make sure Viewer is consistent with tests.
+- [X] Make sure Viewer is consistent with tests.
+- [X] Prepare viewer to take pictures
 - [ ] Go through models (singlemat and multimat) and pick out which ones will stay in corpus. remove ones and put them in excess.
 - [ ] Write big huge prompt for fable which will bring everything together.
 

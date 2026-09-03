@@ -1,5 +1,6 @@
 #include "viewer/Render.hxx"
 
+#include "viewer/Export.hxx"
 #include "viewer/GL.hxx"
 #include "viewer/Geometry.hxx"
 #include "viewer/Interaction.hxx"
@@ -45,7 +46,7 @@ void Console::draw(int fbw, int fbh, float startY) const {
     glPushMatrix();
     glLoadIdentity();
 
-    float scale = 2.0f;
+    float scale = 2.0f * textScale();
     float charH = 8.0f * scale;
     float padding = 8.0f;
     float lineSpacing = charH + 2.0f;
@@ -55,7 +56,7 @@ void Console::draw(int fbw, int fbh, float startY) const {
     float consoleWidth = fbw - 20.0f;  // nearly full width with margins
     
     // Draw semi-transparent background
-    glColor4f(0.0f, 0.0f, 0.0f, 0.6f);
+    viewer::color4f(0.0f, 0.0f, 0.0f, 0.6f);
     glBegin(GL_QUADS);
     glVertex2f(10.0f, startY - padding);
     glVertex2f(10.0f + consoleWidth, startY - padding);
@@ -64,8 +65,8 @@ void Console::draw(int fbw, int fbh, float startY) const {
     glEnd();
 
     // Draw border
-    glColor3f(0.3f, 0.6f, 0.3f);
-    glLineWidth(1.0f);
+    viewer::color3f(0.3f, 0.6f, 0.3f);
+    viewer::lineWidth(1.0f);
     glBegin(GL_LINE_LOOP);
     glVertex2f(10.0f, startY - padding);
     glVertex2f(10.0f + consoleWidth, startY - padding);
@@ -132,7 +133,7 @@ static void materialColor(int matId, float &r, float &g, float &b) {
 }
 
 void drawMesh(const Mesh &m) {
-    glLineWidth(1.25f);
+    viewer::lineWidth(1.25f);
     glBegin(GL_LINES);
     for (std::size_t e = 0; e < m.edges.size(); ++e) {
         int t0 = m.edgeTriangles[e][0];
@@ -147,7 +148,7 @@ void drawMesh(const Mesh &m) {
         } else {
             materialColor(m.triangleMatId[t0], r, g, b);
         }
-        glColor3f(r, g, b);
+        viewer::color3f(r, g, b);
         const Point &a = m.vertices[m.edges[e][0]];
         const Point &b_ = m.vertices[m.edges[e][1]];
         glVertex2d(a[0], a[1]);
@@ -157,8 +158,8 @@ void drawMesh(const Mesh &m) {
 }
 
 void drawMeshOverlay(const Mesh &m, float r, float g, float b, float a, float lineWidth) {
-    glColor4f(r, g, b, a);
-    glLineWidth(lineWidth);
+    viewer::color4f(r, g, b, a);
+    viewer::lineWidth(lineWidth);
     glBegin(GL_LINES);
     for (const auto &tri : m.triangles) {
         const Point &p0 = m.vertices[tri[0]];
@@ -172,15 +173,15 @@ void drawMeshOverlay(const Mesh &m, float r, float g, float b, float a, float li
         glVertex2d(p0[0], p0[1]);
     }
     glEnd();
-    glLineWidth(1.0f);
+    viewer::lineWidth(1.0f);
 }
 
 void drawEdgeSetOnMesh(const Mesh &m,
                        const std::unordered_set<CutMesh::EdgeKey, CutMesh::EdgeKeyHash> &edges,
                        float r, float g, float b,
                        float lineWidth) {
-    glColor3f(r, g, b);
-    glLineWidth(lineWidth);
+    viewer::color3f(r, g, b);
+    viewer::lineWidth(lineWidth);
     glBegin(GL_LINES);
     for (const auto &e : edges) {
         if (e.a < 0 || e.b < 0 || e.a >= static_cast<int>(m.vertices.size()) ||
@@ -198,7 +199,7 @@ void drawEdgeSetOnMesh(const Mesh &m,
 void drawArrow(const Point &p, const Point &dir, double scale, float r, float g, float b) {
     Point d{dir[0] * scale, dir[1] * scale};
     Point q{p[0] + d[0], p[1] + d[1]};
-    glColor3f(r, g, b);
+    viewer::color3f(r, g, b);
     glBegin(GL_LINES);
     glVertex2d(p[0], p[1]);
     glVertex2d(q[0], q[1]);
@@ -223,7 +224,7 @@ void drawArrow(const Point &p, const Point &dir, double scale, float r, float g,
 }
 
 void drawField(const Mesh &m, const PolyField &field, double scale) {
-    glLineWidth(2.5f);
+    viewer::lineWidth(2.5f);
     const float br = 0.2f, bg = 0.2f, bb = 0.95f; // unified blue color
 
     for (size_t i = 0; i < m.triangles.size(); ++i) {
@@ -246,7 +247,7 @@ void drawField(const Mesh &m, const PolyField &field, double scale) {
 }
 
 void drawUField(const Mesh &m, const std::vector<Point> &uField, double scale) {
-    glLineWidth(2.5f);
+    viewer::lineWidth(2.5f);
     const float br = 0.2f, bg = 0.7f, bb = 0.2f; // green color for U field
 
     for (size_t i = 0; i < m.triangles.size(); ++i) {
@@ -259,7 +260,7 @@ void drawUField(const Mesh &m, const std::vector<Point> &uField, double scale) {
 }
 
 void drawVField(const Mesh &m, const std::vector<Point> &vField, double scale) {
-    glLineWidth(2.5f);
+    viewer::lineWidth(2.5f);
     const float vr = 0.9f, vg = 0.2f, vb = 0.2f; // red color for V field
 
     for (size_t i = 0; i < m.triangles.size(); ++i) {
@@ -272,7 +273,7 @@ void drawVField(const Mesh &m, const std::vector<Point> &vField, double scale) {
 }
 
 void drawVertexCrossField(const Mesh &m, const CrossField &cf, double scale) {
-    glLineWidth(2.5f);
+    viewer::lineWidth(2.5f);
     const float br = 0.2f, bg = 0.2f, bb = 0.95f; // unified blue color
 
     const Eigen::VectorXcd &u_k_prev = cf.u_k_prev;
@@ -303,7 +304,7 @@ void drawVertexCrossField(const Mesh &m, const CrossField &cf, double scale) {
 }
 
 void drawVertexCrossFieldUK(const Mesh &m, const CrossField &cf, double scale) {
-    glLineWidth(2.5f);
+    viewer::lineWidth(2.5f);
     const float br = 0.2f, bg = 0.2f, bb = 0.95f; // unified blue color
 
     const Eigen::VectorXcd &u_k = cf.u_k;
@@ -334,7 +335,7 @@ void drawVertexCrossFieldUK(const Mesh &m, const CrossField &cf, double scale) {
 }
 
 void drawTriangleCrossField(const Mesh &m, const DualMBO &dualMBO, double scale) {
-    glLineWidth(2.5f);
+    viewer::lineWidth(2.5f);
     const float br = 0.45f, bg = 0.05f, bb = 0.55f; // dark purple
 
     const Eigen::VectorXcd &u_k = dualMBO.u_k;
@@ -374,7 +375,7 @@ void drawDisk3D(const Point &center, double radius, float baseR, float baseG, fl
     // Center normal pointing out of screen (0,0,1)
     double ndotl_center = std::max(0.0, L[2]);
     double shade_center = 0.3 + 0.7 * ndotl_center; // ambient + diffuse
-    glColor3f(baseR * shade_center, baseG * shade_center, baseB * shade_center);
+    viewer::color3f(baseR * shade_center, baseG * shade_center, baseB * shade_center);
     glVertex2d(center[0], center[1]);
 
     // Rim vertices: compute per-vertex shading by mapping disk to sphere cap
@@ -392,19 +393,19 @@ void drawDisk3D(const Point &center, double radius, float baseR, float baseG, fl
         N.normalize();
         double ndotl = std::max(0.0, N.dot(L));
         double shade = 0.25 + 0.75 * ndotl; // ambient + diffuse
-        glColor3f(baseR * shade, baseG * shade, baseB * shade);
+        viewer::color3f(baseR * shade, baseG * shade, baseB * shade);
         glVertex2d(x, y);
     }
     glEnd();
 
     // Subtle outline to enhance 3D look
-    glLineWidth(1.0f);
+    viewer::lineWidth(1.0f);
     glBegin(GL_LINE_LOOP);
     for (int i = 0; i < segments; ++i) {
         double ang = (static_cast<double>(i) / segments) * 2.0 * M_PI;
         double x = center[0] + radius * std::cos(ang);
         double y = center[1] + radius * std::sin(ang);
-        glColor3f(baseR * 0.5f, baseG * 0.5f, baseB * 0.5f);
+        viewer::color3f(baseR * 0.5f, baseG * 0.5f, baseB * 0.5f);
         glVertex2d(x, y);
     }
     glEnd();
@@ -522,9 +523,9 @@ void drawTextOverlay(int fbw, int fbh, const char *text, float x, float y, float
     glPushMatrix();
     glLoadIdentity();
 
-    glColor3f(r, g, b);
+    viewer::color3f(r, g, b);
     
-    float scale = 2.0f; // scale factor for readability
+    float scale = 2.0f * textScale(); // readability, times the export scale
     float charW = 6.0f * scale;  // 5 pixels + 1 spacing
     float charH = 8.0f * scale;  // 7 pixels + 1 spacing
     
@@ -619,7 +620,7 @@ void drawUVMesh(const MIQSolver &miq) {
     double pad = 0.1 * ext;
 
     // First pass: draw flipped triangles as filled red polygons
-    glColor4f(0.9f, 0.2f, 0.2f, 0.7f); // red with some transparency
+    viewer::color4f(0.9f, 0.2f, 0.2f, 0.7f); // red with some transparency
     glBegin(GL_TRIANGLES);
     for (int i = 0; i < FUV.rows(); ++i) {
         if (!miq.isFlipped(i)) continue;
@@ -645,8 +646,8 @@ void drawUVMesh(const MIQSolver &miq) {
     glEnd();
 
     // Draw UV mesh edges
-    glColor3f(0.3f, 0.8f, 0.9f); // cyan color for UV mesh
-    glLineWidth(1.5f);
+    viewer::color3f(0.3f, 0.8f, 0.9f); // cyan color for UV mesh
+    viewer::lineWidth(1.5f);
     glBegin(GL_LINES);
     for (int i = 0; i < FUV.rows(); ++i) {
         int v0 = FUV(i, 0);
@@ -681,8 +682,8 @@ void drawUVMesh(const MIQSolver &miq) {
     int gridMinV = static_cast<int>(std::floor(minV));
     int gridMaxV = static_cast<int>(std::ceil(maxV));
 
-    glColor4f(0.4f, 0.4f, 0.4f, 0.5f);
-    glLineWidth(1.0f);
+    viewer::color4f(0.4f, 0.4f, 0.4f, 0.5f);
+    viewer::lineWidth(1.0f);
     glBegin(GL_LINES);
     // Vertical lines (constant U)
     for (int u = gridMinU; u <= gridMaxU; ++u) {
@@ -737,8 +738,8 @@ void drawSingularitiesOnUV(const MIQSolver &miq, const CutMesh &cutMesh,
 
 void drawMedialAxis(const MedialAxis &ma, double vertexRadius) {
     // Draw medial axis edges (Voronoi dual edges) in orange
-    glColor3f(1.0f, 0.6f, 0.1f);
-    glLineWidth(2.5f);
+    viewer::color3f(1.0f, 0.6f, 0.1f);
+    viewer::lineWidth(2.5f);
     glBegin(GL_LINES);
     for (const auto &edge : ma.medialEdges) {
         const Point &a = ma.medialVertices[edge[0]].coord;
@@ -747,7 +748,7 @@ void drawMedialAxis(const MedialAxis &ma, double vertexRadius) {
         glVertex2d(b[0], b[1]);
     }
     glEnd();
-    glLineWidth(1.0f);
+    viewer::lineWidth(1.0f);
 
     // Draw medial axis vertices (circumcenters) as small cyan disks. Vertices
     // whose circumcenter fell outside the domain are drawn red instead: they
@@ -762,10 +763,10 @@ namespace {
 
 void medialClassColor(MedialColor c, float alpha) {
     switch (c) {
-        case MedialColor::Green:  glColor4f(0.15f, 0.85f, 0.25f, alpha); return;
-        case MedialColor::Red:    glColor4f(0.95f, 0.25f, 0.20f, alpha); return;
-        case MedialColor::Blue:   glColor4f(0.30f, 0.50f, 0.95f, alpha); return;
-        case MedialColor::Purple: glColor4f(0.80f, 0.30f, 0.95f, alpha); return;
+        case MedialColor::Green:  viewer::color4f(0.15f, 0.85f, 0.25f, alpha); return;
+        case MedialColor::Red:    viewer::color4f(0.95f, 0.25f, 0.20f, alpha); return;
+        case MedialColor::Blue:   viewer::color4f(0.30f, 0.50f, 0.95f, alpha); return;
+        case MedialColor::Purple: viewer::color4f(0.80f, 0.30f, 0.95f, alpha); return;
     }
 }
 
@@ -795,7 +796,7 @@ void drawMedialTMesh(const MedialAxisTMesh &tm, double cornerRadius) {
     }
 
     // ── The downsampled axis in class colour, under the block walls ──
-    glLineWidth(3.0f);
+    viewer::lineWidth(3.0f);
     for (const MedialZone &zone : tm.zones) {
         if (zone.chain.size() < 2) continue;
         medialClassColor(zone.color, 1.0f);
@@ -808,14 +809,14 @@ void drawMedialTMesh(const MedialAxisTMesh &tm, double cornerRadius) {
     }
 
     // ── The T-mesh blocking: every template block's closed outline ──
-    glLineWidth(2.2f);
-    glColor4f(0.94f, 0.94f, 0.94f, 0.95f);
+    viewer::lineWidth(2.2f);
+    viewer::color4f(0.94f, 0.94f, 0.94f, 0.95f);
     for (const TMeshBlock &block : tm.blocks) {
         glBegin(GL_LINE_LOOP);
         for (const Point &p : block.outline) glVertex2d(p[0], p[1]);
         glEnd();
     }
-    glLineWidth(1.0f);
+    viewer::lineWidth(1.0f);
 
     // ── Block corners ──
     for (const TMeshBlock &block : tm.blocks) {
@@ -947,8 +948,8 @@ template <typename Quant>
 void drawQuantizedTMesh(const Quant &bq, double vertexRadius = 0.0) {
     const QuantTMesh &q = bq.tmesh;
 
-    glLineWidth(QUANT_LINE_WIDTH);
-    glColor4f(0.35f, 0.62f, 0.98f, 0.95f);
+    viewer::lineWidth(QUANT_LINE_WIDTH);
+    viewer::color4f(0.35f, 0.62f, 0.98f, 0.95f);
 
     // Every edge of a face at its own full geometry: what to fall back on
     // whenever the face has no grid to draw. Drawing it beats leaving a
@@ -1096,10 +1097,10 @@ void drawQuantizedTMesh(const Quant &bq, double vertexRadius = 0.0) {
             }
             // The disks painted over the line color; restore it for the
             // next face's grid.
-            glColor4f(0.35f, 0.62f, 0.98f, 0.95f);
+            viewer::color4f(0.35f, 0.62f, 0.98f, 0.95f);
         }
     }
-    glLineWidth(1.0f);
+    viewer::lineWidth(1.0f);
 }
 
 }  // namespace
@@ -1113,14 +1114,14 @@ void drawQuantizedLayout(const QuadLayoutQuant &lq, double vertexRadius) {
     // but they are still ground the partition covers -- outline them in the
     // same blue, unsubdivided, so the picture has no hole where one sits and
     // the domain boundary stays unbroken across its share of it.
-    glLineWidth(QUANT_LINE_WIDTH);
-    glColor4f(0.35f, 0.62f, 0.98f, 0.95f);
+    viewer::lineWidth(QUANT_LINE_WIDTH);
+    viewer::color4f(0.35f, 0.62f, 0.98f, 0.95f);
     for (const auto &outline : lq.skippedOutlines) {
         glBegin(GL_LINE_STRIP);
         for (const Point &p : outline) glVertex2d(p[0], p[1]);
         glEnd();
     }
-    glLineWidth(1.0f);
+    viewer::lineWidth(1.0f);
 }
 
 namespace {
@@ -1142,6 +1143,10 @@ std::string formatAxisTick(double v, double step) {
 } // namespace
 
 void drawAxis(const ViewState &vs) {
+    // The switch is here and not at the fifteen call sites, for the same reason
+    // the theme's is inside color3f: one place to keep in step.
+    if (!axisVisible()) return;
+
     double worldW = 1.0, worldH = 1.0;
     computeWorldBox(vs, worldW, worldH);
 
@@ -1161,9 +1166,9 @@ void drawAxis(const ViewState &vs) {
     const double step = niceNorm * mag;
     const double tick = 0.01 * ext;
 
-    glLineWidth(1.5f);
+    viewer::lineWidth(1.5f);
 
-    glColor3f(0.85f, 0.3f, 0.3f);
+    viewer::color3f(0.85f, 0.3f, 0.3f);
     glBegin(GL_LINES);
     glVertex2d(left, 0.0);
     glVertex2d(right, 0.0);
@@ -1174,7 +1179,7 @@ void drawAxis(const ViewState &vs) {
     }
     glEnd();
 
-    glColor3f(0.3f, 0.8f, 0.35f);
+    viewer::color3f(0.3f, 0.8f, 0.35f);
     glBegin(GL_LINES);
     glVertex2d(0.0, bottom);
     glVertex2d(0.0, top);
@@ -1185,7 +1190,7 @@ void drawAxis(const ViewState &vs) {
     }
     glEnd();
 
-    glLineWidth(1.0f);
+    viewer::lineWidth(1.0f);
 
     // Numeric labels in screen space. drawTextOverlay sets up its own
     // screen-space projection (0..fbw, 0..fbh, top-left origin) rather than
@@ -1256,7 +1261,7 @@ void drawScalarField(const Mesh &m, const Eigen::VectorXd &f, double vmax) {
             if (v < 0 || v >= n) continue;
             float r, g, b;
             divergingColor(f[v] / vmax, r, g, b);
-            glColor3f(r, g, b);
+            viewer::color3f(r, g, b);
             glVertex2d(m.vertices[v][0], m.vertices[v][1]);
         }
     }
@@ -1285,7 +1290,7 @@ void drawScalarFieldLegend(int fbw, int fbh, double vmin, double vmax, const cha
         const double t = -1.0 + 2.0 * static_cast<double>(i) / steps;
         float r, g, b;
         divergingColor(t, r, g, b);
-        glColor3f(r, g, b);
+        viewer::color3f(r, g, b);
         const float x = x0 + barW * static_cast<float>(i) / steps;
         glVertex2f(x, y0);
         glVertex2f(x, y0 + barH);
@@ -1293,8 +1298,8 @@ void drawScalarFieldLegend(int fbw, int fbh, double vmin, double vmax, const cha
     glEnd();
 
     // Border
-    glColor3f(0.55f, 0.55f, 0.55f);
-    glLineWidth(1.0f);
+    viewer::color3f(0.55f, 0.55f, 0.55f);
+    viewer::lineWidth(1.0f);
     glBegin(GL_LINE_LOOP);
     glVertex2f(x0, y0);
     glVertex2f(x0 + barW, y0);
@@ -1319,8 +1324,8 @@ void drawScalarFieldLegend(int fbw, int fbh, double vmin, double vmax, const cha
 }
 
 void drawBoundaryEdges(const Mesh &m) {
-    glColor3f(0.7f, 0.7f, 0.7f);
-    glLineWidth(2.0f);
+    viewer::color3f(0.7f, 0.7f, 0.7f);
+    viewer::lineWidth(2.0f);
     glBegin(GL_LINES);
     for (int beIdx : m.boundaryEdges) {
         const Point &a = m.vertices[m.edges[beIdx][0]];
@@ -1329,7 +1334,7 @@ void drawBoundaryEdges(const Mesh &m) {
         glVertex2d(b[0], b[1]);
     }
     glEnd();
-    glLineWidth(1.0f);
+    viewer::lineWidth(1.0f);
 }
 
 void computeUVGParamBounds(const UVGParam &uvp, double &cx, double &cy, double &baseW, double &baseH) {
@@ -1368,8 +1373,8 @@ void drawUVGParam(const UVGParam &uvp) {
     int nV = static_cast<int>(u.size());
 
     // Draw triangle edges in UV space
-    glColor3f(0.3f, 0.8f, 0.9f);
-    glLineWidth(1.5f);
+    viewer::color3f(0.3f, 0.8f, 0.9f);
+    viewer::lineWidth(1.5f);
     glBegin(GL_LINES);
     for (const auto &tri : cutMesh.triangles) {
         for (int e = 0; e < 3; ++e) {
@@ -1381,7 +1386,7 @@ void drawUVGParam(const UVGParam &uvp) {
         }
     }
     glEnd();
-    glLineWidth(1.0f);
+    viewer::lineWidth(1.0f);
 }
 
 void drawFlippedUVTriangles(const UVGParam &uvp) {
@@ -1392,7 +1397,7 @@ void drawFlippedUVTriangles(const UVGParam &uvp) {
     if (u.size() == 0) return;
     int nV = static_cast<int>(u.size());
 
-    glColor4f(0.9f, 0.1f, 0.1f, 0.45f);
+    viewer::color4f(0.9f, 0.1f, 0.1f, 0.45f);
     glBegin(GL_TRIANGLES);
     for (const auto &tri : cutMesh.triangles) {
         int i = tri[0], j = tri[1], k = tri[2];
@@ -1468,8 +1473,8 @@ void drawPolysquare(const Polysquare &ps) {
     if (uv.empty()) return;
     const int nV = static_cast<int>(uv.size());
 
-    glColor3f(0.3f, 0.8f, 0.9f);
-    glLineWidth(1.0f);
+    viewer::color3f(0.3f, 0.8f, 0.9f);
+    viewer::lineWidth(1.0f);
     glBegin(GL_LINES);
     for (const auto &tri : cm.triangles) {
         for (int e = 0; e < 3; ++e) {
@@ -1488,7 +1493,7 @@ void drawFlippedPolysquareTriangles(const Polysquare &ps) {
     if (uv.empty()) return;
     const int nV = static_cast<int>(uv.size());
 
-    glColor4f(0.9f, 0.1f, 0.1f, 0.45f);
+    viewer::color4f(0.9f, 0.1f, 0.1f, 0.45f);
     glBegin(GL_TRIANGLES);
     for (const auto &tri : cm.triangles) {
         const int i = tri[0], j = tri[1], k = tri[2];
@@ -1514,8 +1519,8 @@ void drawPolysquareStructure(const Polysquare &ps, const HarmonicCut &hc) {
 
     // The banks first, so the boundary of the model draws over them.
     for (int pass = 0; pass < 2; ++pass) {
-        if (pass == 0) { glColor3f(1.0f, 0.2f, 0.9f); glLineWidth(2.5f); }
-        else           { glColor3f(1.0f, 0.85f, 0.3f); glLineWidth(3.5f); }
+        if (pass == 0) { viewer::color3f(1.0f, 0.2f, 0.9f); viewer::lineWidth(2.5f); }
+        else           { viewer::color3f(1.0f, 0.85f, 0.3f); viewer::lineWidth(3.5f); }
 
         glBegin(GL_LINES);
         for (int e : cm.boundaryEdges) {
@@ -1531,7 +1536,7 @@ void drawPolysquareStructure(const Polysquare &ps, const HarmonicCut &hc) {
         }
         glEnd();
     }
-    glLineWidth(1.0f);
+    viewer::lineWidth(1.0f);
 }
 
 void drawPolysquareCorners(const Polysquare &ps, const HarmonicCut &hc,
@@ -1556,7 +1561,7 @@ void drawPolysquareCorners(const Polysquare &ps, const HarmonicCut &hc,
 
 namespace {
 // One colour for every edge of the block decomposition, traced or boundary.
-inline void blockEdgeColour() { glColor3f(1.0f, 0.75f, 0.15f); }
+inline void blockEdgeColour() { viewer::color3f(1.0f, 0.75f, 0.15f); }
 } // namespace
 
 void drawBlockEdges(const MotorcycleGraph &mg, bool parameterDomain, float lineWidth) {
@@ -1564,7 +1569,7 @@ void drawBlockEdges(const MotorcycleGraph &mg, bool parameterDomain, float lineW
     if (segs.empty()) return;
 
     blockEdgeColour();
-    glLineWidth(lineWidth);
+    viewer::lineWidth(lineWidth);
     glBegin(GL_LINES);
     for (const auto &s : segs) {
         const Point &a = parameterDomain ? s.ua : s.a;
@@ -1573,7 +1578,7 @@ void drawBlockEdges(const MotorcycleGraph &mg, bool parameterDomain, float lineW
         glVertex2d(b[0], b[1]);
     }
     glEnd();
-    glLineWidth(1.0f);
+    viewer::lineWidth(1.0f);
 }
 
 void drawBlockBoundary(const Polysquare &ps, const HarmonicCut &hc,
@@ -1586,7 +1591,7 @@ void drawBlockBoundary(const Polysquare &ps, const HarmonicCut &hc,
     const auto &cuts = hc.getCutEdges();
 
     blockEdgeColour();
-    glLineWidth(lineWidth);
+    viewer::lineWidth(lineWidth);
     glBegin(GL_LINES);
     for (int e : cm.boundaryEdges) {
         const int a = cm.edges[e][0], b = cm.edges[e][1];
@@ -1600,7 +1605,7 @@ void drawBlockBoundary(const Polysquare &ps, const HarmonicCut &hc,
         glVertex2d(pb[0], pb[1]);
     }
     glEnd();
-    glLineWidth(1.0f);
+    viewer::lineWidth(1.0f);
 }
 
 void drawBlockNodes(const MotorcycleGraph &mg, bool parameterDomain, double radius) {
@@ -1621,15 +1626,15 @@ void drawBlockNodes(const MotorcycleGraph &mg, bool parameterDomain, double radi
 }
 
 void drawQuadLayoutArcs(const QuadLayout &layout, float lineWidth, float r, float g, float b) {
-    glColor3f(r, g, b);
-    glLineWidth(lineWidth);
+    viewer::color3f(r, g, b);
+    viewer::lineWidth(lineWidth);
     for (const auto &arc : layout.getArcs()) {
         if (arc.pts.size() < 2) continue;
         glBegin(GL_LINE_STRIP);
         for (const Point &p : arc.pts) glVertex2d(p[0], p[1]);
         glEnd();
     }
-    glLineWidth(1.0f);
+    viewer::lineWidth(1.0f);
 }
 
 void drawQuadLayoutNodes(const QuadLayout &layout, double radius) {
@@ -1720,7 +1725,7 @@ void drawMaterialFill(const Mesh &m, float alpha) {
     for (std::size_t t = 0; t < m.triangles.size(); ++t) {
         float r, g, b;
         materialColor(m.triangleMatId[t], r, g, b);
-        glColor4f(r, g, b, alpha);
+        viewer::color4f(r, g, b, alpha);
         const auto &tri = m.triangles[t];
         for (int k = 0; k < 3; ++k) {
             const Point &p = m.vertices[tri[k]];
@@ -1740,10 +1745,10 @@ void drawInterfaceNetwork(const Interfaces &itf, double nodeRadius, float lineWi
     // branch -- an inclusion the loop splitting left whole -- is drawn in the
     // same colour: what makes it different is that it carries no node, which
     // the picture shows by there being none on it.
-    glColor3f(0.97f, 0.97f, 0.99f);
-    glLineWidth(lineWidth);
+    viewer::color3f(0.97f, 0.97f, 0.99f);
+    viewer::lineWidth(lineWidth);
     for (const Interfaces::Branch &br : itf.branches()) drawPolylineOnMesh(m, br.verts);
-    glLineWidth(1.0f);
+    viewer::lineWidth(1.0f);
 
     if (!(nodeRadius > 0.0)) return;
     for (const Interfaces::Node &n : itf.nodes()) {
@@ -1789,7 +1794,7 @@ void drawInterfaceLegend(int fbw, int fbh, bool separatrixLegendShown) {
     for (int i = 0; i < kRowCount; ++i) {
         float r, g, b;
         interfaceNodeColor(kRows[i].kind, r, g, b);
-        glColor3f(r, g, b);
+        viewer::color3f(r, g, b);
         const float y = y0 + i * lineH;
         glVertex2f(x0, y);
         glVertex2f(x0 + sw, y);
@@ -1850,7 +1855,7 @@ void drawConeLegend(int fbw, int fbh) {
     for (int i = 0; i < 4; ++i) {
         float r, g, b;
         coneColor(kRows[i].index, r, g, b);
-        glColor3f(r, g, b);
+        viewer::color3f(r, g, b);
         const float y = y0 + i * lineH;
         glVertex2f(x0, y);
         glVertex2f(x0 + sw, y);
@@ -1901,7 +1906,7 @@ void drawCombedFrames(const Mesh &m, const FieldFrames &ff, double scale) {
     const std::vector<int> &a = ff.branch();
     if (th.size() != m.triangles.size() || a.size() != th.size()) return;
 
-    glLineWidth(2.5f);
+    viewer::lineWidth(2.5f);
     for (int t = 0; t < static_cast<int>(m.triangles.size()); ++t) {
         const Triangle &tri = m.triangles[t];
         const Point &p0 = m.vertices[tri[0]];
@@ -1952,7 +1957,7 @@ void drawCombedFrameLegend(int fbw, int fbh, const FieldFrames &ff) {
     for (int i = 0; i < rows; ++i) {
         float r, g, b;
         branchColor(lo + i, r, g, b);
-        glColor3f(r, g, b);
+        viewer::color3f(r, g, b);
         const float y = y0 + i * lineH;
         glVertex2f(x0, y);
         glVertex2f(x0 + sw, y);
@@ -1977,17 +1982,17 @@ void drawCombedFrameLegend(int fbw, int fbh, const FieldFrames &ff) {
 void drawCuttingGraph(const ConeCut &cut, float lineWidth) {
     const Mesh &m = cut.getOriginalMesh();
 
-    glLineWidth(lineWidth);
+    viewer::lineWidth(lineWidth);
 
     // Void arcs: one per hole, both ends on the boundary (Wang et al. Sec. 4.1).
-    glColor3f(1.0f, 0.2f, 0.9f);
+    viewer::color3f(1.0f, 0.2f, 0.9f);
     for (const auto &c : cut.getVoidCuts()) drawPolylineOnMesh(m, c.path);
 
     // Cone arcs: one per interior cone, one end *at* the cone (Sec. 3.2.2).
-    glColor3f(1.0f, 0.65f, 0.1f);
+    viewer::color3f(1.0f, 0.65f, 0.1f);
     for (const auto &c : cut.getConePaths()) drawPolylineOnMesh(m, c.path);
 
-    glLineWidth(1.0f);
+    viewer::lineWidth(1.0f);
 }
 
 // ── the flat cone metric ─────────────────────────────────────────────────────
@@ -2056,8 +2061,8 @@ void drawFlatMetric(const Mesh &m, const FlatMetric &fm, float lineWidth) {
     // The removed input edges go down first, dim, so the diagonals that took
     // their place read as an overlay rather than as more of the metric.
     if (!fm.replaced.empty()) {
-        glLineWidth(std::max(1.0f, lineWidth * 0.6f));
-        glColor4f(0.40f, 0.45f, 0.55f, 0.75f);
+        viewer::lineWidth(std::max(1.0f, lineWidth * 0.6f));
+        viewer::color4f(0.40f, 0.45f, 0.55f, 0.75f);
         glBegin(GL_LINES);
         for (const auto &e : fm.replaced) {
             if (!valid(e[0], e[1])) continue;
@@ -2067,13 +2072,13 @@ void drawFlatMetric(const Mesh &m, const FlatMetric &fm, float lineWidth) {
         glEnd();
     }
 
-    glLineWidth(lineWidth);
+    viewer::lineWidth(lineWidth);
     glBegin(GL_LINES);
     for (const auto &e : fm.edges) {
         if (e.newDiagonal || !valid(e.a, e.b)) continue;
         float r, g, b;
         divergingColor(e.t / fm.absMax, r, g, b);
-        glColor3f(r, g, b);
+        viewer::color3f(r, g, b);
         glVertex2d(m.vertices[e.a][0], m.vertices[e.a][1]);
         glVertex2d(m.vertices[e.b][0], m.vertices[e.b][1]);
     }
@@ -2081,8 +2086,8 @@ void drawFlatMetric(const Mesh &m, const FlatMetric &fm, float lineWidth) {
 
     // The diagonals the weighted-Delaunay flipping introduced, on top and in a
     // colour the ramp never produces.
-    glLineWidth(lineWidth + 1.5f);
-    glColor3f(0.15f, 0.95f, 0.35f);
+    viewer::lineWidth(lineWidth + 1.5f);
+    viewer::color3f(0.15f, 0.95f, 0.35f);
     glBegin(GL_LINES);
     for (const auto &e : fm.edges) {
         if (!e.newDiagonal || !valid(e.a, e.b)) continue;
@@ -2090,7 +2095,7 @@ void drawFlatMetric(const Mesh &m, const FlatMetric &fm, float lineWidth) {
         glVertex2d(m.vertices[e.b][0], m.vertices[e.b][1]);
     }
     glEnd();
-    glLineWidth(1.0f);
+    viewer::lineWidth(1.0f);
 }
 
 // ── the cone angles, unfolded ────────────────────────────────────────────────
@@ -2241,8 +2246,8 @@ void drawConeFans(const std::vector<ConeFan> &fans) {
 
         // The unit circle the fan is measured against: a full turn of the
         // one-ring, so the gap or the overlap against it is the cone angle.
-        glLineWidth(1.0f);
-        glColor4f(0.45f, 0.45f, 0.50f, 0.8f);
+        viewer::lineWidth(1.0f);
+        viewer::color4f(0.45f, 0.45f, 0.50f, 0.8f);
         glBegin(GL_LINE_LOOP);
         for (int i = 0; i < 64; ++i) {
             const double a = 2.0 * M_PI * i / 64.0;
@@ -2252,7 +2257,7 @@ void drawConeFans(const std::vector<ConeFan> &fans) {
 
         // The triangles, translucent, so that where a fan of more than 2pi laps
         // itself the overlap shows up as a brighter wedge.
-        glColor4f(r, g, b, 0.28f);
+        viewer::color4f(r, g, b, 0.28f);
         glBegin(GL_TRIANGLES);
         for (size_t k = 0; k + 1 < f.ring.size(); ++k) {
             glVertex2d(cx, cy);
@@ -2262,8 +2267,8 @@ void drawConeFans(const std::vector<ConeFan> &fans) {
         glEnd();
 
         // Their edges: the spokes to each neighbour, and the chords between.
-        glLineWidth(1.0f);
-        glColor4f(r, g, b, 0.75f);
+        viewer::lineWidth(1.0f);
+        viewer::color4f(r, g, b, 0.75f);
         glBegin(GL_LINES);
         for (size_t k = 0; k < f.ring.size(); ++k) {
             glVertex2d(cx, cy);
@@ -2279,16 +2284,16 @@ void drawConeFans(const std::vector<ConeFan> &fans) {
         // between them is exactly the cone angle less 2pi; on a boundary fan
         // they are the two boundary edges, and the angle between them is the
         // cone angle itself.
-        glLineWidth(3.0f);
+        viewer::lineWidth(3.0f);
         glBegin(GL_LINES);
-        glColor3f(0.95f, 0.95f, 0.95f);
+        viewer::color3f(0.95f, 0.95f, 0.95f);
         glVertex2d(cx, cy);
         glVertex2d(cx + f.ring.front()[0], cy + f.ring.front()[1]);
-        glColor3f(0.98f, 0.85f, 0.15f);
+        viewer::color3f(0.98f, 0.85f, 0.15f);
         glVertex2d(cx, cy);
         glVertex2d(cx + f.ring.back()[0], cy + f.ring.back()[1]);
         glEnd();
-        glLineWidth(1.0f);
+        viewer::lineWidth(1.0f);
 
         drawDisk3D(Point{cx, cy}, 0.11, r, g, b);
     }
@@ -2331,7 +2336,7 @@ void drawLayoutUV(const Immersion &imm, const SubdomainLabels *labels,
     // Q1 first, underneath everything: a triangle the map turned over. It is
     // filled rather than outlined because a fold is usually a handful of
     // triangles in a crease and an outline of one is lost among the wireframe.
-    glColor4f(0.9f, 0.1f, 0.1f, 0.45f);
+    viewer::color4f(0.9f, 0.1f, 0.1f, 0.45f);
     glBegin(GL_TRIANGLES);
     for (const auto &tri : cm.triangles) {
         const int i = tri[0], j = tri[1], k = tri[2];
@@ -2347,8 +2352,8 @@ void drawLayoutUV(const Immersion &imm, const SubdomainLabels *labels,
     glEnd();
 
     // The triangulation, in the same cyan the other parameter domains use.
-    glColor3f(0.3f, 0.8f, 0.9f);
-    glLineWidth(1.0f);
+    viewer::color3f(0.3f, 0.8f, 0.9f);
+    viewer::lineWidth(1.0f);
     glBegin(GL_LINES);
     for (const auto &tri : cm.triangles) {
         for (int e = 0; e < 3; ++e) {
@@ -2363,13 +2368,13 @@ void drawLayoutUV(const Immersion &imm, const SubdomainLabels *labels,
     // The two banks of each arc of G. Drawn apart because Q4 is a statement
     // about the pair: they are the same curve up to R_k, and an arc whose banks
     // are not congruent is where E4 still has work.
-    glLineWidth(2.5f);
+    viewer::lineWidth(2.5f);
     for (const Immersion::Arc &arc : imm.getArcs()) {
         for (int side = 0; side < 2; ++side) {
             const std::vector<int> &chain = side == 0 ? arc.plusChain : arc.minusChain;
             if (chain.size() < 2) continue;
-            if (side == 0) glColor4f(0.98f, 0.70f, 0.15f, 0.95f);
-            else           glColor4f(0.90f, 0.25f, 0.90f, 0.95f);
+            if (side == 0) viewer::color4f(0.98f, 0.70f, 0.15f, 0.95f);
+            else           viewer::color4f(0.90f, 0.25f, 0.90f, 0.95f);
             glBegin(GL_LINE_STRIP);
             for (const int v : chain) {
                 if (!ok(v)) continue;
@@ -2381,19 +2386,19 @@ void drawLayoutUV(const Immersion &imm, const SubdomainLabels *labels,
 
     // dS, coloured by the label Stage 5 gave it. Q3 is read straight off this:
     // every blue run should be vertical and every green one horizontal.
-    glLineWidth(3.0f);
+    viewer::lineWidth(3.0f);
     glBegin(GL_LINES);
     if (labels) {
         for (const auto &be : labels->boundaryEdges()) {
             if (!ok(be.a) || !ok(be.b)) continue;
-            if (be.label == SubdomainLabels::Align::U)      glColor3f(0.35f, 0.55f, 0.95f);
-            else if (be.label == SubdomainLabels::Align::V) glColor3f(0.20f, 0.85f, 0.40f);
-            else                                            glColor3f(0.70f, 0.70f, 0.72f);
+            if (be.label == SubdomainLabels::Align::U)      viewer::color3f(0.35f, 0.55f, 0.95f);
+            else if (be.label == SubdomainLabels::Align::V) viewer::color3f(0.20f, 0.85f, 0.40f);
+            else                                            viewer::color3f(0.70f, 0.70f, 0.72f);
             glVertex2d(uv[be.a][0], uv[be.a][1]);
             glVertex2d(uv[be.b][0], uv[be.b][1]);
         }
     } else {
-        glColor3f(0.70f, 0.70f, 0.72f);
+        viewer::color3f(0.70f, 0.70f, 0.72f);
         for (const int be : cm.boundaryEdges) {
             const int a = cm.edges[be][0], b = cm.edges[be][1];
             if (!ok(a) || !ok(b)) continue;
@@ -2402,7 +2407,7 @@ void drawLayoutUV(const Immersion &imm, const SubdomainLabels *labels,
         }
     }
     glEnd();
-    glLineWidth(1.0f);
+    viewer::lineWidth(1.0f);
 
     // The feature chains -- on a multi-material model, the interfaces -- in the
     // image, which is where E3 and E6 are read off. Q3's rule applies to them
@@ -2417,15 +2422,15 @@ void drawLayoutUV(const Immersion &imm, const SubdomainLabels *labels,
     // curve to the eye.
     if (labels) {
         for (int pass = 0; pass < 2; ++pass) {
-            glLineWidth(pass == 0 ? 4.5f : 1.5f);
+            viewer::lineWidth(pass == 0 ? 4.5f : 1.5f);
             for (const auto &fc : labels->featureChains()) {
                 if (fc.verts.size() < 2) continue;
                 if (pass == 0) {
-                    if (fc.label == SubdomainLabels::Align::U)      glColor3f(0.35f, 0.55f, 0.95f);
-                    else if (fc.label == SubdomainLabels::Align::V) glColor3f(0.20f, 0.85f, 0.40f);
-                    else                                            glColor3f(0.70f, 0.70f, 0.72f);
+                    if (fc.label == SubdomainLabels::Align::U)      viewer::color3f(0.35f, 0.55f, 0.95f);
+                    else if (fc.label == SubdomainLabels::Align::V) viewer::color3f(0.20f, 0.85f, 0.40f);
+                    else                                            viewer::color3f(0.70f, 0.70f, 0.72f);
                 } else {
-                    glColor3f(0.97f, 0.97f, 0.99f);
+                    viewer::color3f(0.97f, 0.97f, 0.99f);
                 }
                 glBegin(GL_LINE_STRIP);
                 for (const int v : fc.verts) {
@@ -2435,7 +2440,7 @@ void drawLayoutUV(const Immersion &imm, const SubdomainLabels *labels,
                 glEnd();
             }
         }
-        glLineWidth(1.0f);
+        viewer::lineWidth(1.0f);
     }
 
     // The cones, at every child the cut left them with, in the index colours
@@ -2508,11 +2513,11 @@ void drawSeparatrices(const Separatrices &sep, Separatrices::Space space,
 
     // The curves first, then the termini, so a disk is never buried under the
     // line of a curve that happens to pass over it.
-    glLineWidth(lineWidth);
+    viewer::lineWidth(lineWidth);
     for (const Separatrices::Curve &c : curves) {
         float r, g, b;
         separatrixColor(classifySeparatrix(c, window), r, g, b);
-        glColor3f(r, g, b);
+        viewer::color3f(r, g, b);
 
         pts = sep.polyline(c, space, &breaks);
         if (pts.size() < 2) continue;
@@ -2532,7 +2537,7 @@ void drawSeparatrices(const Separatrices &sep, Separatrices::Space space,
             start = stop;
         }
     }
-    glLineWidth(1.0f);
+    viewer::lineWidth(1.0f);
 
     if (endRadius <= 0.0) return;
     for (const Separatrices::Curve &c : curves) {
@@ -2573,8 +2578,8 @@ void drawLayoutPatches(const Arrangement &arr, const SplineFit *fit,
     const int steps = (samples < 2) ? 2 : samples;
     std::vector<Point> poly;
 
-    glColor3f(0.42f, 0.74f, 1.0f);
-    glLineWidth(lineWidth);
+    viewer::color3f(0.42f, 0.74f, 1.0f);
+    viewer::lineWidth(lineWidth);
     for (int f : arr.patchFaces()) {
         if (f < 0 || f >= static_cast<int>(faces.size())) continue;
         for (int h : faces[f].half) {
@@ -2609,7 +2614,7 @@ void drawLayoutPatches(const Arrangement &arr, const SplineFit *fit,
             glEnd();
         }
     }
-    glLineWidth(1.0f);
+    viewer::lineWidth(1.0f);
 
     // The nodes on top, so a disk is never buried under the side of the
     // neighbouring patch that runs into it.
@@ -2662,7 +2667,7 @@ void drawQuadMeshArrays(const std::vector<Point> &V,
             if (!ok(q[0]) || !ok(q[1]) || !ok(q[2]) || !ok(q[3])) continue;
             float r, g, b;
             materialColor(mat[i], r, g, b);
-            glColor4f(r, g, b, 0.30f);
+            viewer::color4f(r, g, b, 0.30f);
             for (int k = 0; k < 4; ++k) glVertex2d(V[q[k]][0], V[q[k]][1]);
         }
         glEnd();
@@ -2672,7 +2677,7 @@ void drawQuadMeshArrays(const std::vector<Point> &V,
     // The folds, filled, over the material tint and under everything else.
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glColor4f(0.92f, 0.22f, 0.22f, 0.55f);
+    viewer::color4f(0.92f, 0.22f, 0.22f, 0.55f);
     glBegin(GL_QUADS);
     for (const auto &q : Q) {
         if (!ok(q[0]) || !ok(q[1]) || !ok(q[2]) || !ok(q[3])) continue;
@@ -2723,7 +2728,7 @@ void drawQuadMeshArrays(const std::vector<Point> &V,
     }
     edges.resize(out);
 
-    glLineWidth(lineWidth);
+    viewer::lineWidth(lineWidth);
     glBegin(GL_LINES);
     if (multiMat) {
         for (const auto &e : edges) {
@@ -2733,27 +2738,27 @@ void drawQuadMeshArrays(const std::vector<Point> &V,
             } else {
                 materialColor(e.second, r, g, b);
             }
-            glColor3f(r, g, b);
+            viewer::color3f(r, g, b);
             glVertex2d(V[e.first.first][0],   V[e.first.first][1]);
             glVertex2d(V[e.first.second][0],  V[e.first.second][1]);
         }
     } else {
-        glColor3f(0.78f, 0.80f, 0.84f);
+        viewer::color3f(0.78f, 0.80f, 0.84f);
         for (const auto &e : edges) {
             glVertex2d(V[e.first.first][0],   V[e.first.first][1]);
             glVertex2d(V[e.first.second][0],  V[e.first.second][1]);
         }
     }
     glEnd();
-    glLineWidth(1.0f);
+    viewer::lineWidth(1.0f);
 
     if (blockLineWidth <= 0.0f) return;
 
     // The block walls: the four sides of each structured grid, taken off the
     // block's own vertex array rather than off the arrangement, so a block that
     // was skipped leaves a gap here exactly as it does in the mesh.
-    glColor3f(0.42f, 0.74f, 1.0f);
-    glLineWidth(blockLineWidth);
+    viewer::color3f(0.42f, 0.74f, 1.0f);
+    viewer::lineWidth(blockLineWidth);
     for (const GridRef &b : grids) {
         const int ns = b.ns, nt = b.nt;
         if (!b.vert || ns < 1 || nt < 1) continue;
@@ -2769,7 +2774,7 @@ void drawQuadMeshArrays(const std::vector<Point> &V,
         strip([&] { for (int j = 0; j <= nt; ++j) if (ok(at(0, j)))  glVertex2d(V[at(0, j)][0],  V[at(0, j)][1]); });
         strip([&] { for (int j = 0; j <= nt; ++j) if (ok(at(ns, j))) glVertex2d(V[at(ns, j)][0], V[at(ns, j)][1]); });
     }
-    glLineWidth(1.0f);
+    viewer::lineWidth(1.0f);
 }
 
 std::vector<GridRef> gridsOf(const QuadMesh &qm) {
@@ -2810,8 +2815,8 @@ void drawQuadMesh(const mesh::QuadMesh &sm, const QuadMesh *qm, const DiskTempla
 void drawInclusionCircles(const std::vector<DiskTemplate::Inclusion> &inclusions,
                           float lineWidth, int samples) {
     if (inclusions.empty() || samples < 3) return;
-    glLineWidth(lineWidth);
-    glColor3f(0.55f, 0.62f, 0.72f);
+    viewer::lineWidth(lineWidth);
+    viewer::color3f(0.55f, 0.62f, 0.72f);
     for (const DiskTemplate::Inclusion &inc : inclusions) {
         if (inc.circle.radius <= 0.0) continue;
         glBegin(GL_LINE_LOOP);
@@ -2822,7 +2827,7 @@ void drawInclusionCircles(const std::vector<DiskTemplate::Inclusion> &inclusions
         }
         glEnd();
     }
-    glLineWidth(1.0f);
+    viewer::lineWidth(1.0f);
 }
 
 void drawSeparatrixLegend(int fbw, int fbh) {
@@ -2853,7 +2858,7 @@ void drawSeparatrixLegend(int fbw, int fbh) {
     for (int i = 0; i < kRowCount; ++i) {
         float r, g, b;
         separatrixColor(kRows[i].kind, r, g, b);
-        glColor3f(r, g, b);
+        viewer::color3f(r, g, b);
         const float y = y0 + i * lineH;
         glVertex2f(x0, y);
         glVertex2f(x0 + sw, y);

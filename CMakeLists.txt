@@ -518,6 +518,7 @@ if (BUILD_OPENGL_VIEWER)
         src/viewer/Geometry.cxx
         src/viewer/Render.cxx
         src/viewer/Interaction.cxx
+        src/viewer/Export.cxx
     )
     target_include_directories(Viewer PRIVATE src)
     target_link_libraries(Viewer PRIVATE
