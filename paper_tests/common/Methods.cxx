@@ -86,7 +86,23 @@ double boundingDiagonal(const Mesh &m) {
 // The ladder of tau scales the continuation walks, largest first. The first
 // entry is always 1 -- the shipped tau -- so the continuation starts from the
 // field the single-tau scheme would have returned and only ever refines it.
-std::vector<double> tauLadder(const Mesh &m, const MethodOptions &o, bool enabled) {
+//
+// `rate` is the operator's own diffusion rate, SIPG::medianDiffusionRate(), and
+// the floor is where one step stops resolving anything the mesh can carry:
+//
+//     ell = h sqrt(tau * rate) <= tauFloorEdges * h   =>   tau <= c^2 / rate.
+//
+// Reading `rate` off the assembled K and M rather than from gamma is what keeps
+// tauFloorEdges meaning the same thing when the penalty weight changes -- the
+// gamma-only form ell = sqrt(8 gamma tau) is exact for MinHeight on a uniform
+// mesh and for nothing else, so a weight comparison that used it would be
+// annealing the two schemes to different depths and calling the difference the
+// weight. On a uniform mesh with MinHeight, rate = 8 gamma / h^2 and this is the
+// old floor exactly.
+//
+// `rate <= 0` means the caller could not supply one, and falls back to it.
+std::vector<double> tauLadder(const Mesh &m, const MethodOptions &o, bool enabled,
+                              double rate) {
     std::vector<double> ladder{o.tauScale};
     if (!enabled) return ladder;
 
@@ -94,9 +110,9 @@ std::vector<double> tauLadder(const Mesh &m, const MethodOptions &o, bool enable
     const double h = meanEdgeLength(m);
     if (D <= 0.0 || h <= 0.0 || o.tauRatio <= 0.0 || o.tauRatio >= 1.0) return ladder;
 
-    // ell = sqrt(8 gamma tau) <= tauFloorEdges * h  =>  tau <= (c h)^2 / (8 gamma)
     const double tau0 = o.tauScale * D * D / 10.0;
-    const double tauMin = (o.tauFloorEdges * h) * (o.tauFloorEdges * h) / (8.0 * o.gamma);
+    const double c2 = o.tauFloorEdges * o.tauFloorEdges;
+    const double tauMin = rate > 0.0 ? c2 / rate : c2 * h * h / (8.0 * o.gamma);
 
     double tau = tau0;
     while (tau * o.tauRatio > tauMin && ladder.size() < 40) {
@@ -118,7 +134,13 @@ FieldRun runSIPG(const std::shared_ptr<Mesh> &m, const MethodOptions &o) {
                                                        : metrics::EdgeWeights{};
         const std::vector<char> skip = o.recordHistory ? interfaceEdgeFlags(*m) : std::vector<char>{};
         const double nT = static_cast<double>(m->triangles.size());
-        const std::vector<double> ladder = tauLadder(*m, o, o.tauContinuation);
+
+        // The ladder is not known until the operator has been assembled once:
+        // its floor is set by the operator's own diffusion rate, which depends
+        // on the penalty weight. So start with the shipped tau, and extend the
+        // ladder from level 0's rate. `ladder.size()` is re-read each iteration,
+        // which is what lets it grow underneath the loop.
+        std::vector<double> ladder{o.tauScale};
 
         Eigen::VectorXcd carried;   // the previous level's field
         for (std::size_t level = 0; level < ladder.size(); ++level) {
@@ -126,12 +148,17 @@ FieldRun runSIPG(const std::shared_ptr<Mesh> &m, const MethodOptions &o) {
             solver.setPinDiskCenters(o.pinDiskCenters);
             solver.setTauScale(ladder[level]);
             solver.setHardBoundaryConditions(o.hardBoundary);
+            solver.setPenaltyWeight(o.penaltyWeight);
+            solver.setDiffusionSubsteps(o.diffusionSubsteps);
             if (o.alignInterfaces && isMultiMaterial(*m))
                 solver.setAlignedInteriorEdges(interfaceEdges(*m));
 
             const Clock::time_point tA = Clock::now();
             solver.initialize();
             r.assembleSeconds += since(tA);
+
+            if (level == 0)
+                ladder = tauLadder(*m, o, o.tauContinuation, solver.medianDiffusionRate());
 
             // Every level after the first starts from the one before it. The
             // Dirichlet triangles keep the data this level assembled -- the
@@ -187,7 +214,9 @@ FieldRun runP1MBO(const std::shared_ptr<Mesh> &m, const MethodOptions &o) {
         // random start. `b1TauContinuation` gives it the same ladder our method
         // uses, which is what separates "the continuation" from "the
         // discretisation" as the source of any gain -- see MethodOptions.
-        const std::vector<double> ladder = tauLadder(*m, o, o.b1TauContinuation);
+        // B1 is the P1 cotan operator, whose rate this harness does not assemble; it
+        // keeps the gamma-derived floor, which is the form it was measured with.
+        const std::vector<double> ladder = tauLadder(*m, o, o.b1TauContinuation, -1.0);
         const double nV = static_cast<double>(m->vertices.size());
         double assemble = 0.0, solve = 0.0;
         int iters = 0;

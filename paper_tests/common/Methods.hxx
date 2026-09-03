@@ -8,6 +8,7 @@
 #include <Eigen/Dense>
 
 #include "Metrics.hxx"
+#include "SIPG/SIPG.hxx"
 #include "mesh/Mesh.hxx"
 
 // The three methods E2 to E5 compare, behind one interface.
@@ -97,6 +98,17 @@ struct MethodOptions {
     double tauRatio = 0.25;
     // Per-level iteration cap.
     int tauLevelSteps = 2000;
+
+    // Which penalty weight SIPG assembles. At p=0 this is not a stabilisation
+    // parameter but the discrete Laplacian itself, so it is the discretisation's
+    // one real degree of freedom -- see SIPG::PenaltyWeight for why the textbook
+    // choice is not a consistent one and what the two-point weight repairs.
+    SIPG::PenaltyWeight penaltyWeight = SIPG::PenaltyWeight::MinHeight;
+
+    // Backward-Euler substeps inside one MBO diffusion step. 1 is the shipped
+    // single solve; larger is a closer approximation of the semigroup the
+    // scheme is defined with -- see SIPG::setDiffusionSubsteps.
+    int diffusionSubsteps = 1;
 
     // Give B1 the same ladder. Off by default, because the baseline belongs in
     // the table as it is published; on, it answers the reviewer's question --

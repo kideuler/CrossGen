@@ -78,6 +78,9 @@ int main(int argc, char **argv) {
     double target = 0.05;
     bool diskTemplates = false;
     bool b1Continuation = false;
+    // The p=0 penalty weight, which at this order *is* the discrete Laplacian.
+    // "orth" is the two-point/finite-volume weight; see SIPG::PenaltyWeight.
+    std::string weight = "min";
     int limit = 0;
 
     for (int i = 1; i < argc; ++i) {
@@ -90,11 +93,12 @@ int main(int argc, char **argv) {
         else if (a == "--limit" && i + 1 < argc) limit = std::stoi(argv[++i]);
         else if (a == "--disk-templates") diskTemplates = true;
         else if (a == "--b1-continuation") b1Continuation = true;
+        else if (a == "--weight" && i + 1 < argc) weight = argv[++i];
         else if (a == "--help") {
             std::cout << "Usage: " << argv[0]
                       << " [--out DIR] [--set singlemat|multimat] [--methods SIPG,B1,B2]\n"
                          "       [--target EDGE] [--obj DIR] [--limit N] [--disk-templates]\n"
-                         "       [--b1-continuation] [model ...]\n";
+                         "       [--b1-continuation] [--weight min|harm|orth] [model ...]\n";
             return 0;
         } else only.push_back(a);
     }
@@ -150,6 +154,9 @@ int main(int argc, char **argv) {
             // gives the baseline the same ladder, which is the fair-comparison
             // variant the protocol paragraph has to report beside the headline.
             fo.b1TauContinuation = b1Continuation;
+            fo.penaltyWeight = weight == "orth" ? SIPG::PenaltyWeight::Orthogonal
+                             : weight == "harm" ? SIPG::PenaltyWeight::HarmonicHeight
+                                                : SIPG::PenaltyWeight::MinHeight;
             const FieldRun run = runMethod(name, mesh, fo);
 
             Outcome o;

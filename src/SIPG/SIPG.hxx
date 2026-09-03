@@ -135,6 +135,97 @@ public:
     // the triangle is left to diffuse. 45 degrees of disagreement gives r = 0.
     static constexpr double kCornerCoherenceMin = 0.2;
 
+    // How the two elements on an interior edge combine into one penalty weight.
+    //
+    // At p=0 the volume, consistency and symmetry terms of the SIPG form all
+    // carry grad u_h and so vanish identically on a piecewise constant. What is
+    // left is a(u,v) = sum_e kappa_e [u][v], which means kappa_e is not a free
+    // stabilisation parameter here: it *is* the discrete Laplacian, and it has
+    // to be chosen to be one.
+    //
+    // The textbook interior-penalty weight is not one. gamma |e| / min(h_i, h_j)
+    // comes from a coercivity bound, not from consistency, and it combines the
+    // two half-fluxes in *parallel* where a two-point flux combines them in
+    // series. The test is the one any second-order operator has to pass: applied
+    // to a linear field sampled at the circumcenters it must give zero. Measured
+    // over the 35-model corpus it gives a relative residual of 0.37 -- an O(1)
+    // spurious force on a field with nothing in it left to smooth.
+    //
+    // Orthogonal is the two-point (finite-volume) weight |e| / d_e, with d_e the
+    // distance between the two circumcenters. Both circumcenters lie on the
+    // perpendicular bisector of e, so c_j - c_i is orthogonal to e for *any*
+    // triangle pair and
+    //
+    //     (phi_j - phi_i) / d_e = grad phi . n_e     exactly for linear phi,
+    //
+    // so the fluxes telescope and the residual above is 6e-15 instead of 0.37.
+    // This is the operator the classical finite-volume scheme uses on the
+    // Delaunay/Voronoi pair; the factor 2/3 makes it agree with MinHeight on an
+    // equilateral pair, so gamma (and with it the tau ladder) keeps its meaning.
+    //
+    // HarmonicHeight is the series combination of the same two heights the
+    // penalty already uses -- the SWIP choice. It is here because it is the
+    // obvious repair and it is worth being able to show that it is not enough:
+    // these meshes are near-uniform (area ratios across an edge reach only 2.4),
+    // so it moves the residual by 2% and nothing else.
+    enum class PenaltyWeight {
+        MinHeight,      // gamma |e| / min(h_i, h_j)          -- the textbook one
+        HarmonicHeight, // gamma |e| / ((h_i + h_j) / 2)      -- SWIP
+        Orthogonal      // (2/3) gamma |e| / d_e              -- two-point/FV
+    };
+    void setPenaltyWeight(PenaltyWeight w) { penaltyWeight = w; }
+    PenaltyWeight getPenaltyWeight() const { return penaltyWeight; }
+
+    // Backward-Euler substeps per MBO step.
+    //
+    // Threshold dynamics is "run the heat flow for a time tau, then project",
+    // and the operator that does the first half is the semigroup exp(-tau L).
+    // One backward-Euler solve is not it: it damps a mode of eigenvalue lambda
+    // by 1/(1 + tau lambda) where the semigroup damps it by exp(-tau lambda),
+    // and the two part company exactly where it matters. At the continuation's
+    // floor the stiffest mode has tau*lambda ~ 400, so the semigroup leaves
+    // e^-400 = 0 of it and one Euler step leaves 1/401 -- a quarter of a percent
+    // of the sharpest content the mesh can carry, surviving every step, right
+    // where the projection is most able to turn it into structure.
+    //
+    // n substeps of tau/n replace 1/(1+tau lambda) by (1 + tau lambda/n)^-n,
+    // which is the standard rational approximation of the semigroup and is
+    // monotonically closer to it for every mode. The cost is n solves per step
+    // against one factorisation, so it is n times the solve time and no more
+    // assembly.
+    void setDiffusionSubsteps(int n) { diffusionSubsteps = n < 1 ? 1 : n; }
+
+    // The diffusion rate of a typical element: the median over triangles of
+    // K_ii / M_ii, in units of 1/length^2. Valid after initialize().
+    //
+    // This is what a tau-continuation's floor has to be measured against. The
+    // floor is the point where one MBO step stops resolving anything the mesh
+    // can carry -- the diffusion length ell = h sqrt(tau * lambda) reaching a
+    // few edges -- and lambda is a property of the *assembled operator*, not of
+    // gamma. Deriving it from gamma alone (ell = sqrt(8 gamma tau), which is
+    // K_ii ~ 3 gamma and M_ii ~ h^2/2) is exact only for the MinHeight weight on
+    // a uniform mesh, so a run that changes the weight and keeps that formula is
+    // silently annealing to a different depth and is not a controlled
+    // comparison. Reading the rate off K and M instead makes tauFloorEdges mean
+    // the same thing for every weight.
+    //
+    // The median rather than the maximum: a single sliver would otherwise set
+    // the floor for the whole mesh, and the question the floor answers is what
+    // the mesh typically resolves. On a uniform mesh with the MinHeight weight
+    // it evaluates to 8 gamma / h^2, so the ladder is unchanged there.
+    double medianDiffusionRate() const { return medianRate; }
+
+    // Floor on d_e, as a fraction of (h_i + h_j)/2.
+    //
+    // d_e vanishes when the two triangles are cocircular -- the dual edge has
+    // zero length and the transmissibility |e|/d_e is unbounded. It is a
+    // measure-zero configuration that a structured or recombined patch sits
+    // exactly on, so it has to be handled rather than assumed away: over the
+    // corpus's 292069 interior edges, 19 fall below this floor and exactly one
+    // is non-Delaunay (d_e < 0). Clamping there under-couples an edge whose two
+    // cell centres coincide anyway, which is the harmless direction.
+    static constexpr double kMinDualDistance = 0.05;
+
     // The Dirichlet data as initialize() computed it: triangle -> the unit
     // spin-4 value its incident boundary/interface edges ask for. Non-empty
     // whether or not the pin is hard, because it is the *data* and not the way
@@ -169,6 +260,9 @@ private:
     int maxIterations;   // maximum number of iterations
     bool hardBoundary = true; // see setHardBoundaryConditions
     bool cornerCoherenceFix = true; // see setCornerCoherenceFix
+    PenaltyWeight penaltyWeight = PenaltyWeight::MinHeight; // see setPenaltyWeight
+    int diffusionSubsteps = 1; // see setDiffusionSubsteps
+    double medianRate = 0.0;   // see medianDiffusionRate
 
     // Interior edges promoted to aligned (Dirichlet) edges, per edge of the
     // mesh. Empty when there are none, which is the single-material case.

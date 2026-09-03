@@ -1,4 +1,5 @@
 #include "SIPG.hxx"
+#include <algorithm>
 #include <cmath>
 #include <iostream>
 #include <limits>
@@ -58,6 +59,66 @@ void SIPG::initialize() {
     b.resize(NT);
     b.setZero();
 
+    // Circumcenters and centroids, for the two-point weight. The circumcenter is
+    // where a piecewise-constant DOF has to be taken to sit for the dual edge to
+    // be orthogonal to the primal one; the centroid is only used to orient that
+    // dual edge, since it is always inside its triangle and a circumcenter of an
+    // obtuse triangle is not.
+    std::vector<Point> circum, centro;
+    if (penaltyWeight == PenaltyWeight::Orthogonal) {
+        circum.resize(NT);
+        centro.resize(NT);
+        for (int t = 0; t < NT; ++t) {
+            const Triangle &tri = mesh->triangles[t];
+            const Point &pa = mesh->vertices[tri[0]];
+            const Point &pb = mesh->vertices[tri[1]];
+            const Point &pc = mesh->vertices[tri[2]];
+            const double bx = pb[0] - pa[0], by = pb[1] - pa[1];
+            const double cx = pc[0] - pa[0], cy = pc[1] - pa[1];
+            const double den = 2.0 * (bx * cy - by * cx);
+            const double b2 = bx * bx + by * by, c2 = cx * cx + cy * cy;
+            Point cc = pa;
+            if (std::fabs(den) > 1e-300) {
+                cc[0] = pa[0] + (cy * b2 - by * c2) / den;
+                cc[1] = pa[1] + (bx * c2 - cx * b2) / den;
+            }
+            circum[t] = cc;
+            centro[t] = (pa + pb + pc) / 3.0;
+        }
+    }
+
+    // The penalty weight of an interior edge: the whole discretisation, for the
+    // reason set out at SIPG::PenaltyWeight.
+    auto interiorKappa = [&](int edgeIdx, int ti, int tj, double edgeLen) {
+        const double hi = 2.0 * area[ti] / edgeLen;
+        const double hj = 2.0 * area[tj] / edgeLen;
+        switch (penaltyWeight) {
+        case PenaltyWeight::MinHeight:
+            return gamma * edgeLen / std::min(hi, hj);
+        case PenaltyWeight::HarmonicHeight:
+            return gamma * edgeLen / (0.5 * (hi + hj));
+        case PenaltyWeight::Orthogonal: {
+            const Point &ea = mesh->vertices[mesh->edges[edgeIdx][0]];
+            const Point &eb = mesh->vertices[mesh->edges[edgeIdx][1]];
+            Point n = ea;
+            n[0] = -(eb[1] - ea[1]) / edgeLen;
+            n[1] =  (eb[0] - ea[0]) / edgeLen;
+            const Point dg = centro[tj] - centro[ti];
+            if (dg[0] * n[0] + dg[1] * n[1] < 0.0) { n[0] = -n[0]; n[1] = -n[1]; }
+            const Point dc = circum[tj] - circum[ti];
+            const double d = dc[0] * n[0] + dc[1] * n[1];
+            const double dFloor = kMinDualDistance * 0.5 * (hi + hj);
+            return (2.0 / 3.0) * gamma * edgeLen / std::max(d, dFloor);
+        }
+        }
+        return gamma * edgeLen / std::min(hi, hj);
+    };
+
+    // Diagonal of K from the interior coupling alone, for medianDiffusionRate().
+    // The Dirichlet rows are eliminated below and do not diffuse, so they are
+    // not what the ladder's floor should be read off.
+    std::vector<double> kdiag(NT, 0.0);
+
     // --- Interior edges ---
     for (int edgeIdx = 0; edgeIdx < static_cast<int>(mesh->edges.size()); ++edgeIdx) {
         if (mesh->isBoundaryEdge[edgeIdx]) continue; // handled separately below
@@ -73,13 +134,11 @@ void SIPG::initialize() {
         double edgeLen = std::sqrt(dx * dx + dy * dy);
         if (edgeLen < 1e-14) continue;
 
-        // Normal heights: h_i^e = 2*A_i / |e|
-        double hi = 2.0 * area[ti] / edgeLen;
-        double hj = 2.0 * area[tj] / edgeLen;
-        double he = std::min(hi, hj);
+        // Penalty weight: the discretisation itself, see SIPG::PenaltyWeight.
+        double kappa = interiorKappa(edgeIdx, ti, tj, edgeLen);
 
-        // Penalty weight: kappa_e = gamma * |e| / h_e
-        double kappa = gamma * edgeLen / he;
+        kdiag[ti] += kappa;
+        kdiag[tj] += kappa;
 
         // Planar connection factor P_e = 1 (one global frame)
         // K_ii += kappa,  K_ij -= kappa,  K_ji -= kappa,  K_jj += kappa
@@ -262,6 +321,18 @@ void SIPG::initialize() {
     double D = std::sqrt((maxX - minX) * (maxX - minX) + (maxY - minY) * (maxY - minY));
     tau = tauScale * D * D / 10.0;
 
+    // The typical element's diffusion rate, K_ii / M_ii; see medianDiffusionRate.
+    {
+        std::vector<double> rate;
+        rate.reserve(NT);
+        for (int t = 0; t < NT; ++t)
+            if (kdiag[t] > 0.0 && area[t] > 1e-30) rate.push_back(kdiag[t] / area[t]);
+        if (!rate.empty()) {
+            std::nth_element(rate.begin(), rate.begin() + rate.size() / 2, rate.end());
+            medianRate = rate[rate.size() / 2];
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Step 6 – Form A = M + tau*K, then eliminate boundary triangle DOFs
     //
@@ -271,7 +342,7 @@ void SIPG::initialize() {
     // while interior rows retain full coupling to the (fixed) BC values through
     // the off-diagonal K columns – exactly as CrossField handles vertex BCs.
     // -----------------------------------------------------------------------
-    A = M + tau * K;
+    A = M + (tau / static_cast<double>(diffusionSubsteps)) * K;
 
     const std::complex<double> czero(0.0, 0.0);
     const std::complex<double> cone (1.0, 0.0);
@@ -341,20 +412,29 @@ void SIPG::initialize() {
 // step()  --  one MBO iteration (Algorithm 2 from Section 10)
 // ---------------------------------------------------------------------------
 void SIPG::step() {
-    // Form RHS: r^k = M * u^k + tau * b
-    Eigen::VectorXcd rhs = M * u_k_prev + tau * b;
-
-    // Solve A * u_tilde = r^k
-    Eigen::VectorXcd u_tilde;
-    if (useBiCGSTAB) {
-        u_tilde = solverBiCGSTAB.solve(rhs);
-        if (solverBiCGSTAB.info() != Eigen::Success) {
-            throw std::runtime_error("SIPG: BiCGSTAB solve failed");
-        }
-    } else {
-        u_tilde = solverLU.solve(rhs);
-        if (solverLU.info() != Eigen::Success) {
-            throw std::runtime_error("SIPG: SparseLU solve failed");
+    // The diffusion half of the MBO step: advance by tau, as `diffusionSubsteps`
+    // backward-Euler solves of tau/n against the one factorisation of
+    // A = M + (tau/n) K. n = 1 is the single Euler step; larger n is closer to
+    // the semigroup exp(-tau L) the scheme is defined with, see
+    // SIPG::setDiffusionSubsteps.
+    //
+    // A pinned row of A is the identity and its entry of b is parallel to the
+    // value the row is pinned to, so a Dirichlet triangle is carried through
+    // every substep unchanged, exactly as it is through a single one.
+    const double tauSub = tau / static_cast<double>(diffusionSubsteps);
+    Eigen::VectorXcd u_tilde = u_k_prev;
+    for (int s = 0; s < diffusionSubsteps; ++s) {
+        Eigen::VectorXcd rhs = M * u_tilde + tauSub * b;
+        if (useBiCGSTAB) {
+            u_tilde = solverBiCGSTAB.solve(rhs);
+            if (solverBiCGSTAB.info() != Eigen::Success) {
+                throw std::runtime_error("SIPG: BiCGSTAB solve failed");
+            }
+        } else {
+            u_tilde = solverLU.solve(rhs);
+            if (solverLU.info() != Eigen::Success) {
+                throw std::runtime_error("SIPG: SparseLU solve failed");
+            }
         }
     }
 
