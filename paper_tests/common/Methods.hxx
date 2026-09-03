@@ -81,16 +81,22 @@ struct MethodOptions {
     // fixed point after a *single* solve -- measured, the energy at step 1 and
     // at step 300 agree to every digit. The scheme is then a harmonic extension
     // followed by a normalisation, which is why it returns the same singularity
-    // count as the one-shot polyvector baseline on all 35 models, and the
+    // count as the one-shot polyvector baseline on all 24 models, and the
     // threshold dynamics never actually runs.
     //
     // The fix is the MBO analogue of Ginzburg-Landau's epsilon-continuation:
     // anneal tau down a geometric ladder, re-solving from the previous level's
     // field, until the diffusion length reaches a few mesh edges -- below that
-    // the step resolves nothing the mesh can carry. Measured on the 35-model
-    // corpus this lowers the common energy by 22% in total and turns a loss to
-    // B1 on energy into a win on 27 of 35 models, with boundary alignment still
-    // exact and the Poincare-Hopf residual still zero.
+    // the step resolves nothing the mesh can carry. This was measured, at the
+    // time the fix went in, to lower the common energy by 22% in total on the
+    // then-35-model corpus and turn a loss to B1 on energy into a win on 27 of
+    // 35 models, with boundary alignment still exact and the Poincare-Hopf
+    // residual still zero. That comparison has not been rerun on the trimmed
+    // 24-model corpus -- a same-day check of E3_singlemat_permodel.csv's energy
+    // column found B1 still ahead in total energy and winning on 12 of the 24
+    // models, roughly a coin flip rather than the earlier decisive win, so the
+    // "27 of 35" figure above should not be reused verbatim in the paper
+    // without a fresh tau-continuation-on/off comparison on this corpus.
     bool tauContinuation = true;
     // Floor, as a multiple of the mean edge length: stop once ell <= this * h.
     double tauFloorEdges = 20.0;

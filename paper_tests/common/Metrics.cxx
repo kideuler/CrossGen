@@ -123,7 +123,7 @@ std::vector<double> localEdgeLength(const Mesh &m) {
 
 int eulerCharacteristic(const Mesh &m) {
     // Only vertices some triangle uses. Several models in data/meshes carry
-    // vertices no face references -- geom030 has 357 of them -- and each one
+    // vertices no face references -- geom031 has 309 of them -- and each one
     // adds 1 to V and nothing to E or F, so counting them puts chi out by the
     // same amount and every Poincare-Hopf statement with it.
     std::vector<char> used(m.vertices.size(), 0);

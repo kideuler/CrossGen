@@ -233,7 +233,7 @@ int main(int argc, char **argv) {
 
     // The corpus, plus the five authored junction domains. The outline asks for
     // at least five domains before E5 gets a quantitative table; data/meshes/
-    // multimat has fifteen, so the authored ones are here for Fig. 6's close-ups
+    // multimat has nine, so the authored ones are here for Fig. 6's close-ups
     // and because a junction built to be one junction is the clearest place to
     // measure the junction residual.
     std::vector<Case> cases;

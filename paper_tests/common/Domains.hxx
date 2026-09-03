@@ -20,7 +20,7 @@
 //
 // The **junction** ones are E5's, and the outline names them: a T-junction, a
 // quadruple point, a thin layer, an embedded inclusion, and a junction whose
-// sectors are not right angles. data/meshes/multimat has fifteen models and E5
+// sectors are not right angles. data/meshes/multimat has nine models and E5
 // runs on all of them, but they are models of things rather than of junctions,
 // and the close-ups Fig. 6 wants are easier to read on a domain built to show
 // one junction and nothing else.
