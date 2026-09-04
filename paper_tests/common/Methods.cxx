@@ -34,6 +34,33 @@ std::complex<double> interp(const Mesh &m, int t, const Eigen::VectorXcd &uv,
 } // namespace
 
 // ---------------------------------------------------------------------------
+namespace {
+DualMBO::PenaltyWeight &defaultWeightSlot() {
+    static DualMBO::PenaltyWeight w = DualMBO::PenaltyWeight::MinHeight;
+    return w;
+}
+} // namespace
+
+DualMBO::PenaltyWeight defaultPenaltyWeight() { return defaultWeightSlot(); }
+void setDefaultPenaltyWeight(DualMBO::PenaltyWeight w) { defaultWeightSlot() = w; }
+
+DualMBO::PenaltyWeight parsePenaltyWeight(const std::string &name) {
+    if (name == "min")  return DualMBO::PenaltyWeight::MinHeight;
+    if (name == "harm") return DualMBO::PenaltyWeight::HarmonicHeight;
+    if (name == "orth") return DualMBO::PenaltyWeight::Orthogonal;
+    throw std::invalid_argument("unknown penalty weight '" + name + "' (expected min|harm|orth)");
+}
+
+const char *penaltyWeightName(DualMBO::PenaltyWeight w) {
+    switch (w) {
+    case DualMBO::PenaltyWeight::MinHeight:      return "min";
+    case DualMBO::PenaltyWeight::HarmonicHeight: return "harm";
+    case DualMBO::PenaltyWeight::Orthogonal:     return "orth";
+    }
+    return "min";
+}
+
+// ---------------------------------------------------------------------------
 std::vector<char> interfaceEdgeFlags(const Mesh &m) {
     std::vector<char> flag(m.edges.size(), 0);
     if (m.triangleMatId.size() != m.triangles.size()) return flag;

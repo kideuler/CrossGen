@@ -1,5 +1,7 @@
 #include "Metrics.hxx"
 
+#include "dualmbo/DualMBO.hxx"   // kMinDualDistance, the two-point weight's floor
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -51,6 +53,79 @@ EdgeWeights edgeWeights(const Mesh &m, double gamma) {
         w.kappa[e] = gamma * len / he;
     }
     return w;
+}
+
+EdgeWeights edgeWeightsTwoPoint(const Mesh &m, double gamma) {
+    EdgeWeights w;
+    w.gamma = gamma;
+    const int NT = static_cast<int>(m.triangles.size());
+    w.area.resize(NT);
+    std::vector<Point> circ(NT), cent(NT);
+    for (int t = 0; t < NT; ++t) {
+        w.area[t] = triangleArea(m, t);
+        const Triangle &tri = m.triangles[t];
+        const Point &pa = m.vertices[tri[0]];
+        const Point &pb = m.vertices[tri[1]];
+        const Point &pc = m.vertices[tri[2]];
+        const double bx = pb[0] - pa[0], by = pb[1] - pa[1];
+        const double cx = pc[0] - pa[0], cy = pc[1] - pa[1];
+        const double den = 2.0 * (bx * cy - by * cx);
+        const double b2 = bx * bx + by * by, c2 = cx * cx + cy * cy;
+        Point cc = pa;
+        if (std::fabs(den) > 1e-300) {
+            cc[0] = pa[0] + (cy * b2 - by * c2) / den;
+            cc[1] = pa[1] + (bx * c2 - cx * b2) / den;
+        }
+        circ[t] = cc;
+        cent[t][0] = (pa[0] + pb[0] + pc[0]) / 3.0;
+        cent[t][1] = (pa[1] + pb[1] + pc[1]) / 3.0;
+    }
+
+    w.kappa.assign(m.edges.size(), 0.0);
+    for (std::size_t e = 0; e < m.edges.size(); ++e) {
+        if (m.isBoundaryEdge[e]) continue;
+        const Point &ea = m.vertices[m.edges[e][0]];
+        const Point &eb = m.vertices[m.edges[e][1]];
+        const double len = std::hypot(eb[0] - ea[0], eb[1] - ea[1]);
+        if (len < 1e-14) continue;
+        const int ti = m.edgeTriangles[e][0];
+        const int tj = m.edgeTriangles[e][1];
+        if (ti < 0 || tj < 0) continue;
+        const double hi = 2.0 * w.area[ti] / len, hj = 2.0 * w.area[tj] / len;
+        double nx = -(eb[1] - ea[1]) / len, ny = (eb[0] - ea[0]) / len;
+        if ((cent[tj][0] - cent[ti][0]) * nx + (cent[tj][1] - cent[ti][1]) * ny < 0.0) {
+            nx = -nx; ny = -ny;
+        }
+        const double d = (circ[tj][0] - circ[ti][0]) * nx + (circ[tj][1] - circ[ti][1]) * ny;
+        const double dFloor = DualMBO::kMinDualDistance * 0.5 * (hi + hj);
+        w.kappa[e] = (2.0 / 3.0) * gamma * len / std::max(d, dFloor);
+    }
+    return w;
+}
+
+double boundaryEnergy(const Mesh &m, double gamma, const Eigen::VectorXcd &u,
+                      const std::vector<char> &alignedEdge) {
+    std::vector<double> area(m.triangles.size());
+    for (std::size_t t = 0; t < m.triangles.size(); ++t) area[t] = triangleArea(m, static_cast<int>(t));
+    auto aligned = [&](std::size_t e) { return e < alignedEdge.size() && alignedEdge[e]; };
+
+    double E = 0.0;
+    for (std::size_t e = 0; e < m.edges.size(); ++e) {
+        if (!m.isBoundaryEdge[e] && !aligned(e)) continue;
+        const Point d = m.vertices[m.edges[e][1]] - m.vertices[m.edges[e][0]];
+        const double len = normP(d);
+        if (len < 1e-14) continue;
+        const std::complex<double> ge = std::exp(std::complex<double>(0.0, 4.0 * std::atan2(d[1], d[0])));
+        for (int side = 0; side < 2; ++side) {
+            const int t = m.edgeTriangles[e][side];
+            if (t < 0) continue;
+            if (m.isBoundaryEdge[e] && side == 1) continue;
+            const double h1 = 2.0 * area[t] / len;
+            if (h1 < 1e-16) continue;
+            E += 0.5 * (gamma * len / h1) * std::norm(u[t] - ge);
+        }
+    }
+    return E;
 }
 
 double commonEnergy(const Mesh &m, const EdgeWeights &w, const Eigen::VectorXcd &u,

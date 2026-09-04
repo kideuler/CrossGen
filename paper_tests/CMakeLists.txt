@@ -29,14 +29,14 @@ target_include_directories(PaperCommon PUBLIC
 )
 target_link_libraries(PaperCommon PUBLIC PolyVector)
 
-foreach(EXP E1_Verification E2_Canonical E3_Benchmark E4_Layout E5_MultiMaterial)
+foreach(EXP E1_Verification E2_Canonical E3_Benchmark E4_Layout E5_MultiMaterial MakeDomains)
     add_executable(Paper${EXP} ${EXP}.cxx)
     target_link_libraries(Paper${EXP} PRIVATE PaperCommon)
     set_target_properties(Paper${EXP} PROPERTIES OUTPUT_NAME ${EXP})
 endforeach()
 
 # Where the corpus lives, so an experiment does not have to be told.
-foreach(EXP E1_Verification E2_Canonical E3_Benchmark E4_Layout E5_MultiMaterial)
+foreach(EXP E1_Verification E2_Canonical E3_Benchmark E4_Layout E5_MultiMaterial MakeDomains)
     target_compile_definitions(Paper${EXP} PRIVATE
         PAPER_MESH_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../data/meshes")
 endforeach()

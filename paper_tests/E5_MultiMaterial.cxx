@@ -203,6 +203,10 @@ int main(int argc, char **argv) {
     bool doJunctionDomains = true;
     bool diskTemplates = false;
     int limit = 0;
+    std::vector<std::pair<std::string, double>> layoutOverrides;
+    std::string sub = "multimat";
+    double obliqueSector = 120.0;   // see obliqueJunctionDomain
+    std::vector<double> obliqueSweep;   // E5(b): sector angles to sweep
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -216,11 +220,23 @@ int main(int argc, char **argv) {
         else if (a == "--no-layout") doLayout = false;
         else if (a == "--no-junction-domains") doJunctionDomains = false;
         else if (a == "--disk-templates") diskTemplates = true;
+        else if (a == "--weight" && i + 1 < argc) setDefaultPenaltyWeight(parsePenaltyWeight(argv[++i]));
+        else if (a == "--layout-opt" && i + 1 < argc) layoutOverrides.push_back(parseLayoutOverride(argv[++i]));
+        else if (a == "--set" && i + 1 < argc) sub = argv[++i];
+        else if (a == "--oblique-sector" && i + 1 < argc) obliqueSector = std::stod(argv[++i]);
+        else if (a == "--oblique-sweep" && i + 1 < argc) {
+            for (const std::string &s : split(argv[++i], ',')) obliqueSweep.push_back(std::stod(s));
+        }
         else if (a == "--help") {
             std::cout << "Usage: " << argv[0]
-                      << " [--out DIR] [--methods DualMBO,B1,B2] [--target EDGE] [--h SIZE]\n"
+                      << " [--out DIR] [--set multimat|mechanism|...] [--methods DualMBO,B1,B2]\n"
+                         "       [--target EDGE] [--h SIZE]\n"
                          "       [--obj DIR] [--vtk DIR] [--limit N] [--no-layout]\n"
-                         "       [--no-junction-domains] [--disk-templates] [model ...]\n";
+                         "       [--no-junction-domains] [--disk-templates]\n"
+                         "       [--weight min|harm|orth] [--layout-opt NAME=VALUE ...]\n"
+                         "       [--oblique-sector DEG] [--oblique-sweep DEG,DEG,...] [model ...]\n"
+                         "  --oblique-sector   sector angle of the authored oblique domain (120)\n"
+                         "  --oblique-sweep    E5(b): run the oblique domain at each angle, field and layout\n";
             return 0;
         } else only.push_back(a);
     }
@@ -229,7 +245,8 @@ int main(int argc, char **argv) {
     if (!vtkDir.empty()) ensureDir(vtkDir);
     Verdicts v;
 
-    banner("E5  Multi-material domains");
+    banner("E5  Multi-material domains: data/meshes/" + sub);
+    std::cout << "DualMBO penalty weight " << penaltyWeightName(defaultPenaltyWeight()) << ".\n";
 
     // The corpus, plus the five authored junction domains. The outline asks for
     // at least five domains before E5 gets a quantitative table; data/meshes/
@@ -237,7 +254,7 @@ int main(int argc, char **argv) {
     // and because a junction built to be one junction is the clearest place to
     // measure the junction residual.
     std::vector<Case> cases;
-    for (const Model &mm : select(corpus("multimat"), only)) {
+    for (const Model &mm : select(corpus(sub), only)) {
         std::string why;
         std::shared_ptr<Mesh> mesh = load(mm, why);
         if (!mesh) { v.warn(mm.name + ": " + why); continue; }
@@ -247,8 +264,12 @@ int main(int argc, char **argv) {
         }
         cases.push_back({mm.name, mesh, "corpus"});
     }
-    if (doJunctionDomains && only.empty()) {
-        for (const Domain &d : junctionDomains(h)) {
+    if (doJunctionDomains) {
+        // With no names given, every junction domain runs; with names, only the
+        // junction domains named -- so a single authored domain can be re-run
+        // on its own, e.g. `E5_MultiMaterial oblique`.
+        for (const Domain &d : junctionDomains(h, obliqueSector)) {
+            if (!only.empty() && std::find(only.begin(), only.end(), d.name) == only.end()) continue;
             if (!isMultiMaterial(*d.mesh)) {
                 v.warn(d.name + ": the mesher gave it one material; skipped");
                 continue;
@@ -449,12 +470,14 @@ int main(int argc, char **argv) {
                   "patches", "mesh_quads", "mixed_quads", "pipeline_mixed_quads",
                   "irregular_interior", "irregular_boundary", "irregular_per_material",
                   "min_scaled_jacobian", "mean_scaled_jacobian", "inverted_quads",
-                  "min_zone_dimension", "p01_zone_dimension", "seconds"});
+                  "min_zone_dimension", "p01_zone_dimension",
+                  "integration_fit_residual_max", "unmeshed_patches",
+                  "external_field_used", "seconds"});
 
         for (const Case &c : cases) {
             std::cout << "\n" << c.name << std::flush;
             Table t({"method", "reached", "valid", "patches", "quads", "mixed",
-                     "irr int", "per material", "min SJ", "min zone", "s"});
+                     "irr int", "per material", "min SJ", "min zone", "fit res", "field", "s"});
             for (const std::string &name : methods) {
                 MethodOptions fo;   // the shipped tolerance: this measures the pipeline
                 const FieldRun run = runMethod(name, c.mesh, fo);
@@ -463,6 +486,7 @@ int main(int argc, char **argv) {
                 LayoutOptions lo;
                 lo.quadTargetEdge = target;
                 lo.diskTemplates = diskTemplates;
+                lo.overrides = layoutOverrides;
                 const LayoutResult L = runLayout(c.mesh, run.u, lo, !objDir.empty());
                 const metrics::QuadMetrics &Q = L.quality;
 
@@ -470,7 +494,28 @@ int main(int argc, char **argv) {
                        num(Q.quads), num(L.pipelineMixedQuads),
                        num(Q.irregularInterior), perMaterial(Q.irregularPerMaterial),
                        num(Q.minScaledJacobian, 4), num(Q.minZoneDimension, 4),
-                       num(L.seconds, 2)});
+                       num(L.integrationFitResidualMax, 3),
+                       L.ran && !L.externalFieldUsed ? "own" : "given", num(L.seconds, 2)});
+
+                // Stage 0c excises circular inclusions before Stage 0, which
+                // changes the triangle count and makes the supplied field the
+                // wrong length; the pipeline then solves its own. Such a row
+                // measures the pipeline, not the field, and both methods give
+                // the same numbers -- so say so rather than let the table read
+                // as a comparison.
+                if (L.ran && !L.externalFieldUsed)
+                    v.warn(c.name + "/" + name + ": the pipeline solved its own field (Stage 0c"
+                           " changed the triangle count), so this row is not a comparison of"
+                           " the two methods' fields");
+
+                // A layout that did not validate says why in the pipeline's own
+                // words, so that a failure in the log can be attributed to a
+                // stage rather than wondered at.
+                if (!L.valid) {
+                    if (!L.error.empty()) std::cout << "\n    " << name << " error: " << L.error;
+                    for (const std::string &msg : L.messages) std::cout << "\n    " << name << ": " << msg;
+                    std::cout << "\n";
+                }
 
                 lcsv.row({{"domain", c.name}, {"method", name},
                           {"reached", L.reachedStage}, {"valid", num(L.valid)},
@@ -486,6 +531,9 @@ int main(int argc, char **argv) {
                           {"inverted_quads", num(Q.invertedQuads)},
                           {"min_zone_dimension", num(Q.minZoneDimension, 6)},
                           {"p01_zone_dimension", num(Q.p01ZoneDimension, 6)},
+                          {"integration_fit_residual_max", num(L.integrationFitResidualMax, 6)},
+                          {"unmeshed_patches", num(L.unmeshedPatches)},
+                          {"external_field_used", num(L.externalFieldUsed)},
                           {"seconds", num(L.seconds, 3)}});
 
                 // R1 is asserted only where there *is* a layout to assert it
@@ -510,6 +558,98 @@ int main(int argc, char **argv) {
             std::cout << "\n";
             t.print();
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // E5(b) -- the oblique junction as a function of how oblique it is
+    //
+    // The 120-degree domain above is the one Fig. 6 is built around, and its
+    // layout does not validate on either field. This sweeps the sector angle
+    // of the same construction -- 90 is a T-junction in disguise, 120 the
+    // paper's domain -- and reports, per angle and method, whether the field
+    // was exact at the junction and whether the layout stage then produced a
+    // mesh. It separates two questions a reader will otherwise conflate: what
+    // the *field* does at an oblique junction (Prop. 2: exact, at any angle)
+    // and what the *layout stages* can absorb (measured here: a threshold).
+    // -----------------------------------------------------------------------
+    if (!obliqueSweep.empty()) {
+        banner("E5(b)  The oblique junction as a function of its sector angle");
+        std::cout << "Sectors a/a/(360-2a) at h = " << h << ", target edge " << target
+                  << "; the field at the shipped tolerance, then the layout.\n";
+        Csv oc(outDir + "/E5_oblique_sweep.csv",
+               {"sector_deg", "obliquity_deg", "method", "interface_align_max_deg",
+                "junction_residual_max_deg", "singularities", "ph_residual",
+                "reached", "valid", "patches", "mesh_quads", "unmeshed_patches",
+                "irregular_interior", "min_scaled_jacobian", "inverted_quads",
+                "integration_fit_residual_max", "separatrices_unresolved", "seconds"});
+        Table t({"sector", "obliquity", "method", "iface align max", "junction max", "#sing",
+                 "reached", "valid", "patches", "quads", "unmeshed", "irr int", "min SJ",
+                 "fit res", "s"});
+        for (double a : obliqueSweep) {
+            std::shared_ptr<Mesh> mesh;
+            try { mesh = obliqueJunctionDomain(h, a); }
+            catch (const std::exception &e) { v.warn("oblique sweep " + num(a, 1) + ": " + e.what()); continue; }
+            if (!isMultiMaterial(*mesh)) { v.warn("oblique sweep " + num(a, 1) + ": one material; skipped"); continue; }
+            const std::vector<int> ie = interfaceEdges(*mesh);
+            const Junctions J = junctions(*mesh);
+            double obliq = 0.0;
+            for (double x : J.obliquity) obliq = std::max(obliq, x);
+
+            for (const std::string &name : methods) {
+                MethodOptions fo;   // the shipped tolerance: this measures the pipeline
+                const FieldRun run = runMethod(name, mesh, fo);
+                if (!run.ok) { v.warn("oblique " + num(a, 1) + "/" + name + ": " + run.error); continue; }
+
+                const metrics::AlignmentError ia = metrics::alignmentError(*mesh, run.u, ie);
+                const metrics::SingularityReport sr = metrics::singularities(*mesh, run.u);
+                double jMax = 0.0;
+                for (std::size_t k = 0; k < J.vertices.size(); ++k) {
+                    const double x = (run.hasConversion && run.p1Vertex.size() > 0)
+                        ? junctionResidualVertex(*mesh, run.p1Vertex, J.vertices[k], J.edgesAt[k])
+                        : junctionResidualFace(*mesh, run.u, J.edgesAt[k]);
+                    jMax = std::max(jMax, deg(x));
+                }
+
+                LayoutOptions lo;
+                lo.quadTargetEdge = target;
+                lo.diskTemplates = diskTemplates;
+                lo.overrides = layoutOverrides;
+                const LayoutResult L = runLayout(mesh, run.u, lo, !objDir.empty());
+                const metrics::QuadMetrics &Q = L.quality;
+
+                t.row({num(a, 0), num(obliq, 1), name, num(deg(ia.maxAngle), 3), num(jMax, 3),
+                       num((int)sr.interior.size()), L.reachedStage, L.valid ? "yes" : "no",
+                       num(L.patches), num(Q.quads), num(L.unmeshedPatches),
+                       num(Q.irregularInterior), num(Q.minScaledJacobian, 4),
+                       num(L.integrationFitResidualMax, 3), num(L.seconds, 1)});
+                oc.row({{"sector_deg", num(a, 3)}, {"obliquity_deg", num(obliq, 6)}, {"method", name},
+                        {"interface_align_max_deg", num(deg(ia.maxAngle), 6)},
+                        {"junction_residual_max_deg", num(jMax, 6)},
+                        {"singularities", num((int)sr.interior.size())},
+                        {"ph_residual", num(sr.poincareHopfResidual)},
+                        {"reached", L.reachedStage}, {"valid", num(L.valid)},
+                        {"patches", num(L.patches)}, {"mesh_quads", num(Q.quads)},
+                        {"unmeshed_patches", num(L.unmeshedPatches)},
+                        {"irregular_interior", num(Q.irregularInterior)},
+                        {"min_scaled_jacobian", num(Q.minScaledJacobian, 6)},
+                        {"inverted_quads", num(Q.invertedQuads)},
+                        {"integration_fit_residual_max", num(L.integrationFitResidualMax, 6)},
+                        {"separatrices_unresolved", num(L.separatricesUnresolved)},
+                        {"seconds", num(L.seconds, 3)}});
+                if (!L.valid) {
+                    for (const std::string &msg : L.messages)
+                        if (msg.rfind("Stage 7", 0) == 0 || msg.rfind("Stage 8", 0) == 0 || msg.rfind("Stage 10", 0) == 0)
+                            std::cout << "    " << num(a, 0) << "/" << name << ": " << msg.substr(0, 150) << "\n";
+                }
+                if (!objDir.empty() && !L.quadCells.empty())
+                    writeQuadOBJ(objDir + "/E5_oblique" + num(a, 0) + "_" + name + ".obj", L);
+            }
+        }
+        t.print();
+        std::cout << "\n  The field column is the claim of Prop. 2 and does not depend on the angle.\n"
+                  << "  The layout columns are the pipeline's, and where they stop being 'mesh /\n"
+                  << "  yes' is a limitation of Stages 6-8 at a junction the layout has to absorb\n"
+                  << "  a turn at, not of the field that reached them.\n";
     }
 
     // -----------------------------------------------------------------------

@@ -29,6 +29,26 @@ struct EdgeWeights {
 };
 EdgeWeights edgeWeights(const Mesh &m, double gamma = 10.0);
 
+// The same with the two-point (circumcentric dual) weight,
+// kappa_e = (2/3) gamma |e| / d_e with d_e the distance between the two
+// circumcenters, floored exactly as DualMBO::PenaltyWeight::Orthogonal floors
+// it. Prop. 4 shows this is the consistent weight, so it is the neutral
+// functional for comparing fields that different operators produced: it does
+// not favour the operator that assembled it. Zero on boundary edges.
+EdgeWeights edgeWeightsTwoPoint(const Mesh &m, double gamma = 10.0);
+
+// The one-sided Dirichlet part of the energy alone,
+//
+//   E_bd(u) = 1/2 sum_{e on dS} kappa^1_e |u_{K(e)} - g_e|^2
+//           + 1/2 sum_{e aligned, each side} kappa^1_e |u_K - g_e|^2,
+//
+// kappa^1_e = gamma |e| / h_{K,e}. This is what a field pays for the
+// constraint and it is the term `commonEnergy` deliberately leaves out. It is
+// identical for every method and every interior weight, so adding it to either
+// interior energy charges constraint violation at the same rate for all.
+double boundaryEnergy(const Mesh &m, double gamma, const Eigen::VectorXcd &u,
+                      const std::vector<char> &alignedEdge = {});
+
 // E_face(u) = 1/2 sum_{e interior} kappa_e |u_i - P_e u_j|^2, P_e = 1 in the
 // plane. `skipEdge`, when non-empty, drops the edges flagged in it -- that is
 // how a multi-material energy is compared fairly, since the interface edges

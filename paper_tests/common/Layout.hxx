@@ -46,6 +46,14 @@ struct LayoutOptions {
     // Seconds after which a model is abandoned. Zero is no limit. (Advisory:
     // it is checked between stages, so a stage that runs long overruns it.)
     double timeLimit = 0.0;
+
+    // Named overrides of TORSION::Options fields, applied after the ones above,
+    // so that a pipeline knob can be swept from an experiment's command line
+    // (`--layout-opt outerSteps=32`) without this header knowing the pipeline.
+    // The names are the TORSION::Options member names; an unknown one throws,
+    // so a misspelt sweep fails rather than silently runs the default. The
+    // recognised set is the list in Layout.cxx.
+    std::vector<std::pair<std::string, double>> overrides;
 };
 
 struct LayoutResult {
@@ -57,6 +65,12 @@ struct LayoutResult {
     // The last stage that completed, as a short name, so a table can say where
     // a model stopped rather than only that it did.
     std::string reachedStage = "none";
+
+    // Whether the field this call passed in is the field the pipeline used.
+    // False means Stage 0c changed the triangle count under it -- disk
+    // templates on a domain with a circular inclusion -- and the pipeline
+    // solved its own instead, so the row is not a comparison of fields.
+    bool externalFieldUsed = false;
 
     bool framesValid = false;
     bool immersionValid = false;
@@ -70,6 +84,18 @@ struct LayoutResult {
     int interiorCones = 0;
     int boundaryCones = 0;
     int integrationFlippedFaces = 0;
+
+    // How integrable the field was, as the layout stage found it: the largest
+    // and mean relative deviation, edge by edge, of the integrated map from the
+    // field's own metric (TORSION Stage 4's fit residual). A field that is a
+    // gradient integrates to a map that reproduces it exactly, so this is the
+    // one field-quality number that is measured by the consumer rather than by
+    // us, and it is zero only for a field with no non-integrable curl in it.
+    // The largest frame jump of the combing is kept beside it.
+    double integrationFitResidualMax = 0.0;
+    double integrationFitResidualMean = 0.0;
+    double integrationFlippedAreaFraction = 0.0;
+    double maxFrameJump = 0.0;
     int separatrices = 0;
     int separatricesUnresolved = 0;
     int patches = 0;
@@ -106,6 +132,10 @@ LayoutResult runLayout(const std::shared_ptr<Mesh> &m, const Eigen::VectorXcd &f
                        const LayoutOptions &o, bool keepMesh = false);
 
 bool writeQuadOBJ(const std::string &path, const LayoutResult &r);
+
+// "name=value" -> an entry of LayoutOptions::overrides. Throws on a malformed
+// string; the name itself is checked when the layout runs.
+std::pair<std::string, double> parseLayoutOverride(const std::string &arg);
 
 } // namespace paper
 

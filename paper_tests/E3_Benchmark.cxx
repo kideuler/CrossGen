@@ -25,8 +25,10 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <numeric>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -52,7 +54,9 @@ struct Row {
     double minBoundaryDistanceH = 0.0;
     double maxSpinJump = 0.0;
     int starsPastCondition = 0;
-    double energy = 0.0;
+    double energy = 0.0;      // interior, interior-penalty (min-height) weights
+    double energyTP = 0.0;    // interior, two-point weights: the neutral functional
+    double energyBd = 0.0;    // the one-sided constraint term, same for every method
     double boundaryAlignMaxDeg = 0.0, boundaryAlignP95Deg = 0.0;
     int iterations = 0;
     double assembleSeconds = 0.0, solveSeconds = 0.0, totalSeconds = 0.0;
@@ -77,15 +81,25 @@ int main(int argc, char **argv) {
     std::string sub = "singlemat";
     std::string vtkDir;
     std::vector<std::string> only;
+    bool b1Continuation = false;
+    int b1Seeds = 0;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--out" && i + 1 < argc) outDir = argv[++i];
         else if (a == "--set" && i + 1 < argc) sub = argv[++i];
         else if (a == "--vtk" && i + 1 < argc) vtkDir = argv[++i];
+        else if (a == "--weight" && i + 1 < argc) setDefaultPenaltyWeight(parsePenaltyWeight(argv[++i]));
+        else if (a == "--b1-continuation") b1Continuation = true;
+        else if (a == "--b1-seeds" && i + 1 < argc) b1Seeds = std::stoi(argv[++i]);
         else if (a == "--help") {
             std::cout << "Usage: " << argv[0]
-                      << " [--out DIR] [--set singlemat|multimat] [--vtk DIR] [model ...]\n";
+                      << " [--out DIR] [--set singlemat|multimat] [--vtk DIR]\n"
+                         "       [--weight min|harm|orth] [--b1-continuation] [--b1-seeds N] [model ...]\n"
+                         "  --b1-continuation  give B1 the same tau ladder our method runs (the\n"
+                         "                     fair-comparison variant; write it to its own --out)\n"
+                         "  --b1-seeds N       re-run B1 from N random starts per model and report\n"
+                         "                     how much of its singularity set depends on the seed\n";
             return 0;
         } else only.push_back(a);
     }
@@ -101,7 +115,10 @@ int main(int argc, char **argv) {
         return 2;
     }
     std::cout << models.size() << " model(s); MBO convergence tolerance " << kTol
-              << ", energies at gamma = " << kGammaEval << ".\n";
+              << ", energies at gamma = " << kGammaEval
+              << ", DualMBO penalty weight " << penaltyWeightName(defaultPenaltyWeight())
+              << (b1Continuation ? ", B1 given the tau continuation" : ", B1 as published (one tau)")
+              << ".\n";
 
     Csv csv(outDir + "/E3_" + sub + "_permodel.csv",
             {"model", "method", "vertices", "triangles", "chi",
@@ -110,7 +127,8 @@ int main(int argc, char **argv) {
              "boundary_adjacent",
              "min_boundary_distance_h", "close_pairs", "close_opposite_pairs",
              "max_spin_jump_rad", "stars_past_condition",
-             "energy", "boundary_align_max_deg", "boundary_align_p95_deg",
+             "energy", "energy_twopoint", "energy_boundary",
+             "boundary_align_max_deg", "boundary_align_p95_deg",
              "iterations", "converged", "assemble_s", "solve_s", "total_s",
              "conv_degenerate_faces", "conv_holonomy_lost_edges", "conv_untrackable_edges",
              "conv_singularities_before", "conv_singularities_after",
@@ -121,20 +139,27 @@ int main(int argc, char **argv) {
 
     MethodOptions base;
     base.convergenceTol = kTol;
+    base.b1TauContinuation = b1Continuation;
+
+    // For --b1-seeds: the meshes, kept so the seed sweep does not reload them.
+    std::vector<std::pair<Model, std::shared_ptr<Mesh>>> loaded;
 
     for (const Model &mm : models) {
         std::string why;
         std::shared_ptr<Mesh> mesh = load(mm, why);
         if (!mesh) { v.warn(mm.name + ": " + why); ++loadFailures; continue; }
+        loaded.emplace_back(mm, mesh);
 
         const metrics::EdgeWeights w = metrics::edgeWeights(*mesh, kGammaEval);
+        const metrics::EdgeWeights wtp = metrics::edgeWeightsTwoPoint(*mesh, kGammaEval);
         const std::vector<char> skip = interfaceEdgeFlags(*mesh);
         const int chi = metrics::eulerCharacteristic(*mesh);
 
         std::cout << "\n" << mm.name << "  (" << mesh->vertices.size() << " v, "
                   << mesh->triangles.size() << " t, chi = " << chi << ")\n";
         Table t({"method", "#sing", "indices", "sum 4I", "PH", "PH geom", "dS anom",
-                 "near dS", "min d/h", "pairs<2h", "energy", "dS align max", "iters", "s"});
+                 "near dS", "min d/h", "pairs<2h", "energy", "E_tp", "E_bd",
+                 "dS align max", "iters", "s"});
 
         for (const std::string &name : methodNames()) {
             const FieldRun run = runMethod(name, mesh, base);
@@ -167,6 +192,8 @@ int main(int argc, char **argv) {
             r.maxSpinJump = s.maxSpinJump;
             r.starsPastCondition = s.starsPastCondition;
             r.energy = metrics::commonEnergy(*mesh, w, run.u, skip);
+            r.energyTP = metrics::commonEnergy(*mesh, wtp, run.u, skip);
+            r.energyBd = metrics::boundaryEnergy(*mesh, kGammaEval, run.u, skip);
             r.boundaryAlignMaxDeg = ba.maxAngle * 180.0 / M_PI;
             r.boundaryAlignP95Deg = ba.p95Angle * 180.0 / M_PI;
             r.iterations = run.iterations;
@@ -182,7 +209,8 @@ int main(int argc, char **argv) {
                    num(r.phResidual), num(r.phGeom), num(r.boundaryAnomalies),
                    num(r.boundaryAdjacent),
                    num(r.minBoundaryDistanceH, 3), num(r.closePairs),
-                   num(r.energy, 6), num(r.boundaryAlignMaxDeg, 3),
+                   num(r.energy, 6), num(r.energyTP, 6), num(r.energyBd, 4),
+                   num(r.boundaryAlignMaxDeg, 3),
                    num(r.iterations), num(r.totalSeconds, 3)});
 
             csv.row({{"model", r.model}, {"method", r.method},
@@ -202,6 +230,8 @@ int main(int argc, char **argv) {
                      {"max_spin_jump_rad", num(r.maxSpinJump, 6)},
                      {"stars_past_condition", num(r.starsPastCondition)},
                      {"energy", num(r.energy, 10)},
+                     {"energy_twopoint", num(r.energyTP, 10)},
+                     {"energy_boundary", num(r.energyBd, 10)},
                      {"boundary_align_max_deg", num(r.boundaryAlignMaxDeg, 6)},
                      {"boundary_align_p95_deg", num(r.boundaryAlignP95Deg, 6)},
                      {"iterations", num(r.iterations)},
@@ -279,6 +309,50 @@ int main(int argc, char **argv) {
     at.print();
 
     // -----------------------------------------------------------------------
+    // The constrained energy. Both MBO methods minimise an interior energy
+    // *subject to* boundary tangency; an interior-only comparison charges
+    // neither for the constraint, and a field can buy interior smoothness by
+    // violating it. So: the interior energy in the two-point functional (the
+    // neutral one, Prop. 4), the constraint term, and their sum, per method,
+    // with the number of models on which each baseline's total is below ours.
+    // -----------------------------------------------------------------------
+    heading("Constrained energy: interior (two-point weight) + boundary term, summed over the corpus");
+    {
+        Csv ce(outDir + "/E3_" + sub + "_energy.csv",
+               {"method", "energy_minheight_sum", "energy_twopoint_sum", "energy_boundary_sum",
+                "energy_total_twopoint_sum", "models_total_below_dualmbo",
+                "models_interior_twopoint_below_dualmbo"});
+        std::map<std::string, double> ourTotal, ourTP;
+        for (const Row &r : rows)
+            if (r.ok && r.method == "DualMBO") { ourTotal[r.model] = r.energyTP + r.energyBd; ourTP[r.model] = r.energyTP; }
+        Table et({"method", "sum E_int (min-height)", "sum E_int (two-point)", "sum E_bd",
+                  "sum E_total (two-point)", "models with E_total < ours", "models with E_int(tp) < ours"});
+        for (const std::string &name : methodNames()) {
+            double sMin = 0.0, sTP = 0.0, sBd = 0.0;
+            int belowTotal = 0, belowTP = 0;
+            for (const Row &r : rows) {
+                if (r.method != name || !r.ok) continue;
+                sMin += r.energy; sTP += r.energyTP; sBd += r.energyBd;
+                if (name != "DualMBO") {
+                    auto it = ourTotal.find(r.model);
+                    if (it != ourTotal.end() && r.energyTP + r.energyBd < it->second) ++belowTotal;
+                    auto jt = ourTP.find(r.model);
+                    if (jt != ourTP.end() && r.energyTP < jt->second) ++belowTP;
+                }
+            }
+            et.row({name, num(sMin, 6), num(sTP, 6), num(sBd, 6), num(sTP + sBd, 6),
+                    name == "DualMBO" ? "-" : num(belowTotal),
+                    name == "DualMBO" ? "-" : num(belowTP)});
+            ce.row({{"method", name}, {"energy_minheight_sum", num(sMin, 10)},
+                    {"energy_twopoint_sum", num(sTP, 10)}, {"energy_boundary_sum", num(sBd, 10)},
+                    {"energy_total_twopoint_sum", num(sTP + sBd, 10)},
+                    {"models_total_below_dualmbo", name == "DualMBO" ? "" : num(belowTotal)},
+                    {"models_interior_twopoint_below_dualmbo", name == "DualMBO" ? "" : num(belowTP)}});
+        }
+        et.print();
+    }
+
+    // -----------------------------------------------------------------------
     // The conversion cost
     // -----------------------------------------------------------------------
     heading("The cost of the P1 -> face conversion (B1)");
@@ -325,6 +399,93 @@ int main(int argc, char **argv) {
         cc.row({num(modelsWithLoss), num(lostTotal), num(modelsWithTopoChange),
                 num(createdTotal), num(annihilatedTotal), num(degenerateTotal),
                 num(interiorEdgeTotal)});
+    }
+
+    // -----------------------------------------------------------------------
+    // Reproducibility: how much of B1's answer is its random start.
+    //
+    // Our scheme starts from u = 1 everywhere and is deterministic; B2 is one
+    // linear solve. B1 as published starts from a random interior field, so the
+    // singularity set it lands on is a function of the seed. The fields above
+    // use seed 1; this re-runs B1 from `b1Seeds` seeds and reports, per model,
+    // the range of cone counts, the number of distinct index multisets, how
+    // many seeds satisfy the geometric Poincare-Hopf form, how far the cones of
+    // one seed's set sit from the nearest same-index cone of the first seed's,
+    // and the spread of the constrained energy. A model where any of that
+    // varies is a model on which B1's topology is not a property of the domain.
+    // -----------------------------------------------------------------------
+    if (b1Seeds > 1) {
+        heading("B1 from " + num(b1Seeds) + " random starts: is its singularity set the domain's or the seed's?");
+        Csv sc(outDir + "/E3_" + sub + "_b1seeds.csv",
+               {"model", "seeds", "cones_min", "cones_max", "distinct_index_multisets",
+                "ph_geom_ok_seeds", "cone_displacement_max_h", "energy_total_min",
+                "energy_total_max", "energy_total_spread_rel", "iterations_mean"});
+        Table st({"model", "cones min..max", "distinct multisets", "PH geom ok",
+                  "cone move max (h)", "E_total min", "max", "spread", "iters mean"});
+        int modelsCountVaries = 0, modelsTopologyVaries = 0, modelsMoved = 0;
+
+        for (const auto &[mm, mesh] : loaded) {
+            const metrics::EdgeWeights wtp = metrics::edgeWeightsTwoPoint(*mesh, kGammaEval);
+            const std::vector<char> skip = interfaceEdgeFlags(*mesh);
+            const std::vector<double> hLocal = metrics::localEdgeLength(*mesh);
+
+            int cMin = std::numeric_limits<int>::max(), cMax = 0, phOk = 0;
+            std::set<std::string> multisets;
+            double eMin = std::numeric_limits<double>::max(), eMax = 0.0, moveMax = 0.0;
+            std::vector<double> iters;
+            std::vector<metrics::Singularity> first;
+
+            for (int s = 1; s <= b1Seeds; ++s) {
+                MethodOptions o = base;
+                o.seed = static_cast<unsigned>(s);
+                const FieldRun run = runMethod("B1", mesh, o);
+                if (!run.ok) { v.warn(mm.name + "/B1 seed " + num(s) + ": " + run.error); continue; }
+                const metrics::SingularityReport sr = metrics::singularities(*mesh, run.u);
+                const int n = static_cast<int>(sr.interior.size());
+                cMin = std::min(cMin, n);
+                cMax = std::max(cMax, n);
+                multisets.insert(sr.indexMultiset());
+                if (sr.geometricPoincareHopfResidual == 0) ++phOk;
+                const double e = metrics::commonEnergy(*mesh, wtp, run.u, skip)
+                               + metrics::boundaryEnergy(*mesh, kGammaEval, run.u, skip);
+                eMin = std::min(eMin, e);
+                eMax = std::max(eMax, e);
+                iters.push_back(run.iterations);
+
+                // Nearest same-index cone of the first seed's set, in local edge
+                // lengths; a cone with no partner at all counts as infinitely
+                // far and is reported as the count range above instead.
+                if (s == 1) { first = sr.interior; continue; }
+                for (const metrics::Singularity &a : sr.interior) {
+                    double best = std::numeric_limits<double>::max();
+                    for (const metrics::Singularity &b : first) {
+                        if (b.index4 != a.index4) continue;
+                        best = std::min(best, normP(mesh->vertices[a.vertex] - mesh->vertices[b.vertex]));
+                    }
+                    if (best < std::numeric_limits<double>::max() && hLocal[a.vertex] > 0.0)
+                        moveMax = std::max(moveMax, best / hLocal[a.vertex]);
+                }
+            }
+            if (cMin == std::numeric_limits<int>::max()) continue;
+            const double spread = eMax > 0.0 ? (eMax - eMin) / eMax : 0.0;
+            if (cMin != cMax) ++modelsCountVaries;
+            if (multisets.size() > 1) ++modelsTopologyVaries;
+            if (moveMax > 2.0) ++modelsMoved;
+
+            st.row({mm.name, num(cMin) + ".." + num(cMax), num((int)multisets.size()),
+                    num(phOk) + "/" + num(b1Seeds), num(moveMax, 2), num(eMin, 6), num(eMax, 6),
+                    num(spread, 5), num(mean(iters), 1)});
+            sc.row({{"model", mm.name}, {"seeds", num(b1Seeds)}, {"cones_min", num(cMin)},
+                    {"cones_max", num(cMax)}, {"distinct_index_multisets", num((int)multisets.size())},
+                    {"ph_geom_ok_seeds", num(phOk)}, {"cone_displacement_max_h", num(moveMax, 6)},
+                    {"energy_total_min", num(eMin, 10)}, {"energy_total_max", num(eMax, 10)},
+                    {"energy_total_spread_rel", num(spread, 8)}, {"iterations_mean", num(mean(iters), 4)}});
+        }
+        st.print();
+        std::cout << "\n  Over " << loaded.size() << " model(s): B1's cone count depends on the seed on "
+                  << modelsCountVaries << ", its index multiset on " << modelsTopologyVaries
+                  << ", and a cone moved by more than 2 h between seeds on " << modelsMoved
+                  << ".\n  DualMBO starts from u = 1 and B2 is one linear solve; neither has a seed.\n";
     }
 
     // -----------------------------------------------------------------------

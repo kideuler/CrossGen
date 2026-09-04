@@ -382,18 +382,36 @@ TORSION::~TORSION() = default;
 // runField()  --  Stage 0, MERIDIAN's unchanged
 // ---------------------------------------------------------------------------
 void TORSION::runField() {
-    field = std::make_unique<DualMBO>(mesh, options.dualMBOMaxSteps, options.dualMBOGamma);
-    // On a multi-material domain the interfaces are Dirichlet data for the
-    // field in exactly the way dS is, and that matters more here than in
-    // Pipeline A rather than less: this pipeline integrates the field, so an
-    // interface the field ran straight through is an interface the *map* runs
-    // straight through. See DualMBO::setAlignedInteriorEdges for why the hard pin
-    // and not a penalty.
-    if (interfaces && interfaces->multiMaterial() && options.alignFieldToInterfaces) {
-        field->setAlignedInteriorEdges(interfaces->interfaceEdges());
-        status.fieldAlignedToInterfaces = true;
-    }
-    field->initialize();
+    // One level of the tau-continuation: a fresh operator at this tau, with the
+    // same Dirichlet data, started from the field the previous level left.
+    auto buildLevel = [&](double tauScale, const Eigen::VectorXcd &carried) {
+        auto f = std::make_unique<DualMBO>(mesh, options.dualMBOMaxSteps, options.dualMBOGamma);
+        f->setPenaltyWeight(options.dualMBOWeight);
+        f->setTauScale(tauScale);
+        // On a multi-material domain the interfaces are Dirichlet data for the
+        // field in exactly the way dS is, and that matters more here than in
+        // Pipeline A rather than less: this pipeline integrates the field, so an
+        // interface the field ran straight through is an interface the *map*
+        // runs straight through. See DualMBO::setAlignedInteriorEdges for why
+        // the hard pin and not a penalty.
+        if (interfaces && interfaces->multiMaterial() && options.alignFieldToInterfaces) {
+            f->setAlignedInteriorEdges(interfaces->interfaceEdges());
+            status.fieldAlignedToInterfaces = true;
+        }
+        f->initialize();
+        // The constraint does not travel with the field: every level re-imposes
+        // the Dirichlet data its own assembly computed, and only the free
+        // triangles are carried.
+        if (carried.size() == f->u_k_prev.size()) {
+            Eigen::VectorXcd start = carried;
+            for (const auto &[ti, bc] : f->getBoundaryData()) start[ti] = bc;
+            f->u_k_prev = start;
+            f->u_k = start;
+        }
+        return f;
+    };
+
+    field = buildLevel(1.0, Eigen::VectorXcd());
 
     // Options::externalField: the caller has a field already and wants Stages
     // 0b to 11 run on it unchanged. initialize() still runs, because the
@@ -405,6 +423,7 @@ void TORSION::runField() {
             field->u_k = options.externalField;
             field->error = 0.0;
             status.fieldConverged = true;
+            status.externalFieldUsed = true;
             status.messages.push_back(
                 "Stage 0: using the caller's cross field; the MBO solve was skipped.");
             return;
@@ -417,10 +436,54 @@ void TORSION::runField() {
     }
 
     const double nTris = static_cast<double>(mesh->triangles.size());
-    for (int i = 0; i < options.dualMBOMaxSteps; ++i) {
-        field->step();
-        ++status.mboSteps;
-        if (field->error < 2.0 * nTris * 1e-5) { status.fieldConverged = true; break; }
+
+    // The ladder of tau scales, largest first. The first entry is always 1 --
+    // the heuristic's tau -- so the continuation starts from the field the
+    // single-tau scheme would have returned and only ever refines it. Its floor
+    // is read off the assembled operator, so it cannot be known until level 0
+    // has been built.
+    std::vector<double> ladder{1.0};
+    if (options.dualMBOTauContinuation && options.dualMBOTauRatio > 0.0 &&
+        options.dualMBOTauRatio < 1.0) {
+        double mnx = 1e300, mxx = -1e300, mny = 1e300, mxy = -1e300;
+        for (const Point &p : mesh->vertices) {
+            mnx = std::min(mnx, p[0]); mxx = std::max(mxx, p[0]);
+            mny = std::min(mny, p[1]); mxy = std::max(mxy, p[1]);
+        }
+        const double D = std::hypot(mxx - mnx, mxy - mny);
+        const double rate = field->medianDiffusionRate();
+        if (D > 0.0 && rate > 0.0) {
+            const double tau0 = D * D / 10.0;
+            const double c = options.dualMBOTauFloorEdges;
+            const double tauMin = c * c / rate;
+            double tau = tau0;
+            while (tau * options.dualMBOTauRatio > tauMin && ladder.size() < 40) {
+                tau *= options.dualMBOTauRatio;
+                ladder.push_back(ladder.back() * options.dualMBOTauRatio);
+            }
+        }
+    }
+
+    Eigen::VectorXcd carried;
+    for (std::size_t level = 0; level < ladder.size(); ++level) {
+        if (level > 0) field = buildLevel(ladder[level], carried);
+        const int cap = (ladder.size() == 1)
+                            ? options.dualMBOMaxSteps
+                            : std::min(options.dualMBOMaxSteps, options.dualMBOTauLevelSteps);
+        status.fieldConverged = false;
+        for (int i = 0; i < cap; ++i) {
+            field->step();
+            ++status.mboSteps;
+            if (field->error < 2.0 * nTris * 1e-5) { status.fieldConverged = true; break; }
+        }
+        carried = field->u_k_prev;
+    }
+    if (ladder.size() > 1) {
+        std::ostringstream oss;
+        oss << "the tau-continuation ran " << ladder.size() << " level(s) at ratio "
+            << options.dualMBOTauRatio << " down to tau/tau_0 = " << ladder.back()
+            << ", " << status.mboSteps << " MBO step(s) in total.";
+        status.messages.push_back("Stage 0: " + oss.str());
     }
     if (!status.fieldConverged) {
         std::ostringstream oss;

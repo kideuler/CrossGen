@@ -98,9 +98,11 @@ int main(int argc, char **argv) {
         else if (a == "--jitters" && i + 1 < argc) jitters = std::stoi(argv[++i]);
         else if (a == "--vtk" && i + 1 < argc) vtkDir = argv[++i];
         else if (a == "--quick") { h = 0.05; seeds = 3; jitters = 2; }
+        else if (a == "--weight" && i + 1 < argc) setDefaultPenaltyWeight(parsePenaltyWeight(argv[++i]));
         else if (a == "--help") {
             std::cout << "Usage: " << argv[0]
-                      << " [--out DIR] [--h SIZE] [--seeds N] [--jitters N] [--vtk DIR] [--quick]\n";
+                      << " [--out DIR] [--h SIZE] [--seeds N] [--jitters N] [--vtk DIR] [--quick]\n"
+                         "       [--weight min|harm|orth]\n";
             return 0;
         }
     }
@@ -110,7 +112,8 @@ int main(int argc, char **argv) {
 
     banner("E2  Singularity structure on canonical domains");
     std::cout << "h = " << h << ", MBO convergence tolerance " << kTol
-              << ", energies at gamma = " << kGammaEval << ".\n";
+              << ", energies at gamma = " << kGammaEval
+              << ", DualMBO penalty weight " << penaltyWeightName(defaultPenaltyWeight()) << ".\n";
 
     const std::vector<Domain> domains = canonicalDomains(h);
 

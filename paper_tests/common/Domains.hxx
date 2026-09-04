@@ -82,6 +82,33 @@ std::shared_ptr<Mesh> wedgeDomain(double sweepDegrees, double radius, double h);
 // A regular n-gon, which for n not 4 has no right angle anywhere on it.
 std::shared_ptr<Mesh> regularPolygonDomain(int n, double h);
 
+// The unit disk again, but meshed by `rings` concentric rings whose radial
+// spacing grows geometrically outward, dr_{i+1} = growth * dr_i, with the first
+// spacing chosen so the outermost ring lands exactly on the boundary and the
+// angular count of each ring set to keep its triangles about isotropic. The
+// triangulation is the constrained Delaunay one of exactly those points -- no
+// Steiner points, no quality refinement -- so `growth` is a direct knob on how
+// graded the mesh is at a fixed number of rings, and `growth = 1` is the
+// uniform concentric mesh.
+//
+// It exists because the corpus is near-uniform (area ratios across an edge
+// reach only 2.2) and the inconsistency of the interior-penalty weight is an
+// O(1) *spurious force whose size scales with the mismatch between the two
+// elements on an edge*. On a near-uniform mesh a provable defect can still be
+// invisible in the field, and the honest way to find out is to grade the mesh
+// until it is not near-uniform and measure again -- both the operator's
+// residual on an affine field and, on the one domain whose answer is known in
+// closed form, where the cones actually land. That is E1(f).
+//
+// The disk rather than a square because the disk is the domain with a known
+// answer that a graded mesh does not trivialise: four +1/4 cones at
+// 45 + k*90 degrees from the centre (fixed by the centre pin,
+// DualMBO::setPinDiskCenters). On the square and the L every boundary tangent
+// is axis-aligned, so exp(4 i theta) = 1 on every boundary edge, the constant
+// field is the exact minimiser for *any* weight, and no discretisation can be
+// wrong there.
+std::shared_ptr<Mesh> gradedDiskDomain(double radius, int rings, double growth);
+
 // The canonical set as E2 runs it, at one mesh size.
 std::vector<Domain> canonicalDomains(double h);
 
@@ -112,10 +139,73 @@ std::shared_ptr<Mesh> embeddedInclusionDomain(double h);
 // Three materials meeting at 120 degrees, so that no sector of the junction is
 // a multiple of a right angle and no single cross can be tangent to all three
 // interfaces.
-std::shared_ptr<Mesh> obliqueJunctionDomain(double h);
+//
+// `sectorDegrees` is the angle of the first two sectors; the third takes the
+// rest. 120 is the paper's domain. Other values exist so that the layout
+// stage's behaviour at a junction can be measured as a function of how far the
+// sectors are from a quarter turn: 90 is a T-junction in disguise (90/90/180),
+// 100 is 100/100/160, and so on.
+std::shared_ptr<Mesh> obliqueJunctionDomain(double h, double sectorDegrees = 120.0);
 
-// The five above, at one mesh size.
-std::vector<Domain> junctionDomains(double h);
+// The five above, at one mesh size. `obliqueSectorDegrees` is passed to the
+// oblique domain; 120 is the paper's.
+std::vector<Domain> junctionDomains(double h, double obliqueSectorDegrees = 120.0);
+
+// --- the mechanism set -----------------------------------------------------
+//
+// Domains built to test *where the two discretisations must differ*, rather
+// than to sample an application. The distinction matters and the set is kept
+// apart from data/meshes/{singlemat,multimat} for it: a corpus you choose after
+// seeing the results is not evidence. What makes these legitimate is that each
+// family sweeps one parameter, the prediction is stated before the run, and
+// each family contains the setting at which the prediction says the two methods
+// *agree* -- so the result is a curve with a control at one end and not a win.
+//
+// The mechanism is the boundary data. A vertex-based field must assign one
+// cross to a boundary vertex, and `CrossField` does it by rounding the corner's
+// interior angle into one of four quarter-turn classes (Viertel, Osting and
+// Staten, Table 1). That rounding is exact at 90, 180 and 270 degrees and wrong
+// by up to 22.5 degrees half way between, and the same argument at a material
+// junction is Remark 4.1. A face-based field pins each boundary *edge* to its
+// own tangent and never rounds. So:
+//
+//   comb        all interior angles 90 or 270      -> control, no difference
+//   star        tip angle swept 90 down to 40      -> error grows, both methods
+//                                                     eventually (ours at the
+//                                                     corner-face degeneracy)
+//   laminate    interfaces meeting dS at an angle  -> junction residual grows
+//   grain       Voronoi polycrystal, every triple
+//               junction generically oblique       -> the application case
+
+// A rectilinear comb: a block with `teeth` slots cut into it, every interior
+// angle 90 or 270 degrees. The control: the corner rounding a vertex field does
+// is exact here, so the two methods should agree, and if they do not the
+// explanation is not the one this set is testing.
+std::shared_ptr<Mesh> combDomain(int teeth, double h);
+
+// A `points`-pointed star whose tip interior angle is `tipDegrees`. The valley
+// angle follows, 360 - 360/points - tipDegrees, so one parameter sweeps both
+// away from a multiple of 90 degrees. At 90 degrees the tips are right angles
+// and only the valleys are odd.
+std::shared_ptr<Mesh> starDomain(int points, double tipDegrees, double h);
+
+// `layers` material bands across the unit square, their interfaces at
+// `tiltDegrees` to the x axis. Each interface ends on dS, and where it does the
+// boundary tangent and the interface tangent are two constraints on one corner:
+// a junction of obliquity |tilt - 90| rounded into a right angle. 90 degrees is
+// the control.
+std::shared_ptr<Mesh> laminateDomain(int layers, double tiltDegrees, double h);
+
+// A Voronoi polycrystal of `grains` cells: the aggregate of the Voronoi cells
+// of a jittered set of seeds, one material per cell, meshed so that every cell
+// wall is a chain of mesh edges. Almost every interior vertex is a triple
+// junction whose three sectors are generically not multiples of a right angle,
+// which is the configuration Remark 4.1 is about, and it is what a
+// polycrystalline microstructure actually looks like.
+std::shared_ptr<Mesh> polycrystalDomain(int grains, unsigned seed, double h);
+
+// The whole set, with the note each Domain carries saying what it tests.
+std::vector<Domain> mechanismDomains(double h);
 
 } // namespace paper
 

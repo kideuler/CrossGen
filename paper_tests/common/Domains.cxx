@@ -116,9 +116,14 @@ private:
     std::map<std::pair<long long, long long>, int> index;
 };
 
-std::shared_ptr<Mesh> build(const PSLG &g, double minAngle = 28.0) {
+std::shared_ptr<Mesh> build(const PSLG &g, double minAngle = 28.0, bool justDelaunay = false) {
     TriangleMesher2D::Options opts;
     opts.min_angle_degrees = minAngle;
+    // The constrained Delaunay triangulation of exactly the given points: no
+    // quality refinement, no area constraint, no Steiner points. The caller is
+    // then in charge of where every vertex is, which is what gradedDiskDomain
+    // needs and what no area constraint can give it.
+    opts.just_delaunay = justDelaunay;
     TriangleMesher2D mesher(opts);
     TriangleMesher2D::MeshOutput out = mesher.triangulate(g.in);
 
@@ -215,6 +220,57 @@ std::shared_ptr<Mesh> regularPolygonDomain(int n, double h) {
     g.in.h = h;
     g.exterior(g.ring(corners, h));
     return build(g);
+}
+
+std::shared_ptr<Mesh> gradedDiskDomain(double radius, int rings, double growth) {
+    if (radius <= 0.0 || rings < 3 || growth < 1.0)
+        throw std::runtime_error("gradedDiskDomain: need radius > 0, rings >= 3, growth >= 1");
+
+    // The ring radii, from a geometric sequence of radial spacings, scaled so
+    // the outermost ring is exactly the boundary circle. Fixing the ring count
+    // rather than the first spacing is what makes the sweep a comparison: every
+    // grading gets the same radial resolution and only the *ratio* between
+    // neighbouring elements changes, so a difference between two levels is the
+    // grading and not the mesh size.
+    std::vector<double> r{0.0}, dr;
+    double step = 1.0;
+    for (int i = 0; i < rings; ++i) {
+        dr.push_back(step);
+        r.push_back(r.back() + step);
+        step *= growth;
+    }
+    const double scale = radius / r.back();
+    for (double &x : r) x *= scale;
+    for (double &x : dr) x *= scale;
+
+    // The points: the centre, then each ring, with the angular count chosen so
+    // that a ring's arc spacing is about its radial spacing and the triangles
+    // stay near-isotropic. The grading is then radial and the anisotropy stays
+    // bounded, so what the sweep varies is the *area ratio across an edge* and
+    // not the shape of the elements.
+    PSLG g;
+    g.in.h = dr.front();
+    g.point({0.0, 0.0});
+    std::vector<Point> outer;
+    for (std::size_t i = 1; i < r.size(); ++i) {
+        const int n = std::max(6, static_cast<int>(std::llround(2.0 * M_PI * r[i] / dr[i - 1])));
+        for (int k = 0; k < n; ++k) {
+            const double a = 2.0 * M_PI * k / n;
+            const Point p{r[i] * std::cos(a), r[i] * std::sin(a)};
+            g.point(p);
+            if (i + 1 == r.size()) outer.push_back(p);
+        }
+    }
+
+    // Only the outer ring carries segments: it is the boundary of the domain.
+    // Every other point is an interior PSLG vertex, which the constrained
+    // Delaunay triangulation keeps exactly where it was put.
+    std::vector<std::array<int, 2>> ring;
+    for (std::size_t i = 0; i < outer.size(); ++i)
+        ring.push_back({g.point(outer[i]), g.point(outer[(i + 1) % outer.size()])});
+    g.exterior(ring);
+
+    return build(g, 0.0, /*justDelaunay=*/true);
 }
 
 std::vector<Domain> canonicalDomains(double h) {
@@ -349,18 +405,26 @@ std::shared_ptr<Mesh> embeddedInclusionDomain(double h) {
     return build(g);
 }
 
-std::shared_ptr<Mesh> obliqueJunctionDomain(double h) {
+std::shared_ptr<Mesh> obliqueJunctionDomain(double h, double sectorDegrees) {
     PSLG g;
     g.in.h = h;
+
+    // The three rays, at 90 degrees and then each sector further round; the
+    // third sector is whatever is left of the turn.
+    const double sector[3] = {sectorDegrees, sectorDegrees, 360.0 - 2.0 * sectorDegrees};
+    double rayDeg[3];
+    rayDeg[0] = 90.0;
+    rayDeg[1] = rayDeg[0] + sector[0];
+    rayDeg[2] = rayDeg[1] + sector[1];
 
     // The rays land on the rim, so put a rim vertex exactly where each one does
     // by building the circle out of three arcs that start at those points.
     const int n = circlePoints(1.0, h);
-    const int per = std::max(6, n / 3);
     std::vector<Point> rim;
     for (int k = 0; k < 3; ++k) {
+        const int per = std::max(6, static_cast<int>(std::round(n * sector[k] / 360.0)));
         for (int i = 0; i < per; ++i) {
-            const double a = (90.0 + 120.0 * (k + static_cast<double>(i) / per)) * M_PI / 180.0;
+            const double a = (rayDeg[k] + sector[k] * static_cast<double>(i) / per) * M_PI / 180.0;
             rim.push_back({std::cos(a), std::sin(a)});
         }
     }
@@ -369,19 +433,355 @@ std::shared_ptr<Mesh> obliqueJunctionDomain(double h) {
         ring.push_back({g.point(rim[i]), g.point(rim[(i + 1) % rim.size()])});
     g.exterior(ring);
 
-    // Three rays at 90, 210 and 330 degrees: every sector is 120 degrees, so no
-    // sector is a multiple of a right angle and no one cross is tangent to all
-    // three interfaces at once.
+    // At 120 degrees: three rays at 90, 210 and 330 degrees, every sector 120
+    // degrees, so no sector is a multiple of a right angle and no one cross is
+    // tangent to all three interfaces at once.
     for (int k = 0; k < 3; ++k) {
-        const double a = (90.0 + 120.0 * k) * M_PI / 180.0;
-        const double s = (90.0 + 120.0 * k + 60.0) * M_PI / 180.0;
+        const double a = rayDeg[k] * M_PI / 180.0;
+        const double s = (rayDeg[k] + 0.5 * sector[k]) * M_PI / 180.0;
         g.region(g.polyline({{0.0, 0.0}, {std::cos(a), std::sin(a)}}, h),
                  {0.5 * std::cos(s), 0.5 * std::sin(s)}, k + 1);
     }
     return build(g);
 }
 
-std::vector<Domain> junctionDomains(double h) {
+// ---------------------------------------------------------------------------
+// The mechanism set
+// ---------------------------------------------------------------------------
+std::shared_ptr<Mesh> combDomain(int teeth, double h) {
+    if (teeth < 1) throw std::runtime_error("combDomain: need at least one tooth");
+    // A 1 x 1 block with `teeth` slots cut down from the top edge, each one
+    // slot wide with a tooth of the same width beside it. Every corner is 90 or
+    // 270 degrees, which is the point.
+    const int n = 2 * teeth + 1;          // teeth and slots alternating
+    const double w = 1.0 / n;             // width of each
+    const double d = 0.55;                // slot depth
+
+    std::vector<Point> ring;
+    ring.push_back({0.0, 0.0});
+    ring.push_back({1.0, 0.0});
+    ring.push_back({1.0, 1.0});
+    // Walk back along the top, cutting a slot over every even-indexed band.
+    for (int i = n - 1; i >= 0; --i) {
+        const double xr = (i + 1) * w, xl = i * w;
+        if (i % 2 == 1) {                 // a slot
+            ring.push_back({xr, 1.0});
+            ring.push_back({xr, 1.0 - d});
+            ring.push_back({xl, 1.0 - d});
+            ring.push_back({xl, 1.0});
+        }
+    }
+    ring.push_back({0.0, 1.0});
+
+    PSLG g;
+    g.in.h = h;
+    g.exterior(g.ring(ring, h));
+    return build(g);
+}
+
+std::shared_ptr<Mesh> starDomain(int points, double tipDegrees, double h) {
+    if (points < 3) throw std::runtime_error("starDomain: need at least three points");
+    const double valley = 360.0 - 360.0 / points - tipDegrees;
+    if (tipDegrees <= 5.0 || valley <= 5.0 || valley >= 355.0)
+        throw std::runtime_error("starDomain: that tip angle leaves no valley");
+
+    // Outer radius 1; the inner radius that gives the requested tip angle. The
+    // tip is at (1,0) and its neighbours at radius r, angle +-pi/points, so
+    // tan(tip/2) = r sin(pi/n) / (1 - r cos(pi/n)).
+    const double a = M_PI / points;
+    const double t = std::tan(0.5 * tipDegrees * M_PI / 180.0);
+    const double r = t / (std::sin(a) + t * std::cos(a));
+    if (!(r > 0.0) || r >= 1.0) throw std::runtime_error("starDomain: no inner radius for that tip angle");
+
+    std::vector<Point> ring;
+    for (int i = 0; i < points; ++i) {
+        const double th = 2.0 * a * i;
+        ring.push_back({std::cos(th), std::sin(th)});
+        ring.push_back({r * std::cos(th + a), r * std::sin(th + a)});
+    }
+
+    PSLG g;
+    g.in.h = h;
+    g.exterior(g.ring(ring, h));
+    // A sharp tip is sharper than the quality bound can honour; Triangle
+    // responds by not terminating rather than by failing.
+    return build(g, tipDegrees < 60.0 ? 20.0 : 25.0);
+}
+
+std::shared_ptr<Mesh> laminateDomain(int layers, double tiltDegrees, double h) {
+    if (layers < 2) throw std::runtime_error("laminateDomain: need at least two layers");
+    if (tiltDegrees < 20.0 || tiltDegrees > 90.0)
+        throw std::runtime_error("laminateDomain: tilt outside 20..90 degrees");
+
+    // The domain is the *unit square*, so every corner of dS is a right angle
+    // and the corner rounding a vertex field does is exact there. The only
+    // oblique thing in the domain is where an interface lands on dS, which is
+    // what isolates the junction mechanism from the boundary one: a laminate at
+    // 90 degrees is a control in both, and tilting only moves the junctions.
+    const double tilt = tiltDegrees * M_PI / 180.0;
+    const bool vertical = std::fabs(tiltDegrees - 90.0) < 1e-9;
+    const double slope = vertical ? 0.0 : std::tan(tilt);   // dy/dx
+
+    // Interface k leaves the bottom edge at x = k/layers and runs up-right at
+    // `tilt`, until it leaves the square through the top or the right side.
+    auto foot = [&](int k) { return static_cast<double>(k) / layers; };
+    auto exitPoint = [&](double x0) {
+        if (vertical) return Point{x0, 1.0};
+        const double xTop = x0 + 1.0 / slope;
+        if (xTop <= 1.0) return Point{xTop, 1.0};
+        return Point{1.0, (1.0 - x0) * slope};
+    };
+
+    // The square's own corners, plus every interface foot, so that a foot is a
+    // vertex of the boundary rather than a point the mesher may or may not put
+    // one at, and plus every exit point for the same reason.
+    std::vector<Point> ring;
+    ring.push_back({0.0, 0.0});
+    for (int k = 1; k < layers; ++k) ring.push_back({foot(k), 0.0});
+    ring.push_back({1.0, 0.0});
+    {   // up the right side, through any exits on it, bottom to top
+        std::vector<double> ys;
+        for (int k = 1; k < layers; ++k) {
+            const Point e = exitPoint(foot(k));
+            if (std::fabs(e[0] - 1.0) < 1e-12) ys.push_back(e[1]);
+        }
+        std::sort(ys.begin(), ys.end());
+        for (double y : ys) ring.push_back({1.0, y});
+    }
+    ring.push_back({1.0, 1.0});
+    {   // back along the top, through any exits on it, right to left
+        std::vector<double> xs;
+        for (int k = 1; k < layers; ++k) {
+            const Point e = exitPoint(foot(k));
+            if (std::fabs(e[1] - 1.0) < 1e-12) xs.push_back(e[0]);
+        }
+        std::sort(xs.begin(), xs.end(), std::greater<double>());
+        for (double x : xs) ring.push_back({x, 1.0});
+    }
+    ring.push_back({0.0, 1.0});
+
+    PSLG g;
+    g.in.h = h;
+    g.exterior(g.ring(ring, h));
+
+    // `layers` bands need `layers` region loops but there are only layers - 1
+    // interfaces, so the first interface is split in two and its halves carry
+    // two of them. Which segments a region loop is listed with carries no
+    // meaning: Triangle floods the id from the seed until it meets any segment.
+    auto bandSeed = [&](int k) {   // band k lies right of interface k
+        const double xl = (k == 0) ? 0.0 : foot(k);
+        const double xr = (k + 1 <= layers - 1) ? foot(k + 1) : 1.0;
+        return Point{0.5 * (xl + xr), 0.02};
+    };
+    {
+        const Point a{foot(1), 0.0}, b = exitPoint(foot(1));
+        const Point mid{0.5 * (a[0] + b[0]), 0.5 * (a[1] + b[1])};
+        g.region(g.polyline({a, mid}, h), bandSeed(0), 1);
+        g.region(g.polyline({mid, b}, h), bandSeed(1), 2);
+    }
+    for (int k = 2; k < layers; ++k)
+        g.region(g.polyline({{foot(k), 0.0}, exitPoint(foot(k))}, h), bandSeed(k), k + 1);
+    return build(g);
+}
+
+namespace {
+
+// The circumcenter of three points, or false if they are collinear.
+bool circumcenterOf3(const Point &a, const Point &b, const Point &c, Point &out) {
+    const double bx = b[0] - a[0], by = b[1] - a[1];
+    const double cx = c[0] - a[0], cy = c[1] - a[1];
+    const double den = 2.0 * (bx * cy - by * cx);
+    if (std::fabs(den) < 1e-14) return false;
+    const double b2 = bx * bx + by * by, c2 = cx * cx + cy * cy;
+    out[0] = a[0] + (cy * b2 - by * c2) / den;
+    out[1] = a[1] + (bx * c2 - cx * b2) / den;
+    return true;
+}
+
+} // namespace
+
+std::shared_ptr<Mesh> polycrystalDomain(int grains, unsigned seed, double h) {
+    if (grains < 3) throw std::runtime_error("polycrystalDomain: need at least three grains");
+
+    // --- the seeds ---------------------------------------------------------
+    // A jittered hexagonal packing inside a disk, so the cells come out of
+    // comparable size, plus a ring of ghost seeds outside it. The ghosts are
+    // what make every *real* cell bounded, which is what lets the aggregate be
+    // built without clipping anything: the domain is the union of the real
+    // cells, and its boundary is the walls that only one real cell owns.
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<double> jit(-0.28, 0.28);
+
+    std::vector<Point> site;
+    const double R = 1.0;
+    const int rings = std::max(1, static_cast<int>(std::ceil((std::sqrt(1.0 + 4.0 * (grains - 1) / 3.0) - 1.0) / 2.0)));
+    const double step = R / (rings + 0.5);
+    site.push_back({0.0, 0.0});
+    for (int i = 1; i <= rings && static_cast<int>(site.size()) < grains; ++i) {
+        const int m = 6 * i;
+        for (int k = 0; k < m && static_cast<int>(site.size()) < grains; ++k) {
+            const double th = 2.0 * M_PI * k / m;
+            site.push_back({i * step * std::cos(th), i * step * std::sin(th)});
+        }
+    }
+    for (Point &p : site) { p[0] += jit(rng) * step; p[1] += jit(rng) * step; }
+    const int nReal = static_cast<int>(site.size());
+
+    const int nGhost = std::max(12, 3 * nReal / 2);
+    const double rg = R + 2.0 * step;
+    for (int k = 0; k < nGhost; ++k) {
+        const double th = 2.0 * M_PI * k / nGhost;
+        site.push_back({rg * std::cos(th), rg * std::sin(th)});
+    }
+    const int nAll = static_cast<int>(site.size());
+
+    // --- Delaunay of the seeds, by the empty-circumcircle test --------------
+    // O(n^4) and entirely adequate at this size; what matters is that every
+    // Voronoi vertex is computed exactly once, from its triangle, so the three
+    // cells that meet there are given the identical coordinate rather than
+    // three roundings of it.
+    struct Tri { int a, b, c; Point cc; };
+    std::vector<Tri> tri;
+    for (int i = 0; i < nAll; ++i)
+        for (int j = i + 1; j < nAll; ++j)
+            for (int k = j + 1; k < nAll; ++k) {
+                Point cc{};
+                if (!circumcenterOf3(site[i], site[j], site[k], cc)) continue;
+                const double r2 = (site[i][0] - cc[0]) * (site[i][0] - cc[0])
+                                + (site[i][1] - cc[1]) * (site[i][1] - cc[1]);
+                bool empty = true;
+                for (int m = 0; m < nAll && empty; ++m) {
+                    if (m == i || m == j || m == k) continue;
+                    const double d2 = (site[m][0] - cc[0]) * (site[m][0] - cc[0])
+                                    + (site[m][1] - cc[1]) * (site[m][1] - cc[1]);
+                    if (d2 < r2 * (1.0 - 1e-12)) empty = false;
+                }
+                if (empty) tri.push_back({i, j, k, cc});
+            }
+    if (tri.empty()) throw std::runtime_error("polycrystalDomain: no Delaunay triangles");
+
+    // --- the cells: the circumcenters around each real seed, in order -------
+    std::vector<std::vector<int>> incident(nAll);
+    for (std::size_t t = 0; t < tri.size(); ++t) {
+        incident[tri[t].a].push_back(static_cast<int>(t));
+        incident[tri[t].b].push_back(static_cast<int>(t));
+        incident[tri[t].c].push_back(static_cast<int>(t));
+    }
+
+    std::vector<std::vector<int>> cell(nReal);     // ring of triangle indices
+    for (int s = 0; s < nReal; ++s) {
+        std::vector<int> ts = incident[s];
+        if (ts.size() < 3) throw std::runtime_error("polycrystalDomain: an unbounded cell");
+        std::sort(ts.begin(), ts.end(), [&](int x, int y) {
+            return std::atan2(tri[x].cc[1] - site[s][1], tri[x].cc[0] - site[s][0])
+                 < std::atan2(tri[y].cc[1] - site[s][1], tri[y].cc[0] - site[s][0]);
+        });
+        cell[s] = ts;
+    }
+
+    // --- the walls, each owned once, and the ones only one cell owns --------
+    std::map<std::pair<int, int>, std::vector<int>> wallOwners;   // (tri,tri) -> cells
+    for (int s = 0; s < nReal; ++s) {
+        const std::vector<int> &ts = cell[s];
+        for (std::size_t i = 0; i < ts.size(); ++i) {
+            const int u = ts[i], v = ts[(i + 1) % ts.size()];
+            wallOwners[{std::min(u, v), std::max(u, v)}].push_back(s);
+        }
+    }
+
+    std::vector<std::pair<int, int>> interior, boundary;
+    for (const auto &[w, owners] : wallOwners) {
+        if (owners.size() >= 2) interior.push_back(w);
+        else                    boundary.push_back(w);
+    }
+    if (boundary.size() < 3) throw std::runtime_error("polycrystalDomain: no outer boundary");
+
+    // Chain the boundary walls into one loop.
+    std::map<int, std::vector<int>> at;
+    for (const auto &[u, v] : boundary) { at[u].push_back(v); at[v].push_back(u); }
+    for (const auto &[v, nb] : at)
+        if (nb.size() != 2) throw std::runtime_error("polycrystalDomain: the outer boundary is not a simple loop");
+
+    std::vector<int> loop;
+    {
+        int prev = -1, cur = boundary.front().first;
+        for (std::size_t guard = 0; guard <= boundary.size(); ++guard) {
+            loop.push_back(cur);
+            const std::vector<int> &nb = at[cur];
+            const int nxt = (nb[0] == prev) ? nb[1] : nb[0];
+            prev = cur;
+            cur = nxt;
+            if (cur == loop.front()) break;
+        }
+    }
+    if (loop.size() != boundary.size())
+        throw std::runtime_error("polycrystalDomain: the outer boundary is not one loop");
+
+    // --- the PSLG ----------------------------------------------------------
+    PSLG g;
+    g.in.h = h;
+
+    std::vector<std::array<int, 2>> ring;
+    for (std::size_t i = 0; i < loop.size(); ++i) {
+        const auto side = g.segmentsAlong(tri[loop[i]].cc, tri[loop[(i + 1) % loop.size()]].cc, h);
+        ring.insert(ring.end(), side.begin(), side.end());
+    }
+    g.exterior(ring);
+
+    // Every interior wall once, distributed round-robin over the grains so that
+    // each region loop has segments of its own to be listed with; which wall
+    // goes to which grain carries no meaning, since Triangle floods a region id
+    // from its seed until it meets any segment at all.
+    std::vector<std::vector<std::array<int, 2>>> perGrain(nReal);
+    for (std::size_t i = 0; i < interior.size(); ++i) {
+        const auto segs = g.segmentsAlong(tri[interior[i].first].cc, tri[interior[i].second].cc, h);
+        auto &dst = perGrain[i % nReal];
+        dst.insert(dst.end(), segs.begin(), segs.end());
+    }
+    for (int s = 0; s < nReal; ++s) {
+        if (perGrain[s].size() < 3)
+            throw std::runtime_error("polycrystalDomain: too few walls to give every grain a loop");
+        g.region(perGrain[s], site[s], s + 1);
+    }
+    return build(g);
+}
+
+std::vector<Domain> mechanismDomains(double h) {
+    std::vector<Domain> d;
+    auto add = [&](const std::string &name, std::shared_ptr<Mesh> m, const std::string &note) {
+        Domain dom;
+        dom.name = name;
+        dom.mesh = std::move(m);
+        dom.note = note;
+        d.push_back(std::move(dom));
+    };
+
+    // The control first, so a reader meets the null case before the effect.
+    add("comb", combDomain(4, h), "control: every interior angle 90 or 270 degrees");
+
+    // The star family sweeps the tip angle. 90 degrees still has odd valleys,
+    // so it is not a control; the comb is.
+    for (double t : {90.0, 70.0, 55.0, 45.0})
+        add("star5t" + std::to_string(static_cast<int>(t)), starDomain(5, t, h),
+            "5 points, tip " + std::to_string(static_cast<int>(t)) + " deg, valley "
+            + std::to_string(static_cast<int>(360.0 - 72.0 - t)) + " deg");
+
+    // The laminate family sweeps the angle the interfaces meet dS at.
+    for (double a : {90.0, 75.0, 60.0, 45.0})
+        add("laminate" + std::to_string(static_cast<int>(a)), laminateDomain(5, a, h),
+            "5 layers, interfaces at " + std::to_string(static_cast<int>(a))
+            + " deg to dS, junction obliquity "
+            + std::to_string(static_cast<int>(90.0 - a)) + " deg"
+            + (a == 90.0 ? " (control)" : ""));
+
+    // The application case.
+    for (int n : {7, 19})
+        add("grain" + std::to_string(n), polycrystalDomain(n, 12345u, h),
+            std::to_string(n) + "-grain Voronoi polycrystal, generically oblique triple junctions");
+    return d;
+}
+
+std::vector<Domain> junctionDomains(double h, double obliqueSectorDegrees) {
     std::vector<Domain> d;
     auto add = [&](const std::string &name, std::shared_ptr<Mesh> m, const std::string &note) {
         Domain dom;
@@ -394,7 +794,15 @@ std::vector<Domain> junctionDomains(double h) {
     add("quadruple", quadruplePointDomain(h),    "4 materials meeting at one vertex");
     add("thinlayer", thinLayerDomain(h),         "a band four elements thick across a block");
     add("inclusion", embeddedInclusionDomain(h), "one circular inclusion in a matrix");
-    add("oblique",   obliqueJunctionDomain(h),   "3 materials at 120 degrees: no sector is a right angle");
+    {
+        const double s = obliqueSectorDegrees;
+        std::string note = "3 materials at 120 degrees: no sector is a right angle";
+        if (s != 120.0) {
+            const int a = static_cast<int>(std::lround(s)), b = static_cast<int>(std::lround(360.0 - 2.0 * s));
+            note = "3 materials, sectors " + std::to_string(a) + "/" + std::to_string(a) + "/" + std::to_string(b) + " degrees";
+        }
+        add("oblique", obliqueJunctionDomain(h, s), note);
+    }
     return d;
 }
 

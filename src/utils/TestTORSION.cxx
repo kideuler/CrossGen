@@ -747,6 +747,14 @@ void usage(const char *prog) {
               << "Stages 5 to 10 (MERIDIAN's, unchanged)\n"
               << "  --gamma <g>        edge penalty                          (default 10)\n"
               << "  --steps <n>        dual-mesh MBO steps                        (default 500)\n"
+              << "  --weight <w>       p=0 penalty weight: min | harm | orth   (default orth)\n"
+              << "                       At p=0 the weight is the discrete Laplacian itself,\n"
+              << "                       not a stabilisation parameter; orth is the two-point\n"
+              << "                       (finite-volume) weight and the consistent one\n"
+              << "  --no-continuation  one tau = D^2/10 instead of the annealed ladder\n"
+              << "  --tau-ratio <r>    ratio between continuation levels      (default 0.25)\n"
+              << "  --tau-floor <c>    stop once the diffusion length reaches c mean edges\n"
+              << "                                                            (default 20)\n"
               << "  --cut-to-graph     let a cone arc stop on an earlier arc\n"
               << "  --no-interfaces    ignore the material tags\n"
               << "  --no-field-interfaces  do not align the field to the interfaces\n"
@@ -842,6 +850,16 @@ int main(int argc, char **argv) {
         }
         else if (a == "--gamma" && i + 1 < argc)        opts.dualMBOGamma = std::stod(argv[++i]);
         else if (a == "--steps" && i + 1 < argc)        opts.dualMBOMaxSteps = std::stoi(argv[++i]);
+        else if (a == "--weight" && i + 1 < argc) {
+            const std::string w = argv[++i];
+            if      (w == "min")  opts.dualMBOWeight = DualMBO::PenaltyWeight::MinHeight;
+            else if (w == "harm") opts.dualMBOWeight = DualMBO::PenaltyWeight::HarmonicHeight;
+            else if (w == "orth") opts.dualMBOWeight = DualMBO::PenaltyWeight::Orthogonal;
+            else { std::cerr << "Unknown --weight '" << w << "' (expected min|harm|orth)\n"; return 1; }
+        }
+        else if (a == "--no-continuation")              opts.dualMBOTauContinuation = false;
+        else if (a == "--tau-ratio" && i + 1 < argc)     opts.dualMBOTauRatio = std::stod(argv[++i]);
+        else if (a == "--tau-floor" && i + 1 < argc)     opts.dualMBOTauFloorEdges = std::stod(argv[++i]);
         else if (a == "--cut-to-graph")                 opts.coneCutsToBoundary = false;
         else if (a == "--no-interfaces")                opts.materialInterfaces = false;
         else if (a == "--no-field-interfaces")          opts.alignFieldToInterfaces = false;

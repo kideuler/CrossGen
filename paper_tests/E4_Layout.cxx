@@ -82,10 +82,12 @@ int main(int argc, char **argv) {
     // "orth" is the two-point/finite-volume weight; see DualMBO::PenaltyWeight.
     std::string weight = "min";
     int limit = 0;
+    std::vector<std::pair<std::string, double>> layoutOverrides;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--out" && i + 1 < argc) outDir = argv[++i];
+        else if (a == "--layout-opt" && i + 1 < argc) layoutOverrides.push_back(parseLayoutOverride(argv[++i]));
         else if (a == "--set" && i + 1 < argc) sub = argv[++i];
         else if (a == "--methods" && i + 1 < argc) methods = split(argv[++i], ',');
         else if (a == "--target" && i + 1 < argc) target = std::stod(argv[++i]);
@@ -98,7 +100,8 @@ int main(int argc, char **argv) {
             std::cout << "Usage: " << argv[0]
                       << " [--out DIR] [--set singlemat|multimat] [--methods DualMBO,B1,B2]\n"
                          "       [--target EDGE] [--obj DIR] [--limit N] [--disk-templates]\n"
-                         "       [--b1-continuation] [--weight min|harm|orth] [model ...]\n";
+                         "       [--b1-continuation] [--weight min|harm|orth]\n"
+                         "       [--layout-opt NAME=VALUE ...] [model ...]\n";
             return 0;
         } else only.push_back(a);
     }
@@ -116,7 +119,7 @@ int main(int argc, char **argv) {
     }
     std::cout << models.size() << " model(s), methods:";
     for (const std::string &m : methods) std::cout << " " << m;
-    std::cout << "; target edge " << target << "\n"
+    std::cout << "; target edge " << target << "; DualMBO penalty weight " << weight << "\n"
               << "The MBO runs at the tolerance the pipeline ships with (1e-5), because what\n"
               << "is being measured here is the pipeline.\n";
 
@@ -126,6 +129,8 @@ int main(int argc, char **argv) {
              "frames_valid", "immersion_valid", "layout_valid", "arrangement_valid",
              "splines_valid", "mesh_valid", "mesh_conforming",
              "interior_cones", "boundary_cones", "integration_flipped_faces",
+             "integration_fit_residual_max", "integration_fit_residual_mean",
+             "max_frame_jump_rad",
              "separatrices", "separatrices_unresolved",
              "patches", "coverage", "unmeshed_patches",
              "mesh_vertices", "mesh_quads",
@@ -146,7 +151,7 @@ int main(int argc, char **argv) {
         std::cout << "\n" << mm.name << "  (" << mesh->vertices.size() << " v, "
                   << mesh->triangles.size() << " t)" << std::flush;
         Table t({"method", "reached", "valid", "patches", "quads", "irr int", "irr bnd",
-                 "min SJ", "mean SJ", "inv", "min zone", "1% zone", "s"});
+                 "min SJ", "mean SJ", "inv", "min zone", "1% zone", "fit res", "s"});
 
         for (const std::string &name : methods) {
             MethodOptions fo;   // the shipped tolerance: this measures the pipeline
@@ -172,6 +177,7 @@ int main(int argc, char **argv) {
             LayoutOptions lo;
             lo.quadTargetEdge = target;
             lo.diskTemplates = diskTemplates;
+            lo.overrides = layoutOverrides;
             o.layout = runLayout(mesh, run.u, lo, !objDir.empty());
             outcomes.push_back(o);
 
@@ -181,7 +187,17 @@ int main(int argc, char **argv) {
                    num(Q.quads), num(Q.irregularInterior), num(Q.irregularBoundary),
                    num(Q.minScaledJacobian, 4), num(Q.meanScaledJacobian, 4),
                    num(Q.invertedQuads), num(Q.minZoneDimension, 4),
-                   num(Q.p01ZoneDimension, 4), num(L.seconds, 2)});
+                   num(Q.p01ZoneDimension, 4), num(L.integrationFitResidualMax, 3),
+                   num(L.seconds, 2)});
+
+            // A layout that did not validate says why in the pipeline's own
+            // words, so that a failure in the log can be attributed to a stage
+            // rather than wondered at.
+            if (!L.valid) {
+                if (!L.error.empty()) std::cout << "\n    " << name << " error: " << L.error;
+                for (const std::string &msg : L.messages) std::cout << "\n    " << name << ": " << msg;
+                std::cout << "\n";
+            }
 
             csv.row({{"model", mm.name}, {"method", name},
                      {"vertices", num((int)mesh->vertices.size())},
@@ -198,6 +214,9 @@ int main(int argc, char **argv) {
                      {"interior_cones", num(L.interiorCones)},
                      {"boundary_cones", num(L.boundaryCones)},
                      {"integration_flipped_faces", num(L.integrationFlippedFaces)},
+                     {"integration_fit_residual_max", num(L.integrationFitResidualMax, 6)},
+                     {"integration_fit_residual_mean", num(L.integrationFitResidualMean, 6)},
+                     {"max_frame_jump_rad", num(L.maxFrameJump, 6)},
                      {"separatrices", num(L.separatrices)},
                      {"separatrices_unresolved", num(L.separatricesUnresolved)},
                      {"patches", num(L.patches)}, {"coverage", num(L.coverage, 6)},
@@ -404,6 +423,30 @@ int main(int argc, char **argv) {
                 t.row({me.name, num(win), num(tie), num(loss)});
             }
             t.print();
+
+            // The field's integrability, as Stage 4 measured it. This is not an
+            // element metric and is scored apart from them: it is the property
+            // of the *field* that the layout stage consumes, and the paired
+            // count says on how many models each field integrated more exactly.
+            {
+                int win = 0, tie = 0, loss = 0;
+                double sumA = 0.0, sumB = 0.0;
+                for (const auto &[model, oa] : a) {
+                    auto it = b.find(model);
+                    if (it == b.end()) continue;
+                    const Outcome *ob = it->second;
+                    if (!oa->layout.ran || !ob->layout.ran) continue;
+                    const double xa = oa->layout.integrationFitResidualMax;
+                    const double xb = ob->layout.integrationFitResidualMax;
+                    sumA += xa; sumB += xb;
+                    if (std::fabs(xa - xb) <= 0.01 * std::max(xa, xb)) { ++tie; continue; }
+                    if (xa < xb) ++win; else ++loss;
+                }
+                std::cout << "\n  Integration fit residual (Stage 4, max over edges; lower is a more"
+                          << " integrable field): " << A << " better on " << win << ", tie " << tie
+                          << ", " << B << " better on " << loss << "; summed over the corpus "
+                          << A << " " << num(sumA, 4) << ", " << B << " " << num(sumB, 4) << ".\n";
+            }
 
             // Patch count is not a quality metric in either direction -- fewer
             // patches is a simpler layout and more patches can be the layout the

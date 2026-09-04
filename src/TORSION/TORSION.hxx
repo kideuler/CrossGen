@@ -25,6 +25,9 @@
 #include "TORSION/FieldFrames.hxx"
 #include "TORSION/FieldIntegration.hxx"
 #include "TORSION/TutteEmbedding.hxx"
+// The full definition, not a forward declaration: Options names
+// DualMBO::PenaltyWeight, which is a nested type and cannot be forward declared.
+#include "dualmbo/DualMBO.hxx"
 #include "mesh/Mesh.hxx"
 
 class DualMBO;
@@ -190,6 +193,35 @@ public:
         // --- Stage 0 and 0b, identical to MERIDIAN's -----------------------
         double dualMBOGamma = 10.0;
         int dualMBOMaxSteps = 500;
+
+        // How the p=0 edge penalty combines the two elements on an edge. At
+        // this order the weight is not a stabilisation parameter, it *is* the
+        // discrete Laplacian, so this is the discretisation and not a knob --
+        // see DualMBO::PenaltyWeight. Orthogonal is the two-point
+        // (finite-volume) weight, the one that is consistent on an affine
+        // field, and is what Stage 0 runs.
+        DualMBO::PenaltyWeight dualMBOWeight = DualMBO::PenaltyWeight::Orthogonal;
+
+        // Anneal tau down a geometric ladder rather than taking the single
+        // tau = D^2/10 the heuristic gives.
+        //
+        // At the heuristic's tau one MBO step smooths over several domain
+        // diameters: tau*K swamps M, the iteration reaches its fixed point in a
+        // single solve, and what Stage 0 returns is a harmonic extension
+        // followed by one normalisation with the threshold dynamics never
+        // running. Annealing tau down, restarting each level from the previous
+        // level's field with the pins re-imposed, is the MBO analogue of
+        // Ginzburg-Landau's epsilon-continuation and is part of the scheme
+        // rather than an optimisation of it.
+        //
+        // The floor is where one step stops resolving anything the mesh can
+        // carry: ell = h sqrt(tau lambda) <= tauFloorEdges * h, with lambda the
+        // operator's own median K_ii/M_ii (DualMBO::medianDiffusionRate), so
+        // the floor means the same thing whichever weight is assembled.
+        bool dualMBOTauContinuation = true;
+        double dualMBOTauRatio = 0.25;
+        double dualMBOTauFloorEdges = 20.0;
+        int dualMBOTauLevelSteps = 2000;
 
         // Stage 0 override: one unit spin-4 value per triangle of the mesh the
         // layout is computed on, used instead of running the MBO solve.
@@ -442,6 +474,13 @@ public:
         // --- Stage 0 / 0b / 1 / 2, as MERIDIAN reports them ----------------
         int mboSteps = 0;
         bool fieldConverged = false;
+        // Whether Options::externalField was actually used. It is refused when
+        // its length does not match the triangle count, which happens whenever
+        // Stage 0c excises circular inclusions before Stage 0 -- so a run with
+        // `diskTemplates` on and a disk in the domain solves its own field and
+        // is *not* a comparison of the caller's. An experiment that swaps
+        // fields has to read this rather than assume.
+        bool externalFieldUsed = false;
         bool fieldAlignedToInterfaces = false;
         int coneDipoleUnits = 0;
 

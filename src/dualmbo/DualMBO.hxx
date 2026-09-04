@@ -234,6 +234,15 @@ public:
         return boundaryTriangleBC;
     }
 
+    // The assembled operator, read-only, for the consistency experiment
+    // (paper_tests/E1_Verification, part (e)): K is the edge-penalty stiffness
+    // with the Dirichlet diagonal terms in it, M the mass with the pinned rows
+    // replaced by identity rows. Neither touches the row of a triangle whose
+    // three edges are all interior, which is the only kind that test reads.
+    // Valid after initialize().
+    const Eigen::SparseMatrix<std::complex<double>>& stiffnessMatrix() const { return K; }
+    const Eigen::SparseMatrix<std::complex<double>>& massMatrix() const { return M; }
+
     void step();
 
     void computeSingularities();

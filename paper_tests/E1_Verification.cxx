@@ -29,18 +29,35 @@
 //                        heat content of Esedoglu and Otto, not the Dirichlet
 //                        energy -- so a small rise here is a fact about how
 //                        Prop. 2 has to be stated, not a bug.
+//   (e) consistency      at p = 0 the edge weight kappa_e *is* the discrete
+//                        Laplacian, and a second-order operator has to
+//                        annihilate affine fields. An affine phi is sampled at
+//                        the circumcenters of every mesh in the corpus and
+//                        M^-1 K phi is read on the triangles whose three edges
+//                        are interior, for each of the three weights DualMBO
+//                        can assemble. The two-point (circumcentric dual)
+//                        weight gives rounding by Prop. 4; the interior-penalty
+//                        weight does not, and this part measures by how much.
+//                        It also counts the degenerate edges -- cocircular
+//                        pairs, where the dual edge has no length -- that the
+//                        floor kMinDualDistance exists for.
 //
 // The comparison energies are measured with the *same* functional -- the
 // face-based one of Sec. 5 at the fixed evaluation weight gamma_eval = 10 --
 // whatever gamma the solver ran at. Comparing a solve at gamma = 100 against
 // its own energy would compare two different functionals and would say nothing.
+//
+// `--weight min|harm|orth` selects the penalty weight parts (a) to (d) run
+// with; (e) always measures all three.
 
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <map>
 #include <string>
 #include <vector>
 
+#include "common/Corpus.hxx"
 #include "common/Domains.hxx"
 #include "common/Methods.hxx"
 #include "common/Metrics.hxx"
@@ -89,6 +106,160 @@ std::vector<double> refinementSizes(int levels) {
     return h;
 }
 
+// The circumcenter, exactly as DualMBO::initialize computes it.
+Point circumcenterOf(const Point &pa, const Point &pb, const Point &pc) {
+    const double bx = pb[0] - pa[0], by = pb[1] - pa[1];
+    const double cx = pc[0] - pa[0], cy = pc[1] - pa[1];
+    const double den = 2.0 * (bx * cy - by * cx);
+    const double b2 = bx * bx + by * by, c2 = cx * cx + cy * cy;
+    Point cc = pa;
+    if (std::fabs(den) > 1e-300) {
+        cc[0] = pa[0] + (cy * b2 - by * c2) / den;
+        cc[1] = pa[1] + (bx * c2 - cx * b2) / den;
+    }
+    return cc;
+}
+
+// Everything about a mesh's circumcentric dual that the consistency test and
+// the grading sweep both need: where the cell centres are, how long each dual
+// edge is against the element size, which dual edges the floor clamps, how
+// unequal the two elements on an edge are, and which triangles have three
+// interior edges and so can be read without a boundary row in the way.
+struct DualStats {
+    std::vector<Point> circ, cent;
+    std::vector<double> area;
+    std::vector<char> clampedEdge;   // per edge
+    std::vector<int> tested;         // triangles with three interior edges
+    std::vector<char> clamped;       // parallel to `tested`
+    std::vector<double> dualRatios;  // d_e / d_ref, per interior edge
+    int interiorEdges = 0, nonDelaunay = 0, belowFloor = 0, clampedTriangles = 0;
+    double maxAreaRatio = 1.0, medianDualRatio = 0.0, hMean = 1.0;
+};
+
+DualStats dualStats(const Mesh &m) {
+    DualStats d;
+    const int NT = static_cast<int>(m.triangles.size());
+    d.circ.resize(NT);
+    d.cent.resize(NT);
+    d.area.resize(NT);
+    for (int t = 0; t < NT; ++t) {
+        const Triangle &tri = m.triangles[t];
+        const Point &pa = m.vertices[tri[0]];
+        const Point &pb = m.vertices[tri[1]];
+        const Point &pc = m.vertices[tri[2]];
+        d.circ[t] = circumcenterOf(pa, pb, pc);
+        d.cent[t][0] = (pa[0] + pb[0] + pc[0]) / 3.0;
+        d.cent[t][1] = (pa[1] + pb[1] + pc[1]) / 3.0;
+        d.area[t] = 0.5 * std::fabs((pb[0] - pa[0]) * (pc[1] - pa[1])
+                                  - (pc[0] - pa[0]) * (pb[1] - pa[1]));
+    }
+
+    d.clampedEdge.assign(m.edges.size(), 0);
+    double hSum = 0.0;
+    for (std::size_t e = 0; e < m.edges.size(); ++e) {
+        const Point &ea = m.vertices[m.edges[e][0]];
+        const Point &eb = m.vertices[m.edges[e][1]];
+        const double len = std::hypot(eb[0] - ea[0], eb[1] - ea[1]);
+        hSum += len;
+        if (m.isBoundaryEdge[e] || len < 1e-14) continue;
+        const int ti = m.edgeTriangles[e][0], tj = m.edgeTriangles[e][1];
+        if (ti < 0 || tj < 0) continue;
+        ++d.interiorEdges;
+        const double hi = 2.0 * d.area[ti] / len, hj = 2.0 * d.area[tj] / len;
+        double nx = -(eb[1] - ea[1]) / len, ny = (eb[0] - ea[0]) / len;
+        if ((d.cent[tj][0] - d.cent[ti][0]) * nx + (d.cent[tj][1] - d.cent[ti][1]) * ny < 0.0) {
+            nx = -nx; ny = -ny;
+        }
+        const double de = (d.circ[tj][0] - d.circ[ti][0]) * nx + (d.circ[tj][1] - d.circ[ti][1]) * ny;
+        const double dRef = 0.5 * (hi + hj);
+        if (de < 0.0) ++d.nonDelaunay;
+        if (de < DualMBO::kMinDualDistance * dRef) { ++d.belowFloor; d.clampedEdge[e] = 1; }
+        d.dualRatios.push_back(de / dRef);
+        d.maxAreaRatio = std::max(d.maxAreaRatio,
+                                  std::max(d.area[ti], d.area[tj])
+                                      / std::max(1e-300, std::min(d.area[ti], d.area[tj])));
+    }
+    d.hMean = m.edges.empty() ? 1.0 : hSum / static_cast<double>(m.edges.size());
+    std::vector<double> sorted = d.dualRatios;
+    std::sort(sorted.begin(), sorted.end());
+    d.medianDualRatio = sorted.empty() ? 0.0 : sorted[sorted.size() / 2];
+
+    for (int t = 0; t < NT; ++t) {
+        bool ok = true, cl = false;
+        for (int k = 0; k < 3; ++k) {
+            const int e = m.triangleEdges[t][k];
+            if (e < 0 || m.isBoundaryEdge[e]) { ok = false; break; }
+            if (d.clampedEdge[e]) cl = true;
+        }
+        if (ok) { d.tested.push_back(t); d.clamped.push_back(cl ? 1 : 0); }
+    }
+    for (char c : d.clamped) d.clampedTriangles += c;
+    return d;
+}
+
+// How far the assembled operator is from annihilating an affine field sampled
+// at the cell centres: rho_t = |(M^-1 K phi)_t| * h_mean / gamma, over four
+// directions of the gradient, as an rms and a max over the triangles with three
+// interior edges. Prop. 4 says the two-point weight gives rounding.
+struct Residual { double rms = 0.0, mx = 0.0, rmsAway = 0.0; bool ok = false; };
+
+Residual consistencyResidual(const std::shared_ptr<Mesh> &m, const DualStats &d,
+                             DualMBO::PenaltyWeight w, double gammaEval) {
+    Residual out;
+    const int NT = static_cast<int>(m->triangles.size());
+    // No interface alignment and no disk pin: the operator under test is the
+    // interior coupling alone, and every triangle read below has three interior
+    // edges, so no eliminated row reaches it.
+    DualMBO s(m, 1, gammaEval);
+    s.setPinDiskCenters(false);
+    s.setPenaltyWeight(w);
+    s.initialize();
+    const Eigen::SparseMatrix<std::complex<double>> &K = s.stiffnessMatrix();
+    const Eigen::SparseMatrix<std::complex<double>> &M = s.massMatrix();
+
+    double ss = 0.0, ssAway = 0.0;
+    int cnt = 0, cntAway = 0;
+    for (int k = 0; k < 4; ++k) {
+        const double th = k * M_PI / 4.0;
+        const double ax = std::cos(th), ay = std::sin(th);
+        Eigen::VectorXcd phi(NT);
+        for (int t = 0; t < NT; ++t)
+            phi[t] = std::complex<double>(ax * d.circ[t][0] + ay * d.circ[t][1], 0.0);
+        const Eigen::VectorXcd r = K * phi;
+        for (std::size_t i = 0; i < d.tested.size(); ++i) {
+            const int t = d.tested[i];
+            const double mtt = M.coeff(t, t).real();
+            if (mtt <= 0.0) continue;
+            const double rho = std::abs(r[t]) / mtt * d.hMean / gammaEval;
+            ss += rho * rho;
+            out.mx = std::max(out.mx, rho);
+            ++cnt;
+            if (!d.clamped[i]) { ssAway += rho * rho; ++cntAway; }
+        }
+    }
+    out.rms = cnt ? std::sqrt(ss / cnt) : 0.0;
+    out.rmsAway = cntAway ? std::sqrt(ssAway / cntAway) : 0.0;
+    out.ok = true;
+    return out;
+}
+
+// The disk's answer, known before the run: four +1/4 cones on the diagonals,
+// the rotation fixed by the centre pin. Returns the worst deviation of a cone's
+// angle from 45 + k*90 degrees, and the largest cone radius.
+struct ConeError { double angleDeg = 0.0, radius = 0.0; };
+
+ConeError diskConeError(const Mesh &m, const metrics::SingularityReport &sr) {
+    ConeError e;
+    for (const metrics::Singularity &sg : sr.interior) {
+        const Point d = m.vertices[sg.vertex];
+        double ang = std::atan2(d[1], d[0]) * 180.0 / M_PI;
+        if (ang < 0.0) ang += 360.0;
+        e.angleDeg = std::max(e.angleDeg, std::fabs(std::fmod(ang, 90.0) - 45.0));
+        e.radius = std::max(e.radius, normP(d));
+    }
+    return e;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -101,8 +272,10 @@ int main(int argc, char **argv) {
         if (a == "--out" && i + 1 < argc) outDir = argv[++i];
         else if (a == "--levels" && i + 1 < argc) levels = std::stoi(argv[++i]);
         else if (a == "--h" && i + 1 < argc) h = std::stod(argv[++i]);
+        else if (a == "--weight" && i + 1 < argc) setDefaultPenaltyWeight(parsePenaltyWeight(argv[++i]));
         else if (a == "--help") {
-            std::cout << "Usage: " << argv[0] << " [--out DIR] [--levels N] [--h SIZE]\n";
+            std::cout << "Usage: " << argv[0]
+                      << " [--out DIR] [--levels N] [--h SIZE] [--weight min|harm|orth]\n";
             return 0;
         }
     }
@@ -112,7 +285,9 @@ int main(int argc, char **argv) {
     banner("E1  Verification and parameter study");
     std::cout << "Sweeps run at h = " << h << "; refinement runs " << levels << " levels.\n"
               << "Energies are the face functional of Sec. 5 at the fixed evaluation "
-              << "weight gamma = " << kGammaEval << ".\n";
+              << "weight gamma = " << kGammaEval << ".\n"
+              << "DualMBO penalty weight for (a)-(d): "
+              << penaltyWeightName(defaultPenaltyWeight()) << ".\n";
 
     // -----------------------------------------------------------------------
     // The four sweep domains, at one size.
@@ -281,14 +456,8 @@ int main(int argc, char **argv) {
             // The disk's answer, known before the run: four +1/4 cones on the
             // diagonals. The centre pin is what fixes the rotation -- without it
             // the angles are arbitrary and this column means nothing.
-            double worstAngle = 0.0, worstRadius = 0.0;
-            for (const metrics::Singularity &sg : s.sing.interior) {
-                const Point d = m->vertices[sg.vertex];
-                double ang = std::atan2(d[1], d[0]) * 180.0 / M_PI;
-                if (ang < 0.0) ang += 360.0;
-                worstAngle = std::max(worstAngle, std::fabs(std::fmod(ang, 90.0) - 45.0));
-                worstRadius = std::max(worstRadius, normP(d));
-            }
+            const ConeError ce = diskConeError(*m, s.sing);
+            const double worstAngle = ce.angleDeg, worstRadius = ce.radius;
 
             hs.push_back(hi);
             energies.push_back(s.energy);
@@ -454,6 +623,255 @@ int main(int argc, char **argv) {
             "  column above is the scheme behaving correctly. Prop. 2 should be stated\n"
             "  in the heat content and this table is the evidence for which functional\n"
             "  the statement can be made about.\n";
+    }
+
+    // -----------------------------------------------------------------------
+    // (e) consistency of the p = 0 operator, over the corpus
+    // -----------------------------------------------------------------------
+    heading("E1(e)  Consistency of the edge weight on an affine field");
+    {
+        std::cout <<
+            "  phi(x) = a.x is sampled at the circumcenters, r = M^-1 K phi is read on\n"
+            "  every triangle whose three edges are interior, and rho_t = |r_t| h_mean /\n"
+            "  gamma is reported as an rms and a max over four directions of a. A\n"
+            "  consistent second-order operator gives rounding. d_e is the signed\n"
+            "  distance between the two circumcenters across an edge and d_ref =\n"
+            "  (h_i + h_j)/2; d_e/d_ref = 2/3 on an equilateral pair, d_e = 0 on a\n"
+            "  cocircular one, d_e < 0 on a non-Delaunay one.\n";
+
+        Csv csv(outDir + "/E1_consistency.csv",
+                {"set", "model", "triangles", "interior_edges", "tested_triangles",
+                 "non_delaunay_edges", "edges_below_floor", "clamped_triangles",
+                 "median_dual_ratio", "max_area_ratio", "weight",
+                 "residual_rms", "residual_max", "residual_rms_away_from_floor"});
+
+        const std::vector<DualMBO::PenaltyWeight> weights{
+            DualMBO::PenaltyWeight::MinHeight,
+            DualMBO::PenaltyWeight::HarmonicHeight,
+            DualMBO::PenaltyWeight::Orthogonal};
+
+        for (const std::string set : {"singlemat", "multimat"}) {
+            const std::vector<Model> models = corpus(set);
+            if (models.empty()) {
+                v.warn("E1(e): no models under " + std::string(PAPER_MESH_DIR) + "/" + set);
+                continue;
+            }
+            std::cout << "\n  data/meshes/" << set << "\n";
+            Table t({"model", "triangles", "non-Delaunay", "below floor", "median d_e/d_ref",
+                     "max area ratio", "rms min", "rms harm", "rms orth", "max orth",
+                     "rms orth away from floor"});
+
+            std::map<std::string, double> rmsSum, rmsWorst, rmsAwaySum, rmsAwayWorst;
+            int n = 0, orthAtRounding = 0, interiorEdgesTotal = 0, nonDelaunayTotal = 0,
+                belowFloorTotal = 0, clampedTrianglesTotal = 0;
+            std::vector<double> allRatios;
+
+            for (const Model &mm : models) {
+                std::string why;
+                std::shared_ptr<Mesh> m = load(mm, why);
+                if (!m) { v.warn(mm.name + ": " + why); continue; }
+                const int NT = static_cast<int>(m->triangles.size());
+
+                const DualStats d = dualStats(*m);
+                allRatios.insert(allRatios.end(), d.dualRatios.begin(), d.dualRatios.end());
+
+                std::map<std::string, Residual> res;
+                for (DualMBO::PenaltyWeight w : weights) {
+                    const std::string wn = penaltyWeightName(w);
+                    Residual r;
+                    try {
+                        r = consistencyResidual(m, d, w, kGammaEval);
+                    } catch (const std::exception &ex) {
+                        v.warn(mm.name + "/" + wn + ": " + ex.what());
+                        continue;
+                    }
+                    res[wn] = r;
+                    rmsSum[wn] += r.rms;
+                    rmsWorst[wn] = std::max(rmsWorst[wn], r.rms);
+                    rmsAwaySum[wn] += r.rmsAway;
+                    rmsAwayWorst[wn] = std::max(rmsAwayWorst[wn], r.rmsAway);
+                    csv.row({{"set", set}, {"model", mm.name}, {"triangles", num(NT)},
+                             {"interior_edges", num(d.interiorEdges)},
+                             {"tested_triangles", num((int)d.tested.size())},
+                             {"non_delaunay_edges", num(d.nonDelaunay)},
+                             {"edges_below_floor", num(d.belowFloor)},
+                             {"clamped_triangles", num(d.clampedTriangles)},
+                             {"median_dual_ratio", num(d.medianDualRatio, 6)},
+                             {"max_area_ratio", num(d.maxAreaRatio, 6)},
+                             {"weight", wn}, {"residual_rms", num(r.rms, 6)},
+                             {"residual_max", num(r.mx, 6)},
+                             {"residual_rms_away_from_floor", num(r.rmsAway, 6)}});
+                }
+                if (res.size() != weights.size()) continue;
+                ++n;
+                interiorEdgesTotal += d.interiorEdges;
+                nonDelaunayTotal += d.nonDelaunay;
+                belowFloorTotal += d.belowFloor;
+                clampedTrianglesTotal += d.clampedTriangles;
+                if (res["orth"].rms < 1e-12) ++orthAtRounding;
+                t.row({mm.name, num(NT), num(d.nonDelaunay), num(d.belowFloor),
+                       num(d.medianDualRatio, 4),
+                       num(d.maxAreaRatio, 3), num(res["min"].rms, 3), num(res["harm"].rms, 3),
+                       num(res["orth"].rms, 3), num(res["orth"].mx, 3), num(res["orth"].rmsAway, 3)});
+                // Prop. 4 is a statement about the unclamped operator: assert it
+                // away from the floor, and let the table show what the clamp costs.
+                v.check(res["orth"].rmsAway < 1e-10,
+                        mm.name + ": the two-point weight annihilates the affine field away from "
+                        + num(d.clampedTriangles) + " floor-clamped triangle(s)");
+            }
+            t.print();
+            if (n) {
+                std::sort(allRatios.begin(), allRatios.end());
+                std::cout << "  " << n << " model(s), " << interiorEdgesTotal << " interior edges: "
+                          << nonDelaunayTotal << " non-Delaunay, " << belowFloorTotal
+                          << " below the floor d_e < " << DualMBO::kMinDualDistance
+                          << " d_ref (" << clampedTrianglesTotal
+                          << " triangles touch one); median d_e/d_ref over all edges "
+                          << num(allRatios[allRatios.size() / 2], 4) << "\n";
+                std::cout << "  mean rms residual: min " << num(rmsSum["min"] / n, 3)
+                          << ", harm " << num(rmsSum["harm"] / n, 3)
+                          << ", orth " << num(rmsSum["orth"] / n, 3)
+                          << "; worst rms: min " << num(rmsWorst["min"], 3)
+                          << ", harm " << num(rmsWorst["harm"], 3)
+                          << ", orth " << num(rmsWorst["orth"], 3) << "\n";
+                std::cout << "  away from floor-clamped edges: mean rms min "
+                          << num(rmsAwaySum["min"] / n, 3) << ", harm " << num(rmsAwaySum["harm"] / n, 3)
+                          << ", orth " << num(rmsAwaySum["orth"] / n, 3)
+                          << "; worst orth " << num(rmsAwayWorst["orth"], 3) << "\n";
+                std::cout << "  models with the two-point residual below 1e-12 on every tested "
+                          << "triangle: " << orthAtRounding << "/" << n << "\n";
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // (f) does the inconsistency matter? -- the graded-mesh sweep
+    // -----------------------------------------------------------------------
+    heading("E1(f)  Graded meshes: what the inconsistency costs the field");
+    {
+        std::cout <<
+            "  The corpus is near-uniform, so (e)'s O(1) residual can be a defect that is\n"
+            "  provable and invisible. This grades the disk -- concentric rings whose radial\n"
+            "  spacing grows by `growth` per ring, constrained Delaunay, no Steiner points --\n"
+            "  and reads two things at each grading: the operator's residual on an affine\n"
+            "  field, and where the four cones actually land. The disk is the domain whose\n"
+            "  answer is known in closed form (four +1/4 cones at 45 + k*90 degrees from the\n"
+            "  centre, fixed by the centre pin), so the cone column is *error*, not a proxy.\n";
+
+        Csv csv(outDir + "/E1_graded.csv",
+                {"growth", "vertices", "triangles", "max_area_ratio", "median_dual_ratio",
+                 "non_delaunay_edges", "edges_below_floor", "weight",
+                 "residual_rms", "residual_max", "residual_rms_away_from_floor",
+                 "singularities", "index4_sum", "ph_residual",
+                 "max_cone_angle_error_deg", "max_cone_radius_frac",
+                 "energy_twopoint", "energy_minheight", "iterations"});
+
+        const std::vector<double> growths{1.0, 1.05, 1.10, 1.15, 1.20};
+        const std::vector<DualMBO::PenaltyWeight> weights{
+            DualMBO::PenaltyWeight::MinHeight,
+            DualMBO::PenaltyWeight::Orthogonal};
+
+        Table t({"growth", "triangles", "max area ratio", "median d_e/d_ref", "clamped edges",
+                 "weight", "residual rms", "rms away from floor", "#sing", "sum 4I", "PH",
+                 "max cone angle err (deg)", "max r/R", "E (two-point)"});
+        std::map<std::string, std::vector<double>> coneErr;
+
+        for (double g : growths) {
+            std::shared_ptr<Mesh> m;
+            try {
+                m = gradedDiskDomain(1.0, 50, g);
+            } catch (const std::exception &ex) {
+                v.warn("graded disk growth=" + num(g, 3) + ": " + ex.what());
+                continue;
+            }
+            const DualStats d = dualStats(*m);
+            const metrics::EdgeWeights wTP = metrics::edgeWeightsTwoPoint(*m, kGammaEval);
+            const metrics::EdgeWeights wMin = metrics::edgeWeights(*m, kGammaEval);
+
+            for (DualMBO::PenaltyWeight w : weights) {
+                const std::string wn = penaltyWeightName(w);
+                Residual r;
+                try {
+                    r = consistencyResidual(m, d, w, kGammaEval);
+                } catch (const std::exception &ex) {
+                    v.warn("graded disk growth=" + num(g, 3) + "/" + wn + ": " + ex.what());
+                    continue;
+                }
+
+                MethodOptions o;
+                o.penaltyWeight = w;
+                o.convergenceTol = 1e-9;
+                const Solved s = solve(m, o);
+                if (!s.run.ok) {
+                    v.warn("graded disk growth=" + num(g, 3) + "/" + wn + ": " + s.run.error);
+                    continue;
+                }
+                const ConeError ce = diskConeError(*m, s.sing);
+                const double eTP = metrics::commonEnergy(*m, wTP, s.run.u);
+                const double eMin = metrics::commonEnergy(*m, wMin, s.run.u);
+                coneErr[wn].push_back(ce.angleDeg);
+
+                t.row({num(g, 3), num((int)m->triangles.size()), num(d.maxAreaRatio, 3),
+                       num(d.medianDualRatio, 3), num(d.belowFloor), wn, num(r.rms, 3),
+                       num(r.rmsAway, 3),
+                       num((int)s.sing.interior.size()), num(s.sing.interiorIndex4Sum),
+                       num(s.sing.poincareHopfResidual), num(ce.angleDeg, 4),
+                       num(ce.radius, 4), num(eTP, 6)});
+                csv.row({{"growth", num(g, 4)},
+                         {"vertices", num((int)m->vertices.size())},
+                         {"triangles", num((int)m->triangles.size())},
+                         {"max_area_ratio", num(d.maxAreaRatio, 6)},
+                         {"median_dual_ratio", num(d.medianDualRatio, 6)},
+                         {"non_delaunay_edges", num(d.nonDelaunay)},
+                         {"edges_below_floor", num(d.belowFloor)},
+                         {"weight", wn},
+                         {"residual_rms", num(r.rms, 6)}, {"residual_max", num(r.mx, 6)},
+                         {"residual_rms_away_from_floor", num(r.rmsAway, 6)},
+                         {"singularities", num((int)s.sing.interior.size())},
+                         {"index4_sum", num(s.sing.interiorIndex4Sum)},
+                         {"ph_residual", num(s.sing.poincareHopfResidual)},
+                         {"max_cone_angle_error_deg", num(ce.angleDeg, 6)},
+                         {"max_cone_radius_frac", num(ce.radius, 6)},
+                         {"energy_twopoint", num(eTP, 10)},
+                         {"energy_minheight", num(eMin, 10)},
+                         {"iterations", num(s.run.iterations)}});
+
+                v.check(s.sing.poincareHopfResidual == 0,
+                        "graded disk growth=" + num(g, 3) + "/" + wn + ": Poincare-Hopf holds");
+            }
+        }
+        t.print();
+
+        // The one comparison the sweep exists to make, stated rather than left
+        // to the reader: does the cone placement error grow with the grading for
+        // the inconsistent weight and not for the consistent one?
+        // The comparison is *paired*: both weights run on the same mesh at each
+        // level, so a difference between them is the operator and nothing else.
+        {
+            const std::vector<double> &a = coneErr["min"];
+            const std::vector<double> &b = coneErr["orth"];
+            int betterOrth = 0, levels = 0;
+            double worstA = 0.0, worstB = 0.0;
+            for (std::size_t i = 0; i < a.size() && i < b.size(); ++i) {
+                ++levels;
+                if (b[i] < a[i]) ++betterOrth;
+                worstA = std::max(worstA, a[i]);
+                worstB = std::max(worstB, b[i]);
+            }
+            std::cout << "\n  Paired over " << levels << " grading level(s), on identical meshes:\n"
+                      << "    the two-point weight places the cones closer to their known angles on "
+                      << betterOrth << "/" << levels << ",\n"
+                      << "    worst cone angle error min-height " << num(worstA, 4)
+                      << " deg against two-point " << num(worstB, 4) << " deg.\n"
+                      << "\n  This is the downstream half of Prop. 4. The corpus is near-uniform and\n"
+                      << "  there the two weights give almost the same field; grade the mesh and the\n"
+                      << "  inconsistency stops being invisible. Where the two columns agree the\n"
+                      << "  honest reading is that the defect is real at the operator level and does\n"
+                      << "  not reach the field on that mesh.\n";
+            v.check(betterOrth >= levels - 1,
+                    "graded disk: the consistent weight places the cones at least as well at every"
+                    " grading level but at most one");
+        }
     }
 
     banner("E1 summary");

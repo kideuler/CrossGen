@@ -30,6 +30,16 @@
 //          "face-based" from "MBO" as the source of any improvement.
 namespace paper {
 
+// The process-wide default for MethodOptions::penaltyWeight, so that an
+// experiment can take `--weight min|harm|orth` once on its command line and
+// every MethodOptions it constructs afterwards -- E1 builds one per sweep
+// point -- carries it. Set it before the first MethodOptions is made.
+DualMBO::PenaltyWeight defaultPenaltyWeight();
+void setDefaultPenaltyWeight(DualMBO::PenaltyWeight w);
+// "min" | "harm" | "orth" <-> the enum. An unknown name throws.
+DualMBO::PenaltyWeight parsePenaltyWeight(const std::string &name);
+const char *penaltyWeightName(DualMBO::PenaltyWeight w);
+
 struct MethodOptions {
     // DualMBO and the common energy alike. The outline picks 10 after E1's sweep.
     double gamma = 10.0;
@@ -109,7 +119,7 @@ struct MethodOptions {
     // parameter but the discrete Laplacian itself, so it is the discretisation's
     // one real degree of freedom -- see DualMBO::PenaltyWeight for why the textbook
     // choice is not a consistent one and what the two-point weight repairs.
-    DualMBO::PenaltyWeight penaltyWeight = DualMBO::PenaltyWeight::MinHeight;
+    DualMBO::PenaltyWeight penaltyWeight = defaultPenaltyWeight();
 
     // Backward-Euler substeps inside one MBO diffusion step. 1 is the shipped
     // single solve; larger is a closer approximation of the semigroup the

@@ -204,6 +204,18 @@ void CrossField::initialize(int method, unsigned seed) {
         }
     }
 
+    // A vertex no triangle references has an empty row in M and K, so A is
+    // structurally singular and the direct factorisation is refused -- nine of
+    // the 24 corpus models carry such vertices (geom031 has 309). Give each one
+    // a unit mass entry so the row exists, then pin it below like a boundary
+    // vertex: identity row, value 1, never read by anything since no element
+    // touches it. This changes nothing about the field and lets the direct
+    // solver do its job.
+    std::vector<char> usedVertex(numVertices, 0);
+    for (const Triangle &tri : mesh->triangles) { usedVertex[tri[0]] = 1; usedVertex[tri[1]] = 1; usedVertex[tri[2]] = 1; }
+    for (int v = 0; v < numVertices; ++v)
+        if (!usedVertex[v]) massTrips.emplace_back(v, v, std::complex<double>(1.0, 0.0));
+
     // Assemble sparse matrices
     M.resize(numVertices, numVertices);
     K.resize(numVertices, numVertices);
@@ -235,6 +247,13 @@ void CrossField::initialize(int method, unsigned seed) {
     
     // Create a set for fast boundary lookup
     std::unordered_set<int> boundarySet(mesh->boundaryVertices.begin(), mesh->boundaryVertices.end());
+
+    // The unreferenced vertices, pinned (see the mass assembly above).
+    for (int v = 0; v < numVertices; ++v) {
+        if (usedVertex[v]) continue;
+        boundarySet.insert(v);
+        u_k_prev[v] = one;
+    }
 
     // For column-major matrices, we iterate over all columns and check each entry's row
     // Zero out rows for boundary vertices in M

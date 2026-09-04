@@ -1,7 +1,9 @@
 #include "Layout.hxx"
 
 #include <chrono>
+#include <cmath>
 #include <fstream>
+#include <stdexcept>
 
 #include "MERIDIAN/DiskTemplate.hxx"
 #include "MERIDIAN/QuadMesh.hxx"
@@ -30,6 +32,52 @@ std::string reachedStage(const TORSION::Status &s) {
     return "field";
 }
 
+// The TORSION::Options fields an experiment may override by name. Booleans take
+// 0/1, integers are rounded.
+void applyOverrides(TORSION::Options &t, const std::vector<std::pair<std::string, double>> &ov) {
+    for (const auto &[key, val] : ov) {
+        const int iv = static_cast<int>(std::lround(val));
+        const bool bv = val != 0.0;
+        if      (key == "targetEdge")               t.targetEdge = val;
+        else if (key == "conformalSizing")          t.conformalSizing = bv;
+        else if (key == "alignInIntegration")       t.alignInIntegration = bv;
+        else if (key == "untangle")                 t.untangle = bv;
+        else if (key == "localUntangle")            t.localUntangle = bv;
+        else if (key == "lambdaInit")               t.lambdaInit = val;
+        else if (key == "lambdaGrowth")             t.lambdaGrowth = val;
+        else if (key == "lambdaAlignmentFactor")    t.lambdaAlignmentFactor = val;
+        else if (key == "lambdaSeamFactor")         t.lambdaSeamFactor = val;
+        else if (key == "outerSteps")               t.outerSteps = iv;
+        else if (key == "innerIterations")          t.innerIterations = iv;
+        else if (key == "relabelBetweenSteps")      t.relabelBetweenSteps = bv;
+        else if (key == "seedTopoConstraints")      t.seedTopoConstraints = bv;
+        else if (key == "topoNearMiss")             t.topoNearMiss = val;
+        else if (key == "topoNearMissRetry")        t.topoNearMissRetry = val;
+        else if (key == "seedSelfReturns")          t.seedSelfReturns = bv;
+        else if (key == "seedAllConnections")       t.seedAllConnections = bv;
+        else if (key == "separatrixMaxSteps")       t.separatrixMaxSteps = iv;
+        else if (key == "separatrixSnapRings")      t.separatrixSnapRings = iv;
+        else if (key == "separatrixDetectCycles")   t.separatrixDetectCycles = bv;
+        else if (key == "arrangementCorner")        t.arrangementCorner = val;
+        else if (key == "arrangementCollapse")      t.arrangementCollapse = val;
+        else if (key == "arrangementTrim")          t.arrangementTrim = bv;
+        else if (key == "quadMinIntervals")         t.quadMinIntervals = iv;
+        else if (key == "quadMaxIntervals")         t.quadMaxIntervals = iv;
+        else if (key == "quadSmoothingPasses")      t.quadSmoothingPasses = iv;
+        else if (key == "repairPasses")             t.repairPasses = iv;
+        else if (key == "repairGapLimit")           t.repairGapLimit = val;
+        else if (key == "repairLambdaBoost")        t.repairLambdaBoost = val;
+        else if (key == "repairOuterSteps")         t.repairOuterSteps = iv;
+        else if (key == "repairMaxPerPass")         t.repairMaxPerPass = iv;
+        else if (key == "repairPatience")           t.repairPatience = iv;
+        else if (key == "interfaceCorners")         t.interfaceCorners = bv;
+        else if (key == "cancelInterfaceDipoles")   t.cancelInterfaceDipoles = bv;
+        else if (key == "prescribeInterfaceCones")  t.prescribeInterfaceCones = bv;
+        else if (key == "coneCutsToBoundary")       t.coneCutsToBoundary = bv;
+        else throw std::invalid_argument("LayoutOptions::overrides: unknown TORSION option '" + key + "'");
+    }
+}
+
 } // namespace
 
 LayoutResult runLayout(const std::shared_ptr<Mesh> &m, const Eigen::VectorXcd &field,
@@ -50,6 +98,7 @@ LayoutResult runLayout(const std::shared_ptr<Mesh> &m, const Eigen::VectorXcd &f
         opts.topoNearMiss = o.topoNearMiss;
         opts.topoNearMissRetry = o.topoNearMissRetry;
         opts.quadTargetEdge = o.quadTargetEdge;
+        applyOverrides(opts, o.overrides);
         if (field.size() > 0) opts.externalField = field;
 
         TORSION pipe(work, opts);
@@ -58,6 +107,7 @@ LayoutResult runLayout(const std::shared_ptr<Mesh> &m, const Eigen::VectorXcd &f
 
         const TORSION::Status &s = pipe.getStatus();
         r.reachedStage = reachedStage(s);
+        r.externalFieldUsed = s.externalFieldUsed;
         r.framesValid = s.framesValid;
         r.immersionValid = s.immersionValid;
         r.layoutValid = s.layoutValid;
@@ -70,6 +120,10 @@ LayoutResult runLayout(const std::shared_ptr<Mesh> &m, const Eigen::VectorXcd &f
         r.interiorCones = s.interiorCones;
         r.boundaryCones = s.boundaryCones;
         r.integrationFlippedFaces = s.integrationFlippedFaces;
+        r.integrationFitResidualMax = s.integrationMaxFitResidual;
+        r.integrationFitResidualMean = s.integrationMeanFitResidual;
+        r.integrationFlippedAreaFraction = s.integrationFlippedAreaFraction;
+        r.maxFrameJump = s.maxFrameJump;
         r.separatrices = s.separatrices;
         r.separatricesUnresolved = s.separatricesUnresolved;
         r.patches = s.layoutPatches;
@@ -116,6 +170,13 @@ LayoutResult runLayout(const std::shared_ptr<Mesh> &m, const Eigen::VectorXcd &f
 
     r.seconds = std::chrono::duration<double>(Clock::now() - t0).count();
     return r;
+}
+
+std::pair<std::string, double> parseLayoutOverride(const std::string &arg) {
+    const std::size_t eq = arg.find('=');
+    if (eq == std::string::npos || eq == 0 || eq + 1 >= arg.size())
+        throw std::invalid_argument("--layout-opt expects NAME=VALUE, got '" + arg + "'");
+    return {arg.substr(0, eq), std::stod(arg.substr(eq + 1))};
 }
 
 bool writeQuadOBJ(const std::string &path, const LayoutResult &r) {
