@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -230,7 +231,7 @@ bool beginVectorCapture(std::size_t capacityFloats) {
     return true;
 }
 
-CaptureResult writeVectorCapture(const std::string &path, int fbw, int fbh) {
+CaptureResult buildVectorCapture(std::string &svg, int fbw, int fbh) {
     if (!g_capturing) return CaptureResult::Empty;
     g_capturing = false;
 
@@ -399,11 +400,9 @@ CaptureResult writeVectorCapture(const std::string &path, int fbw, int fbh) {
     flush(body, batch, elements);
     g_stats.elements = elements;
 
-    std::ofstream out(path, std::ios::binary);
-    if (!out) return CaptureResult::WriteFailed;
-
     const auto bg = backgroundColor();
-    out << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+    std::ostringstream doc;
+    doc << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
         << "<svg xmlns=\"http://www.w3.org/2000/svg\" version=\"1.1\"\n"
         << "     width=\"" << W << "\" height=\"" << H << "\"\n"
         << "     viewBox=\"0 0 " << W << " " << H << "\"\n"
@@ -417,9 +416,21 @@ CaptureResult writeVectorCapture(const std::string &path, int fbw, int fbh) {
         rect += "\" fill=\"";
         appendHexColor(rect, bg[0], bg[1], bg[2]);
         rect += "\"/>\n";
-        out << rect;
+        doc << rect;
     }
-    out << body << "</g>\n</svg>\n";
+    doc << body << "</g>\n</svg>\n";
+    svg = doc.str();
+    return CaptureResult::Ok;
+}
+
+CaptureResult writeVectorCapture(const std::string &path, int fbw, int fbh) {
+    std::string svg;
+    const CaptureResult r = buildVectorCapture(svg, fbw, fbh);
+    if (r != CaptureResult::Ok) return r;
+
+    std::ofstream out(path, std::ios::binary);
+    if (!out) return CaptureResult::WriteFailed;
+    out << svg;
     out.flush();
     if (!out) return CaptureResult::WriteFailed;
     return CaptureResult::Ok;

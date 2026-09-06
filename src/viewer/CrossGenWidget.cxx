@@ -20,6 +20,11 @@
 #include <QOpenGLContext>
 #include <QOpenGLFramebufferObject>
 #include <QOpenGLFunctions>
+#include <QPageLayout>
+#include <QPageSize>
+#include <QPainter>
+#include <QPdfWriter>
+#include <QSvgRenderer>
 #include <QLabel>
 #include <QPushButton>
 #include <QScreen>
@@ -511,26 +516,27 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
     case Qt::Key_S:
         // The figure keys. 's' is the vector one and the one to reach for: a
         // wireframe, a cut graph, a quad mesh -- everything this viewer draws
-        // is lines and flat polygons, which is exactly what SVG is for, and a
-        // paper renders it at whatever resolution the press is.
+        // is lines and flat polygons, which is exactly what a vector page is
+        // for, and a paper renders it at whatever resolution the press is. The
+        // file is a PDF, which is what a LaTeX \includegraphics wants.
         //
         // 'S' is the raster fallback at 3x the framebuffer, for the phases
         // whose picture is a filled scalar field over every triangle: those
         // are vector files of a hundred thousand paths that no viewer wants to
         // open and that gain nothing over pixels.
         if (event->modifiers() & Qt::ShiftModifier) exportPng(3);
-        else                                        exportSvg();
+        else                                        exportPdf();
         break;
 
     case Qt::Key_H:
         // Everything on screen that belongs to the viewer rather than to the
-        // model: the console, the key help, and the coordinate axis. One key
-        // for the three of them, because a figure wants none of them and a
-        // working session wants all three.
+        // model: the console, the key help, the coordinate axis and the colour
+        // legends. One key for all four, because a figure wants none of them
+        // and a working session wants all of them.
         showHUD_ = !showHUD_;
         viewer::setAxisVisible(showHUD_);
-        console_.log(showHUD_ ? "[Figure] console, key help and axis shown"
-                              : "[Figure] console, key help and axis hidden");
+        console_.log(showHUD_ ? "[Figure] console, key help, axis and legends shown"
+                              : "[Figure] console, key help, axis and legends hidden");
         update();
         break;
 
@@ -6289,44 +6295,11 @@ void CrossGenWidget::renderNormal() {
         }
     }
 
-    // Colour legend for the scalar field, before the text overlay so the
-    // console keeps drawing on top.
-    if (mode_ == Mode::OASIS && oasisPhase_ == OASISPhase::Field && oasis_.has_value()) {
-        viewer::drawScalarFieldLegend(fbw(), fbh(), -oasisAbsMax_, oasisAbsMax_,
-                                      "quasi-eigenfunction");
-    }
-
-    // Either pipeline: the node colours of the interface network, above the
-    // cone legend, whenever the network is on screen.
-    const bool sepLegendShown = (inPipeline() && cones_.has_value() &&
-                                 pipePhase_ == PipelinePhase::Separatrices &&
-                                 separatrices_.has_value());
-    if (inPipeline() && showInterfaces_ && interfaces_.has_value() &&
-        interfaces_->multiMaterial()) {
-        viewer::drawInterfaceLegend(fbw(), fbh(), sepLegendShown);
-    }
-
-    // Either pipeline: the cone colours everywhere they are drawn, and
-    // whichever ramp -- or, on the field route, whichever palette -- the
-    // current phase is using under them.
-    if (inPipeline() && cones_.has_value()) {
-        viewer::drawConeLegend(fbw(), fbh());
-        if (pipePhase_ == PipelinePhase::Separatrices && separatrices_.has_value()) {
-            viewer::drawSeparatrixLegend(fbw(), fbh());
-        } else if (mode_ == Mode::TORSION && pipePhase_ == PipelinePhase::Flow &&
-                   frames_.has_value()) {
-            viewer::drawCombedFrameLegend(fbw(), fbh(), *frames_);
-        } else if (pipePhase_ == PipelinePhase::Flow && ricciU_.size() > 0) {
-            viewer::drawScalarFieldLegend(fbw(), fbh(), -ricciUAbsMax_, ricciUAbsMax_,
-                                          "conformal factor u, mean removed");
-        } else if (pipePhase_ >= PipelinePhase::Metric &&
-                   pipePhase_ != PipelinePhase::Separatrices &&
-                   pipePhase_ != PipelinePhase::Patches &&
-                   !flatMetric_.edges.empty()) {
-            viewer::drawScalarFieldLegend(fbw(), fbh(), -flatMetric_.absMax, flatMetric_.absMax,
-                                          "log(l_flat / l_input), mean removed");
-        }
-    }
+    // Colour legends. These are chrome too -- a key drawn in screen space in
+    // the viewer's own font, not part of the model -- so 'h' takes them with
+    // the console, the help and the axis. A figure that wants a key gets one
+    // typeset in the caption.
+    if (showHUD_) drawLegends();
 
     // Overlay text. On a multi-material model the two display toggles are
     // appended to whatever the phase's own help says, since they apply at every
@@ -6383,6 +6356,49 @@ void CrossGenWidget::renderNormal() {
     }
 }
 
+// ── legends ─────────────────────────────────────────────────────────────────────────
+
+// The screen-space colour keys, drawn before the text overlay so the console
+// keeps drawing on top. Called only while the HUD is shown.
+void CrossGenWidget::drawLegends() {
+    if (mode_ == Mode::OASIS && oasisPhase_ == OASISPhase::Field && oasis_.has_value()) {
+        viewer::drawScalarFieldLegend(fbw(), fbh(), -oasisAbsMax_, oasisAbsMax_,
+                                      "quasi-eigenfunction");
+    }
+
+    // Either pipeline: the node colours of the interface network, above the
+    // cone legend, whenever the network is on screen.
+    const bool sepLegendShown = (inPipeline() && cones_.has_value() &&
+                                 pipePhase_ == PipelinePhase::Separatrices &&
+                                 separatrices_.has_value());
+    if (inPipeline() && showInterfaces_ && interfaces_.has_value() &&
+        interfaces_->multiMaterial()) {
+        viewer::drawInterfaceLegend(fbw(), fbh(), sepLegendShown);
+    }
+
+    // Either pipeline: the cone colours everywhere they are drawn, and
+    // whichever ramp -- or, on the field route, whichever palette -- the
+    // current phase is using under them.
+    if (inPipeline() && cones_.has_value()) {
+        viewer::drawConeLegend(fbw(), fbh());
+        if (pipePhase_ == PipelinePhase::Separatrices && separatrices_.has_value()) {
+            viewer::drawSeparatrixLegend(fbw(), fbh());
+        } else if (mode_ == Mode::TORSION && pipePhase_ == PipelinePhase::Flow &&
+                   frames_.has_value()) {
+            viewer::drawCombedFrameLegend(fbw(), fbh(), *frames_);
+        } else if (pipePhase_ == PipelinePhase::Flow && ricciU_.size() > 0) {
+            viewer::drawScalarFieldLegend(fbw(), fbh(), -ricciUAbsMax_, ricciUAbsMax_,
+                                          "conformal factor u, mean removed");
+        } else if (pipePhase_ >= PipelinePhase::Metric &&
+                   pipePhase_ != PipelinePhase::Separatrices &&
+                   pipePhase_ != PipelinePhase::Patches &&
+                   !flatMetric_.edges.empty()) {
+            viewer::drawScalarFieldLegend(fbw(), fbh(), -flatMetric_.absMax, flatMetric_.absMax,
+                                          "log(l_flat / l_input), mean removed");
+        }
+    }
+}
+
 // ── overlay helper ────────────────────────────────────────────────────────────
 
 void CrossGenWidget::renderOverlay(const char *helpText) {
@@ -6399,7 +6415,7 @@ void CrossGenWidget::renderOverlay(const char *helpText) {
     // things to keep in step.
     const std::string help =
         std::string(helpText) +
-        "\npress 's' to save an SVG figure, 'S' for a 3x PNG\n"
+        "\npress 's' to save a PDF figure, 'S' for a 3x PNG\n"
         "press 'h' to hide this text, 'b' for a " +
         (viewer::lightBackground() ? "dark" : "white") + " background";
     viewer::drawTextOverlay(w, h, help.c_str(), 10.0f, 20.0f, 0.8f, 0.8f, 0.8f);
@@ -6453,12 +6469,12 @@ QString CrossGenWidget::nextFigurePath(const char *extension) const {
             .arg(QString::fromLatin1(extension)));
 }
 
-void CrossGenWidget::exportSvg() {
+void CrossGenWidget::exportPdf() {
     if (!QDir().mkpath(figureDir_)) {
         console_.log("[Figure] could not create " + figureDir_.toStdString());
         return;
     }
-    const QString path = nextFigurePath("svg");
+    const QString path = nextFigurePath("pdf");
 
     makeCurrent();
 
@@ -6485,15 +6501,46 @@ void CrossGenWidget::exportSvg() {
     // feedback buffer cannot be grown once the primitives have gone through it,
     // so on overflow there is nothing to do but draw it again into a bigger
     // one. Four attempts covers 4M to 256M floats, which is about 9M triangles.
+    std::string svg;
     viewer::CaptureResult result = viewer::CaptureResult::Overflow;
     for (std::size_t capacity = 4u << 20; capacity <= (256u << 20); capacity *= 4) {
         if (!viewer::beginVectorCapture(capacity)) break;
         drawScene();
-        result = viewer::writeVectorCapture(path.toStdString(), fbw(), fbh());
+        result = viewer::buildVectorCapture(svg, fbw(), fbh());
         if (result != viewer::CaptureResult::Overflow) break;
     }
 
     doneCurrent();
+
+    // The capture is SVG because that is what the feedback stream writes; the
+    // file is PDF because that is what a paper includes. Qt paints one onto the
+    // other, and both sides are vector, so nothing is rasterised on the way.
+    // One page the size of the framebuffer at 72 dpi, which puts a pixel on a
+    // point and leaves the figure at the proportions it had on screen.
+    if (result == viewer::CaptureResult::Ok) {
+        const int W = fbw(), H = fbh();
+        QSvgRenderer renderer(QByteArray::fromStdString(svg));
+        if (!renderer.isValid()) {
+            console_.log("[Figure] the captured scene could not be re-read for the PDF");
+            update();
+            return;
+        }
+        QPdfWriter writer(path);
+        writer.setResolution(72);
+        writer.setPageSize(QPageSize(QSizeF(W, H), QPageSize::Point,
+                                     QStringLiteral("figure"),
+                                     QPageSize::ExactMatch));
+        writer.setPageMargins(QMarginsF(0, 0, 0, 0), QPageLayout::Point);
+        writer.setTitle(QFileInfo(path).completeBaseName());
+        QPainter painter;
+        if (!painter.begin(&writer)) {
+            result = viewer::CaptureResult::WriteFailed;
+        } else {
+            painter.setRenderHint(QPainter::Antialiasing, true);
+            renderer.render(&painter, QRectF(0, 0, W, H));
+            painter.end();
+        }
+    }
 
     switch (result) {
     case viewer::CaptureResult::Ok: {
@@ -6501,7 +6548,7 @@ void CrossGenWidget::exportSvg() {
         std::ostringstream oss;
         oss << "[Figure] " << path.toStdString() << " -- " << st.polygons
             << " faces, " << st.lines << " segments, " << st.points
-            << " points in " << st.elements << " SVG elements";
+            << " points in " << st.elements << " vector elements";
         console_.log(oss.str());
         std::cerr << oss.str() << "\n";
         ++figureCounter_;

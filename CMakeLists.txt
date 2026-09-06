@@ -506,7 +506,9 @@ set_tests_properties(MERIDIAN_TMOP_singlemat_geom012 PROPERTIES TIMEOUT 2400)
 option(BUILD_OPENGL_VIEWER "Build the Qt6 OpenGL mesh/field viewer" OFF)
 if (BUILD_OPENGL_VIEWER)
     find_package(OpenGL REQUIRED)
-    find_package(Qt6 REQUIRED COMPONENTS Core Widgets OpenGL OpenGLWidgets)
+    # Svg is for the figure export: the GL feedback capture comes out as an SVG
+    # document, and Qt paints that onto a PDF page.
+    find_package(Qt6 REQUIRED COMPONENTS Core Widgets OpenGL OpenGLWidgets Svg)
 
     # Qt6 requires these global settings
     set(CMAKE_AUTOMOC ON)
@@ -528,6 +530,7 @@ if (BUILD_OPENGL_VIEWER)
         Qt6::Widgets
         Qt6::OpenGL
         Qt6::OpenGLWidgets
+        Qt6::Svg
     )
     target_compile_definitions(Viewer PRIVATE GL_SILENCE_DEPRECATION)
     target_compile_features(Viewer PRIVATE cxx_std_17)

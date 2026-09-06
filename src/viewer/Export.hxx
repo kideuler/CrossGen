@@ -104,6 +104,14 @@ enum class CaptureResult {
 };
 
 bool beginVectorCapture(std::size_t capacityFloats);
+
+// The captured frame as an SVG document in memory. This is the form the PDF
+// export wants: the figure is written by handing the document to a renderer
+// that paints it onto a vector page, so nothing has to go through a file on
+// the way. Ends the capture, exactly as writeVectorCapture does.
+CaptureResult buildVectorCapture(std::string &svg, int fbw, int fbh);
+
+// The same document, straight to a file.
 CaptureResult writeVectorCapture(const std::string &path, int fbw, int fbh);
 bool capturing();
 

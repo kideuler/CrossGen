@@ -569,6 +569,10 @@ private:
     // would be a picture of something that was never on screen.
     void drawScene();
 
+    // The screen-space colour keys. Chrome, like the console and the axis, so
+    // 'h' hides them too.
+    void drawLegends();
+
     // ── figure export ────────────────────────────────────────────────────────
     // Both write into figureDir_ under a name built from the model, the mode
     // and the phase, so a walk through the pipeline pressing 's' at each stage
@@ -576,9 +580,11 @@ private:
     QString nextFigurePath(const char *extension) const;
 
     // The vector one, and the one to prefer: the scene through the GL feedback
-    // buffer, written as SVG. Sizes the feedback buffer by trying and growing,
-    // since the primitive count is not known until it has been drawn.
-    void exportSvg();
+    // buffer, captured as SVG and painted onto a one-page PDF at 1 pt per
+    // pixel, since a PDF is what a paper includes. Sizes the feedback buffer by
+    // trying and growing, since the primitive count is not known until it has
+    // been drawn.
+    void exportPdf();
 
     // The raster fallback, at `scale` times the on-screen framebuffer. For a
     // wireframe figure the SVG is better in every way; this is here for the
