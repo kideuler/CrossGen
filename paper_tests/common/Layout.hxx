@@ -47,6 +47,13 @@ struct LayoutOptions {
     // it is checked between stages, so a stage that runs long overruns it.)
     double timeLimit = 0.0;
 
+    // Post-process the pipeline's final mesh with mesh::TMOP (0 = off, the
+    // default: the metrics reported are the pipeline's own mesh, unsmoothed).
+    // Mirrors TestMERIDIAN's --tmop / --tmop-power, including its choice of
+    // metric (ShapeSize007) -- see mesh/TMOP.hxx.
+    int tmopSweeps = 0;
+    double tmopPower = 2.0;
+
     // Named overrides of TORSION::Options fields, applied after the ones above,
     // so that a pipeline knob can be swept from an experiment's command line
     // (`--layout-opt outerSteps=32`) without this header knowing the pipeline.
@@ -112,6 +119,18 @@ struct LayoutResult {
 
     // Ours, from the element table alone (metrics::quadMetrics).
     metrics::QuadMetrics quality;
+
+    // Set when LayoutOptions::tmopSweeps > 0 and the pipeline reached a mesh.
+    // `quality` above stays the pipeline's own mesh; `qualitySmoothed` is the
+    // same element table after mesh::TMOP has moved the nodes (topology,
+    // materials and target edge length are unchanged, so the two are directly
+    // comparable).
+    bool smoothed = false;
+    bool tmopOk = false;         // mesh::TMOP::run()'s own verdict
+    bool tmopConverged = false;
+    int tmopSweepsRun = 0;
+    double tmopSeconds = 0.0;
+    metrics::QuadMetrics qualitySmoothed;
 
     double seconds = 0.0;
     int outerSteps = 0;

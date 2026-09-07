@@ -82,6 +82,8 @@ int main(int argc, char **argv) {
     // "orth" is the two-point/finite-volume weight; see DualMBO::PenaltyWeight.
     std::string weight = "min";
     int limit = 0;
+    int tmopSweeps = 0;
+    double tmopPower = 2.0;
     std::vector<std::pair<std::string, double>> layoutOverrides;
 
     for (int i = 1; i < argc; ++i) {
@@ -96,11 +98,14 @@ int main(int argc, char **argv) {
         else if (a == "--disk-templates") diskTemplates = true;
         else if (a == "--b1-continuation") b1Continuation = true;
         else if (a == "--weight" && i + 1 < argc) weight = argv[++i];
+        else if (a == "--tmop" && i + 1 < argc) tmopSweeps = std::stoi(argv[++i]);
+        else if (a == "--tmop-power" && i + 1 < argc) tmopPower = std::stod(argv[++i]);
         else if (a == "--help") {
             std::cout << "Usage: " << argv[0]
                       << " [--out DIR] [--set singlemat|multimat] [--methods DualMBO,B1,B2]\n"
                          "       [--target EDGE] [--obj DIR] [--limit N] [--disk-templates]\n"
                          "       [--b1-continuation] [--weight min|harm|orth]\n"
+                         "       [--tmop N] [--tmop-power P]\n"
                          "       [--layout-opt NAME=VALUE ...] [model ...]\n";
             return 0;
         } else only.push_back(a);
@@ -122,6 +127,9 @@ int main(int argc, char **argv) {
     std::cout << "; target edge " << target << "; DualMBO penalty weight " << weight << "\n"
               << "The MBO runs at the tolerance the pipeline ships with (1e-5), because what\n"
               << "is being measured here is the pipeline.\n";
+    if (tmopSweeps > 0)
+        std::cout << "Mesh metrics are also reported after " << tmopSweeps
+                  << " mesh::TMOP sweep(s) (exponent " << tmopPower << ").\n";
 
     Csv csv(outDir + "/E4_" + sub + "_permodel.csv",
             {"model", "method", "vertices", "triangles",
@@ -139,7 +147,15 @@ int main(int argc, char **argv) {
              "pipeline_min_scaled_jacobian",
              "max_angle_deviation_deg", "mean_angle_deviation_deg",
              "min_zone_dimension", "p01_zone_dimension", "mean_zone_dimension",
-             "mixed_quads", "pipeline_mixed_quads", "seconds", "error"});
+             "mixed_quads", "pipeline_mixed_quads", "seconds",
+             "smoothed", "tmop_ok", "tmop_converged", "tmop_sweeps_run", "tmop_seconds",
+             "irregular_interior_smoothed", "irregular_boundary_smoothed",
+             "inverted_quads_smoothed",
+             "min_scaled_jacobian_smoothed", "mean_scaled_jacobian_smoothed",
+             "max_angle_deviation_smoothed_deg", "mean_angle_deviation_smoothed_deg",
+             "min_zone_dimension_smoothed", "p01_zone_dimension_smoothed",
+             "mean_zone_dimension_smoothed", "mixed_quads_smoothed",
+             "error"});
 
     std::vector<Outcome> outcomes;
 
@@ -152,6 +168,8 @@ int main(int argc, char **argv) {
                   << mesh->triangles.size() << " t)" << std::flush;
         Table t({"method", "reached", "valid", "patches", "quads", "irr int", "irr bnd",
                  "min SJ", "mean SJ", "inv", "min zone", "1% zone", "fit res", "s"});
+        Table ts({"method", "min SJ*", "mean SJ*", "inv*", "irr int*", "irr bnd*",
+                  "min zone*", "1% zone*", "sweeps", "conv", "s*"});
 
         for (const std::string &name : methods) {
             MethodOptions fo;   // the shipped tolerance: this measures the pipeline
@@ -178,6 +196,8 @@ int main(int argc, char **argv) {
             lo.quadTargetEdge = target;
             lo.diskTemplates = diskTemplates;
             lo.overrides = layoutOverrides;
+            lo.tmopSweeps = tmopSweeps;
+            lo.tmopPower = tmopPower;
             o.layout = runLayout(mesh, run.u, lo, !objDir.empty());
             outcomes.push_back(o);
 
@@ -189,6 +209,14 @@ int main(int argc, char **argv) {
                    num(Q.invertedQuads), num(Q.minZoneDimension, 4),
                    num(Q.p01ZoneDimension, 4), num(L.integrationFitResidualMax, 3),
                    num(L.seconds, 2)});
+            if (L.smoothed) {
+                const metrics::QuadMetrics &Qs = L.qualitySmoothed;
+                ts.row({name, num(Qs.minScaledJacobian, 4), num(Qs.meanScaledJacobian, 4),
+                        num(Qs.invertedQuads), num(Qs.irregularInterior),
+                        num(Qs.irregularBoundary), num(Qs.minZoneDimension, 4),
+                        num(Qs.p01ZoneDimension, 4), num(L.tmopSweepsRun),
+                        L.tmopConverged ? "yes" : "no", num(L.tmopSeconds, 2)});
+            }
 
             // A layout that did not validate says why in the pipeline's own
             // words, so that a failure in the log can be attributed to a stage
@@ -236,6 +264,21 @@ int main(int argc, char **argv) {
                      {"mixed_quads", num(Q.mixedQuads)},
                      {"pipeline_mixed_quads", num(L.pipelineMixedQuads)},
                      {"seconds", num(L.seconds, 3)},
+                     {"smoothed", num(L.smoothed)}, {"tmop_ok", num(L.tmopOk)},
+                     {"tmop_converged", num(L.tmopConverged)},
+                     {"tmop_sweeps_run", num(L.tmopSweepsRun)},
+                     {"tmop_seconds", num(L.tmopSeconds, 3)},
+                     {"irregular_interior_smoothed", num(L.qualitySmoothed.irregularInterior)},
+                     {"irregular_boundary_smoothed", num(L.qualitySmoothed.irregularBoundary)},
+                     {"inverted_quads_smoothed", num(L.qualitySmoothed.invertedQuads)},
+                     {"min_scaled_jacobian_smoothed", num(L.qualitySmoothed.minScaledJacobian, 6)},
+                     {"mean_scaled_jacobian_smoothed", num(L.qualitySmoothed.meanScaledJacobian, 6)},
+                     {"max_angle_deviation_smoothed_deg", num(L.qualitySmoothed.maxAngleDeviation, 6)},
+                     {"mean_angle_deviation_smoothed_deg", num(L.qualitySmoothed.meanAngleDeviation, 6)},
+                     {"min_zone_dimension_smoothed", num(L.qualitySmoothed.minZoneDimension, 6)},
+                     {"p01_zone_dimension_smoothed", num(L.qualitySmoothed.p01ZoneDimension, 6)},
+                     {"mean_zone_dimension_smoothed", num(L.qualitySmoothed.meanZoneDimension, 6)},
+                     {"mixed_quads_smoothed", num(L.qualitySmoothed.mixedQuads)},
                      {"error", L.error}});
 
             if (!objDir.empty() && !L.quadCells.empty())
@@ -243,6 +286,10 @@ int main(int argc, char **argv) {
         }
         std::cout << "\n";
         t.print();
+        if (tmopSweeps > 0) {
+            std::cout << "\n  After TMOP smoothing (* columns):\n";
+            ts.print();
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -275,15 +322,18 @@ int main(int argc, char **argv) {
             {"method", "models", "reached_mesh", "valid_layout",
              "patches_mean", "irregular_interior_mean", "inverted_total",
              "min_scaled_jacobian_worst", "min_scaled_jacobian_mean",
-             "min_zone_dimension_worst", "p01_zone_dimension_mean", "seconds_mean"});
+             "min_zone_dimension_worst", "p01_zone_dimension_mean", "seconds_mean",
+             "inverted_total_smoothed",
+             "min_scaled_jacobian_worst_smoothed", "min_scaled_jacobian_mean_smoothed"});
     {
         Table t({"method", "reached mesh", "valid layout", "patches mean",
                  "irr int mean", "inverted total", "worst min SJ", "mean min SJ",
                  "worst min zone", "mean 1% zone", "s mean"});
+        Table ts({"method", "inverted total*", "worst min SJ*", "mean min SJ*"});
         for (const std::string &name : methods) {
-            int reached = 0, valid = 0, inverted = 0, n = 0;
-            std::vector<double> patches, irr, sj, zone, p01, secs;
-            double worstSJ = 1.0, worstZone = 1e30;
+            int reached = 0, valid = 0, inverted = 0, n = 0, invertedSmoothed = 0;
+            std::vector<double> patches, irr, sj, zone, p01, secs, sjSmoothed;
+            double worstSJ = 1.0, worstZone = 1e30, worstSJSmoothed = 1.0;
             for (const Outcome &o : outcomes) {
                 if (o.method != name) continue;
                 ++n;
@@ -299,12 +349,19 @@ int main(int argc, char **argv) {
                 p01.push_back(o.layout.quality.p01ZoneDimension);
                 worstSJ = std::min(worstSJ, o.layout.quality.minScaledJacobian);
                 worstZone = std::min(worstZone, o.layout.quality.minZoneDimension);
+                if (o.layout.smoothed) {
+                    invertedSmoothed += o.layout.qualitySmoothed.invertedQuads;
+                    sjSmoothed.push_back(o.layout.qualitySmoothed.minScaledJacobian);
+                    worstSJSmoothed = std::min(worstSJSmoothed, o.layout.qualitySmoothed.minScaledJacobian);
+                }
             }
             if (worstZone > 1e29) worstZone = 0.0;
             t.row({name, num(reached) + "/" + num(n), num(valid) + "/" + num(n),
                    num(mean(patches), 4), num(mean(irr), 4), num(inverted),
                    num(worstSJ, 4), num(mean(sj), 4), num(worstZone, 4),
                    num(mean(p01), 4), num(mean(secs), 3)});
+            if (tmopSweeps > 0)
+                ts.row({name, num(invertedSmoothed), num(worstSJSmoothed, 4), num(mean(sjSmoothed), 4)});
             agg.row({{"method", name}, {"models", num(n)},
                      {"reached_mesh", num(reached)}, {"valid_layout", num(valid)},
                      {"patches_mean", num(mean(patches), 6)},
@@ -314,9 +371,16 @@ int main(int argc, char **argv) {
                      {"min_scaled_jacobian_mean", num(mean(sj), 6)},
                      {"min_zone_dimension_worst", num(worstZone, 6)},
                      {"p01_zone_dimension_mean", num(mean(p01), 6)},
+                     {"inverted_total_smoothed", num(invertedSmoothed)},
+                     {"min_scaled_jacobian_worst_smoothed", num(worstSJSmoothed, 6)},
+                     {"min_scaled_jacobian_mean_smoothed", num(mean(sjSmoothed), 6)},
                      {"seconds_mean", num(mean(secs), 6)}});
         }
         t.print();
+        if (tmopSweeps > 0) {
+            std::cout << "\n  After TMOP smoothing (* columns):\n";
+            ts.print();
+        }
     }
 
     // -----------------------------------------------------------------------

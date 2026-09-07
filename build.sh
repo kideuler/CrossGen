@@ -20,7 +20,7 @@ cd build
     cd .. && git submodule update --init --recursive >/dev/null 2>&1 || true
 )
 cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_OPENGL_VIEWER=ON ../
-make -j
+make -j4
 cd ..
 
 

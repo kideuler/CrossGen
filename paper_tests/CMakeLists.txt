@@ -53,8 +53,18 @@ add_custom_target(paper
     COMMAND $<TARGET_FILE:PaperE1_Verification> --out ${CMAKE_CURRENT_BINARY_DIR}/results
     COMMAND $<TARGET_FILE:PaperE2_Canonical>    --out ${CMAKE_CURRENT_BINARY_DIR}/results
     COMMAND $<TARGET_FILE:PaperE3_Benchmark>    --out ${CMAKE_CURRENT_BINARY_DIR}/results
-    COMMAND $<TARGET_FILE:PaperE4_Layout>       --out ${CMAKE_CURRENT_BINARY_DIR}/results
-    COMMAND $<TARGET_FILE:PaperE5_MultiMaterial> --out ${CMAKE_CURRENT_BINARY_DIR}/results
+    # --tmop makes E4 report the element metrics twice: the pipeline's own mesh
+    # and the same mesh after mesh::TMOP has moved the nodes. 200 is TMOP's own
+    # default sweep cap, so the tolerance decides when to stop and
+    # tmop_converged records whether it did.
+    COMMAND $<TARGET_FILE:PaperE4_Layout>       --out ${CMAKE_CURRENT_BINARY_DIR}/results --tmop 200
+    COMMAND $<TARGET_FILE:PaperE5_MultiMaterial> --out ${CMAKE_CURRENT_BINARY_DIR}/results --disk-templates
+    # The executables write to the build tree; copy the CSVs (and anything
+    # else they produced) back into the source tree's results/, which is
+    # where the README points readers and where the paper's numbers are
+    # written from.
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            ${CMAKE_CURRENT_BINARY_DIR}/results ${CMAKE_CURRENT_SOURCE_DIR}/results
     DEPENDS PaperE1_Verification PaperE2_Canonical PaperE3_Benchmark PaperE4_Layout PaperE5_MultiMaterial
     COMMENT "Running the paper's Tier-1 experiments E1-E5"
     VERBATIM

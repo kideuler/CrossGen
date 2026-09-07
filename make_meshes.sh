@@ -3,7 +3,7 @@
 source clean.sh
 source build.sh --all
 
-export NP=70
+export NP=100
 
 # Geometry lives in per-material-kind subdirectories (singlemat/, multimat/,
 # ...); each one is meshed into the matching subdirectory of data/meshes.

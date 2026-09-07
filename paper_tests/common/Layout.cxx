@@ -8,6 +8,8 @@
 #include "MERIDIAN/DiskTemplate.hxx"
 #include "MERIDIAN/QuadMesh.hxx"
 #include "TORSION/TORSION.hxx"
+#include "mesh/QuadMesh.hxx"
+#include "mesh/TMOP.hxx"
 
 namespace paper {
 namespace {
@@ -146,17 +148,49 @@ LayoutResult runLayout(const std::shared_ptr<Mesh> &m, const Eigen::VectorXcd &f
             const std::vector<Point> *verts = &qm.vertices();
             const std::vector<std::array<int, 4>> *cells = &qm.quads();
             const std::vector<int> *mats = &qm.quadMaterials();
+            bool usingDiskTemplate = false;
             if (pipe.hasDiskTemplate()) {
                 const DiskTemplate &dt = pipe.getDiskTemplate();
                 if (!dt.quads().empty()) {
                     verts = &dt.vertices();
                     cells = &dt.quads();
                     mats = &dt.quadMaterials();
+                    usingDiskTemplate = true;
                 }
             }
-            if (!cells->empty())
+            if (!cells->empty()) {
                 r.quality = metrics::quadMetrics(*verts, *cells, *mats, o.quadTargetEdge);
-            if (keepMesh) {
+
+                if (o.tmopSweeps > 0) {
+                    // Same source as verts/cells/mats above: the disk-template
+                    // merged mesh when Stage 11 produced one, otherwise Stage 10's.
+                    mesh::QuadMesh fm = usingDiskTemplate
+                                            ? mesh::QuadMesh::from(pipe.getDiskTemplate())
+                                            : mesh::QuadMesh::from(qm);
+                    mesh::TMOP::Options topt;
+                    topt.metric = mesh::TMOP::ShapeSize007;
+                    topt.maxSweeps = o.tmopSweeps;
+                    topt.exponent = o.tmopPower;
+                    mesh::TMOP smoother(fm, topt);
+                    r.tmopOk = smoother.run();
+                    const mesh::TMOP::Report &tr = smoother.getReport();
+                    r.tmopConverged = tr.converged;
+                    r.tmopSweepsRun = tr.sweeps;
+                    r.tmopSeconds = tr.seconds;
+                    r.qualitySmoothed =
+                        metrics::quadMetrics(fm.vertices, fm.quads, fm.quadMatId, o.quadTargetEdge);
+                    r.smoothed = true;
+                    if (keepMesh) {
+                        // The smoothed positions are the ones worth keeping for a
+                        // figure; the topology is exactly what verts/cells above
+                        // already carried.
+                        r.quadVertices = fm.vertices;
+                        r.quadCells = fm.quads;
+                        r.quadMaterials = fm.quadMatId;
+                    }
+                }
+            }
+            if (keepMesh && !r.smoothed) {
                 r.quadVertices = *verts;
                 r.quadCells = *cells;
                 r.quadMaterials = *mats;
