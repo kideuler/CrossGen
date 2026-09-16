@@ -36,7 +36,12 @@ std::complex<double> interp(const Mesh &m, int t, const Eigen::VectorXcd &uv,
 // ---------------------------------------------------------------------------
 namespace {
 DualMBO::PenaltyWeight &defaultWeightSlot() {
-    static DualMBO::PenaltyWeight w = DualMBO::PenaltyWeight::MinHeight;
+    // Orthogonal is the two-point/circumcentric weight, which is the method the
+    // paper ships and the one TORSION::Options already defaults to. It was
+    // MinHeight, so an experiment run without --weight silently measured the
+    // ablation; that is what put the interior-penalty rows into E3/E4's tables.
+    // The ablation now has to be asked for: --weight min.
+    static DualMBO::PenaltyWeight w = DualMBO::PenaltyWeight::Orthogonal;
     return w;
 }
 } // namespace

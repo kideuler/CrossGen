@@ -44,21 +44,26 @@ endforeach()
 # E1 and E2 are quick and are run by ctest; E3 to E5 sweep the whole corpus and
 # are not, because a full sweep is minutes to hours and belongs in a run of its
 # own. `make paper` is that run.
+#
+# Every command below names --weight explicitly. The target used to leave it
+# off, which meant `make paper` -- the run the paper's tables are written from
+# -- measured whatever the library default happened to be. It was MinHeight,
+# so E3/E4/E5 reported the ablation as "ours". Do not drop the flag again.
 add_test(NAME Paper_E1_Verification COMMAND E1_Verification --out ${CMAKE_CURRENT_BINARY_DIR}/results --levels 3)
 set_tests_properties(Paper_E1_Verification PROPERTIES TIMEOUT 3600)
 add_test(NAME Paper_E2_Canonical COMMAND E2_Canonical --out ${CMAKE_CURRENT_BINARY_DIR}/results --quick)
 set_tests_properties(Paper_E2_Canonical PROPERTIES TIMEOUT 3600)
 
 add_custom_target(paper
-    COMMAND $<TARGET_FILE:PaperE1_Verification> --out ${CMAKE_CURRENT_BINARY_DIR}/results
-    COMMAND $<TARGET_FILE:PaperE2_Canonical>    --out ${CMAKE_CURRENT_BINARY_DIR}/results
-    COMMAND $<TARGET_FILE:PaperE3_Benchmark>    --out ${CMAKE_CURRENT_BINARY_DIR}/results
+    COMMAND $<TARGET_FILE:PaperE1_Verification> --out ${CMAKE_CURRENT_BINARY_DIR}/results --weight orth
+    COMMAND $<TARGET_FILE:PaperE2_Canonical>    --out ${CMAKE_CURRENT_BINARY_DIR}/results --weight orth
+    COMMAND $<TARGET_FILE:PaperE3_Benchmark>    --out ${CMAKE_CURRENT_BINARY_DIR}/results --weight orth
     # --tmop makes E4 report the element metrics twice: the pipeline's own mesh
     # and the same mesh after mesh::TMOP has moved the nodes. 200 is TMOP's own
     # default sweep cap, so the tolerance decides when to stop and
     # tmop_converged records whether it did.
-    COMMAND $<TARGET_FILE:PaperE4_Layout>       --out ${CMAKE_CURRENT_BINARY_DIR}/results --tmop 200
-    COMMAND $<TARGET_FILE:PaperE5_MultiMaterial> --out ${CMAKE_CURRENT_BINARY_DIR}/results --disk-templates
+    COMMAND $<TARGET_FILE:PaperE4_Layout>       --out ${CMAKE_CURRENT_BINARY_DIR}/results --weight orth --tmop 200
+    COMMAND $<TARGET_FILE:PaperE5_MultiMaterial> --out ${CMAKE_CURRENT_BINARY_DIR}/results --weight orth --disk-templates
     # The executables write to the build tree; copy the CSVs (and anything
     # else they produced) back into the source tree's results/, which is
     # where the README points readers and where the paper's numbers are

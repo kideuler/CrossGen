@@ -80,7 +80,9 @@ int main(int argc, char **argv) {
     bool b1Continuation = false;
     // The p=0 penalty weight, which at this order *is* the discrete Laplacian.
     // "orth" is the two-point/finite-volume weight; see DualMBO::PenaltyWeight.
-    std::string weight = "min";
+    // It is the default because it is the method the paper ships; "min" is the
+    // ablation and has to be asked for.
+    std::string weight = "orth";
     int limit = 0;
     int tmopSweeps = 0;
     double tmopPower = 2.0;
