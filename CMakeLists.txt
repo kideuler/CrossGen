@@ -97,6 +97,17 @@ add_library(PolyVector SHARED
     src/mesh/QuadMesh.hxx
     src/mesh/TMOP.cxx
     src/mesh/TMOP.hxx
+    src/geom/Vec.hxx
+    src/geom/BSpline.hxx
+    src/geom/BSpline.cxx
+    src/geom/Polyline.hxx
+    src/geom/Polyline.cxx
+    src/geom/ArcLength.hxx
+    src/geom/ArcLength.cxx
+    src/geom/Fitting.hxx
+    src/geom/Fitting.cxx
+    src/geom/Coons.hxx
+    src/geom/Coons.cxx
     src/polyvector/PolyVectors.hxx
     src/polyvector/PolyVectors.cxx
     src/dualmbo/DualMBO.hxx
@@ -242,6 +253,12 @@ target_link_libraries(TestDualMBO PRIVATE PolyVector)
 add_executable(TestTMOP src/utils/TestTMOP.cxx)
 target_link_libraries(TestTMOP PRIVATE PolyVector)
 
+# Self-test the spline library of src/geom -- B-spline curves and surfaces,
+# fitting, interpolation, knot insertion, arc length and Coons blends -- on
+# curves whose answers are known in closed form. Needs no files.
+add_executable(TestGeom src/utils/TestGeom.cxx)
+target_link_libraries(TestGeom PRIVATE PolyVector)
+
 # Test the UMBER frame field optimization (Wang et al. 2022, Secs. 4.1-4.2)
 add_executable(TestUMBER src/utils/TestUMBER.cxx)
 target_link_libraries(TestUMBER PRIVATE PolyVector)
@@ -386,6 +403,12 @@ add_test(NAME Tracing_LayoutsOnAllMeshes
 # is what puts the weighted-Delaunay flipping under load. Checks the cone angle
 # sums directly and the Hessian against a finite difference.
 add_test(NAME MERIDIAN_RicciFlowSelfTest COMMAND TestMERIDIAN --selftest)
+
+# The spline library under both pipelines' Stage 9 (src/geom), against closed
+# forms: partition of unity, knot insertion and reversal leaving the curve
+# unchanged, fits reproducing what they can represent, and a Coons net on four
+# straight sides reproducing the bilinear map.
+add_test(NAME Geom_SplineSelfTest COMMAND TestGeom)
 
 # End-to-end: Stages 1 to 7 on a handful of models that between them exercise
 # every part of the later stages -- a plain disk with one interior cone

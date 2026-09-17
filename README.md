@@ -39,4 +39,5 @@ A purely 2D implementation of Cross-fields along with block decomposition
 - [ ] Allow rz spinning,
 
 # Post Paper Direction 2.
-- [ ] Mesh that deformed tank and run hydro on it with different material EOS for IMR presentation
+- [X] Mesh that deformed tank and run hydro on it with different material EOS for IMR presentation
+- [ ] Stalled because we need ALE.
