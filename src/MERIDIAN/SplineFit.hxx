@@ -6,10 +6,19 @@
 #include <vector>
 
 #include "MERIDIAN/Arrangement.hxx"
+#include "geom/BSpline.hxx"
+#include "geom/Polyline.hxx"
 #include "mesh/Mesh.hxx"
 
 // Stage 9 of Shepherd, Gu and Hughes (2022): the spline reconstruction.
 // (docs/shepherd2022.pdf, Sec. 5; docs/ricci_flow_pipeline.md Sec. 11.)
+//
+// The spline mathematics -- the basis, curve and surface evaluation, the
+// least-squares fit and the control-level Coons blend -- lives in src/geom and
+// has no idea what an arrangement is. What stays here is the part that is
+// Stage 9's own: which arcs are fitted and which carried exactly, one knot
+// vector for all of them, the orientation of four arcs into a patch frame, the
+// transfinite correction, and the checks.
 //
 // Stage 8 left a partition of S into quadrilaterals whose sides are arcs. This
 // stage turns each arc into a cubic B-spline and each quadrilateral into a
@@ -86,15 +95,15 @@
 //     S(s,t) += (1-t) d_0(s) + t d_2(s) + (1-s) d_3(t) + s d_1(t)
 //
 // with d_k = (exact side k) - (its control-net curve). The usual bilinear
-// corner term is absent because it is identically zero: fitOne() pins both end
-// control points to the arc's end nodes, so every d_k vanishes at both of its
-// ends. The result is exact on the boundary of the patch, C0 across it -- two
-// patches sharing an exact arc both land on the same polyline -- and a smooth
-// blend inside. What it costs is that such a patch is a Coons surface over
-// piecewise-linear sides rather than a tensor-product bicubic, so the control
-// net alone no longer reproduces it. Stage 10 samples through evaluate(), so
-// this is invisible to the mesh; a consumer that wants the net alone should
-// turn the two options on and accept the deviation.
+// corner term is absent because it is identically zero: the fit pins both end
+// control points to the arc's end nodes (geom::FitOptions::pinEnds), so every
+// d_k vanishes at both of its ends. The result is exact on the boundary of the
+// patch, C0 across it -- two patches sharing an exact arc both land on the same
+// polyline -- and a smooth blend inside. What it costs is that such a patch is
+// a Coons surface over piecewise-linear sides rather than a tensor-product
+// bicubic, so the control net alone no longer reproduces it. Stage 10 samples
+// through evaluate(), so this is invisible to the mesh; a consumer that wants
+// the net alone should turn the two options on and accept the deviation.
 //
 // ### The pullback
 //
@@ -127,14 +136,13 @@ public:
     // last of which are the arc's two end nodes exactly.
     struct Curve {
         int arc = -1;
-        std::vector<Point> ctrl;
+        geom::BSplineCurve<2> spline;
 
         // Set on an arc that is carried as its traced polyline rather than
-        // approximated: evaluate() walks `poly`, and `ctrl` is then only the
+        // approximated: evaluate() walks `poly`, and `spline` is then only the
         // control net the Coons blend is built from. See the header.
         bool exact = false;
-        std::vector<Point> poly;     // the traced polyline, when exact
-        std::vector<double> cum;     // its normalised cumulative chord length
+        geom::Polyline<2> poly;      // the traced polyline, when exact
 
         // Of the traced polyline from the control-net curve. On a fitted arc
         // that is the geometric error of the reconstruction. On an exact arc
@@ -148,7 +156,7 @@ public:
     };
 
     // One bicubic patch, as an (n x n) control net with n = segments + 3, in
-    // row-major order: net[j * n + i] is the control point at (s_i, t_j).
+    // row-major order: surface.control(i, j) is the control point at (s_i, t_j).
     struct Patch {
         int face = -1;                    // the face of the arrangement
         std::array<int, 4> side{{-1, -1, -1, -1}};      // its four arcs
@@ -158,7 +166,8 @@ public:
         // has to correct the net back onto.
         std::array<bool, 4> exactSide{{false, false, false, false}};
         bool corrected = false;                         // any of them
-        std::vector<Point> net;
+        // The net alone. evaluate(Patch) adds the correction on top of it.
+        geom::BSplineSurface<2> surface;
 
         double area = 0.0;         // of the surface, from a sampled grid
         double faceArea = 0.0;     // of the arrangement face it was fitted to
@@ -298,20 +307,14 @@ public:
     const std::vector<double>& grevilles() const { return greville; }
 
 private:
-    void buildKnots();
     void fitArcs();
     void buildPatches();
     void check();
 
-    Curve fitOne(const std::vector<Point> &poly) const;
-    // The plain B-spline over a curve's control points, with no regard for
-    // whether the curve is carried exactly. evaluate() is this on a fitted arc
-    // and the polyline on an exact one; the difference between the two is what
-    // sideCorrection() hands to the Coons blend.
-    Point evaluateNet(const Curve &c, double u) const;
+    // What side `side` of a patch has to be moved by to sit on its polyline:
+    // evaluate(Curve) there minus the plain spline over the curve's control
+    // points. Zero on a fitted side.
     Point sideCorrection(const Patch &p, int side, double w) const;
-    static void basisFuns(int span, double u, const std::vector<double> &U, double *N);
-    int findSpan(double u) const;
 
     const Arrangement *arr = nullptr;
     Options options;

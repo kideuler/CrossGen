@@ -2597,7 +2597,7 @@ void drawLayoutPatches(const Arrangement &arr, const SplineFit *fit,
             poly.clear();
             const SplineFit::Curve *c =
                 (fit && a < static_cast<int>(fit->curves().size()) &&
-                 fit->curves()[a].ctrl.size() >= 2)
+                 fit->curves()[a].spline.size() >= 2)
                     ? &fit->curves()[a]
                     : nullptr;
             if (c) {

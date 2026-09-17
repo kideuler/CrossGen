@@ -11,6 +11,8 @@
 #include <sstream>
 #include <unordered_map>
 
+#include "geom/Coons.hxx"
+
 namespace {
 
 // Union-find over the arcs. The classes are the chords; see the header.
@@ -87,7 +89,7 @@ QuadMesh::QuadMesh(const SplineFit &f, const Options &opts)
 }
 
 // ---------------------------------------------------------------------------
-// tabulate() / paramAtLength() / evaluateArc()
+// tabulate() / evaluateArc()
 //
 // Arc length along one arc, and its inverse. Uniform in the curve parameter,
 // which is not uniform in length -- that is the whole reason the table exists.
@@ -101,7 +103,7 @@ Point QuadMesh::evaluateArc(int arc, double u) const {
         arr->getArcs()[arc].kind != Arrangement::ArcKind::Separatrix;
     if (options.useSplines && !(onFeature && options.featuresOnTracedArcs) &&
         arc < static_cast<int>(fit->curves().size()) &&
-        !fit->curves()[arc].ctrl.empty()) {
+        !fit->curves()[arc].spline.empty()) {
         return fit->evaluate(fit->curves()[arc], u);
     }
     // The traced polyline, parameterised by its own normalised chord length.
@@ -122,32 +124,9 @@ Point QuadMesh::evaluateArc(int arc, double u) const {
     return poly[k - 1] + (poly[k] - poly[k - 1]) * w;
 }
 
-QuadMesh::Table QuadMesh::tabulate(int arc) const {
-    Table t;
-    const int m = std::max(8, options.arcLengthSamples);
-    t.cum.assign(m + 1, 0.0);
-    Point prev = evaluateArc(arc, 0.0);
-    for (int i = 1; i <= m; ++i) {
-        const Point p = evaluateArc(arc, static_cast<double>(i) / m);
-        t.cum[i] = t.cum[i - 1] + normP(p - prev);
-        prev = p;
-    }
-    t.length = t.cum.back();
-    return t;
-}
-
-double QuadMesh::paramAtLength(const Table &t, double s) const {
-    const int m = static_cast<int>(t.cum.size()) - 1;
-    if (m <= 0 || !(t.length > 0.0)) return 0.0;
-    if (s <= 0.0) return 0.0;
-    if (s >= t.length) return 1.0;
-    const int k = static_cast<int>(
-        std::lower_bound(t.cum.begin(), t.cum.end(), s) - t.cum.begin());
-    if (k <= 0) return 0.0;
-    if (k > m) return 1.0;
-    const double seg = t.cum[k] - t.cum[k - 1];
-    const double w = seg > 0.0 ? (s - t.cum[k - 1]) / seg : 0.0;
-    return (static_cast<double>(k - 1) + w) / m;
+geom::ArcLengthTable QuadMesh::tabulate(int arc) const {
+    return geom::ArcLengthTable([&](double u) { return evaluateArc(arc, u); },
+                                std::max(8, options.arcLengthSamples));
 }
 
 // ---------------------------------------------------------------------------
@@ -184,8 +163,8 @@ void QuadMesh::patchSpans(int patch, const std::vector<Arrangement::Side> &sides
         auto side = [&](int k, double c) {
             const bool fwd = sides[k].forward;
             const double frac = (k < 2) ? (fwd ? c : 1.0 - c) : (fwd ? 1.0 - c : c);
-            const Table &t = tables[sides[k].arc];
-            return evaluateArc(sides[k].arc, paramAtLength(t, t.length * frac));
+            const geom::ArcLengthTable &t = tables[sides[k].arc];
+            return evaluateArc(sides[k].arc, t.parameterAt(t.length() * frac));
         };
         std::vector<Point> B(m + 1), T(m + 1), L(m + 1), R(m + 1);
         for (int i = 0; i <= m; ++i) {
@@ -196,10 +175,8 @@ void QuadMesh::patchSpans(int patch, const std::vector<Arrangement::Side> &sides
             const double v = static_cast<double>(j) / m;
             for (int i = 0; i <= m; ++i) {
                 const double u = static_cast<double>(i) / m;
-                grid[static_cast<size_t>(j) * (m + 1) + i] =
-                    B[i] * (1.0 - v) + T[i] * v + L[j] * (1.0 - u) + R[j] * u -
-                    (B.front() * ((1.0 - u) * (1.0 - v)) + B.back() * (u * (1.0 - v)) +
-                     T.front() * ((1.0 - u) * v) + T.back() * (u * v));
+                grid[static_cast<size_t>(j) * (m + 1) + i] = geom::coonsPoint(
+                    B[i], T[i], L[j], R[j], B.front(), B.back(), T.front(), T.back(), u, v);
             }
         }
     }
@@ -255,7 +232,7 @@ void QuadMesh::assignIntervals() {
         meshable.push_back({f, sides});
     }
 
-    tables.assign(nArcs, Table());
+    tables.assign(nArcs, geom::ArcLengthTable());
     for (int a = 0; a < nArcs; ++a) if (used[a]) tables[a] = tabulate(a);
 
     // One (arc, span) pair per direction of every meshable patch: the arc says
@@ -299,7 +276,7 @@ void QuadMesh::assignIntervals() {
         Chord &c = chordList[slot];
         c.minLength = std::numeric_limits<double>::infinity();
         for (int a : c.arcs) {
-            const double L = tables[a].length;
+            const double L = tables[a].length();
             c.minLength = std::min(c.minLength, L);
             c.maxLength = std::max(c.maxLength, L);
         }
@@ -309,7 +286,7 @@ void QuadMesh::assignIntervals() {
         // falls back to its own arcs, which is what it would have used before.
         std::vector<double> &data = chordSpans[slot];
         if (data.empty()) {
-            for (int a : c.arcs) if (tables[a].length > 0.0) data.push_back(tables[a].length);
+            for (int a : c.arcs) if (tables[a].length() > 0.0) data.push_back(tables[a].length());
         }
 
         double logSum = 0.0;
@@ -690,10 +667,10 @@ void QuadMesh::meshArcs() {
         arcParams[a][0] = 0.0;
         arcParams[a][N] = 1.0;
 
-        const Table &t = tables[a];
+        const geom::ArcLengthTable &t = tables[a];
         for (int k = 1; k < N; ++k) {
-            const double u = (t.length > 0.0)
-                                 ? paramAtLength(t, t.length * k / N)
+            const double u = (t.length() > 0.0)
+                                 ? t.parameterAt(t.length() * k / N)
                                  : static_cast<double>(k) / N;
             arcParams[a][k] = u;
             arcNodes[a][k] = static_cast<int>(verts.size());
@@ -919,9 +896,7 @@ void QuadMesh::meshPatches() {
                     const Point &l0 = verts[at(0, j)], &l1 = verts[at(ns, j)];
                     const Point &c00 = verts[at(0, 0)], &c10 = verts[at(ns, 0)];
                     const Point &c01 = verts[at(0, nt)], &c11 = verts[at(ns, nt)];
-                    p = b0 * (1.0 - v) + b1 * v + l0 * (1.0 - u) + l1 * u -
-                        (c00 * ((1.0 - u) * (1.0 - v)) + c10 * (u * (1.0 - v)) +
-                         c01 * ((1.0 - u) * v) + c11 * (u * v));
+                    p = geom::coonsPoint(b0, b1, l0, l1, c00, c10, c01, c11, u, v);
                 }
                 at(i, j) = static_cast<int>(verts.size());
                 verts.push_back(p);

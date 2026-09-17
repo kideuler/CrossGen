@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "MERIDIAN/SplineFit.hxx"
+#include "geom/ArcLength.hxx"
 #include "mesh/Mesh.hxx"
 
 // Stage 10 of the pipeline: the quadrilateral mesh on the layout Stages 8 and 9
@@ -477,17 +478,13 @@ private:
     void classifyMaterials();
     void check();
 
-    // Arc length along a fitted arc, tabulated at uniform parameter, and its
-    // inverse: the parameter at which a given length has been travelled.
-    struct Table {
-        std::vector<double> cum;   // arcLengthSamples + 1 entries, cum[0] = 0
-        double length = 0.0;
-    };
-    Table tabulate(int arc) const;
+    // Arc length along an arc, tabulated at arcLengthSamples uniform steps of
+    // its parameter. The table's parameterAt() is the inverse: the parameter at
+    // which a given length has been travelled.
+    geom::ArcLengthTable tabulate(int arc) const;
     // The mean length of the isoparametric lines of a patch, per direction.
     void patchSpans(int patch, const std::vector<Arrangement::Side> &sides,
                     double &sMean, double &tMean) const;
-    double paramAtLength(const Table &t, double s) const;
     Point evaluateArc(int arc, double u) const;
 
     const SplineFit *fit = nullptr;
@@ -511,7 +508,7 @@ private:
     // contracted, in which case every node is its own class.
     std::vector<int> nodeClass;
     std::vector<int> facePatch;             // arrangement face -> SplineFit patch
-    std::vector<Table> tables;              // per arc
+    std::vector<geom::ArcLengthTable> tables; // per arc
 
     double modelExtent = 1.0;
     Report report;
