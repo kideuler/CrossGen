@@ -29,8 +29,14 @@ A purely 2D implementation of Cross-fields along with block decomposition
 - [X] Get tests ready.
 - [X] Make sure Viewer is consistent with tests.
 - [X] Prepare viewer to take pictures
-- [ ] Go through models (singlemat and multimat) and pick out which ones will stay in corpus. remove ones and put them in excess.
-- [ ] Write big huge prompt for fable which will bring everything together.
+- [X] Go through models (singlemat and multimat) and pick out which ones will stay in corpus. remove ones and put them in excess.
+- [X] Write big huge prompt for fable which will bring everything together.
+- [X] Finish the god damned paper
 
+# Post Paper Direction 1.
+- [ ] Bring in OpenCascade and write a wrapper around it for TopoDS_Edges and TopoDS_Faces
+- [ ] Replace all splines with this API.
+- [ ] Allow rz spinning,
 
-- [ ] Try to parallelize (for a little)
+# Post Paper Direction 2.
+- [ ] Mesh that deformed tank and run hydro on it with different material EOS for IMR presentation
