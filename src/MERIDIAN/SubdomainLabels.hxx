@@ -150,6 +150,17 @@ public:
         int branch = -1;
         int dir = 0;
         bool dirKnown = false;
+        // The quarter turns between the chart of the branch's node0 end and
+        // this chain's own chart: the sum of the Gamma_Hol_k transitions the
+        // branch crosses before it gets here. A branch the cutting graph never
+        // crosses has 0 on every chain. `turnKnown` is false where the branch
+        // could not be walked -- it runs along a seam, or through a cone -- and
+        // the chain then keeps the branch's direction unrotated.
+        int turn = 0;
+        bool turnKnown = false;
+        // +1 when `verts` runs the way the branch does, node0 to node1, -1 the
+        // other way; 0 when the branch was not walked.
+        int sense = 0;
     };
 
     // One sector of one node of the material interface network, as a constraint
@@ -266,6 +277,17 @@ public:
         // one point in three directions. There is no such map, so the
         // continuation spends every outer step failing to reach it.
         bool propagateInterfaceLabels = true;
+
+        // Rotate the propagated direction by the seam transitions a branch
+        // crosses. An arc of G that crosses a branch splits it into chains in
+        // two charts related by psi+ = R_k psi- + t, so the far chain runs k
+        // quarter turns from the near one and, for k odd, holds the *other*
+        // coordinate. Without this every chain of a branch gets the branch's
+        // one label, which is exactly right when nothing crosses it and
+        // unsatisfiable when a cone inside an inclusion has to be cut out
+        // through the interface: E3 then asks for u constant on a curve and on
+        // its own image under a quarter turn. Off restores that behaviour.
+        bool seamTurnInterfaceLabels = true;
     };
 
     struct Report {
@@ -291,6 +313,12 @@ public:
         // count is not an error -- it is the propagation doing its job -- but
         // it is the number that says how much E3 was being asked for before.
         int featureLabelsCorrected = 0;
+        // Chains of a branch that lie beyond one or more crossings of G, and of
+        // those the ones whose label the crossing turned by an odd number of
+        // quarters; branches that could not be walked chain by chain.
+        int featureChainsPastSeam = 0;
+        int featureChainsSeamFlipped = 0;
+        int branchesUnwalked = 0;
 
         int seamArcs = 0;
         int holonomyCount[4] = {0, 0, 0, 0};
@@ -454,6 +482,10 @@ private:
     // direction of travel out of node0, or an empty vector when there is no
     // network to propagate through.
     std::vector<int> propagateDirections(const std::vector<Point> &uv);
+    // FeatureChain::turn for every chain of the network, by walking each branch
+    // from node0 and accumulating the transition of every arc of G it crosses;
+    // and the total per branch, node0 chart to node1 chart, in branchTurn.
+    void computeSeamTurns();
 
     // The mean distance from a cone to its nearest other cone in `uv`, which is
     // the scale a "near miss" is measured against, and the tracer settings that
@@ -486,6 +518,10 @@ private:
     // Direction of travel out of node0 for each branch of the network, in the
     // {+u, +v, -u, -v} numbering, or -1 where the propagation never reached it.
     std::vector<int> branchDir;
+    // Quarter turns from the chart at node0 to the chart at node1 along each
+    // branch, the sum of the seam transitions it crosses; 0 when uncrossed or
+    // when the branch could not be walked.
+    std::vector<int> branchTurn;
     std::vector<TopoPath> tPaths;
     // The pairs of ends already constrained, so that the repair can add to
     // Gamma_topo across several passes without ever adding the same path twice,

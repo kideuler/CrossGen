@@ -257,6 +257,7 @@ public:
         bool prescribeInterfaceCones = true;
         bool interfaceCorners = true;
         bool propagateInterfaceLabels = true;
+        bool seamTurnInterfaceLabels = true;
         bool lagInterfaceScales = false;
 
         // --- Stage 1 and 2, identical to MERIDIAN's ------------------------
@@ -590,6 +591,7 @@ public:
 
         int interfaceCorners = 0;
         int interfaceLabelsCorrected = 0;
+        int interfaceChainsSeamFlipped = 0;
         double interfaceResidual = 0.0;
         int interfaceCornerChanges = 0;
         bool interfacesAligned = false;

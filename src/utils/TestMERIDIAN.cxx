@@ -221,6 +221,8 @@ void usage(const char *argv0) {
               << "                     cross field rather than to the geometry\n"
               << "  --no-propagate     label each interface chain by its own flux rather\n"
               << "                     than by the node quantisation\n"
+              << "  --no-seam-turns    give every chain of a branch the branch's label,\n"
+              << "                     ignoring the quarter turns of the cuts it crosses\n"
               << "  --lag-e6           re-read E6's tangent lengths from the map between\n"
               << "                     outer steps (off; it costs more than it buys)\n"
               << "  --fit-features     mesh dS and the interfaces on their spline fits like\n"
@@ -338,6 +340,7 @@ int main(int argc, char **argv) {
         else if (a == "--no-e6")                   opts.interfaceCorners = false;
         else if (a == "--no-prescribe")            opts.prescribeInterfaceCones = false;
         else if (a == "--no-propagate")            opts.propagateInterfaceLabels = false;
+        else if (a == "--no-seam-turns")           opts.seamTurnInterfaceLabels = false;
         else if (a == "--lag-e6")                  opts.lagInterfaceScales = true;
         else if (a == "--fit-features")            opts.quadFeaturesOnTracedArcs = false;
         else if (a == "--kink" && i + 1 < argc)
@@ -830,6 +833,13 @@ int main(int argc, char **argv) {
                   << " chain(s) labelled from the node quantisation ("
                   << sr.featureLabelsCorrected << " where the flux said otherwise), "
                   << sr.interfaceCorners << " sector(s) for E6";
+        if (sr.featureChainsPastSeam > 0 || sr.branchesUnwalked > 0) {
+            std::cout << "; " << sr.featureChainsPastSeam << " chain(s) past a crossing of G, "
+                      << sr.featureChainsSeamFlipped << " turned an odd number of quarters by it";
+            if (sr.branchesUnwalked > 0) {
+                std::cout << ", " << sr.branchesUnwalked << " branch(es) not walked";
+            }
+        }
         if (sr.interfaceCornersSpanningCut > 0) {
             std::cout << "; " << sr.interfaceCornersSpanningCut
                       << " dropped where the cutting graph runs through the sector";

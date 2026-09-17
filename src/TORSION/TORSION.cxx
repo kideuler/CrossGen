@@ -957,6 +957,7 @@ std::vector<Point> TORSION::untangle() {
     lopts.seedTopoConstraints = false;
     lopts.interfaceCorners = false;
     lopts.propagateInterfaceLabels = options.propagateInterfaceLabels;
+    lopts.seamTurnInterfaceLabels = options.seamTurnInterfaceLabels;
     SubdomainLabels startLabels(*start, lopts, interfaces.get());
     if (options.untangleAlignWeight > 0.0) startLabels.relabel(integratedMap);
 
@@ -1036,6 +1037,7 @@ bool TORSION::runLayoutStages(double nearMiss) {
     lopts.maxTraceSteps = options.separatrixMaxSteps;
     lopts.interfaceCorners = options.interfaceCorners;
     lopts.propagateInterfaceLabels = options.propagateInterfaceLabels;
+    lopts.seamTurnInterfaceLabels = options.seamTurnInterfaceLabels;
     labels = std::make_unique<SubdomainLabels>(*immersion, lopts, interfaces.get());
     const SubdomainLabels::Report &lr = labels->getReport();
     status.boundaryEdgesU = lr.boundaryEdgesU;
@@ -1043,6 +1045,7 @@ bool TORSION::runLayoutStages(double nearMiss) {
     status.featureChains = lr.featureChains;
     status.interfaceCorners = lr.interfaceCorners;
     status.interfaceLabelsCorrected = lr.featureLabelsCorrected;
+    status.interfaceChainsSeamFlipped = lr.featureChainsSeamFlipped;
     status.topoPaths = lr.topoPaths;
     status.topoSelfReturns = lr.topoSelfReturns;
     status.topoExtraPerPair = lr.topoExtraPerPair;

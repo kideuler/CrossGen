@@ -481,6 +481,7 @@ bool MERIDIAN::runLayoutStages(double nearMiss) {
     lopts.maxTraceSteps = options.separatrixMaxSteps;
     lopts.interfaceCorners = options.interfaceCorners;
     lopts.propagateInterfaceLabels = options.propagateInterfaceLabels;
+    lopts.seamTurnInterfaceLabels = options.seamTurnInterfaceLabels;
     labels = std::make_unique<SubdomainLabels>(*immersion, lopts, interfaces.get());
     const SubdomainLabels::Report &lr = labels->getReport();
     status.boundaryEdgesU = lr.boundaryEdgesU;
@@ -488,6 +489,7 @@ bool MERIDIAN::runLayoutStages(double nearMiss) {
     status.featureChains = lr.featureChains;
     status.interfaceCorners = lr.interfaceCorners;
     status.interfaceLabelsCorrected = lr.featureLabelsCorrected;
+    status.interfaceChainsSeamFlipped = lr.featureChainsSeamFlipped;
     status.topoPaths = lr.topoPaths;
     status.topoSelfReturns = lr.topoSelfReturns;
     status.topoExtraPerPair = lr.topoExtraPerPair;

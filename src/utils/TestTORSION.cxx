@@ -760,6 +760,8 @@ void usage(const char *prog) {
               << "  --no-field-interfaces  do not align the field to the interfaces\n"
               << "  --no-cancel-dipoles    keep the +1/-1 pairs on curved interfaces\n"
               << "  --no-e6            leave the interfaces to E3 alone\n"
+              << "  --no-seam-turns    give every chain of an interface branch the branch's\n"
+              << "                     label, ignoring the quarter turns of the cuts it crosses\n"
               << "  --outer <n>        penalty continuation steps            (default 16)\n"
               << "  --inner <n>        inner iterations per step             (default 60)\n"
               << "  --lambda <l>       initial lambda_2..lambda_5            (default 1e-2)\n"
@@ -865,6 +867,7 @@ int main(int argc, char **argv) {
         else if (a == "--no-field-interfaces")          opts.alignFieldToInterfaces = false;
         else if (a == "--no-cancel-dipoles")            opts.cancelInterfaceDipoles = false;
         else if (a == "--no-e6")                        opts.interfaceCorners = false;
+        else if (a == "--no-seam-turns")                opts.seamTurnInterfaceLabels = false;
         else if (a == "--outer" && i + 1 < argc)        opts.outerSteps = std::stoi(argv[++i]);
         else if (a == "--inner" && i + 1 < argc)        opts.innerIterations = std::stoi(argv[++i]);
         else if (a == "--lambda" && i + 1 < argc)       opts.lambdaInit = std::stod(argv[++i]);
@@ -1239,7 +1242,9 @@ int main(int argc, char **argv) {
               << st.boundaryEdgesV << "; " << st.featureChains << " feature chain(s), "
               << st.topoPaths << " Gamma_topo path(s)\n";
     if (st.materials > 1) {
-        std::cout << "  " << st.interfaceCorners << " interface sector(s) for E6\n";
+        std::cout << "  " << st.interfaceCorners << " interface sector(s) for E6; "
+                  << st.interfaceLabelsCorrected << " chain label(s) where the flux said otherwise, "
+                  << st.interfaceChainsSeamFlipped << " turned by a crossing of G\n";
     }
     std::cout << "  Near-miss tolerance " << st.topoNearMissUsed
               << (st.topoNearMissRetried ? "  (after a retry)" : "") << "\n";

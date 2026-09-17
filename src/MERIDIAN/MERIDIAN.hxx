@@ -264,6 +264,8 @@ public:
         // stage existed and is what the --no-e6 flag is for measuring against.
         bool interfaceCorners = true;
         bool propagateInterfaceLabels = true;
+        // See SubdomainLabels::Options::seamTurnInterfaceLabels.
+        bool seamTurnInterfaceLabels = true;
         // See LayoutEnergy::Options::lagInterfaceScales; off, and the numbers
         // that say why are there.
         bool lagInterfaceScales = false;
@@ -513,6 +515,7 @@ public:
         // Stage 5/6, the interface terms
         int interfaceCorners = 0;
         int interfaceLabelsCorrected = 0;
+        int interfaceChainsSeamFlipped = 0;  // labels a crossing of G turned
         double interfaceResidual = 0.0;      // radians
         int interfaceCornerChanges = 0;
         bool interfacesAligned = false;

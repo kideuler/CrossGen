@@ -40,6 +40,7 @@ SubdomainLabels::SubdomainLabels(const Immersion &immersion, const Options &opts
     buildBoundary(uv);
     buildBoundaryChains(uv);
     buildFeatures(uv);
+    computeSeamTurns();
     buildInterfaceCorners();
     labelFeatures(uv);
     if (options.seedTopoConstraints) seedTopoPaths(uv);
@@ -448,6 +449,131 @@ void SubdomainLabels::buildInterfaceCorners() {
 }
 
 // ---------------------------------------------------------------------------
+// computeSeamTurns()
+//
+// A branch the cutting graph crosses is not in one chart. The crossing point of
+// S has two children in Omega, the edges of the branch before it hang off one
+// and the edges after it off the other -- which is why buildFeatures() ends a
+// chain there -- and the two sides are related by Stage 4's transition
+// psi+ = R_k psi- + t. A direction d on the minus side is d + k on the plus
+// side, the same rule addTopoPath() applies to a path of Gamma_topo.
+//
+// This is not a corner case of multi-material models, it is what every
+// *enclosed* region looks like: a cone inside an inclusion has no route to dS
+// that does not cross the interface around it (ConeCut can only choose where),
+// so every such interface comes in two or more charts. The rocket's
+// casing/body interface is a U round two +1 cones, cut twice, each cut a
+// quarter turn: its middle chain holds the other coordinate from its two ends.
+//
+// Branches are walked edge by edge from node0 against Interfaces::Branch::
+// edges, so the order is the model's and not a guess from chord directions.
+// A branch the walk cannot account for -- one running along a seam, which
+// gives two chains over the same edges, or one stopped by a cone, where the
+// turn is the cone's sector and not a transition -- keeps turn 0 on every
+// chain, which is the behaviour before this existed.
+// ---------------------------------------------------------------------------
+void SubdomainLabels::computeSeamTurns() {
+    report.featureChainsPastSeam = report.featureChainsSeamFlipped = 0;
+    report.branchesUnwalked = 0;
+    branchTurn.clear();
+    for (FeatureChain &fc : fChains) { fc.turn = 0; fc.turnKnown = false; fc.sense = 0; }
+    if (!itf) return;
+    const std::vector<Interfaces::Branch> &brs = itf->branches();
+    branchTurn.assign(brs.size(), 0);
+    if (!options.seamTurnInterfaceLabels || brs.empty()) return;
+
+    // (child on one side, child on the other) -> +(arc + 1) plus to minus,
+    // -(arc + 1) minus to plus.
+    const auto &arcList = imm->getArcs();
+    std::unordered_map<long long, int> crossing;
+    for (int a = 0; a < static_cast<int>(arcList.size()); ++a) {
+        const Immersion::Arc &arc = arcList[a];
+        if (arc.degenerate) continue;
+        const size_t n = std::min(arc.plusChain.size(), arc.minusChain.size());
+        for (size_t i = 0; i < n; ++i) {
+            if (arc.plusChain[i] == arc.minusChain[i]) continue;
+            crossing.emplace(static_cast<long long>(arc.plusChain[i]) * 1000003LL + arc.minusChain[i],
+                             +(a + 1));
+            crossing.emplace(static_cast<long long>(arc.minusChain[i]) * 1000003LL + arc.plusChain[i],
+                             -(a + 1));
+        }
+    }
+
+    const std::vector<int> &c2o = imm->getCut().getCutVertexToOriginal();
+    std::vector<std::vector<int>> chainsOf(brs.size());
+    for (int i = 0; i < static_cast<int>(fChains.size()); ++i) {
+        const int b = fChains[i].branch;
+        if (b >= 0 && b < static_cast<int>(brs.size())) chainsOf[b].push_back(i);
+    }
+
+    struct Span { int chain; int lo, hi; int first, last; };   // Omega ends in branch order
+    for (size_t b = 0; b < brs.size(); ++b) {
+        const Interfaces::Branch &br = brs[b];
+        if (chainsOf[b].empty() || br.verts.size() < 2) continue;
+        const int nEdges = static_cast<int>(br.verts.size()) - 1;
+
+        std::unordered_map<EdgeKey, int, EdgeKeyHash> at;
+        at.reserve(br.verts.size() * 2);
+        for (int i = 0; i < nEdges; ++i) at.emplace(EdgeKey(br.verts[i], br.verts[i + 1]), i);
+
+        std::vector<Span> spans;
+        bool ok = true;
+        for (int ci : chainsOf[b]) {
+            const FeatureChain &fc = fChains[ci];
+            if (fc.verts.size() < 2) { ok = false; break; }
+            int lo = nEdges, hi = -1, firstIdx = -1, lastIdx = -1;
+            for (size_t j = 0; j + 1 < fc.verts.size() && ok; ++j) {
+                const int o0 = c2o[fc.verts[j]], o1 = c2o[fc.verts[j + 1]];
+                auto it = (o0 < 0 || o1 < 0) ? at.end() : at.find(EdgeKey(o0, o1));
+                if (it == at.end()) { ok = false; break; }
+                if (j == 0) firstIdx = it->second;
+                lastIdx = it->second;
+                lo = std::min(lo, it->second);
+                hi = std::max(hi, it->second);
+            }
+            if (!ok || hi - lo + 2 != static_cast<int>(fc.verts.size())) { ok = false; break; }
+            // Which end of `verts` sits at br.verts[lo]. With more than one
+            // edge the order of the edge indices says; with one, the vertex.
+            bool frontFirst = (firstIdx < lastIdx) ||
+                              (firstIdx == lastIdx && c2o[fc.verts.front()] == br.verts[lo]);
+            spans.push_back({ci, lo, hi, frontFirst ? fc.verts.front() : fc.verts.back(),
+                             frontFirst ? fc.verts.back() : fc.verts.front()});
+            fChains[ci].sense = frontFirst ? +1 : -1;
+        }
+        std::sort(spans.begin(), spans.end(),
+                  [](const Span &x, const Span &y) { return x.lo < y.lo; });
+        if (ok && (spans.front().lo != 0 || spans.back().hi != nEdges - 1)) ok = false;
+
+        std::vector<int> turn(spans.size(), 0);
+        for (size_t i = 1; ok && i < spans.size(); ++i) {
+            // Contiguous and not overlapping: an overlap is a branch along a
+            // seam, whose two children each made a chain over the same edges.
+            if (spans[i].lo != spans[i - 1].hi + 1) { ok = false; break; }
+            const int a = spans[i - 1].last, c = spans[i].first;
+            if (a == c) { ok = false; break; }   // stopped by a cone, not a crossing
+            auto it = crossing.find(static_cast<long long>(a) * 1000003LL + c);
+            if (it == crossing.end()) { ok = false; break; }
+            const int k = arcList[std::abs(it->second) - 1].k;
+            turn[i] = (it->second > 0) ? turn[i - 1] - k : turn[i - 1] + k;
+        }
+
+        if (!ok) {
+            for (int ci : chainsOf[b]) fChains[ci].sense = 0;
+            ++report.branchesUnwalked;
+            continue;
+        }
+        for (size_t i = 0; i < spans.size(); ++i) {
+            FeatureChain &fc = fChains[spans[i].chain];
+            fc.turn = ((turn[i] % 4) + 4) % 4;
+            fc.turnKnown = true;
+            if (i > 0) ++report.featureChainsPastSeam;
+            if (fc.turn % 2) ++report.featureChainsSeamFlipped;
+        }
+        branchTurn[b] = ((turn.back() % 4) + 4) % 4;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // propagateDirections()
 //
 // Which of {+u, +v, -u, -v} each branch of the network runs along.
@@ -487,23 +613,54 @@ std::vector<int> SubdomainLabels::propagateDirections(const std::vector<Point> &
     }
 
     // The image displacement of each branch, node0 to node1, summed over the
-    // chains that carry it. A chain's own orientation is unknown, so it is
-    // compared against the branch's on the model, where both are known.
+    // chains that carry it, each rotated back into node0's chart by the seam
+    // turns in front of it -- summed unrotated, the pieces of a branch cut
+    // twice by a quarter turn cancel and the seed is read off noise. Where
+    // computeSeamTurns() walked the branch the chain's orientation is known;
+    // elsewhere it is compared against the branch's on the model.
     const Mesh &om = imm->getOriginalMesh();
     const std::vector<int> &c2o = imm->getCut().getCutVertexToOriginal();
+    auto rotateQuarters = [](const Point &p, int q) -> Point {
+        switch (((q % 4) + 4) % 4) {
+            case 0: return p;
+            case 1: return Point{-p[1], p[0]};
+            case 2: return Point{-p[0], -p[1]};
+            default: return Point{p[1], -p[0]};
+        }
+    };
     std::vector<Point> flux(brs.size(), Point{0.0, 0.0});
     std::vector<double> weight(brs.size(), 0.0);
     for (const FeatureChain &fc : fChains) {
-        if (fc.branch < 0 || fc.verts.size() < 2) continue;
-        const Interfaces::Branch &br = brs[fc.branch];
-        const Point mBranch = om.vertices[br.verts.back()] - om.vertices[br.verts.front()];
-        const int o0 = c2o[fc.verts.front()], o1 = c2o[fc.verts.back()];
-        if (o0 < 0 || o1 < 0) continue;
-        const Point mChain = om.vertices[o1] - om.vertices[o0];
-        const double sign = (dotP(mChain, mBranch) >= 0.0) ? 1.0 : -1.0;
-        flux[fc.branch] = flux[fc.branch] + (uv[fc.verts.back()] - uv[fc.verts.front()]) * sign;
+        if (fc.branch < 0 || fc.branch >= static_cast<int>(brs.size()) || fc.verts.size() < 2) {
+            continue;
+        }
+        double sign = fc.sense;
+        if (sign == 0.0) {
+            const Interfaces::Branch &br = brs[fc.branch];
+            const Point mBranch = om.vertices[br.verts.back()] - om.vertices[br.verts.front()];
+            const int o0 = c2o[fc.verts.front()], o1 = c2o[fc.verts.back()];
+            if (o0 < 0 || o1 < 0) continue;
+            const Point mChain = om.vertices[o1] - om.vertices[o0];
+            sign = (dotP(mChain, mBranch) >= 0.0) ? 1.0 : -1.0;
+        }
+        const Point d = (uv[fc.verts.back()] - uv[fc.verts.front()]) * sign;
+        flux[fc.branch] = flux[fc.branch] + rotateQuarters(d, -fc.turn);
         weight[fc.branch] += fc.length;
     }
+    const auto turnOf = [&](int b) -> int {
+        return (b >= 0 && b < static_cast<int>(branchTurn.size())) ? branchTurn[b] : 0;
+    };
+    // Whether ray k of node n is the node0 end of its branch. A branch that
+    // leaves and returns to one node has both rays there, and only the one
+    // pointing at the branch's second vertex is its start.
+    auto atNode0 = [&](size_t n, size_t k) -> bool {
+        const Interfaces::Ray &ray = nds[n].rays[k];
+        if (ray.branch < 0) return false;
+        const Interfaces::Branch &br = brs[ray.branch];
+        if (static_cast<int>(n) != br.node0) return false;
+        if (br.node0 != br.node1 || br.verts.size() < 2) return true;
+        return ray.neighbour == br.verts[1];
+    };
 
     std::vector<int> rayDir(nRays, -1);
     std::vector<char> seen(nRays, 0);
@@ -525,9 +682,19 @@ std::vector<int> SubdomainLabels::propagateDirections(const std::vector<Point> &
             const double v = dotP(flux[b0], axis(d));
             if (v > bestDot) { bestDot = v; best = d; }
         }
-        rayDir[branchRays[b0].front()] = best;
-        stack.assign(1, branchRays[b0].front());
-        seen[branchRays[b0].front()] = 1;
+        // `best` is the direction of travel out of node0 in node0's chart, so
+        // it belongs on the node0 ray. The node1 ray, where that is the only
+        // one there is, points back along the branch in node1's chart.
+        int seedRay = branchRays[b0].front();
+        int seedDir = best + turnOf(b0) + 2;
+        for (int r : branchRays[b0]) {
+            size_t n = 0;
+            while (n + 1 < nds.size() && rayBase[n + 1] <= r) ++n;
+            if (atNode0(n, static_cast<size_t>(r - rayBase[n]))) { seedRay = r; seedDir = best; break; }
+        }
+        rayDir[seedRay] = ((seedDir % 4) + 4) % 4;
+        stack.assign(1, seedRay);
+        seen[seedRay] = 1;
 
         while (!stack.empty()) {
             const int r = stack.back();
@@ -552,10 +719,12 @@ std::vector<int> SubdomainLabels::propagateDirections(const std::vector<Point> &
             if (k > 0 && k - 1 < static_cast<int>(nd.quarters.size())) {
                 push(r - 1, rayDir[r] - nd.quarters[k - 1]);
             }
-            // Across a branch: the far end points the other way.
+            // Across a branch: the far end points the other way, in a chart
+            // turned by the seams the branch crosses on the way there.
             const int b = nd.rays[k].branch;
             if (b >= 0) {
-                for (int other : branchRays[b]) if (other != r) push(other, rayDir[r] + 2);
+                const int t = atNode0(n, static_cast<size_t>(k)) ? turnOf(b) : -turnOf(b);
+                for (int other : branchRays[b]) if (other != r) push(other, rayDir[r] + t + 2);
             }
         }
     }
@@ -569,10 +738,11 @@ std::vector<int> SubdomainLabels::propagateDirections(const std::vector<Point> &
         for (int r : branchRays[b]) {
             size_t n = 0;
             while (n + 1 < nds.size() && rayBase[n + 1] <= r) ++n;
-            if (static_cast<int>(n) == brs[b].node0) { branchDir[b] = rayDir[r]; break; }
+            if (atNode0(n, static_cast<size_t>(r - rayBase[n]))) { branchDir[b] = rayDir[r]; break; }
         }
         if (branchDir[b] < 0 && rayDir[branchRays[b].front()] >= 0) {
-            branchDir[b] = rayDir[branchRays[b].front()];
+            // Only the node1 ray was reached: turn it back into node0's chart.
+            branchDir[b] = (((rayDir[branchRays[b].front()] - turnOf(b) + 2) % 4) + 4) % 4;
         }
     }
     return branchDir;
@@ -619,7 +789,8 @@ void SubdomainLabels::labelFeatures(const std::vector<Point> &uv) {
         fc.dirKnown = false;
         if (propagate && fc.branch >= 0 && fc.branch < static_cast<int>(branchDir.size()) &&
             branchDir[fc.branch] >= 0) {
-            fc.dir = branchDir[fc.branch];
+            // branchDir is in node0's chart; the chain may be past a seam.
+            fc.dir = (branchDir[fc.branch] + fc.turn) % 4;
             fc.dirKnown = true;
             fc.label = (fc.dir % 2 == 0) ? Align::V : Align::U;
             ++report.featureChainsPropagated;
