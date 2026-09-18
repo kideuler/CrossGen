@@ -1,0 +1,77 @@
+# CrossGen
+
+2D cross fields, and quad layouts / block decompositions built from them, for
+planar multi-material domains. C++17, Eigen (submodule), OpenCASCADE, Gmsh,
+optional Qt6 viewer. It backs an IMR 2027 paper: a p=0 dual-mesh MBO cross field
+(`src/dualmbo`) feeding the Shepherd–Gu–Hughes 2022 quad-layout pipeline.
+
+## Rules
+
+- **Read-only git only.** `status`/`diff`/`log`/`show` are fine. Never `add`, `commit`,
+  `push`, `stash`, `checkout`, `reset`, `restore` or `clean`. The user manages history.
+  If you need a "before" baseline, add a runtime flag or env-var override instead of stashing.
+- **OpenCASCADE is confined to `src/geom`.** No OCC header, and no `geom/detail/`
+  include, anywhere else. The build enforces it (OCC is linked PRIVATE to
+  `CrossGenGeom`) and so does ctest `Geom_OpenCascadeConfinedToGeom`. New geometry
+  goes into `src/geom`, behind public headers that name no OCC type.
+- Put throwaway drivers, corpus sweeps and dumps in the session scratchpad, not in the repo.
+- Match the house style: `.hxx`/`.cxx`, `#ifndef __NAME_HXX__` guards, include paths
+  relative to `src/` (`"MERIDIAN/Immersion.hxx"`). Comments are long-form prose that
+  explains *why* and cites paper sections (e.g. "Sec. 3.3", "Q1–Q5", "Definition 2.1").
+
+## Build
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release          # existing build/ is Release, viewer ON, CoMiSo OFF
+cmake --build build -j8                                 # or: --target TestMERIDIAN TestTORSION -j8
+```
+
+- `build.sh` runs `rm -rf build` and does a full rebuild. `make_meshes.sh` also calls
+  `clean.sh`, which deletes the `.msh`/`.obj` meshes. Don't run either unless asked.
+- Options: `BUILD_OPENGL_VIEWER` (Qt6 `Viewer`), `CROSSGEN_ENABLE_COMISO` (MIQ only,
+  default OFF), `CROSSGEN_ENABLE_OPENMP` (TMOP; finds Homebrew libomp), `BUILD_MESH2GMSH`.
+- Libraries: `CrossGenGeom` (src/geom, OCC) and `PolyVector` (all the rest, links
+  CrossGenGeom PUBLIC). Every executable is a thin driver in `src/utils/`.
+- `data/meshes/**` is copied into `build/data/meshes` **at configure time**. Re-run
+  `cmake` after adding or regenerating a mesh.
+
+## Test
+
+- `cd build && ctest` (or `ctest -R MERIDIAN`, `-R TORSION`, `-R Geom`, `-R Paper_`).
+  A project PreToolUse hook (`.claude/hooks/filter-test-output.sh`) cuts `ctest`/`make test`
+  output down to the FAIL/ERROR lines. The end-to-end cases have 2400 s timeouts; the
+  bubbles template cases are the slow ones.
+- Self-tests: `TestMERIDIAN --selftest`, `TestTORSION --selftest`, `TestTMOP --selftest`, `TestGeom`.
+- A single model: `./build/TestMERIDIAN data/meshes/singlemat/geom012.obj [flags]`
+  (TestTORSION works the same way). The flag parser is in `src/utils/TestMERIDIAN.cxx`
+  around line 330. Useful flags: `--disk-templates --near-miss 0.04` (bubbles),
+  `--tmop N`, `--cones N`, `--curves N`, `--step/--brep` (write the output),
+  `--sep`/`--sep-uv`/`--psi`/`--layout` (OBJ dumps). TestTORSION adds
+  `--weight min|harm|orth`, `--no-continuation`, `--ref-test`.
+- Whole corpus: `make meridian` / `make torsion` / `make dualmbo` run from `build/`
+  and don't fail on a bad model. For comparisons, write a scratch driver and run it with `xargs -P`.
+- `TopoDiag <mesh>` is the user's own diagnostic for a single model.
+
+## Layout
+
+| Path | What |
+|---|---|
+| `src/mesh` | `Mesh` (triangle mesh, material tags), `QuadMesh` + MFEM `.mesh` writer, `TMOP` smoother |
+| `src/dualmbo` | **DualMBO**, our method: p=0 dual-mesh MBO. Crosses on faces, singularities on vertices |
+| `src/crossfield`, `src/polyvector` | Baselines B1 (P1-MBO, per vertex) and B2 (polyvectors) |
+| `src/MERIDIAN` | **Pipeline A**, Shepherd 2022 Stages 0b–11: Interfaces → ConeSingularities → ConeCut → RicciFlow → Immersion → SubdomainLabels → LayoutEnergy → Separatrices → Arrangement → SplineFit → QuadMesh, plus DiskTemplate (0c/11). The stage map is in the header comment of `MERIDIAN.hxx` |
+| `src/TORSION` | **Pipeline B**: the same stages, but Stages 3–4 are swapped for integrating the DualMBO field (ConeMetric, FieldFrames, FieldIntegration, TutteEmbedding). Both pipelines meet at `Immersion`, and every stage after that is shared |
+| `src/geom` | Splines, polylines, Coons, B-rep (`Vertex/Edge/Face/Shape`), STEP/BREP output, all on top of OCC |
+| `src/tracing`, `src/quantization`, `src/medialaxis`, `src/UMBER`, `src/OASIS`, `src/Parameterization` | Older approaches (Viertel IMR19 tracing, QGP, medial axis, polysquare, spectral, MIQ). Rarely touched now |
+| `src/viewer` | Qt6 `Viewer`. `run_meshes.sh` opens every mesh in turn; it has figure/SVG export |
+| `paper_tests/` | E1–E5 paper experiments (`make paper`; E1/E2 are also ctests). **Read `paper_tests/README.md` first.** It is the running log of findings, methods and protocol. Results go in `paper_tests/results/` |
+| `data/geometry/{singlemat,multimat}` | `.geo` sources. `Mesh2Dgmsh` turns them into `data/meshes/<kind>/*.obj` (gitignored) |
+| `data/meshes/{singlemat,multimat,mechanism}` | Corpus: 24 + 11 + mechanism set (built by `MakeDomains`, kept separate from the corpus on purpose) |
+| `data/geometry_extra/` | Models dropped from the corpus. Not used |
+| `docs/` | Design notes: `ricci_flow_pipeline.md` (A), `cf_flow_pipeline.md` (B), `multimaterial.md`, `tmop_node_mobility.md`, `shepherd2022.pdf` |
+
+## Before changing a pipeline stage
+
+The memory index has a note for each area (stages 6–10, tracing, multimat, disk
+templates, TMOP, SIPG/DualMBO, geom/OCC). Read the note for the area before
+changing it. Most of them record a trap that already cost a debugging session.
