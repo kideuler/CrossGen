@@ -1,6 +1,7 @@
 #include "geom/Polyline.hxx"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <utility>
 
@@ -29,33 +30,45 @@ Polyline<D>::Polyline(std::vector<Vec<D>> points) : pts(std::move(points)) {
         }
     }
     param.back() = 1.0;
+
+    // The vertices the kernel gets: each one further than an ulp in parameter
+    // from the last one kept. The final vertex always stays, displacing the
+    // one before it if the two are that close.
+    std::vector<double> knots{0.0, 0.0};
+    std::vector<Vec<D>> ctrl{pts.front()};
+    for (std::size_t i = 1; i < pts.size(); ++i) {
+        const double last = knots.back();
+        const bool apart = param[i] - last > std::nextafter(last, 2.0) - last;
+        if (i + 1 == pts.size()) {
+            if (!apart && ctrl.size() > 1) {
+                knots.pop_back();
+                ctrl.pop_back();
+            }
+            knots.push_back(1.0);
+            ctrl.push_back(pts[i]);
+        } else if (apart) {
+            knots.push_back(param[i]);
+            ctrl.push_back(pts[i]);
+        }
+    }
+    knots.push_back(1.0);
+    spline = BSplineCurve<D>(1, knots, ctrl);
 }
 
 template <std::size_t D>
 Vec<D> Polyline<D>::evaluate(double u) const {
     if (pts.empty()) return zero<D>();
     if (pts.size() == 1) return pts.front();
-    u = std::max(0.0, std::min(1.0, u));
-    if (u <= 0.0) return pts.front();
+    if (!(u > 0.0)) return pts.front();
     if (u >= 1.0) return pts.back();
-    const std::size_t k = static_cast<std::size_t>(
-        std::lower_bound(param.begin(), param.end(), u) - param.begin());
-    if (k == 0) return pts.front();
-    if (k >= pts.size()) return pts.back();
-    const double seg = param[k] - param[k - 1];
-    const double w = seg > 0.0 ? (u - param[k - 1]) / seg : 0.0;
-    return pts[k - 1] + (pts[k] - pts[k - 1]) * w;
+    return spline.evaluate(u);
 }
 
 template <std::size_t D>
 double Polyline<D>::distance(const Vec<D> &p) const {
     if (pts.empty()) return std::numeric_limits<double>::infinity();
     if (pts.size() == 1) return norm(p - pts.front());
-    double best = std::numeric_limits<double>::infinity();
-    for (std::size_t i = 0; i + 1 < pts.size(); ++i) {
-        best = std::min(best, distanceToSegment(p, pts[i], pts[i + 1]));
-    }
-    return best;
+    return spline.distance(p);
 }
 
 template class Polyline<2>;

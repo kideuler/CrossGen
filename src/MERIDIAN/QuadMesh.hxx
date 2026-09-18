@@ -7,6 +7,7 @@
 
 #include "MERIDIAN/SplineFit.hxx"
 #include "geom/ArcLength.hxx"
+#include "geom/Polyline.hxx"
 #include "mesh/Mesh.hxx"
 
 // Stage 10 of the pipeline: the quadrilateral mesh on the layout Stages 8 and 9
@@ -509,6 +510,7 @@ private:
     std::vector<int> nodeClass;
     std::vector<int> facePatch;             // arrangement face -> SplineFit patch
     std::vector<geom::ArcLengthTable> tables; // per arc
+    std::vector<geom::Polyline<2>> traced;    // per arc, its traced polyline
 
     double modelExtent = 1.0;
     Report report;

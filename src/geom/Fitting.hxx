@@ -27,7 +27,10 @@
 //     cannot determine a control point, and without which such a control point
 //     goes anywhere at all.
 //
-// With the defaults below it reproduces SplineFit's arcs bit for bit.
+// None of OpenCASCADE's approximators does those three together -- they pick
+// their own knots, and a Coons patch needs opposite sides on the same ones --
+// so the normal equations are assembled and solved here. The basis values in
+// them are the kernel's, and so is the curve that comes out.
 namespace geom {
 
 enum class Parameterization {
@@ -101,10 +104,10 @@ template <std::size_t D>
 FitResult<D> fitCurve(const std::vector<Vec<D>> &points, const FitOptions &options = FitOptions());
 
 // The curve through every point, point i at parameterize(points)[i], over
-// averagedKnots(). The degree is lowered to points.size() - 1 when there are
-// too few points for it; a single point gives a constant curve. Throws
-// std::invalid_argument if two consecutive points share a parameter, which
-// makes the system singular.
+// averagedKnots(), solved by the kernel. The degree is lowered to
+// points.size() - 1 when there are too few points for it; a single point gives
+// a constant curve of degree 1. Throws std::invalid_argument if two consecutive
+// points share a parameter, which makes the system singular.
 template <std::size_t D>
 BSplineCurve<D> interpolateCurve(const std::vector<Vec<D>> &points, int degree = 3,
                                  Parameterization kind = Parameterization::ChordLength);

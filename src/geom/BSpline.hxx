@@ -1,53 +1,92 @@
 #ifndef __GEOM_BSPLINE_HXX__
 #define __GEOM_BSPLINE_HXX__
 
+#include <array>
+#include <memory>
 #include <vector>
 
 #include "geom/Vec.hxx"
 
-// B-spline curves and tensor-product surfaces, of any degree, over any
-// non-decreasing knot vector, in two or three dimensions.
+// B-spline curves and tensor-product surfaces, of any degree from 1 to
+// kMaxDegree, over any knot vector the kernel accepts, in two or three
+// dimensions.
 //
-// This is the spline layer MERIDIAN's Stage 9 (SplineFit) and TORSION's reuse
-// of it were built on, taken out of the pipeline and given no opinion about
-// arrangements, arcs or patches. The pieces, and where each one lives:
+// ### The kernel
+//
+// Every curve and surface in the repository is an OpenCASCADE object, and
+// src/geom is the only code that knows it. The classes here hold a
+// Geom_BSplineCurve or a Geom_BSplineSurface and route evaluation, derivatives,
+// knot insertion, reversal, arc length and projection through the kernel; the
+// headers name nothing of OpenCASCADE, and the build puts its include
+// directories on src/geom's sources alone, so nothing outside this directory
+// can call it even by accident. (ctest's Geom_OpenCascadeConfinedToGeom checks
+// the same thing from the source side.) A new geometric need is met by adding
+// to src/geom, not by reaching past it.
+//
+// Two-dimensional geometry is carried in three dimensions, in the plane z = 0:
+// the kernel's topology (Topology.hxx) is three-dimensional, and a 2-D curve
+// that is already a 3-D object can become the edge of a face, be revolved or be
+// written to STEP without a conversion. The kernel evaluates each coordinate on
+// its own, so reading a 2-D point back loses nothing.
+//
+// The pieces, and where each one lives:
 //
 //     geom/BSpline.hxx    knot vectors, the basis, BSplineCurve, BSplineSurface
 //     geom/Fitting.hxx    least-squares fitting and interpolation of point runs
-//     geom/Polyline.hxx   a polyline parameterised by normalised chord length
-//     geom/ArcLength.hxx  arc length of any parametric curve, and its inverse
-//     geom/Coons.hxx      Coons blends, of points and of control nets
+//     geom/Polyline.hxx   a polyline as a degree-1 curve on normalised chord length
+//     geom/ArcLength.hxx  a tabulated arc length of any parametric curve
+//     geom/Coons.hxx      Coons blends, of points, control nets and curves
+//     geom/Topology.hxx   Vertex, Edge, Face and Shape: the B-rep, and STEP/BREP out
 //
-// The algorithms are the ones in Piegl and Tiller, *The NURBS Book* (2nd ed.):
-// FindSpan and BasisFuns (A2.1, A2.2), the curve point (A3.1), the derivative
-// curve (Eq. 3.8), knot insertion (A5.1), global interpolation (A9.1, with the
-// averaged knots of Eq. 9.8) and least-squares approximation (Sec. 9.4.1).
+// ### What is still computed here, and why
+//
+// Only what the kernel does not offer in the form the pipelines need. The
+// least-squares fit of Fitting.hxx holds its ends, shares one knot vector across
+// every arc and regularises towards the chord, and none of OpenCASCADE's
+// approximators does all three -- they choose their own knots, which would give
+// opposite sides of a patch different ones. The Coons net of Coons.hxx is taken
+// at the Greville abscissae; GeomFill's Coons filling takes it at uniform pole
+// indices instead, which is not linearly precise and bows a patch on straight
+// sides by 1.5e-2 of its size. Both constructions still evaluate the basis and
+// store their results through the kernel.
 //
 // ### Conventions
 //
 // A curve with n control points and degree p has n + p + 1 knots, and is
 // defined over the domain [knots[p], knots[n]]. evaluate() clamps its argument
-// into that domain rather than extrapolating. Nothing requires the knot vector
-// to be clamped, but every constructor in this directory makes clamped ones,
-// and on a clamped knot vector the first and last control points are the two
-// ends of the curve exactly -- which is what lets two splines that share an end
-// point meet at the same double.
+// into that domain rather than extrapolating. The kernel requires interior
+// knots of multiplicity at most p -- a curve is at least C0 -- and distinct
+// knots more than an ulp apart. Every constructor in this directory makes
+// clamped knot vectors, and on a clamped one the first and last control points
+// are the two ends of the curve exactly, which is what lets two splines that
+// share an end point meet at the same double.
 //
 // A surface's control net is stored row-major, net[j * countS() + i] being the
 // control point at (s_i, t_j): i runs along s, j along t. That is the layout
 // SplineFit::Patch has always used, and the one Stage 10 samples.
 //
+// The objects are values. Copies share one kernel object, which is never
+// modified in place: the operations that change a curve (insertKnot,
+// setControlPoint) give it a fresh one first, so a copy, or an Edge built on
+// the curve earlier, keeps the geometry it had.
+//
 // ### Numerical exactness
 //
-// The arithmetic in the .cxx is written expression for expression as it was in
-// SplineFit, not merely to the same formulas: the pipeline's watertightness
-// checks compare doubles for exact equality, and on this toolchain a reordered
-// sum is a different double. Before rewriting anything in the evaluation or
-// fitting paths, rerun the MERIDIAN/TORSION corpus and diff the control points.
+// The kernel's de Boor evaluation is not the basis-function sum SplineFit used
+// before it, and the two differ in the last bit or two (1.2e-15 at most on a
+// unit cubic). What the pipelines compare exactly -- control points two patches
+// share, corners against nodes -- is copied rather than computed, and stays
+// exact; what they sample is to rounding.
 namespace geom {
 
-// The basis is evaluated into stack buffers of this size.
-constexpr int kMaxDegree = 15;
+namespace detail {
+struct CurveData;
+struct SurfaceData;
+struct Access;
+} // namespace detail
+
+// The kernel's own limit (Geom_BSplineCurve::MaxDegree()).
+constexpr int kMaxDegree = 25;
 
 // ---------------------------------------------------------------------------
 // Knot vectors and the basis
@@ -69,7 +108,7 @@ std::vector<double> averagedKnots(const std::vector<double> &params, int degree)
 // per control point: the parameter each control point "belongs to". A curve
 // whose control points sit on a line at their Greville abscissae is that line,
 // linearly parameterised, which is why the Coons blend of Coons.hxx is taken at
-// them.
+// them. degree >= 1.
 std::vector<double> grevilleAbscissae(const std::vector<double> &knots, int degree);
 
 // The number of control points a knot vector of this degree carries.
@@ -77,13 +116,12 @@ inline int controlPointCount(const std::vector<double> &knots, int degree) {
     return static_cast<int>(knots.size()) - degree - 1;
 }
 
-// The knot span containing u: the index k with knots[k] <= u < knots[k+1],
-// restricted to [degree, n - 1] so that u at the end of the domain lands in the
-// last non-empty span.
-int findSpan(const std::vector<double> &knots, int degree, double u);
-
-// The degree + 1 basis functions that are non-zero on `span`, at u, into N.
-void basisFunctions(const std::vector<double> &knots, int degree, int span, double u, double *N);
+// The degree + 1 basis functions that can be non-zero at u, into N, from the
+// kernel (BSplCLib). Returns the index of the control point N[0] belongs to, so
+// that N[a] is the weight of control point (returned + a). u is clamped into
+// the domain; at its end the last basis function is 1. degree 0 is allowed here,
+// though no curve can have it.
+int basisFunctions(const std::vector<double> &knots, int degree, double u, double *N);
 
 // ---------------------------------------------------------------------------
 // BSplineCurve
@@ -93,21 +131,22 @@ class BSplineCurve {
 public:
     BSplineCurve() = default;
 
-    // Throws std::invalid_argument unless 0 <= degree <= kMaxDegree, the knots
-    // do not decrease, the domain is not empty, and
-    // knots.size() == ctrl.size() + degree + 1.
-    BSplineCurve(int degree, std::vector<double> knots, std::vector<Vec<D>> ctrl);
+    // Throws std::invalid_argument unless 1 <= degree <= kMaxDegree, the knots
+    // do not decrease, knots.size() == ctrl.size() + degree + 1, the domain is
+    // not empty, and the kernel accepts the knot vector (no interior knot of
+    // multiplicity above the degree, no two distinct knots within an ulp).
+    BSplineCurve(int degree, const std::vector<double> &knots, const std::vector<Vec<D>> &ctrl);
 
-    bool empty() const { return ctrl.empty(); }
-    int size() const { return static_cast<int>(ctrl.size()); }
-    int degree() const { return p; }
-    const std::vector<double> &knots() const { return knot; }
-    const std::vector<Vec<D>> &controlPoints() const { return ctrl; }
-
+    bool empty() const { return !data; }
+    int size() const;
+    int degree() const;
+    // The flat knot vector, as the constructor took it.
+    std::vector<double> knots() const;
+    std::vector<Vec<D>> controlPoints() const;
+    Vec<D> controlPoint(int i) const;
     // Moving a control point cannot invalidate the curve; adding or removing
     // one would, so only the former is offered.
-    Vec<D> &controlPoint(int i) { return ctrl[i]; }
-    const Vec<D> &controlPoint(int i) const { return ctrl[i]; }
+    void setControlPoint(int i, const Vec<D> &p);
 
     double domainBegin() const;
     double domainEnd() const;
@@ -116,30 +155,55 @@ public:
     Vec<D> evaluate(double u) const;
     Vec<D> operator()(double u) const { return evaluate(u); }
 
+    // The order-th derivative with respect to u at u (clamped), order >= 1. Zero
+    // above the degree.
+    Vec<D> derivativeAt(double u, int order = 1) const;
+
     // segments + 1 points at uniform steps of the parameter over the domain.
     std::vector<Vec<D>> sample(int segments) const;
 
     // The derivative as a curve in its own right, one degree lower over the
-    // same knots less the first and last. Evaluate that for tangents rather
-    // than calling this per point. Throws on a degree-0 curve.
+    // same knots less the first and last. Evaluate that for tangents along a
+    // whole curve rather than calling this per point. Throws on a curve of
+    // degree 1, whose derivative is piecewise constant, and on one with an
+    // interior knot of full multiplicity, whose derivative jumps there -- the
+    // kernel can represent neither; derivativeAt() still answers for both.
     BSplineCurve derivative() const;
 
-    // The same point set traversed the other way: control points reversed and
-    // knots mirrored across the domain, so reversed().evaluate(a + b - u) is
-    // evaluate(u). Mirroring is exact only if the knots are, which uniform
-    // thirds are not -- see SplineFit::Report::maxBoundaryGap.
+    // The same point set traversed the other way, over the mirrored knots, so
+    // reversed().evaluate(a + b - u) is evaluate(u). Mirroring is exact only if
+    // the knots are, which uniform thirds are not: 1 - 2/3 and 1/3 are an ulp
+    // apart.
     BSplineCurve reversed() const;
 
-    // Boehm insertion of u, `times` times, capped so that no knot exceeds
+    // Knot insertion of u, `times` times, capped so that no knot exceeds
     // multiplicity `degree`. The curve does not change, geometrically or in
     // parameterisation; it gains control points. u must lie strictly inside the
     // domain. Returns how many copies were inserted.
     int insertKnot(double u, int times = 1);
 
+    // Arc length over the whole domain, or between two parameters, by the
+    // kernel's Gauss integration.
+    double length() const;
+    double length(double u0, double u1) const;
+    // The parameter at which arc length s has been travelled from the start of
+    // the domain, clamped to it.
+    double parameterAtLength(double s) const;
+
+    // The nearest point of the curve to p, over its whole domain -- the ends and
+    // any corner (a knot of full multiplicity) included, which the kernel's
+    // projection by itself does not look at.
+    struct Nearest {
+        double parameter = 0.0;
+        Vec<D> point{};
+        double distance = 0.0;
+    };
+    Nearest nearest(const Vec<D> &p) const;
+    double distance(const Vec<D> &p) const { return nearest(p).distance; }
+
 private:
-    int p = 0;
-    std::vector<double> knot;
-    std::vector<Vec<D>> ctrl;
+    std::shared_ptr<const detail::CurveData> data;
+    friend struct detail::Access;
 };
 
 // ---------------------------------------------------------------------------
@@ -154,25 +218,27 @@ public:
     // countT fixed by the knot vectors. Throws std::invalid_argument on the
     // same conditions as BSplineCurve, in each direction, or if the net is the
     // wrong size.
-    BSplineSurface(int degreeS, std::vector<double> knotsS,
-                   int degreeT, std::vector<double> knotsT,
-                   std::vector<Vec<D>> net);
+    BSplineSurface(int degreeS, const std::vector<double> &knotsS,
+                   int degreeT, const std::vector<double> &knotsT,
+                   const std::vector<Vec<D>> &net);
 
-    bool empty() const { return net.empty(); }
-    int degreeS() const { return pS; }
-    int degreeT() const { return pT; }
-    int countS() const { return nS; }
-    int countT() const { return nT; }
-    const std::vector<double> &knotsS() const { return knotS; }
-    const std::vector<double> &knotsT() const { return knotT; }
-    const std::vector<Vec<D>> &controlNet() const { return net; }
+    bool empty() const { return !data; }
+    int degreeS() const;
+    int degreeT() const;
+    int countS() const;
+    int countT() const;
+    std::vector<double> knotsS() const;
+    std::vector<double> knotsT() const;
+    std::vector<Vec<D>> controlNet() const;
 
-    const Vec<D> &control(int i, int j) const { return net[static_cast<std::size_t>(j) * nS + i]; }
-    Vec<D> &control(int i, int j) { return net[static_cast<std::size_t>(j) * nS + i]; }
+    Vec<D> control(int i, int j) const;
+    void setControl(int i, int j, const Vec<D> &p);
 
     // The point at (s, t), each clamped into its domain.
     Vec<D> evaluate(double s, double t) const;
     Vec<D> operator()(double s, double t) const { return evaluate(s, t); }
+    // The two first partial derivatives there, d/ds and d/dt.
+    std::array<Vec<D>, 2> partials(double s, double t) const;
 
     // Row j of the net as a curve along s, and column i as a curve along t. On
     // clamped knots the first and last of each are the surface's four
@@ -181,10 +247,8 @@ public:
     BSplineCurve<D> column(int i) const;
 
 private:
-    int pS = 0, pT = 0;
-    int nS = 0, nT = 0;
-    std::vector<double> knotS, knotT;
-    std::vector<Vec<D>> net;
+    std::shared_ptr<const detail::SurfaceData> data;
+    friend struct detail::Access;
 };
 
 extern template class BSplineCurve<2>;
@@ -196,6 +260,14 @@ using BSplineCurve2 = BSplineCurve<2>;
 using BSplineCurve3 = BSplineCurve<3>;
 using BSplineSurface2 = BSplineSurface<2>;
 using BSplineSurface3 = BSplineSurface<3>;
+
+// The same curve or surface in the other dimension: a 2-D one placed in the
+// plane z = 0, or a 3-D one with z dropped (it is not checked that z was zero).
+// The two share one kernel object.
+BSplineCurve<3> lift(const BSplineCurve<2> &c);
+BSplineCurve<2> flatten(const BSplineCurve<3> &c);
+BSplineSurface<3> lift(const BSplineSurface<2> &s);
+BSplineSurface<2> flatten(const BSplineSurface<3> &s);
 
 } // namespace geom
 

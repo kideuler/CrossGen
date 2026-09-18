@@ -73,6 +73,40 @@ if (NOT CROSSGEN_OPENMP_TARGET)
     message(STATUS "No OpenMP: TMOP will run single-threaded")
 endif()
 
+# OpenCASCADE: the geometry kernel
+#
+# Every curve, surface and boundary representation in the repository is an
+# OpenCASCADE object, and src/geom is the only code allowed to know that. It is
+# built as its own library with OpenCASCADE linked PRIVATE, so the kernel's
+# include directories reach src/geom's sources and nothing else: a file
+# anywhere else that includes an OpenCASCADE header does not compile. ctest's
+# Geom_OpenCascadeConfinedToGeom checks the same rule from the source side.
+# (Homebrew: `brew install opencascade`; elsewhere, point OpenCASCADE_DIR at
+# the directory holding OpenCASCADEConfig.cmake.)
+find_package(OpenCASCADE REQUIRED)
+message(STATUS "OpenCASCADE ${OpenCASCADE_VERSION} from ${OpenCASCADE_INSTALL_PREFIX}")
+
+add_library(CrossGenGeom SHARED
+    src/geom/Vec.hxx
+    src/geom/BSpline.hxx
+    src/geom/BSpline.cxx
+    src/geom/Polyline.hxx
+    src/geom/Polyline.cxx
+    src/geom/ArcLength.hxx
+    src/geom/ArcLength.cxx
+    src/geom/Fitting.hxx
+    src/geom/Fitting.cxx
+    src/geom/Coons.hxx
+    src/geom/Coons.cxx
+    src/geom/Topology.hxx
+    src/geom/Topology.cxx
+    src/geom/detail/Occ.hxx
+)
+target_include_directories(CrossGenGeom PUBLIC src)
+target_link_libraries(CrossGenGeom PRIVATE
+    TKernel TKMath TKG2d TKG3d TKGeomBase TKGeomAlgo TKBRep TKTopAlgo
+    TKXSBase TKDE TKDESTEP)
+
 option(BUILD_MESH2GMSH "Build the Mesh2Dgmsh utility" ON)
 
 if (BUILD_MESH2GMSH)
@@ -97,17 +131,6 @@ add_library(PolyVector SHARED
     src/mesh/QuadMesh.hxx
     src/mesh/TMOP.cxx
     src/mesh/TMOP.hxx
-    src/geom/Vec.hxx
-    src/geom/BSpline.hxx
-    src/geom/BSpline.cxx
-    src/geom/Polyline.hxx
-    src/geom/Polyline.cxx
-    src/geom/ArcLength.hxx
-    src/geom/ArcLength.cxx
-    src/geom/Fitting.hxx
-    src/geom/Fitting.cxx
-    src/geom/Coons.hxx
-    src/geom/Coons.cxx
     src/polyvector/PolyVectors.hxx
     src/polyvector/PolyVectors.cxx
     src/dualmbo/DualMBO.hxx
@@ -199,7 +222,7 @@ add_library(PolyVector SHARED
 target_include_directories(PolyVector PUBLIC src)
 target_include_directories(PolyVector PUBLIC src/triangle)
 target_compile_definitions(PolyVector PRIVATE TRILIBRARY ANSI_DECLARATORS)
-target_link_libraries(PolyVector PUBLIC Eigen3::Eigen)
+target_link_libraries(PolyVector PUBLIC Eigen3::Eigen CrossGenGeom)
 if (CROSSGEN_OPENMP_TARGET)
     target_link_libraries(PolyVector PUBLIC ${CROSSGEN_OPENMP_TARGET})
 endif()
@@ -253,11 +276,12 @@ target_link_libraries(TestDualMBO PRIVATE PolyVector)
 add_executable(TestTMOP src/utils/TestTMOP.cxx)
 target_link_libraries(TestTMOP PRIVATE PolyVector)
 
-# Self-test the spline library of src/geom -- B-spline curves and surfaces,
-# fitting, interpolation, knot insertion, arc length and Coons blends -- on
-# curves whose answers are known in closed form. Needs no files.
+# Self-test the geometry layer of src/geom -- B-spline curves and surfaces,
+# fitting, interpolation, knot insertion, arc length, projection, Coons blends
+# and the B-rep of vertices, edges and faces -- on shapes whose answers are
+# known in closed form. Needs no files, and links src/geom alone.
 add_executable(TestGeom src/utils/TestGeom.cxx)
-target_link_libraries(TestGeom PRIVATE PolyVector)
+target_link_libraries(TestGeom PRIVATE CrossGenGeom)
 
 # Test the UMBER frame field optimization (Wang et al. 2022, Secs. 4.1-4.2)
 add_executable(TestUMBER src/utils/TestUMBER.cxx)
@@ -404,11 +428,19 @@ add_test(NAME Tracing_LayoutsOnAllMeshes
 # sums directly and the Hessian against a finite difference.
 add_test(NAME MERIDIAN_RicciFlowSelfTest COMMAND TestMERIDIAN --selftest)
 
-# The spline library under both pipelines' Stage 9 (src/geom), against closed
+# The geometry layer under both pipelines' Stage 9 (src/geom), against closed
 # forms: partition of unity, knot insertion and reversal leaving the curve
-# unchanged, fits reproducing what they can represent, and a Coons net on four
-# straight sides reproducing the bilinear map.
+# unchanged, fits reproducing what they can represent, a Coons net on four
+# straight sides reproducing the bilinear map, and two faces sharing an edge
+# making a valid shape with that edge counted once.
 add_test(NAME Geom_SplineSelfTest COMMAND TestGeom)
+
+# The rule the CrossGenGeom target enforces at compile time, checked on the
+# sources: no file outside src/geom includes an OpenCASCADE header.
+add_test(NAME Geom_OpenCascadeConfinedToGeom
+         COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_CURRENT_SOURCE_DIR}
+                 -DOCC_INCLUDE=${OpenCASCADE_INCLUDE_DIR}
+                 -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/CheckOpenCascadeConfinement.cmake)
 
 # End-to-end: Stages 1 to 7 on a handful of models that between them exercise
 # every part of the later stages -- a plain disk with one interior cone

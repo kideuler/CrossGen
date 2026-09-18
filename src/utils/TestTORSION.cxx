@@ -1331,6 +1331,10 @@ int main(int argc, char **argv) {
                   << " carried exactly; worst sampled cell " << std::fixed
                   << std::setprecision(4) << sr.minCellRatio << " of the mean"
                   << std::defaultfloat << "\n";
+        std::cout << "  B-rep: " << sr.brepFaces << " face(s), " << sr.brepEdges << " edge(s) -- "
+                  << sr.brepSharedEdges << " shared by two faces, " << sr.brepFreeEdges
+                  << " bounding one; the kernel calls it " << (sr.brepValid ? "valid" : "INVALID")
+                  << "\n";
         verdict(st.splinesWatertight, "Watertight: both patches on an arc share its control points");
         verdict(sr.foldedPatches == 0, "No patch folds under its Coons blend");
         if (sr.foldedPatches > 0) {

@@ -8,17 +8,18 @@
 #include "MERIDIAN/Arrangement.hxx"
 #include "geom/BSpline.hxx"
 #include "geom/Polyline.hxx"
+#include "geom/Topology.hxx"
 #include "mesh/Mesh.hxx"
 
 // Stage 9 of Shepherd, Gu and Hughes (2022): the spline reconstruction.
 // (docs/shepherd2022.pdf, Sec. 5; docs/ricci_flow_pipeline.md Sec. 11.)
 //
-// The spline mathematics -- the basis, curve and surface evaluation, the
-// least-squares fit and the control-level Coons blend -- lives in src/geom and
-// has no idea what an arrangement is. What stays here is the part that is
-// Stage 9's own: which arcs are fitted and which carried exactly, one knot
-// vector for all of them, the orientation of four arcs into a patch frame, the
-// transfinite correction, and the checks.
+// The geometry -- curves, surfaces, the least-squares fit, the Coons blend and
+// the B-rep they are assembled into -- lives in src/geom, on the OpenCASCADE
+// kernel, and has no idea what an arrangement is. What stays here is the part
+// that is Stage 9's own: which arcs are fitted and which carried exactly, one
+// knot vector for all of them, the orientation of four arcs into a patch frame,
+// which vertex and edge each node and arc becomes, and the checks.
 //
 // Stage 8 left a partition of S into quadrilaterals whose sides are arcs. This
 // stage turns each arc into a cubic B-spline and each quadrilateral into a
@@ -88,22 +89,39 @@
 // Options::fitInterfaceArcs put either kind back under the fit, which is what
 // tells a fitting artefact from a meshing one.
 //
-// A patch with an exact side is no longer a pure bicubic. The net would leave
-// its boundary rows on the fitted curves, so evaluate(Patch) adds the
-// transfinite correction that pulls each exact side back onto its polyline:
+// A patch with an exact side is no longer a pure bicubic. Its net would leave
+// the boundary rows on the fitted curves, so the patch is instead the Coons
+// surface of its four sides *as they are evaluated* -- the polyline where the
+// side is exact, the cubic where it is fitted:
 //
-//     S(s,t) += (1-t) d_0(s) + t d_2(s) + (1-s) d_3(t) + s d_1(t)
+//     S(s,t) = Net(s,t) + (1-t) d_0(s) + t d_2(s) + (1-s) d_3(t) + s d_1(t)
 //
-// with d_k = (exact side k) - (its control-net curve). The usual bilinear
-// corner term is absent because it is identically zero: the fit pins both end
-// control points to the arc's end nodes (geom::FitOptions::pinEnds), so every
-// d_k vanishes at both of its ends. The result is exact on the boundary of the
-// patch, C0 across it -- two patches sharing an exact arc both land on the same
-// polyline -- and a smooth blend inside. What it costs is that such a patch is
-// a Coons surface over piecewise-linear sides rather than a tensor-product
-// bicubic, so the control net alone no longer reproduces it. Stage 10 samples
-// through evaluate(), so this is invisible to the mesh; a consumer that wants
-// the net alone should turn the two options on and accept the deviation.
+// with d_k = (exact side k) - (its control-net curve). That is the same thing
+// written two ways: the Coons blend is linear in the sides, the net is the blend
+// of the fitted curves (geom/Coons.hxx), and the bilinear corner term cancels
+// because the fit pins both end control points to the arc's end nodes
+// (geom::FitOptions::pinEnds), so every d_k vanishes at both of its ends. It is
+// built as one tensor-product B-spline, geom::coonsSurface() over the side
+// curves with the polylines raised to degree 3 and every pair of opposite sides
+// given one knot vector -- so the patch is a single kernel surface that its own
+// edges lie on, rather than a net with a correction added at evaluation time.
+// The result is exact on the boundary of the patch, C0 across it -- two patches
+// sharing an exact arc both land on the same polyline -- and a smooth blend
+// inside. What it costs is that Patch::surface then carries the polyline's
+// knots and no longer equals Patch::net. Stage 10 samples through evaluate(),
+// so this is invisible to the mesh; a consumer that wants the net alone should
+// turn the two options on and accept the deviation.
+//
+// ### The B-rep
+//
+// The rule above, fit each arc once and share it, is also what a boundary
+// representation is made of, and the output is built as one: a geom::Vertex
+// per node of the arrangement, a geom::Edge per arc on the curve evaluate()
+// walks, and a geom::Face per patch on its surface, bounded by the edges of its
+// four arcs -- the same edge objects, not copies. Two patches are then joined
+// along an arc because they hold one edge, and Report::brepSharedEdges counts
+// it once. shape() is that model, and writeSTEP() puts it where any CAD tool or
+// mesher can read it.
 //
 // ### The pullback
 //
@@ -137,6 +155,10 @@ public:
     struct Curve {
         int arc = -1;
         geom::BSplineCurve<2> spline;
+        // The arc as an edge of the B-rep: on `spline`, or on `poly`'s curve
+        // when the arc is exact, between the vertices of its two nodes. Null if
+        // the kernel refused it; Report::messages says why.
+        geom::Edge edge;
 
         // Set on an arc that is carried as its traced polyline rather than
         // approximated: evaluate() walks `poly`, and `spline` is then only the
@@ -146,8 +168,8 @@ public:
 
         // Of the traced polyline from the control-net curve. On a fitted arc
         // that is the geometric error of the reconstruction. On an exact arc
-        // the curve *is* the polyline and this is instead the size of the
-        // transfinite correction evaluate(Patch) applies along that side.
+        // the curve *is* the polyline and this is instead how far a patch on
+        // that side departs from its net there.
         double maxDeviation = 0.0;
         double rmsDeviation = 0.0;
         double length = 0.0;         // of the traced polyline
@@ -155,19 +177,28 @@ public:
         bool underdetermined = false; // fewer data points than control points
     };
 
-    // One bicubic patch, as an (n x n) control net with n = segments + 3, in
-    // row-major order: surface.control(i, j) is the control point at (s_i, t_j).
+    // One patch: its (n x n) control net with n = segments + 3, in row-major
+    // order (net.control(i, j) is the control point at (s_i, t_j)), the surface
+    // evaluate() reads, and the face of the B-rep on that surface.
     struct Patch {
         int face = -1;                    // the face of the arrangement
         std::array<int, 4> side{{-1, -1, -1, -1}};      // its four arcs
         std::array<bool, 4> forward{{true, true, true, true}};
         std::array<int, 4> corner{{-1, -1, -1, -1}};    // its four nodes
-        // Which sides are carried exactly, and so which of them evaluate()
-        // has to correct the net back onto.
+        // Which sides are carried exactly, and so on which of them the patch
+        // departs from its net.
         std::array<bool, 4> exactSide{{false, false, false, false}};
         bool corrected = false;                         // any of them
-        // The net alone. evaluate(Patch) adds the correction on top of it.
+        // The Coons net of the four fitted curves over the shared knot vector:
+        // what two patches sharing an arc must agree on to the bit.
+        geom::BSplineSurface<2> net;
+        // The patch: the Coons surface of the four sides as evaluated. The net
+        // itself unless a side is exact; see the header.
         geom::BSplineSurface<2> surface;
+        // `surface` bounded by the edges of the four arcs: the face of the
+        // B-rep, as `face` is the face of the arrangement. Null if the kernel
+        // refused it; Report::messages says why.
+        geom::Face brepFace;
 
         double area = 0.0;         // of the surface, from a sampled grid
         double faceArea = 0.0;     // of the arrangement face it was fitted to
@@ -232,9 +263,9 @@ public:
         int worstArc = -1;
 
         // The same measurement on the exact arcs, where it is not an error of
-        // the model but the size of the correction evaluate(Patch) applies to
-        // keep the net's boundary row on the polyline. It says how far the
-        // control net alone would have been from the input.
+        // the model but how far a patch built on the polyline departs from the
+        // net's boundary row. It says how far the control net alone would have
+        // been from the input.
         double maxNetDeviation = 0.0;
         int worstNetArc = -1;
 
@@ -260,15 +291,28 @@ public:
         // which reproduces the reversed curve only because the uniform knot
         // vector is symmetric -- and it is not, in binary: 1 - (1/3) and (2/3)
         // are a double apart. So the mirrored basis functions differ in the last
-        // bit and the two evaluations of one arc land an ulp apart. It is 2e-16
-        // of the model on the corpus, with or without an exact side, and
-        // boundaryTolerance is what separates that floor from a real gap.
+        // bit and the two evaluations of one arc land an ulp apart; on an exact
+        // side the polyline's degree elevation adds a few more. It is below
+        // 4e-15 of the model on the corpus, and boundaryTolerance is what
+        // separates that floor from a real gap.
         double maxBoundaryGap = 0.0;
         static constexpr double boundaryTolerance = 1e-12;
 
         double patchArea = 0.0;
         double faceArea = 0.0;      // the same patches as arrangement faces
         double minCellRatio = 0.0;
+
+        // The B-rep, counted by the kernel. Every patch should have a face and
+        // every arc two patches share should be one edge bounding both of them,
+        // so brepFaces == patches and brepSharedEdges == sharedArcs; the free
+        // edges are then the boundary of the patched region. brepValid is the
+        // kernel's own check of the whole shape (BRepCheck).
+        int brepFaces = 0;
+        int brepEdges = 0;
+        int brepSharedEdges = 0;
+        int brepFreeEdges = 0;
+        int brepFailures = 0;       // arcs and patches the kernel refused
+        bool brepValid = false;
 
         bool watertight = false;
         bool valid = false;
@@ -300,6 +344,12 @@ public:
     // model, one .obj group per patch.
     bool writeSurfaceOBJ(const std::string &filename, int samples = 0) const;
 
+    // The B-rep: every face, and the edges of arcs no patch uses, in the plane
+    // z = 0.
+    const geom::Shape& shape() const { return model; }
+    bool writeBREP(const std::string &filename) const { return model.writeBREP(filename); }
+    bool writeSTEP(const std::string &filename) const { return model.writeSTEP(filename); }
+
     // The clamped uniform knot vector these curves are written over, and the
     // Greville abscissae the Coons blend is taken at. Public because Stage 10's
     // knot insertion needs them.
@@ -309,12 +359,8 @@ public:
 private:
     void fitArcs();
     void buildPatches();
+    void buildShape();
     void check();
-
-    // What side `side` of a patch has to be moved by to sit on its polyline:
-    // evaluate(Curve) there minus the plain spline over the curve's control
-    // points. Zero on a fitted side.
-    Point sideCorrection(const Patch &p, int side, double w) const;
 
     const Arrangement *arr = nullptr;
     Options options;
@@ -323,6 +369,7 @@ private:
     std::vector<double> greville;
     std::vector<Curve> fitted;     // one per arc of the arrangement, in order
     std::vector<Patch> nets;
+    geom::Shape model;
 
     double modelExtent = 1.0;
     Report report;

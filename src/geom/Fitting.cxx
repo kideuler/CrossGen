@@ -1,6 +1,9 @@
 #include "geom/Fitting.hxx"
 
-#include <Eigen/Dense>
+#include <BSplCLib.hxx>
+#include <TColStd_Array1OfInteger.hxx>
+#include <TColgp_Array1OfPnt.hxx>
+#include <math_Matrix.hxx>
 
 #include <algorithm>
 #include <cmath>
@@ -9,10 +12,35 @@
 #include <string>
 
 #include "geom/Polyline.hxx"
+#include "geom/detail/Occ.hxx"
 
 namespace geom {
 
 namespace {
+
+// The non-zero basis functions at a run of parameters, from the kernel, over
+// one knot vector converted once rather than per point.
+class Basis {
+public:
+    Basis(const std::vector<double> &knots, int degree)
+        : p(degree), flat(detail::toArray(knots)), values(1, 1, 1, degree + 1) {}
+
+    // Fills N[0..p] and returns the index of the control point N[0] weights.
+    int at(double u, double *N) {
+        int first = 0;
+        const int status = detail::guard("fitCurve", [&] {
+            return BSplCLib::EvalBsplineBasis(0, p + 1, flat, u, first, values);
+        });
+        if (status != 0) throw std::runtime_error("fitCurve: the kernel could not evaluate the basis");
+        for (int a = 0; a <= p; ++a) N[a] = values(1, a + 1);
+        return first - 1;
+    }
+
+private:
+    int p;
+    TColStd_Array1OfReal flat;
+    math_Matrix values;
+};
 
 // Cholesky on a small dense SPD system, in place, for `rhs` right-hand sides
 // laid end to end in b. The systems a fit produces are (control points) square
@@ -108,8 +136,8 @@ Deviation deviation(const BSplineCurve<D> &curve, const std::vector<Vec<D>> &poi
 // The normal equations of min sum_k |C(t_k) - d_k|^2 over the free control
 // points, with the pinned ones moved to the right-hand side, plus the Tikhonov
 // term. Each data point touches only the degree + 1 basis functions of its
-// span, and a basis function that is exactly zero there is skipped, so the
-// accumulation order is SplineFit's and so are the doubles.
+// span -- the kernel's values -- and a basis function that is exactly zero
+// there is skipped.
 // ---------------------------------------------------------------------------
 template <std::size_t D>
 FitResult<D> fitCurve(const std::vector<Vec<D>> &points, const FitOptions &options) {
@@ -124,7 +152,7 @@ FitResult<D> fitCurve(const std::vector<Vec<D>> &points, const FitOptions &optio
     std::vector<Vec<D>> ctrl(static_cast<std::size_t>(n), zero<D>());
     if (points.size() < 2) {
         if (!points.empty()) std::fill(ctrl.begin(), ctrl.end(), points.front());
-        result.curve = BSplineCurve<D>(p, std::move(knots), std::move(ctrl));
+        result.curve = BSplineCurve<D>(p, knots, ctrl);
         return result;
     }
 
@@ -170,17 +198,17 @@ FitResult<D> fitCurve(const std::vector<Vec<D>> &points, const FitOptions &optio
         std::vector<double> rhs(static_cast<std::size_t>(free) * D, 0.0);
         const std::size_t kBegin = pin ? 1 : 0;
         const std::size_t kEnd = pin ? data.size() - 1 : data.size();
+        Basis basis(knots, p);
         double N[kMaxDegree + 1];
         int idx[kMaxDegree + 1];
         double val[kMaxDegree + 1];
         for (std::size_t k = kBegin; k < kEnd; ++k) {
-            const int span = findSpan(knots, p, t[k]);
-            basisFunctions(knots, p, span, t[k], N);
+            const int firstIndex = basis.at(t[k], N);
             // The residual with the held control points already subtracted.
             Vec<D> b = data[k];
             int nz = 0;
             for (int a = 0; a <= p; ++a) {
-                const int i = span - p + a;
+                const int i = firstIndex + a;
                 if (pin && i == 0) b = b - p0 * N[a];
                 else if (pin && i == n - 1) b = b - pn * N[a];
                 else if (N[a] != 0.0) { idx[nz] = i - first; val[nz] = N[a]; ++nz; }
@@ -219,7 +247,7 @@ FitResult<D> fitCurve(const std::vector<Vec<D>> &points, const FitOptions &optio
         }
     }
 
-    result.curve = BSplineCurve<D>(p, std::move(knots), std::move(ctrl));
+    result.curve = BSplineCurve<D>(p, knots, ctrl);
 
     // The error the fit actually made, measured against the points it was given
     // and not against its own parameterisation.
@@ -235,15 +263,14 @@ FitResult<D> fitCurve(const std::vector<Vec<D>> &points, const FitOptions &optio
 //
 // The collocation system N_i(t_k) P_i = Q_k is banded, square and, with
 // averaged knots and distinct parameters, non-singular (Schoenberg-Whitney).
-// It is solved densely: interpolation is for runs of tens or hundreds of
-// points, not for a whole mesh boundary.
+// The kernel solves it (BSplCLib::Interpolate, a banded LU).
 // ---------------------------------------------------------------------------
 template <std::size_t D>
 BSplineCurve<D> interpolateCurve(const std::vector<Vec<D>> &points, int degree,
                                  Parameterization kind) {
     const int m = static_cast<int>(points.size());
     if (m == 0) return BSplineCurve<D>();
-    if (m == 1) return BSplineCurve<D>(0, {0.0, 1.0}, points);
+    if (m == 1) return BSplineCurve<D>(1, {0.0, 0.0, 1.0, 1.0}, {points[0], points[0]});
     const int p = std::max(1, std::min(degree, m - 1));
     if (p > kMaxDegree) throw std::invalid_argument("interpolateCurve: degree out of range");
 
@@ -254,30 +281,28 @@ BSplineCurve<D> interpolateCurve(const std::vector<Vec<D>> &points, int degree,
                                         " and " + std::to_string(k) + " share a parameter");
         }
     }
-    std::vector<double> knots = averagedKnots(t, p);
+    const std::vector<double> knots = averagedKnots(t, p);
 
-    Eigen::MatrixXd A = Eigen::MatrixXd::Zero(m, m);
-    double N[kMaxDegree + 1];
-    for (int k = 0; k < m; ++k) {
-        const int span = findSpan(knots, p, t[k]);
-        basisFunctions(knots, p, span, t[k], N);
-        for (int a = 0; a <= p; ++a) A(k, span - p + a) = N[a];
+    const TColStd_Array1OfReal flat = detail::toArray(knots);
+    const TColStd_Array1OfReal params = detail::toArray(t);
+    TColStd_Array1OfInteger contact(1, m);
+    contact.Init(0);
+    TColgp_Array1OfPnt poles(1, m);
+    for (int k = 0; k < m; ++k) poles(k + 1) = detail::toPnt(points[k]);
+    int problem = 0;
+    detail::guard("interpolateCurve", [&] {
+        BSplCLib::Interpolate(p, flat, params, contact, poles, problem);
+    });
+    if (problem != 0) {
+        throw std::runtime_error("interpolateCurve: the collocation system is singular");
     }
-    const Eigen::PartialPivLU<Eigen::MatrixXd> lu(A);
-    Eigen::MatrixXd rhs(m, static_cast<Eigen::Index>(D));
-    for (int k = 0; k < m; ++k) {
-        for (std::size_t d = 0; d < D; ++d) rhs(k, static_cast<Eigen::Index>(d)) = points[k][d];
-    }
-    const Eigen::MatrixXd sol = lu.solve(rhs);
 
     std::vector<Vec<D>> ctrl(static_cast<std::size_t>(m));
-    for (int i = 0; i < m; ++i) {
-        for (std::size_t d = 0; d < D; ++d) ctrl[i][d] = sol(i, static_cast<Eigen::Index>(d));
-    }
+    for (int i = 0; i < m; ++i) ctrl[i] = detail::fromPnt<D>(poles(i + 1));
     // The ends are interpolated by construction; say so exactly.
     ctrl.front() = points.front();
     ctrl.back() = points.back();
-    return BSplineCurve<D>(p, std::move(knots), std::move(ctrl));
+    return BSplineCurve<D>(p, knots, ctrl);
 }
 
 template std::vector<double> parameterize<2>(const std::vector<Vec<2>> &, Parameterization);

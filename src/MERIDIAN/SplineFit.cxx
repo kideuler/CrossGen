@@ -38,53 +38,26 @@ SplineFit::SplineFit(const Arrangement &arrangement, const Options &opts)
 
     fitArcs();
     buildPatches();
+    buildShape();
     check();
 }
 
 // An exact arc is walked along its own normalised chord length, which is the
 // parameterisation the fit was taken in as well. Using the same one for both is
-// what keeps the difference between them -- the correction the Coons blend gets
-// -- as small as the two curves actually are apart, rather than inflating it
-// with a reparameterisation.
+// what keeps a patch on that arc as close to its net as the two curves actually
+// are apart, rather than further by a reparameterisation.
 Point SplineFit::evaluate(const Curve &c, double u) const {
     if (!c.exact || c.poly.size() < 2) return c.spline.evaluate(u);
     return c.poly.evaluate(u);
 }
 
-// ---------------------------------------------------------------------------
-// sideCorrection()
-//
-// What side `k` of a patch has to be moved by, at patch-frame parameter `w`, to
-// put it back on the polyline it was carried from. Zero on a fitted side, and
-// zero at both ends of an exact one because the fit pinned the end control
-// points to the arc's end nodes.
-//
-// The mapping is the inverse of the one buildPatches() used to orient the four
-// control polygons: sides 0 and 1 run with the (s, t) frame and sides 2 and 3
-// against it, and either may additionally be traversed against the arc's own
-// direction.
-// ---------------------------------------------------------------------------
-Point SplineFit::sideCorrection(const Patch &p, int k, double w) const {
-    if (!p.exactSide[k]) return Point{0.0, 0.0};
-    const Curve &c = fitted[p.side[k]];
-    double u = (k < 2) ? w : 1.0 - w;
-    if (!p.forward[k]) u = 1.0 - u;
-    return evaluate(c, u) - c.spline.evaluate(u);
-}
-
+// The patch is one surface, the Coons surface of its four sides as evaluate()
+// walks them (see buildPatches()), so there is nothing to add to it here.
 Point SplineFit::evaluate(const Patch &p, double s, double t) const {
-    const int n = controlPointsPerArc();
-    if (p.surface.countS() != n || p.surface.countT() != n) return Point{0.0, 0.0};
+    if (p.surface.empty()) return Point{0.0, 0.0};
     s = std::max(0.0, std::min(1.0, s));
     t = std::max(0.0, std::min(1.0, t));
-    Point out = p.surface.evaluate(s, t);
-    // The transfinite correction of the header. No bilinear corner term: every
-    // d_k is zero at both of its ends, so the term it would subtract is zero.
-    if (p.corrected) {
-        out = out + sideCorrection(p, 0, s) * (1.0 - t) + sideCorrection(p, 2, s) * t +
-              sideCorrection(p, 3, t) * (1.0 - s) + sideCorrection(p, 1, t) * s;
-    }
-    return out;
+    return p.surface.evaluate(s, t);
 }
 
 // ---------------------------------------------------------------------------
@@ -105,12 +78,35 @@ Point SplineFit::evaluate(const Patch &p, double s, double t) const {
 // least-squares fit that is free at the ends misses each of them by its own
 // residual. Holding them costs two degrees of freedom and buys exact
 // interpolation of every corner of the layout.
+//
+// Each arc then becomes the edge of the B-rep between the vertices of its two
+// nodes, one vertex per node however many arcs meet there. The pinned ends are
+// what lets the kernel accept that: the curve ends exactly on the node. An arc
+// Stage 8 calls degenerate -- shorter than its merge tolerance, which on the
+// corpus means a run of one repeated point -- has no geometry to be an edge of,
+// and is left out of the B-rep rather than counted as refused.
 // ---------------------------------------------------------------------------
 void SplineFit::fitArcs() {
     const std::vector<Arrangement::Arc> &list = arr->getArcs();
     report.arcs = static_cast<int>(list.size());
     report.controlPointsPerArc = controlPointsPerArc();
     fitted.assign(list.size(), Curve());
+
+    std::vector<geom::Vertex> vertexOf(arr->getNodes().size());
+    auto vertex = [&](int node) {
+        if (vertexOf[node].isNull()) vertexOf[node] = geom::Vertex(arr->getNodes()[node].p);
+        return vertexOf[node];
+    };
+    std::string firstRefusal;
+    auto makeEdge = [&](Curve &c, const Arrangement::Arc &ar) {
+        if (ar.from < 0 || ar.to < 0 || ar.degenerate) return;
+        try {
+            c.edge = geom::Edge(c.exact ? c.poly.curve() : c.spline, vertex(ar.from), vertex(ar.to));
+        } catch (const std::exception &e) {
+            ++report.brepFailures;
+            if (firstRefusal.empty()) firstRefusal = "arc " + std::to_string(c.arc) + ": " + e.what();
+        }
+    };
 
     geom::FitOptions fopts;
     fopts.degree = 3;
@@ -140,6 +136,7 @@ void SplineFit::fitArcs() {
         if (exact) {
             c.exact = true;
             c.poly = geom::Polyline<2>(list[a].points);
+            makeEdge(c, list[a]);
             ++report.exactArcs;
             if (c.maxDeviation > report.maxNetDeviation) {
                 report.maxNetDeviation = c.maxDeviation;
@@ -147,6 +144,7 @@ void SplineFit::fitArcs() {
             }
             continue;
         }
+        makeEdge(c, list[a]);
 
         ++report.fittedArcs;
         if (c.maxDeviation > report.maxDeviation) {
@@ -159,6 +157,11 @@ void SplineFit::fitArcs() {
     report.rmsDeviation = count > 0 ? std::sqrt(sum / count) / modelExtent : 0.0;
     report.maxDeviation /= modelExtent;
     report.maxNetDeviation /= modelExtent;
+    if (!firstRefusal.empty()) {
+        report.messages.push_back("The kernel refused " + std::to_string(report.brepFailures) +
+                                  " arc(s) as edges, so no face can use them; the first: " +
+                                  firstRefusal);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -178,9 +181,17 @@ void SplineFit::fitArcs() {
 // second reason, after the shared knot vector, that every arc is given the same
 // one. Nothing is refitted, so both patches sharing an arc get the same control
 // points to the last bit.
+//
+// The net is the patch when every side is fitted. When one is exact the patch
+// is the Coons surface of the sides as evaluated instead (see the header):
+// geom::coonsSurface() over the polyline in that side's place, which it raises
+// to degree 3 and shares knots with its opposite side before blending. Either
+// way the face of the B-rep is then built on the patch and the four arcs' edges.
 // ---------------------------------------------------------------------------
 void SplineFit::buildPatches() {
     const int n = controlPointsPerArc();
+    int refusedFaces = 0;
+    std::string firstRefusal;
     const std::vector<int> &pf = arr->patchFaces();
     report.faces = static_cast<int>(pf.size());
 
@@ -218,8 +229,39 @@ void SplineFit::buildPatches() {
         const std::vector<Point> C1 = oriented(2, true);   // (0,1) -> (1,1)
         const std::vector<Point> D0 = oriented(3, true);   // (0,0) -> (0,1)
 
-        p.surface = geom::BSplineSurface<2>(3, knot, 3, knot,
-                                            geom::coonsNet(C0, C1, D0, D1, greville, greville));
+        p.net = geom::BSplineSurface<2>(3, knot, 3, knot,
+                                        geom::coonsNet(C0, C1, D0, D1, greville, greville));
+        std::array<bool, 4> alongFrame{};
+        for (int k = 0; k < 4; ++k) alongFrame[k] = (k < 2) == p.forward[k];
+        if (!p.corrected) {
+            p.surface = p.net;
+        } else {
+            auto sideCurve = [&](int k, const std::vector<Point> &ctrl) {
+                const Curve &c = fitted[p.side[k]];
+                if (!c.exact) return geom::BSplineCurve<2>(3, knot, ctrl);
+                return alongFrame[k] ? c.poly.curve() : c.poly.curve().reversed();
+            };
+            try {
+                p.surface = geom::coonsSurface(sideCurve(0, C0), sideCurve(2, C1), sideCurve(3, D0),
+                                               sideCurve(1, D1));
+            } catch (const std::exception &e) {
+                ++report.skipped;
+                report.messages.push_back("Face " + std::to_string(f) + " has no Coons surface: " +
+                                          e.what());
+                continue;
+            }
+        }
+        try {
+            p.brepFace = geom::Face(p.surface,
+                                {fitted[p.side[0]].edge, fitted[p.side[1]].edge,
+                                 fitted[p.side[2]].edge, fitted[p.side[3]].edge},
+                                alongFrame);
+        } catch (const std::exception &e) {
+            if (refusedFaces++ == 0) {
+                firstRefusal = "patch " + std::to_string(nets.size()) + " (face " +
+                               std::to_string(f) + "): " + e.what();
+            }
+        }
 
         // Area and the worst sampled cell, which is what says the blend did not
         // fold the patch over.
@@ -252,6 +294,42 @@ void SplineFit::buildPatches() {
         nets.push_back(std::move(p));
     }
     report.patches = static_cast<int>(nets.size());
+    report.brepFailures += refusedFaces;
+    if (refusedFaces > 0) {
+        report.messages.push_back("The kernel refused " + std::to_string(refusedFaces) +
+                                  " patch(es) as faces of the B-rep; the first: " + firstRefusal);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// buildShape()
+//
+// The faces, and the edges of the arcs that bound none of them -- a separatrix
+// the layout never closed a patch on is still part of the model -- as one
+// compound. The kernel then counts what is shared.
+// ---------------------------------------------------------------------------
+void SplineFit::buildShape() {
+    std::vector<geom::Face> faces;
+    std::vector<char> onFace(fitted.size(), 0);
+    for (const Patch &p : nets) {
+        if (p.brepFace.isNull()) continue;
+        faces.push_back(p.brepFace);
+        for (int k = 0; k < 4; ++k) onFace[p.side[k]] = 1;
+    }
+    std::vector<geom::Edge> loose;
+    for (size_t a = 0; a < fitted.size(); ++a) {
+        if (!onFace[a] && !fitted[a].edge.isNull()) loose.push_back(fitted[a].edge);
+    }
+    try {
+        model = geom::Shape(faces, loose);
+        report.brepFaces = model.faceCount();
+        report.brepEdges = model.edgeCount();
+        report.brepSharedEdges = model.sharedEdgeCount();
+        report.brepFreeEdges = model.freeEdgeCount();
+        report.brepValid = model.isValid();
+    } catch (const std::exception &e) {
+        report.messages.push_back(std::string("The B-rep could not be assembled: ") + e.what());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -283,10 +361,10 @@ void SplineFit::check() {
                 std::vector<Point> row(n);
                 for (int i = 0; i < n; ++i) {
                     switch (s) {
-                        case 0: row[i] = p.surface.control(i, 0); break;
-                        case 1: row[i] = p.surface.control(n - 1, i); break;
-                        case 2: row[i] = p.surface.control(n - 1 - i, n - 1); break;
-                        default: row[i] = p.surface.control(0, n - 1 - i); break;
+                        case 0: row[i] = p.net.control(i, 0); break;
+                        case 1: row[i] = p.net.control(n - 1, i); break;
+                        case 2: row[i] = p.net.control(n - 1 - i, n - 1); break;
+                        default: row[i] = p.net.control(0, n - 1 - i); break;
                     }
                 }
                 if (!p.forward[s]) std::reverse(row.begin(), row.end());
@@ -307,10 +385,10 @@ void SplineFit::check() {
         report.faceArea += p.faceArea;
         report.minCellRatio = std::min(report.minCellRatio, p.minCellRatio);
         for (int k = 0; k < 4; ++k) {
-            const Point corner = (k == 0) ? p.surface.control(0, 0)
-                               : (k == 1) ? p.surface.control(n - 1, 0)
-                               : (k == 2) ? p.surface.control(n - 1, n - 1)
-                                          : p.surface.control(0, n - 1);
+            const Point corner = (k == 0) ? p.net.control(0, 0)
+                               : (k == 1) ? p.net.control(n - 1, 0)
+                               : (k == 2) ? p.net.control(n - 1, n - 1)
+                                          : p.net.control(0, n - 1);
             report.maxCornerGap = std::max(report.maxCornerGap,
                                            normP(corner - arr->getNodes()[p.corner[k]].p) /
                                                modelExtent);
@@ -420,7 +498,7 @@ bool SplineFit::writeNetOBJ(const std::string &filename) const {
     for (size_t k = 0; k < nets.size(); ++k) {
         const Patch &p = nets[k];
         out << "o patch" << k << "_net\n";
-        for (const Point &q : p.surface.controlNet()) out << "v " << q[0] << " " << q[1] << " 0\n";
+        for (const Point &q : p.net.controlNet()) out << "v " << q[0] << " " << q[1] << " 0\n";
         for (int j = 0; j < n; ++j) {
             out << "l";
             for (int i = 0; i < n; ++i) out << " " << (base + j * n + i);

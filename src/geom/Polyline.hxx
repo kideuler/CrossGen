@@ -3,6 +3,7 @@
 
 #include <vector>
 
+#include "geom/BSpline.hxx"
 #include "geom/Vec.hxx"
 
 namespace geom {
@@ -19,6 +20,13 @@ double polylineLength(const std::vector<Vec<D>> &points);
 // and it is the parameterisation fitCurve() fits in by default, so a polyline
 // and the spline fitted through it can be compared at the same u. Where the
 // polyline has no length at all its vertices are spread uniformly instead.
+//
+// To the kernel it is a degree-1 B-spline whose knots are those parameters
+// (curve()), so it can be the edge of a face and a side of a Coons surface like
+// any other curve. The kernel wants its knots more than an ulp apart, so a
+// vertex that repeats its predecessor -- or lies within an ulp of it in
+// parameter -- is left out of the curve; that changes neither the point set nor
+// the parameterisation. points() and parameters() still give every vertex.
 template <std::size_t D>
 class Polyline {
 public:
@@ -31,8 +39,12 @@ public:
     const std::vector<double> &parameters() const { return param; }
     double length() const { return total; }
 
-    // The point at u, clamped into [0, 1], interpolated linearly within the
-    // segment that contains it. The zero vector on an empty polyline.
+    // The degree-1 curve. Empty unless there are at least two vertices.
+    const BSplineCurve<D> &curve() const { return spline; }
+
+    // The point at u, clamped into [0, 1]: the first and last vertex exactly at
+    // the ends, the kernel's evaluation of curve() between them. The zero
+    // vector on an empty polyline.
     Vec<D> evaluate(double u) const;
     Vec<D> operator()(double u) const { return evaluate(u); }
 
@@ -43,6 +55,7 @@ private:
     std::vector<Vec<D>> pts;
     std::vector<double> param;
     double total = 0.0;
+    BSplineCurve<D> spline;
 };
 
 extern template class Polyline<2>;

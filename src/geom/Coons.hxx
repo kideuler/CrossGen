@@ -1,6 +1,7 @@
 #ifndef __GEOM_COONS_HXX__
 #define __GEOM_COONS_HXX__
 
+#include <utility>
 #include <vector>
 
 #include "geom/BSpline.hxx"
@@ -30,7 +31,18 @@
 // construction of SplineFit (Shepherd, Gu and Hughes 2022, Sec. 5). Taking the
 // blend at the Grevilles rather than at i / (n - 1) is what lets the bilinear
 // term reproduce a linear function exactly: four straight sides give the
-// bilinear patch, not a slightly bowed one.
+// bilinear patch, not a slightly bowed one. It is also why this is not
+// OpenCASCADE's GeomFill Coons filling, which blends at the pole indices and
+// misses the bilinear patch on straight B-spline sides by 1.5e-2 of its size.
+//
+// coonsSurface() is the curve-level form, and by that linear precision it is
+// the Coons patch of the four curves *as curves*, not merely of their control
+// polygons: sum_j N_j(t) (1 - t_j) = 1 - t with t_j the Grevilles, so the
+// tensor-product surface over the blended net is (1 - t) B(s) + t T(s) + ...
+// identically. Sides that do not share a knot vector are first given one
+// (makeCompatible), which changes neither of them, so any four curves meeting
+// at their corners have a Coons surface -- a polyline side and a cubic side
+// included.
 namespace geom {
 
 template <std::size_t D>
@@ -55,8 +67,21 @@ std::vector<Vec<D>> coonsNet(const std::vector<Vec<D>> &bottom, const std::vecto
                              const std::vector<double> &grevilleS,
                              const std::vector<double> &grevilleT);
 
-// The same, from four curves: bottom and top must share a degree and a knot
-// vector, and so must left and right.
+// Two curves over one parameter domain, re-expressed over a common degree and
+// knot vector without changing either: the lower degree is raised and each
+// curve is given the other's knots, by the kernel. Knots of the two that are
+// within a few ulps of each other are first made the same double, which is what
+// lets a curve and its mirrored neighbour (1 - 2/3 against 1/3) agree. Throws
+// std::invalid_argument if either is empty or the domains differ.
+template <std::size_t D>
+std::pair<BSplineCurve<D>, BSplineCurve<D>> makeCompatible(const BSplineCurve<D> &a,
+                                                           const BSplineCurve<D> &b);
+
+// The Coons surface of four curves, in the orientation above. Opposite sides
+// that do not already share a degree and a knot vector are made to
+// (makeCompatible); where they do, the net is exactly coonsNet() of their
+// control points. Each pair must share a parameter domain, which is mapped
+// onto [0, 1] for the blend.
 template <std::size_t D>
 BSplineSurface<D> coonsSurface(const BSplineCurve<D> &bottom, const BSplineCurve<D> &top,
                                const BSplineCurve<D> &left, const BSplineCurve<D> &right);
@@ -67,6 +92,10 @@ extern template std::vector<Vec<2>> coonsNet<2>(const std::vector<Vec<2>> &, con
 extern template std::vector<Vec<3>> coonsNet<3>(const std::vector<Vec<3>> &, const std::vector<Vec<3>> &,
                                                 const std::vector<Vec<3>> &, const std::vector<Vec<3>> &,
                                                 const std::vector<double> &, const std::vector<double> &);
+extern template std::pair<BSplineCurve<2>, BSplineCurve<2>> makeCompatible<2>(const BSplineCurve<2> &,
+                                                                             const BSplineCurve<2> &);
+extern template std::pair<BSplineCurve<3>, BSplineCurve<3>> makeCompatible<3>(const BSplineCurve<3> &,
+                                                                             const BSplineCurve<3> &);
 extern template BSplineSurface<2> coonsSurface<2>(const BSplineCurve<2> &, const BSplineCurve<2> &,
                                                   const BSplineCurve<2> &, const BSplineCurve<2> &);
 extern template BSplineSurface<3> coonsSurface<3>(const BSplineCurve<3> &, const BSplineCurve<3> &,

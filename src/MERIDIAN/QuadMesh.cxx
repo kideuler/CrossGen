@@ -71,6 +71,9 @@ QuadMesh::QuadMesh(const SplineFit &f, const Options &opts)
     }
     if (options.minIntervals < 1) options.minIntervals = 1;
 
+    traced.reserve(arr->getArcs().size());
+    for (const Arrangement::Arc &a : arr->getArcs()) traced.emplace_back(a.points);
+
     facePatch.assign(arr->getFaces().size(), -1);
     for (size_t k = 0; k < fit->patches().size(); ++k) {
         const int f2 = fit->patches()[k].face;
@@ -107,21 +110,8 @@ Point QuadMesh::evaluateArc(int arc, double u) const {
         return fit->evaluate(fit->curves()[arc], u);
     }
     // The traced polyline, parameterised by its own normalised chord length.
-    const std::vector<Point> &poly = arr->getArcs()[arc].points;
-    if (poly.empty()) return Point{0.0, 0.0};
-    if (poly.size() == 1) return poly.front();
-    std::vector<double> cum(poly.size(), 0.0);
-    for (size_t i = 1; i < poly.size(); ++i) cum[i] = cum[i - 1] + normP(poly[i] - poly[i - 1]);
-    const double total = cum.back();
-    if (!(total > 0.0)) return poly.front();
-    const double s = u * total;
-    const size_t k = static_cast<size_t>(
-        std::lower_bound(cum.begin(), cum.end(), s) - cum.begin());
-    if (k == 0) return poly.front();
-    if (k >= poly.size()) return poly.back();
-    const double seg = cum[k] - cum[k - 1];
-    const double w = seg > 0.0 ? (s - cum[k - 1]) / seg : 0.0;
-    return poly[k - 1] + (poly[k] - poly[k - 1]) * w;
+    if (arc < 0 || arc >= static_cast<int>(traced.size())) return Point{0.0, 0.0};
+    return traced[arc].evaluate(u);
 }
 
 geom::ArcLengthTable QuadMesh::tabulate(int arc) const {

@@ -284,6 +284,8 @@ void usage(const char *argv0) {
               << "  --fit <file.obj>   write the fitted arc curves\n"
               << "  --net <file.obj>   write the patch control nets\n"
               << "  --surf <file.obj>  write the reconstructed patches\n"
+              << "  --step <file.step> write the reconstructed model as a STEP B-rep\n"
+              << "  --brep <file.brep> ... and in OpenCASCADE's native BREP format\n"
               << "  --no-mesh          skip Stage 10 (quadrilateral meshing)\n"
               << "  --target <h>       target edge length, model units      (default 0.05)\n"
               << "  --collapse-span <f>  contract a chord whose every patch is thinner\n"
@@ -314,6 +316,7 @@ int main(int argc, char **argv) {
     MERIDIAN::Options opts;
     std::string cutOut, psiOut, layoutOut, sepOut, sepUVOut;
     std::string arcsOut, facesOut, fitOut, netOut, surfOut, meshOut, meshVTUOut, mfemOut;
+    std::string stepOut, brepOut;
     int tmopSweeps = 0;
     double tmopPower = 2.0;
     bool tmopPinFeatures = false;
@@ -400,6 +403,8 @@ int main(int argc, char **argv) {
         else if (a == "--fit" && i + 1 < argc)     fitOut = argv[++i];
         else if (a == "--net" && i + 1 < argc)     netOut = argv[++i];
         else if (a == "--surf" && i + 1 < argc)    surfOut = argv[++i];
+        else if (a == "--step" && i + 1 < argc)    stepOut = argv[++i];
+        else if (a == "--brep" && i + 1 < argc)    brepOut = argv[++i];
         else if (a == "--no-mesh")                 opts.runQuadMesh = false;
         else if (a == "--target" && i + 1 < argc)  opts.quadTargetEdge = std::stod(argv[++i]);
         else if (a == "--collapse-span" && i+1 < argc) opts.quadCollapseSpan = std::stod(argv[++i]);
@@ -1263,7 +1268,7 @@ int main(int argc, char **argv) {
                   << std::setprecision(3) << sf.maxNetDeviation << " of the model"
                   << std::defaultfloat;
         if (sf.worstNetArc >= 0) std::cout << " (arc " << sf.worstNetArc << ")";
-        std::cout << ", which is what the transfinite correction takes out\n";
+        std::cout << ", which is what building those patches on the polylines takes out\n";
     }
     std::cout << "  Patches: " << sf.patches << " of " << sf.faces << " face(s), "
               << sf.controlPointsPerArc << " x " << sf.controlPointsPerArc
@@ -1276,6 +1281,10 @@ int main(int argc, char **argv) {
               << ", corners off their node by " << sf.maxCornerGap
               << ", patch boundaries off their arc by " << sf.maxBoundaryGap
               << std::defaultfloat << "\n";
+    std::cout << "  B-rep: " << sf.brepFaces << " face(s), " << sf.brepEdges << " edge(s) -- "
+              << sf.brepSharedEdges << " shared by two faces, " << sf.brepFreeEdges
+              << " bounding one; the kernel calls it " << (sf.brepValid ? "valid" : "INVALID")
+              << "\n";
     std::cout << "  Worst sampled cell is " << std::fixed << std::setprecision(4)
               << sf.minCellRatio << " of the mean; " << sf.foldedPatches
               << " folded patch(es)" << std::defaultfloat << "\n";
@@ -1289,6 +1298,8 @@ int main(int argc, char **argv) {
     verdict(sf.maxBoundaryGap <= SplineFit::Report::boundaryTolerance,
             "Every patch lies on the four arcs it was built from");
     verdict(sf.watertight, "Watertight: both patches on an arc carry the same control points");
+    verdict(sf.brepFaces == sf.patches && sf.brepSharedEdges == sf.sharedArcs && sf.brepValid,
+            "The B-rep is closed: every patch is a face, every shared arc one edge of two");
     verdict(sf.foldedPatches == 0, "No patch folds");
     for (const std::string &m : sf.messages) std::cout << "  " << kWarn << " " << m << "\n";
 
@@ -1311,6 +1322,20 @@ int main(int argc, char **argv) {
             std::cout << "  Wrote the patches to " << surfOut << "\n";
         } else {
             std::cout << "  " << kWarn << " Failed to write " << surfOut << "\n";
+        }
+    }
+    if (!stepOut.empty()) {
+        if (fit.writeSTEP(stepOut)) {
+            std::cout << "  Wrote the B-rep to " << stepOut << "\n";
+        } else {
+            std::cout << "  " << kWarn << " Failed to write " << stepOut << "\n";
+        }
+    }
+    if (!brepOut.empty()) {
+        if (fit.writeBREP(brepOut)) {
+            std::cout << "  Wrote the B-rep to " << brepOut << "\n";
+        } else {
+            std::cout << "  " << kWarn << " Failed to write " << brepOut << "\n";
         }
     }
 
