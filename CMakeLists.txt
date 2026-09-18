@@ -185,6 +185,23 @@ add_library(PolyVector SHARED
     src/TORSION/FieldIntegration.cxx
     src/TORSION/TORSION.hxx
     src/TORSION/TORSION.cxx
+    src/ATLAS/SquareTransport.hxx
+    src/ATLAS/PlanarDomain.hxx
+    src/ATLAS/PlanarDomain.cxx
+    src/ATLAS/SquareCarrier.hxx
+    src/ATLAS/SquareCarrier.cxx
+    src/ATLAS/CavityFill.hxx
+    src/ATLAS/CavityFill.cxx
+    src/ATLAS/ExplicitTemplates.hxx
+    src/ATLAS/ExplicitTemplates.cxx
+    src/ATLAS/RectangleCertifier.hxx
+    src/ATLAS/RectangleCertifier.cxx
+    src/ATLAS/BlockCover.hxx
+    src/ATLAS/BlockCover.cxx
+    src/ATLAS/CavityRewrite.hxx
+    src/ATLAS/CavityRewrite.cxx
+    src/ATLAS/ATLAS.hxx
+    src/ATLAS/ATLAS.cxx
     src/UMBER/Polysquare.hxx
     src/UMBER/Polysquare.cxx
     src/UMBER/MotorcycleGraph.hxx
@@ -301,6 +318,14 @@ target_link_libraries(TestMERIDIAN PRIVATE PolyVector)
 # and Reference::Field -- on meshes whose answers are known in closed form.
 add_executable(TestTORSION src/utils/TestTORSION.cxx)
 target_link_libraries(TestTORSION PRIVATE PolyVector)
+
+# Test ATLAS, the square-transport blocking of
+# docs/square_transport_2d_theory_and_implementation.md, Stages 1-6: the
+# three-quad carrier and its integer transports, whole-region templates,
+# certified rectangles, a conforming cover, and cavity rewrites. --selftest
+# runs the spec's regression geometries whose answers are known in closed form.
+add_executable(TestATLAS src/utils/TestATLAS.cxx)
+target_link_libraries(TestATLAS PRIVATE PolyVector)
 
 # copy all meshes to build directory for easy access, keeping the material
 # subdirectory layout (singlemat/, multimat/, ...) intact
@@ -530,6 +555,24 @@ add_test(NAME TORSION_ReferenceMetrics
          COMMAND TestTORSION --ref-test
                  ${CMAKE_CURRENT_SOURCE_DIR}/data/meshes/singlemat/geom003.obj)
 set_tests_properties(TORSION_ReferenceMetrics PROPERTIES TIMEOUT 2400)
+
+# ATLAS on inputs whose blocking is known before it runs (Sec. 13.3 of the
+# spec): one triangle (Sec. 3.1's corner determinants exactly, three blocks), a
+# rectangle (one block), a disk (a five-block O-grid), an annulus (four
+# sectors), an L (three blocks), two materials (two blocks sharing the
+# interface), the certificate refusing a periodic band and an L-tromino, and
+# Stage 6 alone lowering the valence defect of a raw carrier.
+add_test(NAME ATLAS_SelfTest COMMAND TestATLAS --selftest)
+
+# End-to-end on a single- and a multi-material model. The exit code is the
+# validity of the blocking, which the fine fallback also satisfies; how coarse
+# it came out is printed, not asserted.
+foreach(ATLAS_CASE singlemat/geom001 multimat/geom001)
+    string(REPLACE "/" "_" ATLAS_CASE_NAME ${ATLAS_CASE})
+    add_test(NAME ATLAS_Blocking_${ATLAS_CASE_NAME}
+             COMMAND TestATLAS ${CMAKE_CURRENT_SOURCE_DIR}/data/meshes/${ATLAS_CASE}.obj)
+    set_tests_properties(ATLAS_Blocking_${ATLAS_CASE_NAME} PROPERTIES TIMEOUT 2400)
+endforeach()
 
 # The TMOP smoother and the node-mobility layer under it, on meshes built in
 # memory: a distorted grid whose boundary is straight (so a shape metric has to

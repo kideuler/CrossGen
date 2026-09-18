@@ -33,11 +33,16 @@ A purely 2D implementation of Cross-fields along with block decomposition
 - [X] Write big huge prompt for fable which will bring everything together.
 - [X] Finish the god damned paper
 
-# Post Paper Direction 1.
-- [ ] Bring in OpenCascade and write a wrapper around it for TopoDS_Edges and TopoDS_Faces
-- [ ] Replace all splines with this API.
+# Direction 1.
+- [X] Bring in OpenCascade and write a wrapper around it for TopoDS_Edges and TopoDS_Faces
+- [X] Replace all splines with this API.
 - [ ] Allow rz spinning,
 
-# Post Paper Direction 2.
+# Direction 2.
 - [X] Mesh that deformed tank and run hydro on it with different material EOS for IMR presentation
 - [ ] Stalled because we need ALE.
+
+# Direction 3. (ATLAS)
+- [ ] implement docs/square_transport_2d_theory_and_implementation.md
+- [ ] Get general workflow working.
+- [ ] Replace ILP parts with google or-tools
