@@ -371,3 +371,68 @@ bool BlockCover::writeOBJ(const std::string &path) const {
     }
     return static_cast<bool>(out);
 }
+
+// ---------------------------------------------------------------------------
+// Sec. 6's program, for an exact solver.
+// ---------------------------------------------------------------------------
+BlockCover::Model BlockCover::exactCoverModel() const {
+    Model M;
+    const int NQ = C_.numCells();
+    M.cells = NQ;
+    std::vector<Certificate> all = R_.getCandidates();
+    for (int q = 0; q < NQ; ++q) all.push_back(singleton(q));
+    const int N = static_cast<int>(all.size());
+    std::vector<Geo> geo(N);
+    std::vector<std::vector<int>> atCell(NQ);
+    for (int i = 0; i < N; ++i) {
+        geo[i] = geometry(all[i]);
+        M.candidateCells.push_back(all[i].cells);
+        M.cost.push_back(cost(all[i]));
+        for (int q : all[i].cells) atCell[q].push_back(i);
+    }
+    std::vector<int> stampP(NQ, -1), stampR(NQ, -1);
+    std::vector<int> seen(N, -1);
+    for (int i = 0; i < N; ++i) {
+        for (int q : all[i].cells) stampP[q] = i;
+        // Candidates at the cells round P's sides and corners.
+        std::vector<int> touch;
+        for (int s = 0; s < 4; ++s) {
+            for (int v : all[i].sides[s]) {
+                for (int r = C_.ringPtr[v]; r < C_.ringPtr[v + 1]; ++r) {
+                    for (int j : atCell[C_.ringCell[r]]) {
+                        if (j <= i || seen[j] == i) continue;
+                        seen[j] = i;
+                        touch.push_back(j);
+                    }
+                }
+            }
+        }
+        for (int j : touch) {
+            bool overlap = false;
+            for (int q : all[j].cells) if (stampP[q] == i) { overlap = true; break; }
+            if (overlap) continue;
+            for (int q : all[j].cells) stampR[q] = j;
+            auto inP = [&](int q) { return q >= 0 && stampP[q] == i; };
+            auto inR = [&](int q) { return q >= 0 && stampR[q] == j; };
+            if (!compatible(geo[i], inP, geo[j], inR)) M.conflicts.emplace_back(i, j);
+        }
+    }
+    return M;
+}
+
+bool BlockCover::writeModel(const std::string &path) const {
+    std::ofstream out(path);
+    if (!out) return false;
+    const Model M = exactCoverModel();
+    out.precision(12);
+    out << M.cells << " " << M.candidateCells.size() << "\n";
+    for (size_t i = 0; i < M.candidateCells.size(); ++i) {
+        out << M.cost[i] << " " << M.candidateCells[i].size();
+        for (int q : M.candidateCells[i]) out << " " << q;
+        out << "\n";
+    }
+    out << M.conflicts.size() << "\n";
+    for (const auto &c : M.conflicts) out << c.first << " " << c.second << "\n";
+    out << report_.objective << " " << report_.blocks << "\n";
+    return static_cast<bool>(out);
+}

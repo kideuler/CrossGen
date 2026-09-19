@@ -53,10 +53,15 @@
 // derived topology. It does no geometric checking itself -- that is
 // CavityFill::validate(), which every caller runs *before* building an Edit,
 // so an invalid state is never committed and no rollback is needed. The one
-// invariant apply() does rely on is that a boundary vertex is never deleted:
-// the domain boundary only ever gains collinear points (Sec. 1.1's geometric
-// preservation), and validate() audits that from the provenance each vertex
-// carries.
+// invariant apply() does rely on is that the domain boundary is only ever
+// re-subdivided: collinear points inserted on an input boundary segment, or
+// ones strictly inside it dropped, never an input vertex (Sec. 1.1's
+// geometric preservation). validate() audits that from the provenance each
+// vertex carries.
+//
+// A carrier may also be given outright as quadrilaterals (Quads): that is how
+// Realisation hands over a layout found on a CoarseDomain, and validate() is
+// then the whole verdict on it -- the same audit, with nothing assumed.
 class SquareCarrier {
 public:
     enum class Origin : unsigned char {
@@ -65,10 +70,28 @@ public:
         Centroid,       // c_T of Sec. 3
         Template,       // an interior vertex of a Stage 3 replacement
         BoundarySplit,  // a point inserted on a domain boundary segment (Sec. 8.4)
-        Rewrite         // an interior vertex of a Stage 6 rewrite
+        Rewrite,        // an interior vertex of a Stage 6 rewrite
+        Realised        // an interior vertex of a coarse layout realised here (Realisation)
     };
 
-    enum class CellOrigin : unsigned char { Split, Template, Rewrite };
+    enum class CellOrigin : unsigned char { Split, Template, Rewrite, Realised };
+
+    // A carrier given outright as quadrilaterals, rather than split from the
+    // domain's triangles: what Realisation builds when it carries a coarse
+    // layout onto the fine domain. Every array is per vertex or per cell, as
+    // in the authoritative state below; a boundary vertex must be an input
+    // vertex (sourceVertex) or lie on an input boundary edge (sourceEdge), and
+    // validate() audits exactly that.
+    struct Quads {
+        std::vector<Point> vertices;
+        std::vector<Origin> origin;
+        std::vector<int> sourceVertex;
+        std::vector<int> sourceEdge;
+        std::vector<char> designated;
+        std::vector<std::array<int, 4>> cells;    // counter-clockwise
+        std::vector<int> material;
+        std::vector<int> group;
+    };
 
     struct Options {
         // Tolerances of the validator. The angle sums of Sec. 9.2 are sums of
@@ -97,7 +120,7 @@ public:
         int vertices = 0, cells = 0, edges = 0;
         int boundaryEdges = 0, interfaceEdges = 0;
         int sourceTriangles = 0;
-        int splitCells = 0, templateCells = 0, rewriteCells = 0;
+        int splitCells = 0, templateCells = 0, rewriteCells = 0, realisedCells = 0;
         int components = 0, holes = 0;
         int nonManifoldEdges = 0;
         int nonManifoldVertices = 0;
@@ -129,6 +152,9 @@ public:
 
     SquareCarrier(const PlanarDomain &domain, const Options &opts);
     explicit SquareCarrier(const PlanarDomain &domain) : SquareCarrier(domain, Options()) {}
+    // A carrier from explicit quadrilaterals over the same domain. Nothing is
+    // assumed about them: validate() is the whole verdict.
+    SquareCarrier(const PlanarDomain &domain, const Options &opts, const Quads &quads);
 
     const PlanarDomain &getDomain() const { return *domain_; }
     const Options &getOptions() const { return opts_; }
@@ -205,9 +231,14 @@ public:
     Point cellCentroid(int q) const;
 
     // The domain's interior angle at a vertex on dS: the input's own at an
-    // input vertex, pi at a midpoint or an inserted point.
+    // input vertex, pi at a midpoint or an inserted point. This is geometry,
+    // what the cells' angles must sum to there.
     double boundaryAngle(int v) const;
-    // Regular valence: 4 inside, round(angle / (pi/2)) clamped to [1, 4] on dS.
+    // The angle the layout sees there (PlanarDomain::targetAngle): the same
+    // unless the domain is a coarse proxy for a curved boundary.
+    double layoutAngle(int v) const;
+    // Regular valence: 4 inside, round(layoutAngle / (pi/2)) clamped to
+    // [1, 4] on dS.
     int targetValence(int v) const;
     int defect(int v) const;
     // A vertex no block may run through (Sec. 4 and 5.2): irregular, a

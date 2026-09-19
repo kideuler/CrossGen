@@ -104,6 +104,99 @@ CavityFill::Boundary CavityFill::boundaryOf(const SquareCarrier &C, const std::v
 }
 
 // ---------------------------------------------------------------------------
+bool CavityFill::droppable(const SquareCarrier &C, int v, const std::unordered_set<int> &inCavity) {
+    if (!C.boundaryVertex[v] || C.protectedVertex[v] || C.designatedVertex[v]) return false;
+    if (C.vertexOrigin[v] != Origin::EdgeMidpoint && C.vertexOrigin[v] != Origin::BoundarySplit) return false;
+    const int e = C.sourceEdge[v];
+    if (e < 0 || !C.getDomain().boundaryEdge[e]) return false;
+    for (int r = C.ringPtr[v]; r < C.ringPtr[v + 1]; ++r) {
+        if (!inCavity.count(C.ringCell[r])) return false;
+    }
+    return true;
+}
+
+int CavityFill::domainEdge(const SquareCarrier &C, int a, int b) {
+    const PlanarDomain &D = C.getDomain();
+    for (int v : {a, b}) {
+        if (v < 0) continue;
+        const int e = C.sourceEdge[v];
+        if (e >= 0 && D.boundaryEdge[e] && C.vertexOrigin[v] != Origin::MeshVertex) return e;
+    }
+    if (a < 0 || b < 0) return -1;
+    const int u = C.sourceVertex[a], w = C.sourceVertex[b];
+    if (u < 0 || w < 0) return -1;
+    const Mesh &M = D.getMesh();
+    const auto range = M.vertexTriangles.trianglesForVertex(u);
+    for (const int *t = range.first; t != range.second; ++t) {
+        for (int k = 0; k < 3; ++k) {
+            const int e = M.triangleEdges[*t][k];
+            const auto &ev = M.edges[e];
+            if ((ev[0] == u && ev[1] == w) || (ev[0] == w && ev[1] == u)) return D.boundaryEdge[e] ? e : -1;
+        }
+    }
+    return -1;
+}
+
+std::vector<int> CavityFill::insertOnBoundary(const SquareCarrier &C, Patch &P, const std::vector<int> &ids,
+                                              int extra) {
+    if (extra <= 0) return ids;
+    struct Seg { int a, b, meshEdge; };
+    std::vector<Seg> segs;
+    for (size_t k = 0; k + 1 < ids.size(); ++k) {
+        const int a = ids[k], b = ids[k + 1];
+        int e = -1;
+        if (a >= 0 && b >= 0) {
+            // Only a segment that is on dS: either a carrier boundary edge,
+            // or two boundary points a drop has made neighbours.
+            const int ce = C.edgeBetween(a, b);
+            if (ce < 0 || C.boundaryEdge[ce]) e = domainEdge(C, a, b);
+        } else if (a < 0 && P.newOrigin[-1 - a] == Origin::BoundarySplit) {
+            e = P.newSourceEdge[-1 - a];
+        } else if (b < 0 && P.newOrigin[-1 - b] == Origin::BoundarySplit) {
+            e = P.newSourceEdge[-1 - b];
+        }
+        segs.push_back({a, b, e});
+    }
+    for (int x = 0; x < extra; ++x) {
+        int best = -1;
+        double bestL = -1.0;
+        for (size_t k = 0; k < segs.size(); ++k) {
+            if (segs[k].meshEdge < 0) continue;
+            const double L = normP(P.at(C, segs[k].b) - P.at(C, segs[k].a));
+            if (L > bestL) { bestL = L; best = static_cast<int>(k); }
+        }
+        if (best < 0) return {};
+        const Seg s = segs[best];
+        const int m = P.addVertex((P.at(C, s.a) + P.at(C, s.b)) * 0.5, Origin::BoundarySplit, s.meshEdge);
+        segs[best] = Seg{s.a, m, s.meshEdge};
+        segs.insert(segs.begin() + best + 1, Seg{m, s.b, s.meshEdge});
+    }
+    std::vector<int> out{segs.front().a};
+    for (const Seg &s : segs) out.push_back(s.b);
+    return out;
+}
+
+std::vector<int> CavityFill::dropFromBoundary(const SquareCarrier &C, const std::vector<int> &ids,
+                                              const std::vector<char> &mayDrop, int count) {
+    std::vector<int> out = ids;
+    std::vector<char> may = mayDrop;
+    for (int x = 0; x < count; ++x) {
+        int best = -1;
+        double bestL = 1e300;
+        for (size_t k = 1; k + 1 < out.size(); ++k) {
+            if (!may[k]) continue;
+            const double L = normP(C.vertices[out[k]] - C.vertices[out[k - 1]]) +
+                             normP(C.vertices[out[k + 1]] - C.vertices[out[k]]);
+            if (L < bestL) { bestL = L; best = static_cast<int>(k); }
+        }
+        if (best < 0) return {};
+        out.erase(out.begin() + best);
+        may.erase(may.begin() + best);
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 bool CavityFill::grid(const SquareCarrier &C, Patch &P, const std::array<std::vector<int>, 4> &sides,
                       Origin interiorOrigin, std::vector<int> *nodesOut) {
     const int n = static_cast<int>(sides[0].size()) - 1;
@@ -330,6 +423,111 @@ bool CavityFill::repairStar(const std::vector<int> &n, const std::vector<char> &
     return bestD >= 0;
 }
 
+namespace {
+
+// The integer x in [L, H], x >= 1, minimising |x - a| + |x - b|, nearest c
+// among the minimisers. False when [L, H] has no integer >= 1.
+bool bestSpoke(long long L, long long H, long long a, long long b, double c, long long &x) {
+    L = std::max(1LL, L);
+    if (L > H) return false;
+    const long long p = std::min(a, b), q = std::max(a, b);
+    long long lo = std::max(L, p), hi = std::min(H, q);
+    if (lo > hi) {
+        x = (H < p) ? H : L;
+        return true;
+    }
+    x = std::max(lo, std::min(hi, static_cast<long long>(std::llround(c))));
+    return true;
+}
+
+} // namespace
+
+bool CavityFill::rangeStar(const std::vector<int> &n, const std::vector<int> &lo, const std::vector<int> &hi,
+                           std::vector<int> &s, std::vector<int> &have, int window) {
+    const int K = static_cast<int>(n.size());
+    if (K != 3 && K != 5) return false;
+    std::vector<double> ideal(K, 1.0);
+    {
+        std::vector<std::vector<double>> M(K, std::vector<double>(K + 1, 0.0));
+        for (int i = 0; i < K; ++i) {
+            M[i][(i + K - 1) % K] += 1.0;
+            M[i][(i + 1) % K] += 1.0;
+            M[i][K] = n[i];
+        }
+        for (int c = 0; c < K; ++c) {
+            int piv = c;
+            for (int r = c + 1; r < K; ++r) if (std::fabs(M[r][c]) > std::fabs(M[piv][c])) piv = r;
+            std::swap(M[c], M[piv]);
+            for (int r = 0; r < K; ++r) {
+                if (r == c) continue;
+                const double f = M[r][c] / M[c][c];
+                for (int k = c; k <= K; ++k) M[r][k] -= f * M[c][k];
+            }
+        }
+        for (int i = 0; i < K; ++i) ideal[i] = std::max(1.0, M[i][K] / M[i][i]);
+    }
+    int maxH = 1;
+    for (int x : hi) maxH = std::max(maxH, x);
+    long long bestD = -1;
+    double bestDev = 0.0;
+    std::vector<long long> cur(K, 1);
+    auto consider = [&]() {
+        long long D = 0;
+        double dev = 0.0;
+        for (int i = 0; i < K; ++i) {
+            if (cur[i] < 1) return;
+            const long long h = cur[(i + K - 1) % K] + cur[(i + 1) % K];
+            if (h < lo[i] || h > hi[i]) return;
+            D += std::llabs(h - n[i]);
+            dev += (cur[i] - ideal[i]) * (cur[i] - ideal[i]);
+        }
+        if (bestD < 0 || D < bestD || (D == bestD && dev < bestDev)) {
+            bestD = D;
+            bestDev = dev;
+            s.assign(cur.begin(), cur.end());
+        }
+    };
+    // Spoke j, given its two neighbours' partners: side j-1 = s_{j-2} + s_j and
+    // side j+1 = s_j + s_{j+2}.
+    auto settle = [&](int j) {
+        const int sa = (j + K - 1) % K, oa = (j + K - 2) % K;
+        const int sb = (j + 1) % K, ob = (j + 2) % K;
+        const long long L = std::max(static_cast<long long>(lo[sa]) - cur[oa], static_cast<long long>(lo[sb]) - cur[ob]);
+        const long long H = std::min(static_cast<long long>(hi[sa]) - cur[oa], static_cast<long long>(hi[sb]) - cur[ob]);
+        long long x = 0;
+        if (!bestSpoke(L, H, n[sa] - cur[oa], n[sb] - cur[ob], ideal[j], x)) return false;
+        cur[j] = x;
+        return true;
+    };
+    // The enumerated spokes range over a window round the real solution;
+    // the rest settle exactly.
+    long long a[3], b[3];
+    for (int k = 0; k < 3; ++k) {
+        const long long c = std::llround(ideal[k]);
+        a[k] = std::max(1LL, c - window);
+        b[k] = std::min(static_cast<long long>(maxH), c + window);
+    }
+    if (K == 3) {
+        for (cur[0] = a[0]; cur[0] <= b[0]; ++cur[0]) {
+            for (cur[1] = a[1]; cur[1] <= b[1]; ++cur[1]) {
+                if (settle(2)) consider();
+            }
+        }
+    } else {
+        for (cur[0] = a[0]; cur[0] <= b[0]; ++cur[0]) {
+            for (cur[1] = a[1]; cur[1] <= b[1]; ++cur[1]) {
+                for (cur[2] = a[2]; cur[2] <= b[2]; ++cur[2]) {
+                    if (settle(3) && settle(4)) consider();
+                }
+            }
+        }
+    }
+    if (bestD < 0) return false;
+    have.assign(K, 0);
+    for (int i = 0; i < K; ++i) have[i] = s[(i + K - 1) % K] + s[(i + 1) % K];
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 void CavityFill::smooth(const SquareCarrier &C, Patch &P, int iterations) {
     if (iterations <= 0 || P.newVertices.empty()) return;
@@ -443,24 +641,48 @@ CavityFill::Verdict CavityFill::validate(const SquareCarrier &C, const std::vect
         }
     }
 
-    // Match the cavity's boundary, allowing collinear points inserted on a
-    // domain boundary edge and nothing else.
+    // Match the cavity's boundary. Between two consecutive vertices the
+    // patch must keep (anchors), the old boundary is either one edge -- kept
+    // as it is, or, on dS, subdivided by inserted points -- or a run of
+    // droppable points along one domain segment, which the patch may walk
+    // with any in-order subset of them plus inserted points, all collinear.
+    std::unordered_map<int, std::pair<int, bool>> oldNext;
+    for (const Half &h : oldHalf) oldNext.emplace(h.a, std::make_pair(h.b, h.domain));
+    std::unordered_map<int, char> drop;
+    for (const Half &h : oldHalf) drop.emplace(h.a, droppable(C, h.a, inCav) ? 1 : 0);
     int consumed = 0;
-    for (const Half &h : oldHalf) {
-        auto it = nextOf.find(h.a);
+    for (const Half &h0 : oldHalf) {
+        const int a = h0.a;
+        if (drop[a]) continue;
+        // The old run from a to the next anchor b.
+        std::unordered_set<int> run;
+        bool allDomain = true;
+        int b = a;
+        int guard = 0;
+        do {
+            const auto &nx = oldNext[b];
+            allDomain = allDomain && nx.second;
+            b = nx.first;
+            if (drop[b]) run.insert(b);
+            if (++guard > static_cast<int>(oldHalf.size()) + 1) return fail("the cavity boundary does not close");
+        } while (drop[b]);
+        auto it = nextOf.find(a);
         if (it == nextOf.end()) return fail("a cavity boundary vertex is not on the patch boundary");
         int w = it->second;
         ++consumed;
-        const Point pa = C.vertices[h.a], pb = C.vertices[h.b];
+        const Point pa = C.vertices[a], pb = C.vertices[b];
         const Point d = pb - pa;
         const double L2 = dotP(d, d);
         double lastT = 0.0;
-        int guard = 0;
-        while (w != h.b) {
-            if (w >= 0) return fail("the patch boundary leaves the cavity boundary");
-            if (!h.domain) return fail("a point was inserted on an edge shared with a neighbour (hanging node)");
-            if (P.newOrigin[-1 - w] != Origin::BoundarySplit) return fail("an inserted boundary point is not marked as one");
-            const Point pw = P.newVertices[-1 - w];
+        guard = 0;
+        while (w != b) {
+            if (!allDomain) return fail("a point was inserted on an edge shared with a neighbour (hanging node)");
+            if (w >= 0) {
+                if (!run.count(w)) return fail("the patch boundary leaves the cavity boundary");
+            } else if (P.newOrigin[-1 - w] != Origin::BoundarySplit) {
+                return fail("an inserted boundary point is not marked as one");
+            }
+            const Point pw = P.at(C, w);
             const double t = dotP(pw - pa, d) / L2;
             const double off = std::fabs(cross2(pw - pa, d)) / std::sqrt(L2);
             if (!(t > lastT) || !(t < 1.0) || off > 1e-9 * std::sqrt(L2)) {

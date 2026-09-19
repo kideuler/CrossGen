@@ -105,6 +105,26 @@ public:
     // The macro edges as OBJ polylines over the carrier's vertices (Sec. 13.1).
     bool writeOBJ(const std::string &path) const;
 
+    // Sec. 6's exact-cover program over this cover's candidates -- every
+    // block Stage 4 certified, then every singleton cell -- for an external
+    // solver: z_P in {0,1}, sum over P containing q of z_P = 1 for every
+    // cell, z_P + z_R <= 1 for every incompatible pair, minimise
+    // sum z_P cost(P). Only pairs that touch without sharing a cell are
+    // listed; two that share a cell are excluded by the equalities already.
+    // This class solves the same program by local improvement from the base
+    // complex; the model is what an exact (CP-SAT, MIP) backend would take.
+    struct Model {
+        int cells = 0;
+        std::vector<std::vector<int>> candidateCells;
+        std::vector<double> cost;
+        std::vector<std::pair<int, int>> conflicts;
+    };
+    Model exactCoverModel() const;
+    // As text: "cells candidates", one "cost k c_1 .. c_k" line per candidate,
+    // "conflicts", one "i j" line per pair; then the objective and block
+    // count this cover reached.
+    bool writeModel(const std::string &path) const;
+
 private:
     struct Geo {
         std::array<std::vector<int>, 4> sideEdges;

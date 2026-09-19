@@ -274,6 +274,56 @@ std::vector<std::vector<int>> RectangleCertifier::baseComplex(const std::vector<
     return patches;
 }
 
+int RectangleCertifier::basePatchCount(const SquareCarrier &C) {
+    const int NE = C.numEdges(), NV = C.numVertices(), NQ = C.numCells();
+    std::vector<char> cut(NE, 0);
+    for (int e = 0; e < NE; ++e) cut[e] = C.isFeatureEdge(e) ? 1 : 0;
+    std::vector<int> es, es2;
+    for (int v = 0; v < NV; ++v) {
+        if (!(C.forcedMacrovertex(v) || C.designatedVertex[v])) continue;
+        C.vertexEdges(v, es);
+        for (int e0 : es) {
+            if (C.isFeatureEdge(e0)) continue;
+            int u = v, e = e0;
+            for (int guard = 0; guard < NE + 1; ++guard) {
+                if (cut[e] == 2) break;
+                cut[e] = 2;
+                const int x = C.otherEnd(e, u);
+                if (C.boundaryVertex[x] || C.valence[x] != 4 || C.designatedVertex[x] || C.forcedMacrovertex(x)) break;
+                C.vertexEdges(x, es2);
+                if (es2.size() != 4) break;
+                int k = 0;
+                while (k < 4 && es2[k] != e) ++k;
+                if (k == 4) break;
+                const int nxt = es2[(k + 2) & 3];
+                if (C.isFeatureEdge(nxt)) break;
+                u = x;
+                e = nxt;
+            }
+        }
+    }
+    std::vector<int> seen(NQ, 0);
+    int patches = 0;
+    std::vector<int> stack;
+    for (int s = 0; s < NQ; ++s) {
+        if (seen[s]) continue;
+        ++patches;
+        stack.assign(1, s);
+        seen[s] = 1;
+        while (!stack.empty()) {
+            const int q = stack.back();
+            stack.pop_back();
+            for (int i = 0; i < 4; ++i) {
+                const int r = C.neighbor[q][i];
+                if (r < 0 || seen[r] || cut[C.cellEdges[q][i]]) continue;
+                seen[r] = 1;
+                stack.push_back(r);
+            }
+        }
+    }
+    return patches;
+}
+
 int RectangleCertifier::addCandidate(Certificate &&cert) {
     const unsigned long long h = cellSetHash(cert.cells);
     auto it = seen_.find(h);

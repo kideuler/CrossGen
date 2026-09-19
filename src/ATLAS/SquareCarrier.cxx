@@ -83,6 +83,34 @@ SquareCarrier::SquareCarrier(const PlanarDomain &domain, const Options &opts)
     rebuild();
 }
 
+SquareCarrier::SquareCarrier(const PlanarDomain &domain, const Options &opts, const Quads &Q)
+    : domain_(&domain), opts_(opts) {
+    const int NV = static_cast<int>(Q.vertices.size());
+    vertices = Q.vertices;
+    vertexOrigin = Q.origin;
+    vertexOrigin.resize(NV, Origin::Realised);
+    sourceVertex = Q.sourceVertex;
+    sourceVertex.resize(NV, -1);
+    sourceEdge = Q.sourceEdge;
+    sourceEdge.resize(NV, -1);
+    protectedVertex.assign(NV, 0);
+    for (int v = 0; v < NV; ++v) {
+        if (sourceVertex[v] >= 0) protectedVertex[v] = domain.protectedVertex[sourceVertex[v]];
+    }
+    designatedVertex = Q.designated;
+    designatedVertex.resize(NV, 0);
+    cells = Q.cells;
+    const int NQ = static_cast<int>(cells.size());
+    cellMaterial = Q.material;
+    cellMaterial.resize(NQ, 1);
+    cellTriangle.assign(NQ, -1);
+    cellOrigin.assign(NQ, CellOrigin::Realised);
+    cellGroup = Q.group;
+    cellGroup.resize(NQ, -1);
+    initialSplit_ = false;
+    rebuild();
+}
+
 // ---------------------------------------------------------------------------
 // Topology
 // ---------------------------------------------------------------------------
@@ -368,9 +396,14 @@ double SquareCarrier::boundaryAngle(int v) const {
     return M_PI;
 }
 
+double SquareCarrier::layoutAngle(int v) const {
+    if (sourceVertex[v] >= 0) return domain_->targetAngle[sourceVertex[v]];
+    return M_PI;
+}
+
 int SquareCarrier::targetValence(int v) const {
     if (!boundaryVertex[v]) return 4;
-    const int t = static_cast<int>(std::lround(boundaryAngle(v) / M_PI_2));
+    const int t = static_cast<int>(std::lround(layoutAngle(v) / M_PI_2));
     return std::max(1, std::min(4, t));
 }
 
@@ -490,6 +523,7 @@ const SquareCarrier::Report &SquareCarrier::validate() {
             case CellOrigin::Split: ++R.splitCells; break;
             case CellOrigin::Template: ++R.templateCells; break;
             case CellOrigin::Rewrite: ++R.rewriteCells; break;
+            case CellOrigin::Realised: ++R.realisedCells; break;
         }
     }
     for (int v = 0; v < NV; ++v) {

@@ -61,6 +61,14 @@ public:
         bool materialInterfaces = true;
         // Vertices the caller designates as macrovertices, whatever their angle.
         std::vector<int> extraCorners;
+        // The interior angle the *layout* is to see at a vertex, where the
+        // mesh's own angle is only a proxy for it (NaN, or a short vector,
+        // means "the mesh's own"). CoarseDomain needs this: a coarse
+        // re-triangulation of a circle is an inscribed polygon whose vertices
+        // turn by 45 degrees each, and a layout that believed those angles
+        // would put a block corner at every one of them. The curve itself has
+        // no corner there, and the fine mesh's angle says so.
+        std::vector<double> angleOverride;
         // A triangle whose area is below this fraction of the squared bounding
         // box diagonal is degenerate.
         double degenerateArea = 1e-14;
@@ -135,6 +143,10 @@ public:
     std::vector<char> protectedVertex;     // a required macrovertex
     std::vector<CornerKind> cornerKind;
     std::vector<double> interiorAngle;     // sum of incident triangle angles
+    // The angle corners and valence targets are read from: interiorAngle,
+    // except where Options::angleOverride says otherwise. Geometry (the angle
+    // sums of Sec. 9.2) always uses interiorAngle.
+    std::vector<double> targetAngle;
     std::vector<int> loopOf;               // boundary loop, -1 if interior
     std::vector<int> interfaceDegree;      // interface edges at the vertex
 

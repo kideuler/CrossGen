@@ -200,6 +200,10 @@ add_library(PolyVector SHARED
     src/ATLAS/BlockCover.cxx
     src/ATLAS/CavityRewrite.hxx
     src/ATLAS/CavityRewrite.cxx
+    src/ATLAS/CoarseDomain.hxx
+    src/ATLAS/CoarseDomain.cxx
+    src/ATLAS/Realisation.hxx
+    src/ATLAS/Realisation.cxx
     src/ATLAS/ATLAS.hxx
     src/ATLAS/ATLAS.cxx
     src/UMBER/Polysquare.hxx
@@ -560,9 +564,26 @@ set_tests_properties(TORSION_ReferenceMetrics PROPERTIES TIMEOUT 2400)
 # spec): one triangle (Sec. 3.1's corner determinants exactly, three blocks), a
 # rectangle (one block), a disk (a five-block O-grid), an annulus (four
 # sectors), an L (three blocks), two materials (two blocks sharing the
-# interface), the certificate refusing a periodic band and an L-tromino, and
-# Stage 6 alone lowering the valence defect of a raw carrier.
+# interface), the certificate refusing a periodic band and an L-tromino,
+# Stage 6 alone lowering the valence defect of a raw carrier, a plate with two
+# holes blocked by a coarse search and realised on the input, and two meshes of
+# one boundary giving blockings of about the same size.
 add_test(NAME ATLAS_SelfTest COMMAND TestATLAS --selftest)
+
+# The coarse searches on models no template covers whole -- holes, a slot, a
+# gear -- with a ceiling on the block count well above what they reach now
+# (13-20, 8-12, 55-70 on 2026-09-18) and far below the thousands the fine
+# carrier alone gives. A regression in the search shows up as a failure here
+# rather than as a still-valid fine fallback.
+foreach(ATLAS_CASE "singlemat/geom007 30" "singlemat/geom021 20" "singlemat/geom009 100")
+    string(REPLACE " " ";" ATLAS_ARGS ${ATLAS_CASE})
+    list(GET ATLAS_ARGS 0 ATLAS_MODEL)
+    list(GET ATLAS_ARGS 1 ATLAS_MAX)
+    string(REPLACE "/" "_" ATLAS_CASE_NAME ${ATLAS_MODEL})
+    add_test(NAME ATLAS_Coarse_${ATLAS_CASE_NAME}
+             COMMAND TestATLAS ${CMAKE_CURRENT_SOURCE_DIR}/data/meshes/${ATLAS_MODEL}.obj --max-blocks ${ATLAS_MAX})
+    set_tests_properties(ATLAS_Coarse_${ATLAS_CASE_NAME} PROPERTIES TIMEOUT 600)
+endforeach()
 
 # End-to-end on a single- and a multi-material model. The exit code is the
 # validity of the blocking, which the fine fallback also satisfies; how coarse

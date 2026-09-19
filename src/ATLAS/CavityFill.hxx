@@ -14,14 +14,25 @@
 //
 // A cavity is a set of carrier cells. Its replacement (a Patch) is a set of new
 // cells over the cavity's own boundary vertices plus new vertices. The boundary
-// is never moved: the one change allowed to it is inserting collinear points on
-// a *domain* boundary segment (Sec. 8.4 -- "Changing the number or positions of
+// is never moved: the one change allowed to it is the subdivision of a
+// *domain* boundary segment (Sec. 8.4 -- "Changing the number or positions of
 // boundary subdivisions may require replacing or refining neighboring cells";
-// on dS there is no neighbour, so it requires nothing). That single rule is
-// what makes Sec. 8.4's three agreements hold by construction rather than by
-// checking: the geometric boundary curve, the incidences and the edge
-// parameterisations of every retained edge are all literally unchanged,
-// because the retained edges are the same pairs of the same vertices.
+// on dS there is no neighbour, so it requires nothing). Collinear points may
+// be inserted on such a segment, and a collinear point strictly inside one may
+// be dropped when no cell outside the cavity uses it (droppable()): either way
+// the polyline -- Sec. 1.1's geometric boundary -- is literally the same point
+// set, and every input vertex on it stays. That single rule is what makes Sec.
+// 8.4's three agreements hold by construction rather than by checking: the
+// geometric boundary curve, the incidences and the edge parameterisations of
+// every retained edge are all unchanged, because the retained edges are the
+// same pairs of the same vertices.
+//
+// Dropping matters as much as inserting. A 3-5 pair is a dislocation: the
+// development of a loop round it closes in rotation and misses by one unit in
+// translation, so no fill of a cavity round it that keeps the cavity's own
+// boundary can remove it. A cavity that reaches dS can, by absorbing the
+// missing unit there -- one boundary edge fewer or more on the side the extra
+// half-row ends on -- and that is how a dislocation leaves the domain.
 //
 // ### The certificate (Sec. 9.2)
 //
@@ -32,8 +43,9 @@
 //      det DX is affine in (u, v) and so is positive on [0,1]^2 iff it is at
 //      the corners;
 //   2. the patch is a consistently oriented, edge-manifold complex whose
-//      boundary is exactly the cavity's boundary, each domain-boundary edge
-//      possibly subdivided by collinear inserted points;
+//      boundary is exactly the cavity's boundary, each domain-boundary
+//      segment possibly subdivided differently (collinear points inserted,
+//      droppable ones left out, in order);
 //   3. every new interior vertex has a one-ring whose angles sum to 2 pi, and
 //      every retained boundary vertex has the same interior angle inside the
 //      patch as it had inside the cavity (pi at an inserted point);
@@ -99,6 +111,23 @@ public:
     static Boundary boundaryOf(const SquareCarrier &C, const std::vector<int> &cells,
                                const std::unordered_set<int> &inCavity);
 
+    // A boundary vertex of the cavity that a replacement may leave out: a
+    // midpoint or inserted point strictly inside a domain boundary segment,
+    // neither protected nor designated, with every cell at it in the cavity.
+    static bool droppable(const SquareCarrier &C, int v, const std::unordered_set<int> &inCavity);
+    // The input (domain mesh) boundary edge that the boundary segment a-b of
+    // the carrier lies on, or -1. a and b need not be adjacent in the carrier,
+    // only on one domain segment.
+    static int domainEdge(const SquareCarrier &C, int a, int b);
+    // ids with `extra` collinear points inserted on its domain-boundary
+    // segments, longest first; empty when there is no such segment.
+    static std::vector<int> insertOnBoundary(const SquareCarrier &C, Patch &P, const std::vector<int> &ids,
+                                             int extra);
+    // ids with `count` of its interior droppable vertices left out, the one
+    // whose two edges are shortest together first; `mayDrop` says which may go.
+    static std::vector<int> dropFromBoundary(const SquareCarrier &C, const std::vector<int> &ids,
+                                             const std::vector<char> &mayDrop, int count);
+
     // A structured n x m grid over a four-sided region. sides[0..3] are the
     // bottom (corner 0 -> 1, n edges), right (1 -> 2, m edges), top (2 -> 3,
     // n edges) and left (3 -> 0, m edges) boundary node ids, consecutive sides
@@ -137,6 +166,14 @@ public:
     // budget of increments misses -- is still found. False when no such s.
     static bool repairStar(const std::vector<int> &n, const std::vector<char> &splittable,
                            std::vector<int> &s);
+    // The same with a range [lo_k, hi_k] for each side's edge count: spoke
+    // counts s whose sides s_{k-1} + s_{k+1} all fall in their ranges,
+    // minimising the total change from n and then the distance from the real
+    // solution. `have` returns the side counts the solution gives. The first
+    // two (K = 3) or three (K = 5) spokes are searched within `window` of the
+    // real solution, the others settle exactly.
+    static bool rangeStar(const std::vector<int> &n, const std::vector<int> &lo, const std::vector<int> &hi,
+                          std::vector<int> &s, std::vector<int> &have, int window = 40);
 
     // Jacobi-Laplacian smoothing of the patch's free vertices: every new vertex
     // except a point inserted on dS. The cavity boundary does not move.

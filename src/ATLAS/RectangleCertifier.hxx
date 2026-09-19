@@ -140,6 +140,12 @@ public:
     const SquareCarrier &getCarrier() const { return C_; }
 
     static const char *failureName(Failure f);
+    // The number of patches of C's base complex -- lines traced straight
+    // through regular vertices from every forced macrovertex and every
+    // designated one -- without certifying any of them. It is the block
+    // count Stages 4 and 5 start from, cheap enough for Stage 6 to evaluate
+    // after every trial move on a coarse carrier (N_B of Sec. 8.3's score).
+    static int basePatchCount(const SquareCarrier &C);
     // Distortion and complexity of a certified block.
     static void measure(const SquareCarrier &C, Certificate &cert);
 

@@ -52,6 +52,10 @@ PlanarDomain::PlanarDomain(const Mesh &mesh, const Options &opts) : mesh_(mesh),
     report_.meanEdge = mesh_.edges.empty() ? 0.0 : edgeSum / mesh_.edges.size();
 
     checkTriangles();
+    targetAngle = interiorAngle;
+    for (int v = 0; v < NV && v < static_cast<int>(opts_.angleOverride.size()); ++v) {
+        if (std::isfinite(opts_.angleOverride[v])) targetAngle[v] = opts_.angleOverride[v];
+    }
     checkManifold();
     buildLoops();
     buildComponents();
@@ -321,7 +325,7 @@ void PlanarDomain::tagCorners() {
             else if (deg >= 3) mark(v, CornerKind::InterfaceJunction);
             else if (deg == 1) mark(v, CornerKind::InterfaceDangling);
         }
-        if (onBoundary && std::fabs(interiorAngle[v] - M_PI) > cornerTol) {
+        if (onBoundary && std::fabs(targetAngle[v] - M_PI) > cornerTol) {
             mark(v, CornerKind::BoundaryCorner);
         }
     }
