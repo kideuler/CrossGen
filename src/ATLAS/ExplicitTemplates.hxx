@@ -58,6 +58,29 @@
 //     another, hence convex, and every core cell is the intersection of two
 //     strips between non-crossing segments of a convex quadrilateral, hence
 //     convex.
+//   * Half O-grids. Not one of Sec. 7's families, and needed because of what
+//     Sec. 7.3 does to a region whose two protected corners are real corners:
+//     it has to make them two of its four split points, and a split point is
+//     where two shells meet, so each corner is cut into two cells. On
+//     singlemat/geom002, a half disk, that meshed as cells of 27 and 61
+//     degrees in each 90-degree corner, and Sec. 4's count then asks the
+//     interior for four three-valent vertices, where one cell at each corner
+//     would leave it two. A region with two
+//     corners joined by a straight side -- every body that crosses the axis
+//     of an axisymmetric (r, z) model -- is instead half of an O-grid: mirror
+//     it across that side, lay Sec. 7.3's O-grid over the mirror image with its
+//     centre on the side and its split points in mirror pairs, and cut it back
+//     along the side. What is left is a core resting on the side and three
+//     shells round it, four blocks, the two corners each the corner of one
+//     side shell, and the side's two outer stretches radial lines of those
+//     shells. Sec. 7.3's certificate carries over unchanged: every shell cell
+//     is X(s, t) = c + lambda d(s) with lambda increasing in t, so
+//     det DX = lambda_t det(q', d) > 0 whether the radial spacing is uniform
+//     (the rays in the arc's interior) or the side's own points (the rays
+//     along it). The counts close only if the core's side on the straight
+//     side has as many edges as the arc opposite it, which a straight dS side
+//     meets by Sec. 8.4's inserted points and an interface meets only by
+//     widening the core.
 //   * Annuli (Sec. 7.4). Two loops, both radial graphs about a point of the
 //     hole: four sectors, no centre, the hole kept exactly. When one loop
 //     has exactly four protected corners -- a plate with a hole -- the
@@ -74,7 +97,13 @@ public:
         bool sections = true;
         bool stars = true;
         bool ogrids = true;
+        bool halfOGrids = true;
         bool annuli = true;
+        // A half O-grid gives each of its two corners one cell, so it is tried
+        // only when both are below this interior angle (degrees). Round it to
+        // the nearest quarter turn: a corner past 135 degrees wants two cells,
+        // which is what the full O-grid gives it.
+        double halfOGridCorner = 135.0;
         // A protected corner with an interior angle past pi by more than this
         // (degrees) is reflex and emits sections.
         double reflexAngle = 20.0;
@@ -146,6 +175,7 @@ private:
     bool trySections(const Region &R, CavityFill::Patch &P, Attempt &A);
     bool tryStar(const Region &R, CavityFill::Patch &P, Attempt &A);
     bool tryOGrid(const Region &R, CavityFill::Patch &P, Attempt &A);
+    bool tryHalfOGrid(const Region &R, CavityFill::Patch &P, Attempt &A);
     bool tryAnnulus(const Region &R, CavityFill::Patch &P, Attempt &A);
 
     bool isNode(int v) const;

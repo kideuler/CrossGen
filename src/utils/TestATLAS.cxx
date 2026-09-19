@@ -561,6 +561,60 @@ int selfTest() {
         }
     }
 
+    // -----------------------------------------------------------------
+    heading("Case 13  Half disk: a four-block half O-grid");
+    // -----------------------------------------------------------------
+    {
+        // Every body that crosses the axis of an (r, z) model is one of these.
+        // Its two corners are real quarter turns, and Sec. 7.3's O-grid would
+        // make them split points and cut each into two cells; half of an
+        // O-grid gives each one cell and needs two three-valent vertices
+        // inside instead of four.
+        std::vector<Point> loop;
+        const int n = 36;
+        for (int i = 0; i <= n; ++i) loop.push_back({std::cos(M_PI * i / n), std::sin(M_PI * i / n)});
+        auto mesh = meshLoops({loop}, {0}, 0.08);
+        ATLAS pipe(mesh, quietOptions());
+        const bool ok = pipe.run();
+        summary(pipe);
+        check(ok && pipe.hasCover(), "the pipeline returns a valid blocking");
+        if (fineSearch(pipe).templates && !fineSearch(pipe).templates->getReport().attempts.empty()) {
+            const ExplicitTemplates::Attempt &a = fineSearch(pipe).templates->getReport().attempts.back();
+            check(a.accepted && a.family == "half O-grid" && a.blocks == 4,
+                  "Stage 3 lays a core on the diameter and three shells round it");
+        }
+        if (ok && pipe.hasCover()) {
+            const BlockCover &cover = pipe.getCover();
+            const SquareCarrier &C = pipe.getCarrier();
+            check(cover.getReport().blocks == 4, "four blocks");
+            // Block corners at each carrier vertex: one at each end of the
+            // diameter, three at the core's two top corners, none irregular
+            // anywhere else.
+            std::vector<int> corners(C.vertices.size(), 0);
+            for (const BlockCover::Block &b : cover.getBlocks()) for (int v : b.cert.corners) ++corners[v];
+            int endsOneBlock = 0, threeValent = 0, otherIrregular = 0;
+            for (size_t v = 0; v < C.vertices.size(); ++v) {
+                if (corners[v] == 0) continue;
+                const bool end = std::fabs(std::fabs(C.vertices[v][0]) - 1.0) < 1e-9 && std::fabs(C.vertices[v][1]) < 1e-9;
+                if (end && corners[v] == 1) ++endsOneBlock;
+                else if (!C.boundaryVertex[v] && corners[v] == 3) ++threeValent;
+                else if (C.boundaryVertex[v] ? corners[v] != 2 : corners[v] != 4) ++otherIrregular;
+            }
+            check(endsOneBlock == 2, "each end of the diameter is the corner of one block");
+            check(threeValent == 2 && otherIrregular == 0,
+                  "two three-valent macrovertices, the core's top corners, and nothing else irregular");
+            BlockMesh::Options mo;
+            mo.targetEdgeLength = 0.1;
+            BlockMesh bm(cover, mo);
+            std::cout << "  TFI mesh at h = 0.1: worst scaled Jacobian " << std::fixed << std::setprecision(3)
+                      << bm.getReport().minScaledJacobian << std::defaultfloat << "\n";
+            // 1/sqrt(2) is the O-grid's own figure: at a core corner the core
+            // takes a quarter turn and the two shells 135 degrees each.
+            check(bm.getReport().valid && bm.getReport().minScaledJacobian > 0.65,
+                  "the TFI mesh on it is valid, no element below 0.65");
+        }
+    }
+
     heading("Self-test result");
     if (failures == 0) {
         std::cout << "  " << kPass << " Every check held.\n";
@@ -745,6 +799,7 @@ void usage(const char *prog) {
               << "  --no-sections         no sectioned quadrilaterals (Secs. 7.1, 7.2)\n"
               << "  --no-stars            no three- or five-block stars\n"
               << "  --no-ogrid            no O-grids (Sec. 7.3)\n"
+              << "  --no-half-ogrid       no half O-grids (two corners on a straight side, e.g. an axis)\n"
               << "  --no-annulus          no annuli (Sec. 7.4)\n"
               << "  --reflex-angle <deg>  a corner past pi by this emits sections      (default 20)\n"
               << "  --core <f>            O-grid core at this fraction of the radius   (default 0.5)\n"
@@ -833,6 +888,7 @@ int main(int argc, char **argv) {
         else if (a == "--no-sections")                    opts.templates.sections = false;
         else if (a == "--no-stars")                       opts.templates.stars = false;
         else if (a == "--no-ogrid")                       opts.templates.ogrids = false;
+        else if (a == "--no-half-ogrid")                  opts.templates.halfOGrids = false;
         else if (a == "--no-annulus")                     opts.templates.annuli = false;
         else if (a == "--reflex-angle" && i + 1 < argc)   opts.templates.reflexAngle = std::stod(argv[++i]);
         else if (a == "--core" && i + 1 < argc)           opts.templates.coreFraction = std::stod(argv[++i]);

@@ -564,8 +564,9 @@ set_tests_properties(TORSION_ReferenceMetrics PROPERTIES TIMEOUT 2400)
 
 # ATLAS on inputs whose blocking is known before it runs (Sec. 13.3 of the
 # spec): one triangle (Sec. 3.1's corner determinants exactly, three blocks), a
-# rectangle (one block), a disk (a five-block O-grid), an annulus (four
-# sectors), an L (three blocks), two materials (two blocks sharing the
+# rectangle (one block), a disk (a five-block O-grid), a half disk (a four-block
+# half O-grid, one block at each corner), an annulus (four sectors), an L
+# (three blocks), two materials (two blocks sharing the
 # interface), the certificate refusing a periodic band and an L-tromino,
 # Stage 6 alone lowering the valence defect of a raw carrier, a plate with two
 # holes blocked by a coarse search and realised on the input, two meshes of
@@ -581,6 +582,14 @@ add_test(NAME ATLAS_Mesh_singlemat_geom014
          COMMAND TestATLAS ${CMAKE_CURRENT_SOURCE_DIR}/data/meshes/singlemat/geom014.obj
                  --mesh 0.05 --mesh-tmop 1000)
 set_tests_properties(ATLAS_Mesh_singlemat_geom014 PROPERTIES TIMEOUT 600)
+
+# The corpus's half disk. Before the half O-grid it was a five-block O-grid with
+# each 90-degree corner cut into two cells and a worst TFI element of 0.054; now
+# four blocks and 0.70. Exit 8 above four blocks, 9 if the mesh does not validate.
+add_test(NAME ATLAS_HalfOGrid_singlemat_geom002
+         COMMAND TestATLAS ${CMAKE_CURRENT_SOURCE_DIR}/data/meshes/singlemat/geom002.obj
+                 --max-blocks 4 --mesh 0.05)
+set_tests_properties(ATLAS_HalfOGrid_singlemat_geom002 PROPERTIES TIMEOUT 600)
 
 # The coarse searches on models no template covers whole -- holes, a slot, a
 # gear -- with a ceiling on the block count well above what they reach now

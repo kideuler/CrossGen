@@ -222,7 +222,8 @@ bool ExplicitTemplates::attempt(const Region &R, Attempt &A) {
         }
         const CavityFill::Verdict V =
             CavityFill::settle(C_, R.cells, P, opts_.minScaledJacobian,
-                               (std::string(family) == "O-grid" || std::string(family) == "annulus")
+                               (std::string(family) == "O-grid" || std::string(family) == "half O-grid" ||
+                                std::string(family) == "annulus")
                                    ? 0 : opts_.smoothingIterations);
         if (!V.valid) {
             reasons.push_back(std::string(family) + ": " + V.reason);
@@ -272,6 +273,10 @@ bool ExplicitTemplates::attempt(const Region &R, Attempt &A) {
             if (reasons.size() > before + 1) reasons.erase(reasons.begin() + before, reasons.end() - 1);
         }
         if (opts_.stars && reflex == 0 && (K == 3 || K == 5) && run("star", &ExplicitTemplates::tryStar)) return true;
+        // Two real corners want a cell each, which the half O-grid gives them
+        // and the O-grid cannot; it declines anything else, and the O-grid is
+        // still there behind it.
+        if (opts_.halfOGrids && K == 2 && run("half O-grid", &ExplicitTemplates::tryHalfOGrid)) return true;
         if (opts_.ogrids && K <= 2 && run("O-grid", &ExplicitTemplates::tryOGrid)) return true;
         if (reasons.empty()) {
             std::ostringstream os;
@@ -934,6 +939,352 @@ bool ExplicitTemplates::tryOGrid(const Region &R, Patch &P, Attempt &A) {
     P.kind = "O-grid";
     A.maps = "1 straight-line core, 4 radial";
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Half O-grid: Sec. 7.3 mirrored across a straight side and cut back.
+// ---------------------------------------------------------------------------
+//
+// Names, walking the loop with the region on the left: the straight side runs
+// from corner A to corner B through s1 and s2, the core's feet; the arc runs
+// back from B to A through t2 and t1, where the shells split; q2 and q1 are the
+// core's top corners, on the rays from c through t2 and t1. The four blocks
+// are the core s1 s2 q2 q1, the shell at B (s2 B t2 q2), the top shell
+// (q2 t2 t1 q1) and the shell at A (q1 t1 A s1). Opposite sides must carry
+// equal counts, so with m the depth of the shells, S the height of the core
+// and W its width,
+//
+//     |A s1| = |s2 B| = m,   |B t2| = |t1 A| = S,   |s1 s2| = |t2 t1| = W,
+//
+// and the straight side has 2m + W edges against the arc's 2S + W. Their
+// totals have one parity -- the loop is a quad region's boundary, so it is
+// even -- but on a disk the arc is about pi/2 times longer than the side, so
+// with the core at Sec. 7.3's proportions |s1 s2| has fewer edges than
+// |t2 t1|. Points are inserted where the difference falls (Sec. 8.4), which on
+// the axis of an (r, z) model is dS. Where it cannot be, the only split left
+// is the one whose core is as wide as the arc above it; that candidate is
+// kept, ranked last.
+bool ExplicitTemplates::tryHalfOGrid(const Region &R, Patch &P, Attempt &A) {
+    const std::vector<int> &L = R.B.loops[R.outer];
+    const int N = static_cast<int>(L.size());
+    auto fail = [&](const std::string &why) { A.reason = why; return false; };
+
+    std::vector<int> npos;
+    for (int i = 0; i < N; ++i) if (isNode(L[i])) npos.push_back(i);
+    if (npos.size() != 2) return fail("not two protected corners");
+    const double maxCorner = opts_.halfOGridCorner * M_PI / 180.0;
+    for (int i : npos) {
+        if (R.B.angle[R.outer][i] > maxCorner) return fail("a corner is flat enough to want two cells");
+    }
+
+    // The two sides between the corners, in loop order. One must be straight.
+    auto sideIds = [&](int from, int to) {
+        std::vector<int> ids;
+        for (int i = from;; i = (i + 1) % N) {
+            ids.push_back(L[i]);
+            if (i == to) break;
+        }
+        return ids;
+    };
+    auto positions = [&](const std::vector<int> &ids) {
+        std::vector<Point> X;
+        X.reserve(ids.size());
+        for (int v : ids) X.push_back(C_.vertices[v]);
+        return X;
+    };
+    const std::vector<int> side0 = sideIds(npos[0], npos[1]), side1 = sideIds(npos[1], npos[0]);
+    const bool straight0 = collinear(positions(side0), 1e-6), straight1 = collinear(positions(side1), 1e-6);
+    if (straight0 == straight1) {
+        return fail(straight0 ? "both sides between the corners are straight"
+                              : "neither side between the corners is straight");
+    }
+    const std::vector<int> &base = straight0 ? side0 : side1;   // A -> B
+    const std::vector<int> &arc = straight0 ? side1 : side0;    // B -> A
+    const int D = static_cast<int>(base.size()) - 1, Ar = static_cast<int>(arc.size()) - 1;
+    if (D < 3 || Ar < 3) return fail("too few boundary edges for a core and three shells");
+    const Point Apt = C_.vertices[base.front()], Bpt = C_.vertices[base.back()];
+    const double len = normP(Bpt - Apt);
+    if (!(len > 0.0)) return fail("the straight side has no length");
+    const Point e = (Bpt - Apt) / len;
+    const Point nrm{-e[1], e[0]};   // into the region
+    const std::vector<Point> Xa = positions(arc);
+
+    // c, on the straight side and in the kernel of the arc. The side is a ray
+    // from any point of it, so only the arc's edges bound the depth, and their
+    // minimum is concave along the side. Sec. 7.3's O-grid starts its kernel
+    // point from the area centroid; the mirror image's centroid is this
+    // region's dropped onto the side, and c stays there unless that is less
+    // than half as deep as the deepest point, when it moves towards it until
+    // it is. Not the deepest point itself: on a long flat body (rocket's
+    // capsule) the depth is the height all along the middle, the maximum is a
+    // plateau, and wherever a search stops on it the core is off-centre.
+    auto depthAt = [&](double u) {
+        const Point p = Apt + (Bpt - Apt) * u;
+        double d = 1e300;
+        for (int k = 0; k < Ar; ++k) {
+            const Point a = Xa[k], b = Xa[k + 1];
+            const double l = normP(b - a);
+            if (l > 0.0) d = std::min(d, cross2(b - a, p - a) / l);
+        }
+        return d;
+    };
+    double lo = 0.0, hi = 1.0;
+    for (int it = 0; it < 80; ++it) {
+        const double u1 = lo + (hi - lo) / 3.0, u2 = hi - (hi - lo) / 3.0;
+        if (depthAt(u1) < depthAt(u2)) lo = u1;
+        else hi = u2;
+    }
+    const double uDeep = 0.5 * (lo + hi), dMax = depthAt(uDeep);
+    if (!(dMax > 1e-3 * R.h)) return fail("not star-shaped about any point of the straight side");
+    double uc = std::clamp(dotP(CavityFill::areaCentroid(positions(L)) - Apt, e) / len, 0.0, 1.0);
+    if (depthAt(uc) < 0.5 * dMax) {
+        // Concave, so the depth rises monotonically from uc to uDeep.
+        double a = uc, b = uDeep;
+        for (int it = 0; it < 60; ++it) {
+            const double m = 0.5 * (a + b);
+            if (depthAt(m) < 0.5 * dMax) a = m;
+            else b = m;
+        }
+        uc = b;
+    }
+    const Point c = Apt + (Bpt - Apt) * uc;
+
+    // Sec. 7.3's ideal split directions for the mirror image: the corners of
+    // the rectangle on its axes -- the side and its normal -- with half-widths
+    // the extents. On a half disk, 45 and 135 degrees.
+    std::vector<double> th(Ar + 1);
+    double w1p = 0.0, w1m = 0.0, w2 = 0.0;
+    for (int k = 0; k <= Ar; ++k) {
+        const Point d = Xa[k] - c;
+        th[k] = std::atan2(dotP(d, nrm), dotP(d, e));
+        w1p = std::max(w1p, dotP(d, e));
+        w1m = std::max(w1m, -dotP(d, e));
+        w2 = std::max(w2, dotP(d, nrm));
+    }
+    const double ideal2 = std::atan2(w2, w1p), ideal1 = M_PI - std::atan2(w2, w1m);
+    std::vector<double> ub(D + 1);
+    for (int k = 0; k <= D; ++k) ub[k] = dotP(C_.vertices[base[k]] - c, e);
+
+    // Which stretches may take inserted points: prefix counts of dS segments.
+    auto splittablePrefix = [&](const std::vector<int> &ids) {
+        std::vector<int> pre(ids.size(), 0);
+        for (size_t k = 0; k + 1 < ids.size(); ++k) {
+            const int ed = C_.edgeBetween(ids[k], ids[k + 1]);
+            pre[k + 1] = pre[k] + ((opts_.splitBoundary && ed >= 0 && C_.boundaryEdge[ed]) ? 1 : 0);
+        }
+        return pre;
+    };
+    const std::vector<int> preB = splittablePrefix(base), preA = splittablePrefix(arc);
+    auto baseSplits = [&](int i, int j) { return preB[j] - preB[i] > 0; };
+    auto arcSplits = [&](int i, int j) { return preA[j] - preA[i] > 0; };
+
+    struct Split { int j2, j1, i1, i2; double cost; };
+    std::vector<Split> splits;
+    const double alpha = opts_.coreFraction;
+    auto nearestArc = [&](double target) {
+        int best = 1;
+        for (int k = 1; k < Ar; ++k) if (std::fabs(th[k] - target) < std::fabs(th[best] - target)) best = k;
+        return best;
+    };
+    const int j2c = nearestArc(ideal2), j1c = nearestArc(ideal1);
+    const int window = 2;
+    for (int j2 = std::max(1, j2c - window); j2 <= std::min(Ar - 2, j2c + window); ++j2) {
+        std::set<int> j1s;
+        for (int j1 = j1c - window; j1 <= j1c + window; ++j1) j1s.insert(j1);
+        j1s.insert(Ar - j2);   // |B t2| = |t1 A| with nothing inserted on the arc
+        for (int j1 : j1s) {
+            if (j1 <= j2 || j1 > Ar - 1) continue;
+            const Point q2 = c + (Xa[j2] - c) * alpha, q1 = c + (Xa[j1] - c) * alpha;
+            const double x2 = dotP(q2 - c, e), x1 = dotP(q1 - c, e);
+            if (!(x1 < 0.0 && x2 > 0.0)) continue;
+            // The core's feet go under its top corners, as in the mirrored O-grid.
+            int i1c = -1, i2c = -1;
+            for (int k = 1; k < D; ++k) {
+                if (ub[k] < 0.0 && (i1c < 0 || std::fabs(ub[k] - x1) < std::fabs(ub[i1c] - x1))) i1c = k;
+                if (ub[k] > 0.0 && (i2c < 0 || std::fabs(ub[k] - x2) < std::fabs(ub[i2c] - x2))) i2c = k;
+            }
+            auto consider = [&](int i1, int i2) {
+                if (i1 < 1 || i2 > D - 1 || i1 >= i2) return;
+                if (!(ub[i1] < 0.0 && ub[i2] > 0.0)) return;
+                const int nR = j2, nT = j1 - j2, nL = Ar - j1, mA = i1, w0 = i2 - i1, mB = D - i2;
+                const int S = std::max(nR, nL), M = std::max(mA, mB), W = std::max(w0, nT);
+                if ((S > nR && !arcSplits(0, j2)) || (S > nL && !arcSplits(j1, Ar))) return;
+                if ((M > mA && !baseSplits(0, i1)) || (M > mB && !baseSplits(i2, D))) return;
+                if ((W > w0 && !baseSplits(i1, i2)) || (W > nT && !arcSplits(j2, j1))) return;
+                const double da = th[j2] - ideal2, db = th[j1] - ideal1;
+                const double pa = (ub[i1] - x1) / len, pb = (ub[i2] - x2) / len;
+                const int extra = (S - nR) + (S - nL) + (M - mA) + (M - mB) + (W - w0) + (W - nT);
+                splits.push_back({j2, j1, i1, i2, da * da + db * db + pa * pa + pb * pb + 1e-9 * extra});
+            };
+            if (i1c >= 0 && i2c >= 0) {
+                for (int d1 = -window; d1 <= window; ++d1)
+                    for (int d2 = -window; d2 <= window; ++d2) consider(i1c + d1, i2c + d2);
+            }
+            // Nothing insertable anywhere: the core as wide as the arc above it.
+            const int nT = j1 - j2;
+            if (D - nT >= 2 && (D - nT) % 2 == 0) consider((D - nT) / 2, D - (D - nT) / 2);
+        }
+    }
+    if (splits.empty()) return fail("no split of the two sides closes the counts");
+    std::stable_sort(splits.begin(), splits.end(), [](const Split &a, const Split &b) { return a.cost < b.cost; });
+
+    // Build one split; false with a reason when its geometry does not close.
+    auto build = [&](const Split &sp, Patch &Q, int &inserted, std::string &why) {
+        auto sub = [](const std::vector<int> &v, int a, int b) {
+            return std::vector<int>(v.begin() + a, v.begin() + b + 1);
+        };
+        std::vector<int> bA = sub(base, 0, sp.i1), bW = sub(base, sp.i1, sp.i2), bB = sub(base, sp.i2, D);
+        std::vector<int> aR = sub(arc, 0, sp.j2), aT = sub(arc, sp.j2, sp.j1), aL = sub(arc, sp.j1, Ar);
+        const int S = std::max(sp.j2, Ar - sp.j1), M = std::max(sp.i1, D - sp.i2);
+        const int W = std::max(sp.i2 - sp.i1, sp.j1 - sp.j2);
+        inserted = 0;
+        auto grow = [&](std::vector<int> &ids, int to) {
+            const int extra = to - (static_cast<int>(ids.size()) - 1);
+            if (extra <= 0) return true;
+            ids = splitArc(Q, ids, extra);
+            inserted += extra;
+            return !ids.empty();
+        };
+        if (!grow(aR, S) || !grow(aL, S) || !grow(bA, M) || !grow(bB, M) || !grow(bW, W) || !grow(aT, W)) {
+            why = "a stretch that needs points is not dS";
+            return false;
+        }
+        auto X = [&](int id) { return Q.at(C_, id); };
+        const int s1 = bA.back(), s2 = bB.front(), t2 = aR.back(), t1 = aL.front();
+        const Point q2p = c + (X(t2) - c) * alpha, q1p = c + (X(t1) - c) * alpha;
+        const std::array<Point, 4> quad = {X(s1), X(s2), q2p, q1p};
+        for (int k = 0; k < 4; ++k) {
+            if (!(cross2(quad[(k + 1) % 4] - quad[k], quad[(k + 3) % 4] - quad[k]) > 0.0)) {
+                why = "the core quadrilateral is not convex";
+                return false;
+            }
+        }
+        const int q2 = Q.addVertex(q2p, Origin::Template), q1 = Q.addVertex(q1p, Origin::Template);
+
+        // The core side a -> b's nodes: where the rays from c through the
+        // shell's arc cross it, a and b themselves at the ends.
+        auto raysOnto = [&](const std::vector<int> &outer, int a, int b, std::vector<int> &out) {
+            out.assign(1, a);
+            const Point pa = X(a), ed = X(b) - pa, w = pa - c;
+            double lastS = 0.0;
+            const int n = static_cast<int>(outer.size()) - 1;
+            for (int k = 1; k < n; ++k) {
+                const Point d = X(outer[k]) - c;
+                const double den = cross2(d, ed);
+                if (std::fabs(den) < 1e-300) return false;
+                const double t = cross2(w, ed) / den, s = cross2(w, d) / den;
+                if (!(t > 0.0 && t < 1.0 && s > lastS && s < 1.0)) return false;
+                lastS = s;
+                out.push_back(Q.addVertex(c + d * t, Origin::Template));
+            }
+            out.push_back(b);
+            return true;
+        };
+        std::vector<int> coreR, coreT, coreL;
+        if (!raysOnto(aR, s2, q2, coreR) || !raysOnto(aT, q2, q1, coreT) || !raysOnto(aL, q1, s1, coreL)) {
+            why = "a ray misses its core side";
+            return false;
+        }
+
+        // Radial lines, core end first: uniform on the two split rays, the
+        // side's own points on the two stretches of the straight side.
+        auto uniformRay = [&](int from, int to) {
+            std::vector<int> r{from};
+            for (int j = 1; j < M; ++j) {
+                r.push_back(Q.addVertex(X(from) + (X(to) - X(from)) * (static_cast<double>(j) / M), Origin::Template));
+            }
+            r.push_back(to);
+            return r;
+        };
+        const std::vector<int> rayT2 = uniformRay(q2, t2), rayT1 = uniformRay(q1, t1);
+        const std::vector<int> rayB = bB, rayA(bA.rbegin(), bA.rend());
+
+        // One shell: core[i] -> outer[i], i = 0..n, with `first` and `last` its
+        // radial lines at i = 0 and n. A radial line in between takes the two
+        // end lines' fractions blended by i/n, so it meets both exactly and its
+        // fractions stay increasing -- all Sec. 7.3's det DX > 0 asks of lambda.
+        auto shell = [&](const std::vector<int> &core, const std::vector<int> &outer, const std::vector<int> &first,
+                         const std::vector<int> &last) {
+            const int n = static_cast<int>(outer.size()) - 1;
+            auto fractions = [&](const std::vector<int> &ray) {
+                std::vector<double> f(M + 1);
+                const Point a = X(ray.front());
+                const double l = normP(X(ray.back()) - a);
+                for (int j = 0; j <= M; ++j) f[j] = normP(X(ray[j]) - a) / l;
+                return f;
+            };
+            const std::vector<double> f0 = fractions(first), f1 = fractions(last);
+            std::vector<int> nodes(static_cast<size_t>(n + 1) * (M + 1));
+            auto at = [&](int i, int j) -> int & { return nodes[i + (n + 1) * j]; };
+            for (int i = 0; i <= n; ++i) { at(i, 0) = core[i]; at(i, M) = outer[i]; }
+            for (int j = 0; j <= M; ++j) { at(0, j) = first[j]; at(n, j) = last[j]; }
+            for (int i = 1; i < n; ++i) {
+                const double lam = static_cast<double>(i) / n;
+                const Point a0 = X(core[i]), a1 = X(outer[i]);
+                for (int j = 1; j < M; ++j) {
+                    at(i, j) = Q.addVertex(a0 + (a1 - a0) * ((1.0 - lam) * f0[j] + lam * f1[j]), Origin::Template);
+                }
+            }
+            for (int j = 0; j < M; ++j) {
+                for (int i = 0; i < n; ++i) Q.cells.push_back({at(i, j), at(i, j + 1), at(i + 1, j + 1), at(i + 1, j)});
+            }
+        };
+        shell(coreR, aR, rayB, rayT2);
+        shell(coreT, aT, rayT2, rayT1);
+        shell(coreL, aL, rayT1, rayA);
+
+        // The core: a straight-line grid, as the O-grid's, its bottom the
+        // straight side between the feet.
+        {
+            const int n = W, mm = S;
+            std::vector<int> nodes(static_cast<size_t>(n + 1) * (mm + 1));
+            auto at = [&](int i, int j) -> int & { return nodes[i + (n + 1) * j]; };
+            for (int i = 0; i <= n; ++i) { at(i, 0) = bW[i]; at(i, mm) = coreT[n - i]; }
+            for (int j = 0; j <= mm; ++j) { at(n, j) = coreR[j]; at(0, j) = coreL[mm - j]; }
+            for (int j = 1; j < mm; ++j) {
+                for (int i = 1; i < n; ++i) {
+                    const Point b0 = X(at(i, 0)), t0 = X(at(i, mm)), l0 = X(at(0, j)), r0 = X(at(n, j));
+                    const Point r = t0 - b0, s = r0 - l0;
+                    const double den = cross2(r, s);
+                    if (std::fabs(den) < 1e-300) {
+                        why = "two core chords are parallel";
+                        return false;
+                    }
+                    at(i, j) = Q.addVertex(b0 + r * (cross2(l0 - b0, s) / den), Origin::Template);
+                }
+            }
+            for (int j = 0; j < mm; ++j) {
+                for (int i = 0; i < n; ++i) Q.cells.push_back({at(i, j), at(i + 1, j), at(i + 1, j + 1), at(i, j + 1)});
+            }
+        }
+        for (int v : {s1, s2, t1, t2, q1, q2}) Q.designated.push_back(v);
+        Q.blocks = 4;
+        Q.kind = "half O-grid";
+        return true;
+    };
+
+    // The best few splits by Sec. 7.3's proportions; the first that certifies.
+    std::string why = "no split built";
+    const size_t tries = std::min<size_t>(splits.size(), 6);
+    for (size_t k = 0; k < tries; ++k) {
+        Patch Q;
+        int inserted = 0;
+        std::string reason;
+        if (!build(splits[k], Q, inserted, reason)) {
+            why = reason;
+            continue;
+        }
+        const CavityFill::Verdict V = CavityFill::validate(C_, R.cells, Q, opts_.minScaledJacobian);
+        if (!V.valid) {
+            why = V.reason;
+            continue;
+        }
+        P = std::move(Q);
+        A.splits += inserted;
+        A.maps = "1 straight-line core, 3 radial";
+        return true;
+    }
+    return fail(why);
 }
 
 // ---------------------------------------------------------------------------
