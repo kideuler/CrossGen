@@ -16,6 +16,8 @@
 #include "mesh/Mesh.hxx"
 #include "mesh/QuadMesh.hxx"
 #include "mesh/TMOP.hxx"
+#include "ATLAS/ATLAS.hxx"
+#include "ATLAS/BlockMesh.hxx"
 #include "MERIDIAN/Arrangement.hxx"
 #include "MERIDIAN/ConeCut.hxx"
 #include "MERIDIAN/MERIDIAN.hxx"
@@ -69,6 +71,7 @@ enum class Mode {
     OASIS       = 5,
     UMBER       = 6,
     MERIDIAN    = 7,
+    ATLAS       = 8,
 };
 
 enum class Phase {
@@ -267,6 +270,50 @@ enum class PipelinePhase {
     Patches      = 10,
     Mesh         = 11,
     Smoothed     = 12,
+};
+
+// ATLAS (mode 8), docs/square_transport_2d_theory_and_implementation.md: a
+// block decomposition with no cross field in it, so none of the pipelines'
+// first seven phases apply. It has its own six stages up to the blocks, and
+// then the pipelines' last two phases, drawn by the same code:
+//
+//   Domain     Stage 1, PlanarDomain: the input validated and tagged, every
+//              protected vertex drawn in the colour of the quarter turns its
+//              corner takes out of Sec. 4's identity -- which is the cone
+//              index the pipelines would give a boundary cone there.
+//
+//   Carrier    Stage 2, SquareCarrier: the three-quad split of the input,
+//              valid by construction, with every vertex whose valence is not
+//              the regular one drawn as a disk in the cones' colours. On any
+//              real mesh that is thousands of them, and the picture is the
+//              argument for everything after it (CoarseDomain's header).
+//
+//   Search     Stages 3 to 6: ATLAS::run(), every search in parallel threads,
+//              blocking and announced a frame ahead. What is drawn is the
+//              search that won, on the carrier it searched -- for a coarse
+//              search the coarse re-triangulation of the domain, with the
+//              input's own dS under it -- together with the blocks it found
+//              there. 'p' swaps in the carrier the search started from, since
+//              what Stages 3 and 6 did is the difference between the two.
+//
+//   Blocks     Stages 4 and 5 on the input: the winning layout realised on
+//              the input domain and certified there, drawn as MERIDIAN's
+//              Patches phase draws its layout -- block sides in light blue,
+//              macrovertices as green disks, nothing of the model beneath.
+//
+//   Mesh       BlockMesh: Sec. 11.2's counts and transfinite interpolation per
+//              block, opened on a dialog as Stage 10 is ('e' re-opens it).
+//
+//   Smoothed   mesh::TMOP, the same dialog, the same solve and the same
+//              picture as the pipelines' Stage 12 ('c' re-opens it).
+enum class ATLASPhase {
+    MeshOnly = 1,
+    Domain   = 2,
+    Carrier  = 3,
+    Search   = 4,
+    Blocks   = 5,
+    Mesh     = 6,
+    Smoothed = 7,
 };
 
 // OASIS is a one-shot solve driven by a parameter dialog rather than a
@@ -523,6 +570,36 @@ private:
     // excised.
     void runDiskTemplates(const std::vector<std::vector<int>> &rims);
 
+    // ATLAS, Stage 1 and Stage 2 on their own: cheap, so each phase builds its
+    // own and says what it found. ATLAS::run() rebuilds both internally; they
+    // are milliseconds.
+    void runATLASDomain();
+    void runATLASCarrier();
+
+    // Stages 1 to 6, ATLAS::run(): every search, in parallel threads. Blocking,
+    // and announced a frame ahead like the Ricci solve.
+    void runATLAS();
+
+    // The winning cover on the input, reported once when the Blocks phase is
+    // first drawn.
+    void logATLASBlocks();
+
+    // The TFI mesh on the blocks (BlockMesh). The dialog is Stage 10's -- one
+    // target edge length, tried and looked at -- with Stage 10's settings
+    // shared, so a comparison with MERIDIAN or TORSION at the same target is
+    // the default; the chart switch stands where Stage 10's spline one does.
+    bool promptATLASMesh();
+    void runATLASMesh();
+
+    // Everything ATLAS mode draws, phase by phase.
+    void renderATLAS();
+
+    // The mesh Stage 12 smooths: ATLAS's TFI mesh in ATLAS mode, Stage 11's
+    // merged mesh where there is one, Stage 10's otherwise. mesh::QuadMesh
+    // takes all three the same way.
+    bool haveFinishedMesh() const;
+    mesh::QuadMesh finishedMesh(const mesh::QuadMesh::Options &o) const;
+
     // Whether a parameter domain occupies the right half of the window.
     bool inUVSplitScreen() const;
 
@@ -745,6 +822,22 @@ private:
     // draw; cleared whenever either of them is rebuilt.
     std::optional<mesh::QuadMesh>        smoothMesh_;
 
+    // ATLAS. The domain is built on mesh_ and the carrier on the domain, so
+    // they are declared in that order and destroyed the other way round.
+    // atlas_ owns its own copies of both and everything after them; the mesh
+    // copies what it needs from the chosen cover and holds nothing of atlas_,
+    // but it is meaningless without it and is cleared with it.
+    std::unique_ptr<PlanarDomain>  atlasDomain_;
+    std::unique_ptr<SquareCarrier> atlasCarrier_;
+    std::unique_ptr<ATLAS>         atlas_;
+    std::optional<BlockMesh>       atlasMesh_;
+    // 'p' at the Search phase: the carrier the winning search started from
+    // rather than the one it ended on.
+    bool atlasShowInitial_ = false;
+    // Whether the input carries more than one material: what the 'm' key and
+    // the material fill are offered on, since there is no Stage 0b here.
+    bool atlasMultiMaterial_ = false;
+
     // Guiding field for the OASIS orientation term. Held by shared_ptr because
     // OASIS keeps a reference to it for as long as it lives; separate from
     // crossField_, which belongs to MBO mode and follows its own state machine.
@@ -758,6 +851,7 @@ private:
     OASISPhase     oasisPhase_ = OASISPhase::MeshOnly;
     UMBERPhase     umberPhase_ = UMBERPhase::MeshOnly;
     PipelinePhase  pipePhase_ = PipelinePhase::MeshOnly;
+    ATLASPhase     atlasPhase_ = ATLASPhase::MeshOnly;
 
     // OASIS parameters and derived display range.
     double oasisLambda_  = 0.0;   // set by the dialog on first use
@@ -833,6 +927,15 @@ private:
     double nearMissBefore_    = 0.0;
     // Stage 0c is attempted once per run, at the moment the mode is chosen.
     bool disksAttempted_        = false;
+    // ATLAS's stages, with the same one-shot discipline. run() is announced a
+    // frame ahead; the mesh dialog, like Stage 10's, counts as asked once it
+    // has opened.
+    bool atlasDomainAttempted_  = false;
+    bool atlasCarrierAttempted_ = false;
+    bool atlasAnnounced_        = false;
+    bool atlasAttempted_        = false;
+    bool atlasBlocksLogged_     = false;
+    bool atlasMeshAttempted_    = false;
 
     // Why the last phases have nothing to show, in one clause, or empty when
     // nothing is wrong. Kept on screen rather than only in the console: the
@@ -890,6 +993,10 @@ private:
         double collapseSpan = QuadMesh::Options().collapseSpan;
     };
     MERIDIANMeshSettings meshSettings_;
+    // ATLAS's one departure from those: whether the interior nodes come
+    // through the block's certified chart (BlockMesh::Options::useChart) or
+    // from the Coons blend of its sides -- the counterpart of useSplines.
+    bool atlasUseChart_ = true;
 
     // Stages 0c and 11, surviving a reset like every other judgement in this
     // widget so that the next run opens on whatever was last tried. `excise` is
@@ -931,6 +1038,14 @@ private:
         double cornerAngle = mesh::QuadMesh::Options().cornerAngle;
     };
     TMOPSettings tmopSettings_;
+    // ATLAS's copy, which differs in one default: mu is sampled at the element
+    // corners. Those are the Jacobians Sec. 9.1 of the square-transport spec
+    // judges an element by, and at the 2x2 Gauss points a corner can turn over
+    // without the barrier seeing it -- measured on ATLAS's TFI meshes, where
+    // six corpus models came out of TMOP with folds they did not go in with,
+    // and none did sampled at the corners. Kept apart so the pipelines' Stage
+    // 12 runs exactly as it always has.
+    TMOPSettings atlasTmopSettings_ = [] { TMOPSettings t; t.corners = true; return t; }();
 
     // Chord collapse settings, surviving a reset the way oasisLambda_ does so
     // that the dialog opens on whatever was tried last.

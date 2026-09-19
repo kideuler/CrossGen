@@ -9,6 +9,10 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "ATLAS/BlockCover.hxx"
+#include "ATLAS/BlockMesh.hxx"
+#include "ATLAS/PlanarDomain.hxx"
+#include "ATLAS/SquareCarrier.hxx"
 #include "MERIDIAN/Arrangement.hxx"
 #include "MERIDIAN/DiskTemplate.hxx"
 #include "MERIDIAN/ConeCut.hxx"
@@ -562,5 +566,46 @@ void drawQuadMesh(const mesh::QuadMesh &sm, const QuadMesh *qm, const DiskTempla
 // purpose rather than found in the input.
 void drawInclusionCircles(const std::vector<DiskTemplate::Inclusion> &inclusions,
                           float lineWidth, int samples = 96);
+
+// ── ATLAS: the domain, the carrier, the blocks and the mesh ─────────────────
+//
+// ATLAS has no cross field and no cones. What stands in for both is the
+// valence of the carrier's vertices (Sec. 4 of
+// docs/square_transport_2d_theory_and_implementation.md): a vertex of valence
+// q carries 4 - q quarter turns of curvature inside and t - q on dS, t the
+// regular valence its angle asks for. That is the index a cone of the same
+// valence has in the two pipelines, so it is drawn in their colours -- blue
+// for +1 (valence 3), red for -1 (valence 5), cyan for -2 -- and a picture of
+// the carrier reads the same way as a picture of their cones.
+
+// Stage 1: every protected vertex, coloured by the quarter turns 2 - t the
+// corner takes out of Sec. 4's identity -- a convex right angle +1, a reflex
+// one -1, a straight protected vertex (an interface landing, say) 0 in grey.
+void drawPlanarDomain(const PlanarDomain &D, double radius);
+
+// A carrier as the quad mesh it is -- edges in the colours drawQuadMesh gives
+// a mesh, a non-convex cell filled red -- and every vertex whose valence is
+// not the regular one as a disk of its defect's colour.
+void drawSquareCarrier(const SquareCarrier &C, float lineWidth, double radius,
+                       bool materialFill = false);
+// The disks alone, for drawing over something laid on the carrier's edges.
+void drawCarrierDefects(const SquareCarrier &C, double radius);
+
+// Stages 4 and 5: the blocks of a cover as MERIDIAN's Patches phase draws its
+// layout, each block side in light blue and every macrovertex as a green disk
+// (no disks when nodeRadius <= 0).
+void drawBlockCover(const BlockCover &cover, double nodeRadius, float lineWidth);
+
+// The key for drawPlanarDomain (corners) or drawSquareCarrier (defects), where
+// drawConeLegend puts the cones' key.
+void drawATLASLegend(int fbw, int fbh, bool corners);
+
+// ATLAS's TFI mesh, and the same mesh after TMOP with the walls still taken
+// off its blocks: drawn by the one routine Stage 10, Stage 11 and Stage 12 use,
+// so the three methods' meshes are pictured identically.
+void drawQuadMesh(const BlockMesh &bm, float lineWidth, float blockLineWidth,
+                  bool materialFill = false);
+void drawQuadMesh(const mesh::QuadMesh &sm, const BlockMesh &bm, float lineWidth,
+                  float blockLineWidth, bool materialFill = false);
 
 } // namespace viewer

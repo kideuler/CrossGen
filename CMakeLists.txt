@@ -204,6 +204,8 @@ add_library(PolyVector SHARED
     src/ATLAS/CoarseDomain.cxx
     src/ATLAS/Realisation.hxx
     src/ATLAS/Realisation.cxx
+    src/ATLAS/BlockMesh.hxx
+    src/ATLAS/BlockMesh.cxx
     src/ATLAS/ATLAS.hxx
     src/ATLAS/ATLAS.cxx
     src/UMBER/Polysquare.hxx
@@ -566,9 +568,19 @@ set_tests_properties(TORSION_ReferenceMetrics PROPERTIES TIMEOUT 2400)
 # sectors), an L (three blocks), two materials (two blocks sharing the
 # interface), the certificate refusing a periodic band and an L-tromino,
 # Stage 6 alone lowering the valence defect of a raw carrier, a plate with two
-# holes blocked by a coarse search and realised on the input, and two meshes of
-# one boundary giving blockings of about the same size.
+# holes blocked by a coarse search and realised on the input, two meshes of
+# one boundary giving blockings of about the same size, and the TFI mesh on the
+# blocks (BlockMesh) where its counts and boundary are known.
 add_test(NAME ATLAS_SelfTest COMMAND TestATLAS --selftest)
+
+# The TFI mesh on the blocks and TMOP after it, as the viewer's ATLAS mode runs
+# them; exit 9 if the smoothed mesh folds. geom014 is where TMOP sampled at the
+# 2x2 Gauss points turned four corners of a valid TFI mesh over (worst scaled
+# Jacobian 0.19 -> -0.81); sampled at the corners it reaches 0.46 with none.
+add_test(NAME ATLAS_Mesh_singlemat_geom014
+         COMMAND TestATLAS ${CMAKE_CURRENT_SOURCE_DIR}/data/meshes/singlemat/geom014.obj
+                 --mesh 0.05 --mesh-tmop 1000)
+set_tests_properties(ATLAS_Mesh_singlemat_geom014 PROPERTIES TIMEOUT 600)
 
 # The coarse searches on models no template covers whole -- holes, a slot, a
 # gear -- with a ceiling on the block count well above what they reach now

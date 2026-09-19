@@ -97,6 +97,7 @@ public:
 
     BlockCover(const RectangleCertifier &rects, const Options &opts);
 
+    const SquareCarrier &getCarrier() const { return C_; }
     const std::vector<Block> &getBlocks() const { return blocks_; }
     const std::vector<MacroEdge> &getMacroEdges() const { return macroEdges_; }
     const std::vector<int> &getMacroVertices() const { return macroVertices_; }

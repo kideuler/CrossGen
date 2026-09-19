@@ -22,15 +22,22 @@
 //                Stage 6 alone lowering the valence defect of a raw carrier
 //                without ever leaving it invalid; a plate with two holes,
 //                which no template covers, blocked by a coarse search and
-//                realised on the input; and Sec. 13.3's last row, two meshes
-//                of one boundary giving blockings of about the same size.
+//                realised on the input; Sec. 13.3's last row, two meshes of
+//                one boundary giving blockings of about the same size; and the
+//                TFI mesh on the blocks (BlockMesh), whose counts and
+//                boundary are known on a rectangle and two materials.
+//
+// --mesh <h> then meshes the chosen blocking at target edge length h, as the
+// viewer's ATLAS mode does (Sec. 11.2's counts, transfinite interpolation per
+// block, Winslow where a block folds), and --mesh-tmop runs mesh::TMOP on it.
 //
 // A model is searched on its own carrier (Sec. 3's split of it) and on coarse
 // re-triangulations of its domain (CoarseDomain), whose layouts are carried
 // back onto it (Realisation) and certified there; the report shows every
 // search and which one won. Exit codes: 0 valid, 2 the mesh did not load, 3
 // the pipeline threw, 4 the domain failed Stage 1, 5 the carrier failed Stage
-// 2, 7 no valid cover, 8 valid but coarser than --max-blocks allows.
+// 2, 7 no valid cover, 8 valid but coarser than --max-blocks allows, 9 the
+// --mesh asked for folds (after TMOP, when --mesh-tmop asked for that too).
 
 #include <algorithm>
 #include <cmath>
@@ -42,8 +49,10 @@
 #include <vector>
 
 #include "ATLAS/ATLAS.hxx"
+#include "ATLAS/BlockMesh.hxx"
 #include "TestHelper.hxx"
 #include "mesh/QuadMesh.hxx"
+#include "mesh/TMOP.hxx"
 
 namespace {
 
@@ -333,9 +342,11 @@ int selfTest() {
     // -----------------------------------------------------------------
     heading("Case 7  Two materials: the interface is a shared macro edge");
     // -----------------------------------------------------------------
+    std::unique_ptr<ATLAS> twoMat;
     {
         auto mesh = gridMesh(20, 10, 2.0, 1.0, 1.0);
-        ATLAS pipe(mesh, quietOptions());
+        twoMat = std::make_unique<ATLAS>(mesh, quietOptions());
+        ATLAS &pipe = *twoMat;
         const bool ok = pipe.run();
         summary(pipe);
         check(pipe.getDomain().getReport().interfaceLandings == 2, "Stage 1 finds the interface's two landings");
@@ -490,6 +501,66 @@ int selfTest() {
               "their block counts agree to within a quarter");
     }
 
+    // -----------------------------------------------------------------
+    heading("Case 12  A TFI mesh on the blocks (Secs. 11.2, 11.3)");
+    // -----------------------------------------------------------------
+    {
+        // Known answers first. The rectangle is one 2 x 1 block, so a target
+        // of 0.1 is 20 x 10 squares whether the interior comes from the chart
+        // or from the Coons blend, and a straight boundary is reproduced
+        // exactly. Then the two materials: two blocks, the interface one
+        // shared macro edge, so its nodes are shared and no element has two
+        // materials. Then the annulus, whose curved sides the elements chord.
+        if (rect && rect->hasCover()) {
+            for (bool chart : {true, false}) {
+                BlockMesh::Options mo;
+                mo.targetEdgeLength = 0.1;
+                mo.useChart = chart;
+                BlockMesh bm(rect->getCover(), mo);
+                const BlockMesh::Report &r = bm.getReport();
+                std::cout << "  rectangle, " << (chart ? "chart" : "Coons") << ": " << r.quads << " quads over "
+                          << r.blocks << " block(s), worst scaled Jacobian " << std::fixed << std::setprecision(6)
+                          << r.minScaledJacobian << ", boundary deviation " << r.boundaryDeviation
+                          << std::defaultfloat << "\n";
+                check(r.valid && r.quads == 200 && bm.blocks().size() == 1 && bm.blocks()[0].ns * bm.blocks()[0].nt == 200,
+                      std::string("rectangle: 20 x 10 elements at h = 0.1 (") + (chart ? "chart)" : "Coons)"));
+                check(r.minScaledJacobian > 0.999 && r.boundaryDeviation < 1e-12,
+                      "... square, and the boundary reproduced exactly");
+            }
+        }
+        if (twoMat && twoMat->hasCover()) {
+            BlockMesh::Options mo;
+            mo.targetEdgeLength = 0.1;
+            BlockMesh bm(twoMat->getCover(), mo);
+            const BlockMesh::Report &r = bm.getReport();
+            std::cout << "  two materials: " << r.quads << " quads, " << r.materials << " material(s), "
+                      << r.interfaceEdges << " element edge(s) on the interface\n";
+            check(r.valid && r.conforming, "two materials: a valid, conforming mesh");
+            check(r.materials == 2 && r.interfaceEdges == 10 && r.interfaceDeviation < 1e-12,
+                  "... two materials meeting along the interface's ten shared edges");
+        }
+        if (ring && ring->hasCover()) {
+            const double h = 0.1;
+            BlockMesh::Options mo;
+            mo.targetEdgeLength = h;
+            BlockMesh bm(ring->getCover(), mo);
+            const BlockMesh::Report &r = bm.getReport();
+            std::cout << "  annulus: " << r.quads << " quads over " << r.blocks << " block(s), " << r.chords
+                      << " chord(s), worst scaled Jacobian " << std::fixed << std::setprecision(3)
+                      << r.minScaledJacobian << ", boundary deviation " << std::setprecision(4)
+                      << r.boundaryDeviation << ", edge ratio rms " << std::setprecision(3) << r.edgeRatioRms
+                      << std::defaultfloat << "\n";
+            check(r.valid && r.invertedQuads == 0, "annulus: a valid mesh, nothing folded");
+            check(r.boundaryDeviation < 0.1 * h, "... chording the circles by under a tenth of the target");
+            check(r.edgeRatioRms < 0.35, "... at edges near the target (rms log ratio under 0.35)");
+            // The adaptor TMOP is handed the mesh through.
+            mesh::QuadMesh qm = mesh::QuadMesh::from(bm);
+            check(static_cast<int>(qm.quads.size()) == r.quads && qm.nonManifoldEdges.empty() &&
+                      qm.boundaryLoops.size() == 2,
+                  "mesh::QuadMesh::from takes it whole: every element, two boundary loops, manifold");
+        }
+    }
+
     heading("Self-test result");
     if (failures == 0) {
         std::cout << "  " << kPass << " Every check held.\n";
@@ -632,6 +703,36 @@ void printSearch(const ATLAS::Search &s, bool chosen) {
     std::cout << "  " << std::fixed << std::setprecision(2) << s.seconds << " s" << std::defaultfloat << "\n";
 }
 
+// The TFI mesh on the chosen blocks, in the words the viewer's Mesh phase uses.
+void printMesh(const BlockMesh &bm) {
+    const BlockMesh::Report &r = bm.getReport();
+    std::cout << "  " << r.quads << " quad(s) on " << r.vertices << " vertices over " << r.blocks << " block(s); "
+              << r.chords << " chord(s) over " << r.arcsAssigned << " macro edge(s), " << r.minIntervals << " to "
+              << r.maxIntervals << " edges each (mean " << std::fixed << std::setprecision(2) << r.meanIntervals
+              << ")" << std::defaultfloat;
+    if (r.clampedChords > 0) std::cout << ", " << r.clampedChords << " clamped by a bound";
+    std::cout << "\n";
+    std::cout << "  Edges " << std::fixed << std::setprecision(4) << r.minEdge << " to " << r.maxEdge
+              << " against a target of " << r.target << " (worst " << std::setprecision(2) << r.worstEdgeRatio
+              << "x, rms log ratio " << std::setprecision(3) << r.edgeRatioRms << ")\n";
+    std::cout << "  Scaled Jacobian " << std::setprecision(4) << r.minScaledJacobian << " worst, "
+              << r.meanScaledJacobian << " mean; before the Winslow pass " << r.minScaledJacobianBefore << " worst, "
+              << r.invertedBefore << " folded (" << r.smoothedBlocks << " block(s) smoothed)\n";
+    std::cout << "  Boundary: chords within " << std::setprecision(5) << r.boundaryDeviation << " of dS ("
+              << std::setprecision(3) << (r.target > 0.0 ? r.boundaryDeviation / r.target : 0.0)
+              << " of the target)";
+    if (r.materials > 1) {
+        std::cout << "; interfaces within " << std::setprecision(5) << r.interfaceDeviation << ", "
+                  << r.interfaceEdges << " element edge(s) on them";
+    }
+    std::cout << "; area " << std::setprecision(6) << r.meshArea << " of the domain's " << r.domainArea
+              << std::defaultfloat << "\n";
+    verdict(r.conforming, "Conforming: no edge used three times, no crack (Sec. 11.3's incidence)");
+    verdict(r.invertedQuads == 0, "No element folds (Sec. 11.3's four corner Jacobians)");
+    verdict(r.unmeshedBlocks == 0, "Every block meshed");
+    for (const std::string &m : r.messages) warn(m);
+}
+
 void usage(const char *prog) {
     std::cout << "Usage: " << prog << " <mesh.obj> [options]\n"
               << "       " << prog << " --selftest\n\n"
@@ -687,7 +788,17 @@ void usage(const char *prog) {
               << "                        (the coarse carrier's for a coarse search), for an external solver\n"
               << "  --carrier <f.obj>     the carrier the best blocking lives on\n"
               << "  --blocks <f.obj>      the macro edges of the best blocking, as polylines\n"
-              << "  --mfem <f.mesh>       the carrier of the best blocking for MFEM, material per element\n";
+              << "  --mfem <f.mesh>       the carrier of the best blocking for MFEM, material per element\n\n"
+              << "A quadrilateral mesh on the blocks (BlockMesh; Secs. 11.2, 11.3)\n"
+              << "  --mesh <h>            mesh the best blocking at target edge length h, transfinite\n"
+              << "                        interpolation per block; exit 9 unless it validates\n"
+              << "  --mesh-coons          interiors by the Coons blend of the sides, not through the chart\n"
+              << "  --mesh-min <n>        fewest edges per chord                         (default 1)\n"
+              << "  --mesh-max <n>        most edges per chord, 0 = none                 (default 0)\n"
+              << "  --mesh-no-smooth      no Winslow pass on the folded blocks\n"
+              << "  --mesh-tmop <n>       then TMOP (mesh::TMOP's defaults, sampled at the corners) for at\n"
+              << "                        most n sweeps\n"
+              << "  --mesh-obj <f.obj>    write the mesh (after TMOP when that ran)\n";
 }
 
 } // namespace
@@ -704,6 +815,10 @@ int main(int argc, char **argv) {
     std::string modelOut;
     int maxBlocks = -1;
     std::vector<double> spacings;
+    BlockMesh::Options meshOpts;
+    meshOpts.targetEdgeLength = 0.0;   // no mesh unless --mesh
+    int meshTMOP = 0;
+    std::string meshOut;
 
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
@@ -751,6 +866,13 @@ int main(int argc, char **argv) {
         else if (a == "--carrier" && i + 1 < argc)        carrierOut = argv[++i];
         else if (a == "--blocks" && i + 1 < argc)         blocksOut = argv[++i];
         else if (a == "--mfem" && i + 1 < argc)           mfemOut = argv[++i];
+        else if (a == "--mesh" && i + 1 < argc)           meshOpts.targetEdgeLength = std::stod(argv[++i]);
+        else if (a == "--mesh-coons")                     meshOpts.useChart = false;
+        else if (a == "--mesh-min" && i + 1 < argc)       meshOpts.minIntervals = std::stoi(argv[++i]);
+        else if (a == "--mesh-max" && i + 1 < argc)       meshOpts.maxIntervals = std::stoi(argv[++i]);
+        else if (a == "--mesh-no-smooth")                 meshOpts.smoothingPasses = 0;
+        else if (a == "--mesh-tmop" && i + 1 < argc)      meshTMOP = std::stoi(argv[++i]);
+        else if (a == "--mesh-obj" && i + 1 < argc)       meshOut = argv[++i];
         else { std::cerr << "Unknown option: " << a << "\n"; usage(argv[0]); return 1; }
     }
 
@@ -928,6 +1050,41 @@ int main(int argc, char **argv) {
         }
     }
 
+    // ---------------------------------------------------------------------
+    bool meshValid = true;
+    if (meshOpts.targetEdgeLength > 0.0) {
+        heading("A quadrilateral mesh on the blocks (Secs. 11.2, 11.3)");
+        BlockMesh bm(pipe.getCover(), meshOpts);
+        printMesh(bm);
+        meshValid = bm.getReport().valid;
+        mesh::QuadMesh qm = mesh::QuadMesh::from(bm);
+        if (meshTMOP > 0) {
+            // Sampled at the corners, as the viewer's ATLAS mode does: the
+            // barrier then guards the corner Jacobians Sec. 9.1 judges an
+            // element by. At the 2x2 Gauss points a corner can turn over
+            // unseen, and on six corpus models it did.
+            mesh::TMOP::Options to;
+            to.maxSweeps = meshTMOP;
+            to.quadrature = mesh::TMOP::Corners;
+            mesh::TMOP smoother(qm, to);
+            const bool improved = smoother.run();
+            const mesh::TMOP::Report &tr = smoother.getReport();
+            std::cout << "  TMOP: " << tr.sweeps << " sweep(s)";
+            if (tr.untangleSweeps > 0) std::cout << " after " << tr.untangleSweeps << " untangling";
+            std::cout << "; scaled Jacobian " << std::fixed << std::setprecision(4) << tr.minScaledJacobianBefore
+                      << " -> " << tr.minScaledJacobianAfter << " worst, " << tr.meanScaledJacobianBefore << " -> "
+                      << tr.meanScaledJacobianAfter << " mean, folds " << tr.invertedBefore << " -> "
+                      << tr.invertedAfter << std::defaultfloat << "\n";
+            verdict(improved && tr.invertedAfter == 0, "TMOP left the mesh better than it found it, nothing folded");
+            // The mesh handed on is the smoothed one: it is what must not fold.
+            meshValid = tr.invertedAfter == 0;
+        }
+        if (!meshOut.empty()) {
+            if (qm.writeOBJ(meshOut)) std::cout << "  Wrote the mesh to " << meshOut << "\n";
+            else warn("Failed to write " + meshOut);
+        }
+    }
+
     heading("Result");
     for (const std::string &m : st.messages) {
         if (m.rfind("Stopping", 0) == 0 || m.rfind("Stages 4-6", 0) == 0) warn(m);
@@ -948,5 +1105,6 @@ int main(int argc, char **argv) {
         verdict(coarse, "At most " + std::to_string(maxBlocks) + " blocks (--max-blocks)");
         if (!coarse) return 8;
     }
+    if (ok && !meshValid) return 9;
     return ok ? 0 : 7;
 }

@@ -127,6 +127,19 @@ PipelinePhase nextPipelinePhase(PipelinePhase p) {
     return PipelinePhase::Smoothed;
 }
 
+ATLASPhase nextATLASPhase(ATLASPhase p) {
+    switch (p) {
+        case ATLASPhase::MeshOnly: return ATLASPhase::Domain;
+        case ATLASPhase::Domain:   return ATLASPhase::Carrier;
+        case ATLASPhase::Carrier:  return ATLASPhase::Search;
+        case ATLASPhase::Search:   return ATLASPhase::Blocks;
+        case ATLASPhase::Blocks:   return ATLASPhase::Mesh;
+        case ATLASPhase::Mesh:     return ATLASPhase::Smoothed;
+        case ATLASPhase::Smoothed: return ATLASPhase::Smoothed;
+    }
+    return ATLASPhase::Smoothed;
+}
+
 MedialAxisPhase nextMedialAxisPhase(MedialAxisPhase p) {
     switch (p) {
         case MedialAxisPhase::MeshOnly:     return MedialAxisPhase::DelaunayMesh;
@@ -210,6 +223,20 @@ const char *pipelinePhaseName(PipelinePhase p, Mode m) {
     return "?";
 }
 
+// The last two are the pipelines' Mesh and Smoothed phases in all but number.
+const char *atlasPhaseName(ATLASPhase p) {
+    switch (p) {
+        case ATLASPhase::MeshOnly: return "1) mesh";
+        case ATLASPhase::Domain:   return "2) planar domain (Stage 1, Sec. 1.1)";
+        case ATLASPhase::Carrier:  return "3) three-quad carrier (Stage 2, Sec. 3)";
+        case ATLASPhase::Search:   return "4) search and rewrite (Stages 3-6, Secs. 7, 8)";
+        case ATLASPhase::Blocks:   return "5) blocks on the input (Stages 4-5, Secs. 5, 6)";
+        case ATLASPhase::Mesh:     return "6) quadrilateral mesh (Secs. 11.2, 11.3)";
+        case ATLASPhase::Smoothed: return "7) TMOP smoothing (mesh::TMOP)";
+    }
+    return "?";
+}
+
 const char *medialAxisPhaseName(MedialAxisPhase p) {
     switch (p) {
         case MedialAxisPhase::MeshOnly:     return "1) mesh";
@@ -241,6 +268,7 @@ const char *modeName(Mode m) {
         case Mode::OASIS:      return "OASIS";
         case Mode::UMBER:      return "UMBER";
         case Mode::MERIDIAN:   return "MERIDIAN";
+        case Mode::ATLAS:      return "ATLAS";
     }
     return "?";
 }
@@ -249,7 +277,7 @@ const char *modeName(Mode m) {
 // mode does not mean chasing three copies of it.
 const char *kModeMenu =
     "press '1' for PolyVector, '2' for MBO, '3' for Medial Axis, '4' for TORSION, "
-    "'5' for OASIS, '6' for UMBER, '7' for MERIDIAN";
+    "'5' for OASIS, '6' for UMBER, '7' for MERIDIAN, '8' for ATLAS";
 
 } // anonymous namespace
 
@@ -442,6 +470,15 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
                 pipePhase_ = PipelinePhase::Mesh;
             }
         }
+        // ATLAS's mesh the same way, off the same key, for the same reasons.
+        if (mode_ == Mode::ATLAS && atlasPhase_ >= ATLASPhase::Mesh && atlas_ &&
+            atlas_->hasCover()) {
+            atlasMeshAttempted_ = true;
+            if (promptATLASMesh()) {
+                runATLASMesh();
+                atlasPhase_ = ATLASPhase::Mesh;
+            }
+        }
         break;
 
     case Qt::Key_I:
@@ -462,16 +499,32 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
         // The materials as a fill rather than as the colour of a wireframe
         // edge. Off by default because it competes with the conformal factor
         // and the flat metric for the same triangles.
-        if (inPipeline() && interfaces_.has_value() &&
-            interfaces_->multiMaterial()) {
+        if ((inPipeline() && interfaces_.has_value() && interfaces_->multiMaterial()) ||
+            (mode_ == Mode::ATLAS && atlasMultiMaterial_)) {
             showMaterialFill_ = !showMaterialFill_;
-            console_.log(showMaterialFill_ ? "[Interfaces] triangles filled by material"
-                                           : "[Interfaces] material fill off");
+            if (mode_ == Mode::ATLAS)
+                console_.log(showMaterialFill_ ? "[ATLAS] cells and elements filled by material"
+                                               : "[ATLAS] material fill off");
+            else
+                console_.log(showMaterialFill_ ? "[Interfaces] triangles filled by material"
+                                               : "[Interfaces] material fill off");
             update();
         }
         break;
 
     case Qt::Key_P:
+        // ATLAS's Search phase is the same kind of pair: the carrier the
+        // winning search started from and the one it ended on, and what Stages
+        // 3 and 6 did is the difference.
+        if (mode_ == Mode::ATLAS && atlasPhase_ == ATLASPhase::Search && atlas_ &&
+            atlas_->hasCover()) {
+            atlasShowInitial_ = !atlasShowInitial_;
+            console_.log(atlasShowInitial_
+                             ? "[Search] the carrier the search started from: Stage 2 on its domain"
+                             : "[Search] the carrier the search ended on, with the blocks it found");
+            update();
+            break;
+        }
         // Both phases that carry two maps of the same domain in the right half
         // put the swap on this key, and for the same reason: what the stage did
         // is the difference between them, and a difference between two pictures
@@ -624,6 +677,20 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
         }
         break;
 
+    case Qt::Key_8:
+        // No Stage 0c: ATLAS lays a circular inclusion out like any other
+        // region (Sec. 7.4's annulus is one of its templates), so the mesh is
+        // taken as it was loaded.
+        if (mode_ == Mode::Unselected && phase_ == Phase::MeshOnly) {
+            mode_ = Mode::ATLAS;
+            atlasMultiMaterial_ = false;
+            for (size_t t = 1; t < mesh_->triangleMatId.size() && !atlasMultiMaterial_; ++t)
+                atlasMultiMaterial_ = mesh_->triangleMatId[t] != mesh_->triangleMatId[0];
+            std::cerr << "[Viewer] Selected mode: " << modeName(mode_) << " (press 'c' to advance)\n";
+            console_.log("Selected mode: ATLAS (square-transport blocking, Stages 1-6, and a TFI mesh)");
+        }
+        break;
+
     default:
         QOpenGLWidget::keyPressEvent(event);
         break;
@@ -731,6 +798,13 @@ void CrossGenWidget::doReset() {
     diskFill_.reset();
     smoothMesh_.reset();
     pipelineBlocked_.clear();
+    // ATLAS's, in reverse of how each stands on the one before it.
+    atlasMesh_.reset();
+    atlas_.reset();
+    atlasCarrier_.reset();
+    atlasDomain_.reset();
+    atlasShowInitial_ = false;
+    atlasMultiMaterial_ = false;
     // Stage 0c replaced the mesh every later stage was written on, so the reset
     // has to put the loaded one back before anything is built on it again.
     if (inputMesh_) mesh_ = inputMesh_;
@@ -773,6 +847,7 @@ void CrossGenWidget::doReset() {
     oasisPhase_ = OASISPhase::MeshOnly;
     umberPhase_ = UMBERPhase::MeshOnly;
     pipePhase_ = PipelinePhase::MeshOnly;
+    atlasPhase_ = ATLASPhase::MeshOnly;
     // oasisLambda_ deliberately survives a reset so it can be reused as the
     // dialog's default on the next run.
 
@@ -809,6 +884,12 @@ void CrossGenWidget::doReset() {
     meshAttempted_         = false;
     tmopAttempted_         = false;
     disksAttempted_        = false;
+    atlasDomainAttempted_  = false;
+    atlasCarrierAttempted_ = false;
+    atlasAnnounced_        = false;
+    atlasAttempted_        = false;
+    atlasBlocksLogged_     = false;
+    atlasMeshAttempted_    = false;
 
     view_.cx    = 0.5 * (bounds_.minx + bounds_.maxx);
     view_.cy    = 0.5 * (bounds_.miny + bounds_.maxy);
@@ -3938,10 +4019,13 @@ void CrossGenWidget::runMERIDIANMesh() {
 // counts are read off the mesh that is about to be smoothed and not off the
 // last one.
 bool CrossGenWidget::promptTMOP() {
-    if (!quadMesh_.has_value()) return false;
+    // ATLAS keeps its own settings; see atlasTmopSettings_.
+    TMOPSettings &ts = (mode_ == Mode::ATLAS) ? atlasTmopSettings_ : tmopSettings_;
+    if (!haveFinishedMesh()) return false;
+    const bool atlas = (mode_ == Mode::ATLAS);
 
     QDialog dlg(this);
-    dlg.setWindowTitle("Stage 12 — TMOP smoothing");
+    dlg.setWindowTitle(atlas ? "ATLAS — TMOP smoothing" : "Stage 12 — TMOP smoothing");
 
     auto *metricBox = new QComboBox(&dlg);
     // Ordered as the header lists them, and paired with the enum value rather
@@ -3959,7 +4043,7 @@ bool CrossGenWidget::promptTMOP() {
     for (const auto &m : metrics)
         metricBox->addItem(QString::fromUtf8(m.second), m.first);
     {
-        const int at = metricBox->findData(tmopSettings_.metric);
+        const int at = metricBox->findData(ts.metric);
         metricBox->setCurrentIndex(at >= 0 ? at : 0);
     }
     metricBox->setToolTip(
@@ -3973,14 +4057,14 @@ bool CrossGenWidget::promptTMOP() {
     gammaBox->setRange(0.0, 1.0);
     gammaBox->setDecimals(2);
     gammaBox->setSingleStep(0.05);
-    gammaBox->setValue(tmopSettings_.gamma);
+    gammaBox->setValue(ts.gamma);
     gammaBox->setToolTip("Weight on the size term of metric 100. Ignored by every other metric.");
 
     auto *powerBox = new QDoubleSpinBox(&dlg);
     powerBox->setRange(1.0, 8.0);
     powerBox->setDecimals(1);
     powerBox->setSingleStep(1.0);
-    powerBox->setValue(tmopSettings_.exponent);
+    powerBox->setValue(ts.exponent);
     powerBox->setToolTip(
         "Minimise the integral of mu^p rather than of mu.\n"
         "1 optimises the average, and an average can be lowered by making most\n"
@@ -3992,13 +4076,13 @@ bool CrossGenWidget::promptTMOP() {
 
     auto *sweepBox = new QSpinBox(&dlg);
     sweepBox->setRange(1, 100000);
-    sweepBox->setValue(tmopSettings_.sweeps);
+    sweepBox->setValue(ts.sweeps);
     sweepBox->setToolTip(
         "Most Gauss-Seidel sweeps over the movable nodes. The solve stops before\n"
         "this when a sweep stops moving anything, and says which of the two it was.");
 
     auto *pinBox = new QCheckBox("pin every feature node instead of sliding it", &dlg);
-    pinBox->setChecked(tmopSettings_.pinFeatures);
+    pinBox->setChecked(ts.pinFeatures);
     pinBox->setToolTip(
         "On, only interior nodes move and the boundary and the material interfaces\n"
         "stay exactly where Stage 10 put them. Off, a node on a smooth stretch of\n"
@@ -4013,7 +4097,7 @@ bool CrossGenWidget::promptTMOP() {
     cornerBox->setRange(0.0, 90.0);
     cornerBox->setDecimals(1);
     cornerBox->setSingleStep(5.0);
-    cornerBox->setValue(tmopSettings_.cornerAngle);
+    cornerBox->setValue(ts.cornerAngle);
     cornerBox->setToolTip(
         "A feature node whose two incident feature edges meet at less than\n"
         "(180 - this) degrees is a corner and is fixed; anything straighter slides.\n"
@@ -4024,7 +4108,7 @@ bool CrossGenWidget::promptTMOP() {
     targetBox->addItem("uniform square, side h", mesh::TMOP::TargetUniformSquare);
     targetBox->addItem("each element's own current shape", mesh::TMOP::TargetCurrentShape);
     {
-        const int at = targetBox->findData(tmopSettings_.target);
+        const int at = targetBox->findData(ts.target);
         targetBox->setCurrentIndex(at >= 0 ? at : 0);
     }
     targetBox->setToolTip(
@@ -4038,19 +4122,19 @@ bool CrossGenWidget::promptTMOP() {
     sizeBox->setRange(0.0, 10.0);
     sizeBox->setDecimals(4);
     sizeBox->setSingleStep(0.01);
-    sizeBox->setValue(tmopSettings_.targetSize);
+    sizeBox->setValue(ts.targetSize);
     sizeBox->setSpecialValueText("mean edge");
     sizeBox->setToolTip("h for the uniform-square target. Blank takes the mesh's own mean edge length.");
 
     auto *cornerQuadBox = new QCheckBox("sample mu at the corners instead of 2x2 Gauss", &dlg);
-    cornerQuadBox->setChecked(tmopSettings_.corners);
+    cornerQuadBox->setChecked(ts.corners);
     cornerQuadBox->setToolTip(
         "The corner Jacobians are the ones the scaled-Jacobian report reads, so\n"
         "this drives exactly the number the result is judged by. 2x2 Gauss is the\n"
         "default because it sees the interior of the element and not only its rim.");
 
     auto *untangleBox = new QCheckBox("untangle first where an element is folded", &dlg);
-    untangleBox->setChecked(tmopSettings_.untangle);
+    untangleBox->setChecked(ts.untangle);
     untangleBox->setToolTip(
         "Run metric 022 first, whose barrier sits below the worst determinant on\n"
         "the mesh rather than at zero, until nothing is inverted. Without it a\n"
@@ -4059,7 +4143,7 @@ bool CrossGenWidget::promptTMOP() {
 
     auto *threadBox = new QSpinBox(&dlg);
     threadBox->setRange(0, 256);
-    threadBox->setValue(tmopSettings_.threads);
+    threadBox->setValue(ts.threads);
     threadBox->setSpecialValueText("auto");
     threadBox->setToolTip(
         "OpenMP threads. The mesh that comes out is bit-identical whatever this\n"
@@ -4082,8 +4166,7 @@ bool CrossGenWidget::promptTMOP() {
         // in the label the counts would have gone in.
         mesh::QuadMesh m;
         try {
-            m = diskFill_.has_value() ? mesh::QuadMesh::from(*diskFill_, o)
-                                      : mesh::QuadMesh::from(*quadMesh_, o);
+            m = finishedMesh(o);
         } catch (const std::exception &e) {
             derived->setText(QString("cannot be built: %1").arg(e.what()));
             return;
@@ -4122,23 +4205,25 @@ bool CrossGenWidget::promptTMOP() {
     form->addRow(untangleBox);
     form->addRow("threads", threadBox);
     form->addRow("this mesh", derived);
-    form->addRow(new QLabel("Always run on the Stage 10 mesh, never on the last\n"
-                            "smoothed one, so a second setting is a fresh attempt.", &dlg));
+    form->addRow(new QLabel(atlas ? "Always run on the TFI mesh, never on the last\n"
+                                    "smoothed one, so a second setting is a fresh attempt."
+                                  : "Always run on the Stage 10 mesh, never on the last\n"
+                                    "smoothed one, so a second setting is a fresh attempt.", &dlg));
     form->addRow(buttons);
 
     if (dlg.exec() != QDialog::Accepted) return false;
 
-    tmopSettings_.metric      = metricBox->currentData().toInt();
-    tmopSettings_.gamma       = gammaBox->value();
-    tmopSettings_.exponent    = powerBox->value();
-    tmopSettings_.sweeps      = sweepBox->value();
-    tmopSettings_.pinFeatures = pinBox->isChecked();
-    tmopSettings_.cornerAngle = cornerBox->value();
-    tmopSettings_.target      = targetBox->currentData().toInt();
-    tmopSettings_.targetSize  = sizeBox->value();
-    tmopSettings_.corners     = cornerQuadBox->isChecked();
-    tmopSettings_.untangle    = untangleBox->isChecked();
-    tmopSettings_.threads     = threadBox->value();
+    ts.metric      = metricBox->currentData().toInt();
+    ts.gamma       = gammaBox->value();
+    ts.exponent    = powerBox->value();
+    ts.sweeps      = sweepBox->value();
+    ts.pinFeatures = pinBox->isChecked();
+    ts.cornerAngle = cornerBox->value();
+    ts.target      = targetBox->currentData().toInt();
+    ts.targetSize  = sizeBox->value();
+    ts.corners     = cornerQuadBox->isChecked();
+    ts.untangle    = untangleBox->isChecked();
+    ts.threads     = threadBox->value();
     return true;
 }
 
@@ -4146,8 +4231,15 @@ bool CrossGenWidget::promptTMOP() {
 // different scale: a thousand sweeps over a mesh of this size is a fraction of
 // a second, so it is not announced a frame ahead the way the Ricci solve is.
 void CrossGenWidget::runTMOP() {
-    if (!quadMesh_.has_value()) {
-        blockPipeline("Stage 12 not run", "Stage 10 produced no mesh to smooth");
+    // ATLAS keeps its own settings; see atlasTmopSettings_.
+    TMOPSettings &ts = (mode_ == Mode::ATLAS) ? atlasTmopSettings_ : tmopSettings_;
+    // The pipelines number this Stage 12 after their Stage 10; ATLAS's stages
+    // stop at 6, so there it is named for what it smooths.
+    const bool atlas = (mode_ == Mode::ATLAS);
+    const std::string stage = atlas ? "TMOP" : "Stage 12";
+    if (!haveFinishedMesh()) {
+        blockPipeline(stage + " not run", atlas ? "there is no TFI mesh to smooth"
+                                                : "Stage 10 produced no mesh to smooth");
         return;
     }
     tmopAttempted_ = true;
@@ -4160,30 +4252,28 @@ void CrossGenWidget::runTMOP() {
     // replacing it, so the blocks the drawing takes its walls from still index
     // what comes back.
     mesh::QuadMesh::Options mopts;
-    mopts.cornerAngle = tmopSettings_.cornerAngle;
-    mopts.fixAllFeatureNodes = tmopSettings_.pinFeatures;
+    mopts.cornerAngle = ts.cornerAngle;
+    mopts.fixAllFeatureNodes = ts.pinFeatures;
 
     auto t0 = Clock::now();
     try {
-        smoothMesh_.emplace(diskFill_.has_value()
-                                ? mesh::QuadMesh::from(*diskFill_, mopts)
-                                : mesh::QuadMesh::from(*quadMesh_, mopts));
+        smoothMesh_.emplace(finishedMesh(mopts));
     } catch (const std::exception &e) {
         smoothMesh_.reset();
-        blockPipeline("Stage 12 failed", e.what());
+        blockPipeline(stage + " failed", e.what());
         return;
     }
 
     mesh::TMOP::Options topt;
-    topt.metric     = static_cast<mesh::TMOP::Metric>(tmopSettings_.metric);
-    topt.gamma      = tmopSettings_.gamma;
-    topt.exponent   = tmopSettings_.exponent;
-    topt.target     = static_cast<mesh::TMOP::Target>(tmopSettings_.target);
-    topt.targetSize = tmopSettings_.targetSize;
-    topt.quadrature = tmopSettings_.corners ? mesh::TMOP::Corners : mesh::TMOP::Gauss2x2;
-    topt.maxSweeps  = tmopSettings_.sweeps;
-    topt.untangle   = tmopSettings_.untangle;
-    topt.threads    = tmopSettings_.threads;
+    topt.metric     = static_cast<mesh::TMOP::Metric>(ts.metric);
+    topt.gamma      = ts.gamma;
+    topt.exponent   = ts.exponent;
+    topt.target     = static_cast<mesh::TMOP::Target>(ts.target);
+    topt.targetSize = ts.targetSize;
+    topt.quadrature = ts.corners ? mesh::TMOP::Corners : mesh::TMOP::Gauss2x2;
+    topt.maxSweeps  = ts.sweeps;
+    topt.untangle   = ts.untangle;
+    topt.threads    = ts.threads;
 
     // Nothing below the solve is allowed to take the window down with it: a
     // stage that refuses says so on the overlay and leaves the phase before it
@@ -4194,7 +4284,7 @@ void CrossGenWidget::runTMOP() {
         ok = smoother.run();
     } catch (const std::exception &e) {
         smoothMesh_.reset();
-        blockPipeline("Stage 12 failed", e.what());
+        blockPipeline(stage + " failed", e.what());
         return;
     }
     auto t1 = Clock::now();
@@ -4202,7 +4292,7 @@ void CrossGenWidget::runTMOP() {
 
     {
         std::ostringstream oss;
-        oss << "[TMOP] Stage 12: " << tr.sweeps << " sweep(s)";
+        oss << "[TMOP] " << (atlas ? "" : "Stage 12: ") << tr.sweeps << " sweep(s)";
         if (tr.untangleSweeps > 0) oss << " after " << tr.untangleSweeps << " untangling";
         oss << " over " << tr.colors << " colour(s) on " << tr.threads << " thread(s)"
             << (tr.openMP ? "" : " (no OpenMP)") << ", "
@@ -4251,13 +4341,469 @@ void CrossGenWidget::runTMOP() {
     for (const std::string &m : tr.messages) console_.log("[TMOP] " + m);
     {
         std::ostringstream oss;
-        oss << "[TMOP] Stage 12 " << (ok ? "left the mesh better than it found it [PASS]"
-                                         : "did not improve the mesh [FAIL]");
+        oss << "[TMOP] " << (atlas ? "the smoother " : "Stage 12 ")
+            << (ok ? "left the mesh better than it found it [PASS]" : "did not improve the mesh [FAIL]");
         console_.log(oss.str());
         std::cerr << "[Viewer] " << oss.str() << "\n";
     }
-    console_.log("[TMOP] the same picture as Stage 10, with the nodes where the solve "
-                 "left them. Press 'c' to smooth the Stage 10 mesh again at other settings");
+    console_.log(atlas ? "[TMOP] the same picture as the TFI mesh, with the nodes where the solve "
+                         "left them. Press 'c' to smooth the TFI mesh again at other settings"
+                       : "[TMOP] the same picture as Stage 10, with the nodes where the solve "
+                         "left them. Press 'c' to smooth the Stage 10 mesh again at other settings");
+}
+
+// The mesh Stage 12 is handed, whichever stage finished it. In ATLAS mode it
+// is ATLAS's own and nothing else, so a MERIDIAN mesh left over from before a
+// reset could not be smoothed in its place.
+bool CrossGenWidget::haveFinishedMesh() const {
+    if (mode_ == Mode::ATLAS) return atlasMesh_.has_value();
+    return quadMesh_.has_value();
+}
+
+mesh::QuadMesh CrossGenWidget::finishedMesh(const mesh::QuadMesh::Options &o) const {
+    if (mode_ == Mode::ATLAS) return mesh::QuadMesh::from(*atlasMesh_, o);
+    return diskFill_.has_value() ? mesh::QuadMesh::from(*diskFill_, o)
+                                 : mesh::QuadMesh::from(*quadMesh_, o);
+}
+
+// ── ATLAS ─────────────────────────────────────────────────────────────────────
+//
+// docs/square_transport_2d_theory_and_implementation.md, Stages 1 to 6, then the
+// pipelines' last two phases on its blocks. Every stage is ATLAS's library code
+// with its own defaults; the viewer only decides when each runs and what of it
+// is drawn, as it does for the pipelines.
+
+// Stage 1 on its own: validate and tag the domain.
+void CrossGenWidget::runATLASDomain() {
+    atlasDomainAttempted_ = true;
+    pipelineBlocked_.clear();
+    auto t0 = Clock::now();
+    try {
+        atlasDomain_ = std::make_unique<PlanarDomain>(*mesh_, ATLAS::Options().domain);
+    } catch (const std::exception &e) {
+        atlasDomain_.reset();
+        blockPipeline("Stage 1 failed", e.what());
+        return;
+    }
+    auto t1 = Clock::now();
+    const PlanarDomain::Report &r = atlasDomain_->getReport();
+    {
+        std::ostringstream oss;
+        oss << "[Domain] Stage 1: " << r.vertices << " vertices, " << r.triangles << " triangles; "
+            << r.components << " component(s), " << r.loops << " boundary loop(s), " << r.holes
+            << " hole(s), " << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Domain] protected: " << r.boundaryCorners << " boundary corner(s)";
+        if (r.materials > 1) {
+            oss << ", " << r.interfaceJunctions << " junction(s), " << r.interfaceLandings << " landing(s), "
+                << r.interfaceKinks << " kink(s) on " << r.interfaceEdges << " interface edge(s) between "
+                << r.materials << " materials";
+        }
+        console_.log(oss.str());
+    }
+    for (const std::string &m : r.messages) console_.log("[Domain] " + m);
+    {
+        std::ostringstream oss;
+        oss << "[Domain] Stage 1 " << (r.valid ? "validates: a planar domain as Sec. 1.1 asks [PASS]"
+                                              : "does not validate [FAIL]");
+        console_.log(oss.str());
+        std::cerr << "[Viewer] " << oss.str() << "\n";
+    }
+    if (!r.valid) {
+        blockPipeline("Stage 1 failed", "the mesh is not a domain Sec. 1.1 accepts");
+        return;
+    }
+    console_.log("[Domain] a disk at every protected vertex, coloured by the quarter turns its corner "
+                 "takes out of Sec. 4's identity -- a cone's index, in the cones' colours");
+}
+
+// Stage 2 on its own: the three-quad split, which is the guaranteed incumbent.
+void CrossGenWidget::runATLASCarrier() {
+    atlasCarrierAttempted_ = true;
+    if (!atlasDomain_ || !atlasDomain_->getReport().valid) {
+        blockPipeline("Stage 2 not built", "Stage 1 did not validate the domain");
+        return;
+    }
+    pipelineBlocked_.clear();
+    auto t0 = Clock::now();
+    atlasCarrier_ = std::make_unique<SquareCarrier>(*atlasDomain_, ATLAS::Options().carrier);
+    const SquareCarrier::Report &r = atlasCarrier_->validate();
+    auto t1 = Clock::now();
+    {
+        std::ostringstream oss;
+        oss << "[Carrier] Stage 2: " << r.cells << " cells from " << r.sourceTriangles
+            << " triangles, three each, on " << r.vertices << " vertices, "
+            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Carrier] Sec. 3.1: every corner determinant / 2A_T in [" << std::fixed << std::setprecision(4)
+            << r.minCornerDetRatio << ", " << r.maxCornerDetRatio << "], " << r.jacobianBoundViolations
+            << " outside (1/12, 1/4); scaled Jacobian " << r.minScaledJacobian << " worst";
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Carrier] irregular: " << r.irregularInterior << " inside, " << r.irregularBoundary
+            << " on dS, total valence defect " << r.totalDefect << "; Sec. 4: " << r.eulerLHS << " = "
+            << r.eulerRHS << (r.eulerHolds ? " [PASS]" : " [FAIL]");
+        console_.log(oss.str());
+    }
+    for (const std::string &m : r.messages) console_.log("[Carrier] " + m);
+    {
+        std::ostringstream oss;
+        oss << "[Carrier] Stage 2 " << (r.valid ? "validates" : "does not validate") << ": the singleton "
+            << "blocking, " << r.cells << " blocks, is the incumbent " << (r.valid ? "[PASS]" : "[FAIL]");
+        console_.log(oss.str());
+        std::cerr << "[Viewer] " << oss.str() << "\n";
+    }
+    if (!r.valid) {
+        blockPipeline("Stage 2 failed", "the three-quad carrier does not validate");
+        return;
+    }
+    console_.log("[Carrier] a disk at every vertex of the wrong valence for where it is: the "
+                 "singularities the carrier inherits from the triangulation (Sec. 8.1)");
+}
+
+// Stages 1 to 6 in one call: ATLAS::run() and all of its searches.
+void CrossGenWidget::runATLAS() {
+    atlasAttempted_ = true;
+    atlasShowInitial_ = false;
+    atlasBlocksLogged_ = false;
+    atlasMesh_.reset();
+    smoothMesh_.reset();
+    atlas_.reset();
+    if (!atlasCarrier_ || !atlasCarrier_->getReport().valid) {
+        blockPipeline("Stages 3-6 not run", "Stage 2 did not validate the carrier");
+        return;
+    }
+    pipelineBlocked_.clear();
+
+    auto t0 = Clock::now();
+    bool ok = false;
+    try {
+        atlas_ = std::make_unique<ATLAS>(mesh_, ATLAS::Options());
+        ok = atlas_->run();
+    } catch (const std::exception &e) {
+        atlas_.reset();
+        blockPipeline("Stages 3-6 failed", e.what());
+        return;
+    }
+    auto t1 = Clock::now();
+    const double seconds = std::chrono::duration<double>(t1 - t0).count();
+
+    // One line per search, the winner marked: which kind of carrier the layout
+    // came from is the first thing to know about it.
+    const ATLAS::Status &st = atlas_->getStatus();
+    for (int i = 0; i < atlas_->numSearches(); ++i) {
+        const ATLAS::Search &sr = atlas_->getSearch(i);
+        std::ostringstream oss;
+        oss << "[Search] " << sr.name << ": ";
+        if (sr.succeeded()) oss << sr.finalCover()->getReport().blocks << " block(s)";
+        else oss << "no valid cover";
+        if (sr.coarse && sr.coarseDomain) {
+            oss << " from a coarse domain of " << sr.coarseDomain->getReport().triangles << " triangles";
+            if (sr.realised) oss << (sr.realisedReport.valid ? ", realised on the input" : ", did not realise");
+        }
+        if (i == st.chosen) oss << "  <- chosen";
+        console_.log(oss.str());
+    }
+    if (!ok || !atlas_->hasCover()) {
+        blockPipeline("Stages 3-6 found no cover", "no search produced a valid conforming blocking");
+        return;
+    }
+    const ATLAS::Search &s = atlas_->getChosen();
+    if (s.rewrite && s.annealed) {
+        const CavityRewrite::AnnealReport &ar = s.rewrite->getAnnealReport();
+        std::ostringstream oss;
+        oss << "[Search] Stage 6 annealed: " << ar.moves << " move(s), " << ar.accepted << " accepted; base patches "
+            << ar.blocksBefore << " -> " << ar.blocksAfter;
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Search] the " << s.name << " search wins with " << st.bestBlocks << " block(s) (objective "
+            << std::fixed << std::setprecision(2) << st.bestObjective << "), " << std::setprecision(1) << seconds
+            << " s in all";
+        console_.log(oss.str());
+        std::cerr << "[Viewer] " << oss.str() << "\n";
+    }
+    console_.log(s.coarse ? "[Search] drawn: its coarse carrier, the input's dS in grey, block sides in blue. "
+                            "Press 'p' for where it started"
+                          : "[Search] drawn: its carrier, block sides in blue. Press 'p' for where it started");
+}
+
+// The chosen cover on the input, once.
+void CrossGenWidget::logATLASBlocks() {
+    atlasBlocksLogged_ = true;
+    const ATLAS::Search &s = atlas_->getChosen();
+    const SquareCarrier &C = atlas_->getCarrier();
+    const BlockCover::Report &br = atlas_->getCover().getReport();
+    {
+        std::ostringstream oss;
+        oss << "[Blocks] " << br.blocks << " block(s) over " << C.numCells() << " cell(s) of the "
+            << (s.coarse ? "realised" : "fine") << " carrier; " << br.macroVertices << " macrovertices ("
+            << br.irregularMacroVertices << " irregular), " << br.macroEdges << " macro edges";
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Blocks] the carrier " << (C.getReport().valid ? "passes" : "fails")
+            << " Stage 2's validate() on the input; scaled Jacobian " << std::fixed << std::setprecision(4)
+            << C.getReport().minScaledJacobian << " worst " << (C.getReport().valid ? "[PASS]" : "[FAIL]");
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Blocks] Sec. 13.2: every cell in one block, every side dS or one neighbour's, no T-junction, "
+            << "every protected vertex a corner, Sec. 4 " << br.eulerLHS << " = " << br.eulerRHS << ": "
+            << (br.valid ? "a conforming blocking [PASS]" : "not conforming [FAIL]");
+        console_.log(oss.str());
+        std::cerr << "[Viewer] " << oss.str() << "\n";
+    }
+    console_.log("[Blocks] block sides in light blue, macrovertices in green. Press 'c' to mesh the blocks");
+}
+
+// The mesh dialog: Stage 10's, less what has no counterpart here (the chord
+// contraction and the disk templates), with the chart switch where Stage 10's
+// spline switch is.
+bool CrossGenWidget::promptATLASMesh() {
+    if (!atlas_ || !atlas_->hasCover() || !mesh_) return false;
+
+    Point lo{ std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity() };
+    Point hi{ -lo[0], -lo[1] };
+    for (const Point &p : mesh_->vertices) {
+        lo[0] = std::min(lo[0], p[0]); lo[1] = std::min(lo[1], p[1]);
+        hi[0] = std::max(hi[0], p[0]); hi[1] = std::max(hi[1], p[1]);
+    }
+    const double diag = std::hypot(hi[0] - lo[0], hi[1] - lo[1]);
+    const double extent = (diag > 0.0) ? diag : 1.0;
+
+    QDialog dlg(this);
+    dlg.setWindowTitle("ATLAS — quadrilateral mesh on the blocks");
+
+    auto *targetBox = new QDoubleSpinBox(&dlg);
+    targetBox->setRange(1e-4, 10.0);
+    targetBox->setDecimals(4);
+    targetBox->setSingleStep(0.01);
+    targetBox->setValue(meshSettings_.target);
+    targetBox->setToolTip(
+        "Target length of a mesh edge, in the units of the model.\n"
+        "The same number the MERIDIAN and TORSION mesh dialogs take, and\n"
+        "shared with them, so the three layouts can be meshed alike.");
+
+    auto *derived = new QLabel(&dlg);
+    derived->setTextFormat(Qt::PlainText);
+    const BlockCover::Report &br = atlas_->getCover().getReport();
+    const int blocks = br.blocks, edges = br.macroEdges;
+    auto updateDerived = [targetBox, derived, extent, blocks, edges]() {
+        const double h = targetBox->value();
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(4)
+            << "diagonal of S                 = " << extent << "\n"
+            << "edges across it   diag / h    = " << std::setprecision(1) << (extent / h) << "\n"
+            << blocks << " block(s) and " << edges << " macro edge(s) to mesh";
+        derived->setText(QString::fromStdString(oss.str()));
+    };
+    QObject::connect(targetBox, &QDoubleSpinBox::valueChanged, &dlg, updateDerived);
+    updateDerived();
+
+    auto *minBox = new QSpinBox(&dlg);
+    minBox->setRange(1, 64);
+    minBox->setValue(meshSettings_.minEdges);
+    minBox->setToolTip("Fewest edges any chord may be given.");
+
+    auto *maxBox = new QSpinBox(&dlg);
+    maxBox->setRange(0, 4096);
+    maxBox->setValue(meshSettings_.maxEdges);
+    maxBox->setSpecialValueText("none");
+    maxBox->setToolTip("Most edges any chord may be given. 0 for no ceiling.");
+
+    auto *chartBox = new QCheckBox("place the interior nodes through the blocks' charts", &dlg);
+    chartBox->setChecked(atlasUseChart_);
+    chartBox->setToolTip(
+        "On, the four sides' chart coordinates are blended by transfinite\n"
+        "interpolation and each block's certified chart -- its carrier cells, a\n"
+        "valid piecewise-bilinear map (Sec. 5.3) -- is evaluated there, as Stage 10\n"
+        "evaluates its spline patches. Off, the interior is the Coons blend of the\n"
+        "four sides' points, with no chart trusted inside the block.");
+
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    buttons->button(QDialogButtonBox::Ok)->setText("Mesh");
+    QObject::connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    QObject::connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+
+    auto *form = new QFormLayout(&dlg);
+    form->addRow("target edge length", targetBox);
+    form->addRow("implied sizing", derived);
+    form->addRow("fewest edges per chord", minBox);
+    form->addRow("most edges per chord", maxBox);
+    form->addRow(chartBox);
+    form->addRow(new QLabel("Transfinite interpolation per block. Only a block that\n"
+                            "folds is smoothed, by Stage 10's Winslow pass.", &dlg));
+    form->addRow(buttons);
+
+    if (dlg.exec() != QDialog::Accepted) return false;
+
+    meshSettings_.target   = targetBox->value();
+    meshSettings_.minEdges = minBox->value();
+    meshSettings_.maxEdges = maxBox->value();
+    atlasUseChart_         = chartBox->isChecked();
+    return true;
+}
+
+// BlockMesh at the dialog's settings, reported line for line as Stage 10 is.
+void CrossGenWidget::runATLASMesh() {
+    if (!atlas_ || !atlas_->hasCover()) {
+        blockPipeline("the mesh not built", "Stages 3-6 produced no blocks to mesh");
+        return;
+    }
+    atlasMeshAttempted_ = true;
+    atlasMesh_.reset();
+    // TMOP stood on the mesh that is about to be replaced.
+    smoothMesh_.reset();
+    tmopAttempted_ = false;
+    pipelineBlocked_.clear();
+
+    BlockMesh::Options mo;
+    mo.targetEdgeLength = meshSettings_.target;
+    mo.minIntervals     = meshSettings_.minEdges;
+    mo.maxIntervals     = meshSettings_.maxEdges;
+    mo.useChart         = atlasUseChart_;
+    // Stage 10's selective Winslow pass at the pipelines' setting, for the
+    // reason runMERIDIANMesh gives: the mesh TMOP is handed, and the quality
+    // reported here, are then the same kind of thing for all three methods.
+    mo.smoothingPasses    = TORSION::Options().quadSmoothingPasses;
+    mo.smoothingThreshold = TORSION::Options().quadSmoothingThreshold;
+
+    auto t0 = Clock::now();
+    try {
+        atlasMesh_.emplace(atlas_->getCover(), mo);
+    } catch (const std::exception &e) {
+        atlasMesh_.reset();
+        blockPipeline("the mesh failed", e.what());
+        return;
+    }
+    auto t1 = Clock::now();
+
+    const BlockMesh::Report &r = atlasMesh_->getReport();
+    {
+        std::ostringstream oss;
+        oss << "[Mesh] " << r.quads << " quad(s) on " << r.vertices << " vertices over " << r.blocks
+            << " block(s), " << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Mesh] " << r.chords << " chord(s) over " << r.arcsAssigned << " macro edge(s), "
+            << r.minIntervals << " to " << r.maxIntervals << " edges each (mean " << std::fixed
+            << std::setprecision(2) << r.meanIntervals << ")";
+        if (r.clampedChords > 0) oss << ", " << r.clampedChords << " clamped by a bound";
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Mesh] edges " << std::fixed << std::setprecision(4) << r.minEdge << " to " << r.maxEdge
+            << " against a target of " << r.target << " (worst " << std::setprecision(2) << r.worstEdgeRatio
+            << "x, rms log ratio " << std::setprecision(3) << r.edgeRatioRms << ")";
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Mesh] scaled Jacobian " << std::fixed << std::setprecision(4) << r.minScaledJacobian
+            << " worst, " << r.meanScaledJacobian << " mean";
+        if (r.smoothedBlocks > 0) {
+            oss << " (Winslow on " << r.smoothedBlocks << " folded block(s): " << r.invertedBefore << " fold(s), "
+                << r.minScaledJacobianBefore << " worst before)";
+        }
+        if (r.invertedQuads > 0) oss << " -- " << r.invertedQuads << " element(s) fold";
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Mesh] Sec. 11.3: every boundary node on dS, the edges between them within " << std::fixed
+            << std::setprecision(4) << r.boundaryDeviation << " of it (" << std::setprecision(3)
+            << (r.target > 0.0 ? r.boundaryDeviation / r.target : 0.0) << " of the target)";
+        if (r.materials > 1) {
+            oss << "; " << r.materials << " materials meeting on " << r.interfaceEdges
+                << " element edge(s), within " << std::setprecision(4) << r.interfaceDeviation
+                << " of the interfaces";
+        }
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Mesh] " << r.interiorEdges << " interior and " << r.boundaryEdges << " boundary edge(s), "
+            << r.nonManifoldEdges << " used a third time, " << r.cracks << " crack(s): "
+            << (r.conforming ? "conforming [PASS]" : "not conforming [FAIL]");
+        console_.log(oss.str());
+    }
+    for (const std::string &m : r.messages) console_.log("[Mesh] " + m);
+    {
+        std::ostringstream oss;
+        oss << "[Mesh] the mesh " << (r.valid ? "validates [PASS]" : "does not validate [FAIL]");
+        console_.log(oss.str());
+        std::cerr << "[Viewer] " << oss.str() << "\n";
+    }
+    console_.log("[Mesh] transfinite grid: grey is a mesh edge, blue a block wall, red a folded element. "
+                 "Press 'c' to smooth it, 'e' to mesh again at another target");
+}
+
+// What ATLAS mode draws. The later a phase, the more of the model its picture
+// replaces -- the blocks and the meshes are drawn alone, as the pipelines draw
+// theirs -- but only when that picture exists: a stage that refused leaves the
+// last picture that did, so the window is never blank.
+void CrossGenWidget::renderATLAS() {
+    const bool matFill = showMaterialFill_ && atlasMultiMaterial_;
+    const bool haveCover = atlas_ && atlas_->hasCover();
+
+    // The mesh, and after TMOP the same mesh drawn by the same routine off the
+    // same block walls: the pipelines' Mesh and Smoothed pictures exactly.
+    if (atlasPhase_ >= ATLASPhase::Mesh && atlasMesh_.has_value()) {
+        if (atlasPhase_ == ATLASPhase::Smoothed && smoothMesh_.has_value())
+            viewer::drawQuadMesh(*smoothMesh_, *atlasMesh_, 1.0f, 2.5f, matFill);
+        else
+            viewer::drawQuadMesh(*atlasMesh_, 1.0f, 2.5f, matFill);
+        return;
+    }
+
+    // The blocks on the input, as MERIDIAN's Patches phase draws its layout.
+    if (atlasPhase_ >= ATLASPhase::Blocks && haveCover) {
+        viewer::drawBlockCover(atlas_->getCover(), 0.30 * avgEdge_, 3.0f);
+        return;
+    }
+
+    // The winning search on the carrier it searched. A coarse carrier's
+    // boundary is a polygon inscribed in the input's, so the input's own dS
+    // goes under it: what Realisation will carry the layout onto.
+    if (atlasPhase_ == ATLASPhase::Search && haveCover) {
+        const ATLAS::Search &s = atlas_->getChosen();
+        const SquareCarrier *C = atlasShowInitial_ ? s.initial.get() : s.best.get();
+        if (!C) C = s.best ? s.best.get() : s.initial.get();
+        if (C) {
+            viewer::drawBoundaryEdges(*mesh_);
+            viewer::drawSquareCarrier(*C, 1.25f, 0.0, matFill);
+            if (C == s.best.get() && s.bestCover) viewer::drawBlockCover(*s.bestCover, 0.0, 2.5f);
+            viewer::drawCarrierDefects(*C, 0.3 * C->meanEdgeLength());
+            return;
+        }
+    }
+
+    if (atlasPhase_ >= ATLASPhase::Carrier && atlasCarrier_) {
+        viewer::drawSquareCarrier(*atlasCarrier_, 1.0f, 0.3 * atlasCarrier_->meanEdgeLength(), matFill);
+        return;
+    }
+
+    if (matFill) viewer::drawMaterialFill(*mesh_, 0.28f);
+    viewer::drawMesh(*mesh_);
+    if (atlasPhase_ >= ATLASPhase::Domain && atlasDomain_) {
+        viewer::drawBoundaryEdges(*mesh_);
+        viewer::drawPlanarDomain(*atlasDomain_, 0.5 * avgEdge_);
+    }
 }
 
 // ── Stage 0c: the circular inclusions, taken out before anything is built ────
@@ -4637,6 +5183,28 @@ void CrossGenWidget::advancePhase() {
         // 'c' at this phase re-opens it. This is now the last phase, so 'c'
         // arrives here rather than at the Mesh one.
         if (pipePhase_ == PipelinePhase::Smoothed && quadMesh_.has_value()) {
+            tmopAttempted_ = true;
+            if (promptTMOP()) runTMOP();
+        }
+    } else if (mode_ == Mode::ATLAS) {
+        ATLASPhase old = atlasPhase_;
+        atlasPhase_ = nextATLASPhase(atlasPhase_);
+        if (atlasPhase_ != old)
+            std::cerr << "[Viewer] ATLAS Phase " << atlasPhaseName(atlasPhase_) << "\n";
+
+        // The last two phases as the pipelines have them: the mesh dialog on
+        // the way into Mesh, the TMOP one on the way into Smoothed and on every
+        // 'c' there, each marked as asked before it opens.
+        if (old == ATLASPhase::Search && atlasPhase_ == ATLASPhase::Blocks && !atlasAttempted_) {
+            // 'c' pressed again before the frame that runs the search: run it
+            // now rather than enter a phase whose input does not exist.
+            runATLAS();
+        }
+        if (old == ATLASPhase::Blocks && atlasPhase_ == ATLASPhase::Mesh && atlas_ && atlas_->hasCover()) {
+            atlasMeshAttempted_ = true;
+            if (promptATLASMesh()) runATLASMesh();
+        }
+        if (atlasPhase_ == ATLASPhase::Smoothed && atlasMesh_.has_value()) {
             tmopAttempted_ = true;
             if (promptTMOP()) runTMOP();
         }
@@ -5130,6 +5698,45 @@ void CrossGenWidget::runComputations() {
     // the dialog that belongs to it never opens. Cancelling counts as having
     // asked; 'c' re-opens it.
     if (inPipeline() && pipePhase_ == PipelinePhase::Smoothed && quadMesh_.has_value() &&
+        !tmopAttempted_) {
+        tmopAttempted_ = true;
+        if (promptTMOP()) runTMOP();
+    }
+
+    // ── ATLAS: Stages 1 and 2, the search, and the catch-ups ─────────────────
+    //
+    // Each stage once per run, as in the pipelines. The search is announced a
+    // frame ahead so the notice is on screen while the GUI thread waits on its
+    // threads; the two dialogs are asked for again here in case the phase was
+    // entered before its input existed.
+    if (mode_ == Mode::ATLAS && atlasPhase_ >= ATLASPhase::Domain && !atlasDomainAttempted_)
+        runATLASDomain();
+    if (mode_ == Mode::ATLAS && atlasPhase_ >= ATLASPhase::Carrier && !atlasCarrierAttempted_)
+        runATLASCarrier();
+    if (mode_ == Mode::ATLAS && atlasPhase_ >= ATLASPhase::Search && !atlasAttempted_) {
+        if (!atlasAnnounced_) {
+            std::ostringstream oss;
+            const ATLAS::Options o;
+            const int coarse = atlasMultiMaterial_ ? 0 : static_cast<int>(o.coarseSpacings.size()) *
+                                                             std::max(1, o.coarseSeeds);
+            oss << "[Search] running Stages 3-6: the fine search";
+            if (coarse > 0) oss << " and " << coarse << " coarse one(s), in parallel threads";
+            oss << "; this blocks...";
+            console_.log(oss.str());
+            atlasAnnounced_ = true;
+        } else {
+            runATLAS();
+        }
+    }
+    if (mode_ == Mode::ATLAS && atlasPhase_ >= ATLASPhase::Blocks && atlas_ && atlas_->hasCover() &&
+        !atlasBlocksLogged_)
+        logATLASBlocks();
+    if (mode_ == Mode::ATLAS && atlasPhase_ == ATLASPhase::Mesh && atlas_ && atlas_->hasCover() &&
+        !atlasMeshAttempted_) {
+        atlasMeshAttempted_ = true;
+        if (promptATLASMesh()) runATLASMesh();
+    }
+    if (mode_ == Mode::ATLAS && atlasPhase_ == ATLASPhase::Smoothed && atlasMesh_.has_value() &&
         !tmopAttempted_) {
         tmopAttempted_ = true;
         if (promptTMOP()) runTMOP();
@@ -6199,6 +6806,9 @@ void CrossGenWidget::renderNormal() {
             // says nothing the rim does not.
             if (!diskFill_.has_value()) viewer::drawInclusionCircles(inclusions_, 1.5f);
         }
+    } else if (mode_ == Mode::ATLAS) {
+        viewer::drawAxis(view_);
+        renderATLAS();
     } else if (mode_ == Mode::MedialAxis) {
         viewer::drawAxis(view_);
         // The map and block phases draw over the boundary alone: the
@@ -6305,21 +6915,43 @@ void CrossGenWidget::renderNormal() {
     // appended to whatever the phase's own help says, since they apply at every
     // phase of either pipeline and to none of the other modes.
     const std::string meridianKeys =
-        (inPipeline() ? (pipelineBlocked_.empty() ? std::string()
-                                                  : pipelineBlocked_ + "\n")
-                      : std::string()) +
+        ((inPipeline() || mode_ == Mode::ATLAS)
+             ? (pipelineBlocked_.empty() ? std::string() : pipelineBlocked_ + "\n")
+             : std::string()) +
         ((inPipeline() && interfaces_.has_value() && interfaces_->multiMaterial())
              ? std::string("press 'i' to show/hide the interface network\n"
                            "press 'm' to fill the triangles by material\n")
+             : std::string()) +
+        ((mode_ == Mode::ATLAS && atlasMultiMaterial_)
+             ? std::string("press 'm' to fill the elements by material\n")
              : std::string());
 
     if (mode_ == Mode::Unselected) {
         renderOverlay("press '1' for PolyVector mode\npress '2' for MBO mode\n"
                       "press '3' for Medial Axis mode\npress '4' for TORSION mode\n"
                       "press '5' for OASIS mode\npress '6' for UMBER mode\n"
-                      "press '7' for MERIDIAN mode\n"
+                      "press '7' for MERIDIAN mode\npress '8' for ATLAS mode\n"
                       "right-drag to pan, scroll to zoom\n"
                       "press 'r' to restart\npress 'q' to quit");
+    } else if (mode_ == Mode::ATLAS && atlasPhase_ == ATLASPhase::Smoothed) {
+        renderOverlay((meridianKeys +
+                       "press 'c' to smooth again at other TMOP settings\n"
+                       "press 'e' to mesh again at another target edge length\n"
+                       "press 'r' to restart\npress 'q' to quit").c_str());
+    } else if (mode_ == Mode::ATLAS && atlasPhase_ == ATLASPhase::Mesh) {
+        renderOverlay((meridianKeys +
+                       "press 'c' to smooth the mesh with TMOP\n"
+                       "press 'e' to mesh again at another target edge length\n"
+                       "press 'r' to restart\npress 'q' to quit").c_str());
+    } else if (mode_ == Mode::ATLAS && atlasPhase_ == ATLASPhase::Blocks) {
+        renderOverlay((meridianKeys + "press 'c' to mesh the blocks (TFI)\n"
+                       "press 'r' to restart\npress 'q' to quit").c_str());
+    } else if (mode_ == Mode::ATLAS && atlasPhase_ == ATLASPhase::Search && atlas_ &&
+               atlas_->hasCover()) {
+        renderOverlay((meridianKeys +
+                       (atlasShowInitial_ ? "press 'p' for the carrier the search ended on\n"
+                                          : "press 'p' for the carrier the search started from\n") +
+                       "press 'c' to continue\npress 'r' to restart\npress 'q' to quit").c_str());
     } else if (mode_ == Mode::OASIS) {
         renderOverlay("press 'c' to change lambda / orientation\n"
                       "press 'r' to restart\npress 'q' to quit");
@@ -6361,6 +6993,16 @@ void CrossGenWidget::renderNormal() {
 // The screen-space colour keys, drawn before the text overlay so the console
 // keeps drawing on top. Called only while the HUD is shown.
 void CrossGenWidget::drawLegends() {
+    // ATLAS: the corners' key at Stage 1, the defects' at the two carrier
+    // phases; none once the blocks replace the carrier.
+    if (mode_ == Mode::ATLAS) {
+        if (atlasPhase_ == ATLASPhase::Domain && atlasDomain_)
+            viewer::drawATLASLegend(fbw(), fbh(), true);
+        else if ((atlasPhase_ == ATLASPhase::Carrier && atlasCarrier_) ||
+                 (atlasPhase_ == ATLASPhase::Search && atlas_ && atlas_->hasCover()))
+            viewer::drawATLASLegend(fbw(), fbh(), false);
+        return;
+    }
     if (mode_ == Mode::OASIS && oasisPhase_ == OASISPhase::Field && oasis_.has_value()) {
         viewer::drawScalarFieldLegend(fbw(), fbh(), -oasisAbsMax_, oasisAbsMax_,
                                       "quasi-eigenfunction");
@@ -6453,6 +7095,7 @@ QString CrossGenWidget::nextFigurePath(const char *extension) const {
     case Mode::MedialAxis: phase = medialAxisPhaseName(maPhase_);        break;
     case Mode::OASIS:      phase = oasisPhaseName(oasisPhase_);          break;
     case Mode::UMBER:      phase = umberPhaseName(umberPhase_);          break;
+    case Mode::ATLAS:      phase = atlasPhaseName(atlasPhase_);          break;
     case Mode::PolyVector:
     case Mode::Unselected:  phase = phaseName(phase_);                   break;
     }

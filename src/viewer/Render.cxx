@@ -2830,6 +2830,147 @@ void drawInclusionCircles(const std::vector<DiskTemplate::Inclusion> &inclusions
     viewer::lineWidth(1.0f);
 }
 
+// ── ATLAS ────────────────────────────────────────────────────────────────────
+
+namespace {
+
+// The cones' colours for +1, -1 and -2 and their yellow beyond; 0 -- a
+// protected vertex that is regular for the layout -- in a neutral grey.
+void atlasIndexColor(int index, float &r, float &g, float &b) {
+    if (index == 0) { r = 0.58f; g = 0.60f; b = 0.64f; return; }
+    coneColor(index, r, g, b);
+}
+
+// The regular valence at a boundary vertex from its layout angle, as
+// SquareCarrier::targetValence reads it.
+int regularValence(double angle) {
+    const int t = static_cast<int>(std::lround(angle / (0.5 * M_PI)));
+    return std::min(4, std::max(1, t));
+}
+
+std::vector<GridRef> gridsOf(const BlockMesh &bm) {
+    std::vector<GridRef> g;
+    g.reserve(bm.blocks().size());
+    for (const BlockMesh::Block &b : bm.blocks()) g.push_back({ b.ns, b.nt, &b.vert });
+    return g;
+}
+
+} // namespace
+
+void drawPlanarDomain(const PlanarDomain &D, double radius) {
+    if (!(radius > 0.0)) return;
+    const Mesh &m = D.getMesh();
+    for (size_t v = 0; v < D.protectedVertex.size() && v < m.vertices.size(); ++v) {
+        if (!D.protectedVertex[v]) continue;
+        const int index = D.loopOf[v] >= 0 ? 2 - regularValence(D.targetAngle[v]) : 0;
+        float r, g, b;
+        atlasIndexColor(index, r, g, b);
+        drawDisk3D(m.vertices[v], radius, r, g, b);
+    }
+}
+
+void drawSquareCarrier(const SquareCarrier &C, float lineWidth, double radius, bool materialFill) {
+    drawQuadMeshArrays(C.vertices, C.cells, C.cellMaterial, {}, lineWidth, 0.0f, materialFill);
+    drawCarrierDefects(C, radius);
+}
+
+void drawCarrierDefects(const SquareCarrier &C, double radius) {
+    if (!(radius > 0.0)) return;
+    for (int v = 0; v < C.numVertices(); ++v) {
+        if (C.valence[v] <= 0) continue;
+        const int index = C.boundaryVertex[v] ? C.targetValence(v) - C.valence[v] : 4 - C.valence[v];
+        if (index == 0) continue;
+        float r, g, b;
+        atlasIndexColor(index, r, g, b);
+        drawDisk3D(C.vertices[v], radius, r, g, b);
+    }
+}
+
+void drawBlockCover(const BlockCover &cover, double nodeRadius, float lineWidth) {
+    const SquareCarrier &C = cover.getCarrier();
+    viewer::color3f(0.42f, 0.74f, 1.0f);
+    viewer::lineWidth(lineWidth);
+    for (const BlockCover::MacroEdge &me : cover.getMacroEdges()) {
+        if (me.chain.size() < 2) continue;
+        glBegin(GL_LINE_STRIP);
+        for (int v : me.chain) {
+            if (v < 0 || v >= C.numVertices()) continue;
+            glVertex2d(C.vertices[v][0], C.vertices[v][1]);
+        }
+        glEnd();
+    }
+    viewer::lineWidth(1.0f);
+    if (!(nodeRadius > 0.0)) return;
+    for (int v : cover.getMacroVertices()) {
+        if (v < 0 || v >= C.numVertices()) continue;
+        drawDisk3D(C.vertices[v], nodeRadius, 0.15f, 0.88f, 0.30f);
+    }
+}
+
+void drawATLASLegend(int fbw, int fbh, bool corners) {
+    struct Row { int index; const char *label; };
+    static const Row kCorners[] = {
+        {  1, "+1  convex corner, one cell"   },
+        {  0, " 0  protected, straight"       },
+        { -1, "-1  reflex corner, three cells" },
+        { -2, "-2  a cusp, four cells"        },
+    };
+    static const Row kDefects[] = {
+        {  1, "+1  valence 3, a cell short" },
+        { -1, "-1  valence 5, a cell over"  },
+        { -2, "-2  valence 6"               },
+        { -3, "further off"                 },
+    };
+    const Row *rows = corners ? kCorners : kDefects;
+
+    const float x0 = 20.0f;
+    const float sw = 16.0f;
+    const float lineH = 22.0f;
+    const float y0 = static_cast<float>(fbh) - 190.0f;  // where the cone legend sits
+
+    glMatrixMode(GL_PROJECTION);
+    glPushMatrix();
+    glLoadIdentity();
+    glOrtho(0, fbw, fbh, 0, -1, 1); // top-left origin
+    glMatrixMode(GL_MODELVIEW);
+    glPushMatrix();
+    glLoadIdentity();
+
+    glBegin(GL_QUADS);
+    for (int i = 0; i < 4; ++i) {
+        float r, g, b;
+        atlasIndexColor(rows[i].index, r, g, b);
+        viewer::color3f(r, g, b);
+        const float y = y0 + i * lineH;
+        glVertex2f(x0, y);
+        glVertex2f(x0 + sw, y);
+        glVertex2f(x0 + sw, y + sw);
+        glVertex2f(x0, y + sw);
+    }
+    glEnd();
+
+    glMatrixMode(GL_PROJECTION);
+    glPopMatrix();
+    glMatrixMode(GL_MODELVIEW);
+    glPopMatrix();
+
+    for (int i = 0; i < 4; ++i) {
+        drawTextOverlay(fbw, fbh, rows[i].label, x0 + sw + 8.0f, y0 + i * lineH + 2.0f,
+                        0.8f, 0.8f, 0.8f);
+    }
+}
+
+void drawQuadMesh(const BlockMesh &bm, float lineWidth, float blockLineWidth, bool materialFill) {
+    drawQuadMeshArrays(bm.vertices(), bm.quads(), bm.quadMaterials(), gridsOf(bm),
+                       lineWidth, blockLineWidth, materialFill);
+}
+
+void drawQuadMesh(const mesh::QuadMesh &sm, const BlockMesh &bm, float lineWidth,
+                  float blockLineWidth, bool materialFill) {
+    drawQuadMeshArrays(sm.vertices, sm.quads, sm.quadMatId, gridsOf(bm),
+                       lineWidth, blockLineWidth, materialFill);
+}
+
 void drawSeparatrixLegend(int fbw, int fbh) {
     struct Row { SepClass kind; const char *label; };
     static const Row kRows[] = {
