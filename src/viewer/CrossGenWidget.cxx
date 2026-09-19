@@ -4104,6 +4104,23 @@ bool CrossGenWidget::promptTMOP() {
         "Generous on purpose: a node on a discretised circle turns by 360/nSeg,\n"
         "and none of those may be mistaken for corners.");
 
+    auto *curveBox = new QComboBox(&dlg);
+    curveBox->addItem("the interpolant of its smooth run", mesh::QuadMesh::Options::CurveSpline);
+    curveBox->addItem("the run's own polyline, exactly", mesh::QuadMesh::Options::CurvePolyline);
+    curveBox->addItem("the chord through its two neighbours", mesh::QuadMesh::Options::CurveChord);
+    {
+        const int at = curveBox->findData(ts.curveSource);
+        curveBox->setCurrentIndex(at >= 0 ? at : 0);
+    }
+    curveBox->setToolTip(
+        "What a sliding feature node moves along, and so where it is after a step.\n"
+        "The chord leaves it one sagitta inside the feature every time, always on\n"
+        "the inside of a turn, so a discretised circle relaxes towards its own\n"
+        "inscribed polygon. The other two make the node's degree of freedom the\n"
+        "parameter of a curve it cannot leave: the polyline itself, which changes\n"
+        "no geometry, or the C2 interpolant through the run's nodes, which rounds\n"
+        "that circle back out towards the circle.");
+
     auto *targetBox = new QComboBox(&dlg);
     targetBox->addItem("uniform square, side h", mesh::TMOP::TargetUniformSquare);
     targetBox->addItem("each element's own current shape", mesh::TMOP::TargetCurrentShape);
@@ -4156,10 +4173,12 @@ bool CrossGenWidget::promptTMOP() {
     // much of the mesh is even allowed to move.
     auto *derived = new QLabel(&dlg);
     derived->setTextFormat(Qt::PlainText);
-    auto updateDerived = [&, derived, pinBox, cornerBox]() {
+    auto updateDerived = [&, derived, pinBox, cornerBox, curveBox]() {
         mesh::QuadMesh::Options o;
         o.cornerAngle = cornerBox->value();
         o.fixAllFeatureNodes = pinBox->isChecked();
+        o.curveSource = static_cast<mesh::QuadMesh::Options::CurveSource>(
+            curveBox->currentData().toInt());
         // This runs inside a Qt signal, where an escaping exception is a
         // terminate rather than a message. A mesh the class refuses to build is
         // a real answer to "what would the smoother see here", so it is shown
@@ -4185,6 +4204,7 @@ bool CrossGenWidget::promptTMOP() {
     };
     QObject::connect(pinBox, &QCheckBox::toggled, &dlg, updateDerived);
     QObject::connect(cornerBox, &QDoubleSpinBox::valueChanged, &dlg, updateDerived);
+    QObject::connect(curveBox, &QComboBox::currentIndexChanged, &dlg, updateDerived);
     updateDerived();
 
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
@@ -4199,6 +4219,7 @@ bool CrossGenWidget::promptTMOP() {
     form->addRow("sweeps at most", sweepBox);
     form->addRow(pinBox);
     form->addRow("corner if the feature turns by", cornerBox);
+    form->addRow("a feature node slides on", curveBox);
     form->addRow("target", targetBox);
     form->addRow("target size h", sizeBox);
     form->addRow(cornerQuadBox);
@@ -4219,6 +4240,7 @@ bool CrossGenWidget::promptTMOP() {
     ts.sweeps      = sweepBox->value();
     ts.pinFeatures = pinBox->isChecked();
     ts.cornerAngle = cornerBox->value();
+    ts.curveSource = curveBox->currentData().toInt();
     ts.target      = targetBox->currentData().toInt();
     ts.targetSize  = sizeBox->value();
     ts.corners     = cornerQuadBox->isChecked();
@@ -4254,6 +4276,7 @@ void CrossGenWidget::runTMOP() {
     mesh::QuadMesh::Options mopts;
     mopts.cornerAngle = ts.cornerAngle;
     mopts.fixAllFeatureNodes = ts.pinFeatures;
+    mopts.curveSource = static_cast<mesh::QuadMesh::Options::CurveSource>(ts.curveSource);
 
     auto t0 = Clock::now();
     try {
@@ -4304,6 +4327,18 @@ void CrossGenWidget::runTMOP() {
         std::ostringstream oss;
         oss << "[TMOP] nodes: " << tr.freeNodes << " free, " << tr.slidingNodes
             << " sliding, " << tr.fixedNodes << " fixed";
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        if (tr.featureCurves == 0) {
+            oss << "[TMOP] feature nodes slide along the chord through their two neighbours";
+        } else {
+            oss << "[TMOP] " << tr.curveNodes << " feature node(s) on " << tr.featureCurves
+                << " curve(s), " << tr.fittedCurves << " of them interpolants; bow "
+                << std::scientific << std::setprecision(2) << tr.curveBow << ", off-curve "
+                << tr.curveDeviation;
+        }
         console_.log(oss.str());
     }
     {

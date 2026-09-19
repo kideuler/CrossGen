@@ -1036,6 +1036,7 @@ private:
         // is why changing either of them rebuilds it.
         bool   pinFeatures = mesh::QuadMesh::Options().fixAllFeatureNodes;
         double cornerAngle = mesh::QuadMesh::Options().cornerAngle;
+        int    curveSource = mesh::QuadMesh::Options().curveSource;
     };
     TMOPSettings tmopSettings_;
     // ATLAS's copy, which differs in one default: mu is sampled at the element

@@ -404,8 +404,10 @@ Point TMOP::nodeGradient(int v) const {
 // the local solve
 // ---------------------------------------------------------------------------
 
-Point TMOP::nodeStep(int v) {
+Point TMOP::nodeStep(int v, double *newParam) {
     const Point zero{0.0, 0.0};
+    if (newParam && v >= 0 && v < static_cast<int>(mesh.curveParam.size()))
+        *newParam = mesh.curveParam[v];
     if (v < 0 || v >= static_cast<int>(mesh.vertices.size())) return zero;
     if (v >= static_cast<int>(mesh.nodeType.size())) return zero;
     if (mesh.nodeType[v] == QuadMesh::NodeFixed) return zero;
@@ -434,6 +436,12 @@ Point TMOP::nodeStep(int v) {
     double a = H[0], b = h01, d = H[3];
 
     Point dir{0.0, 0.0};
+    // Arc length the restricted Newton step asks for, and the parameter step it
+    // becomes; both only meaningful for a node on a curve.
+    const bool onCurve = mesh.isOnCurve(v);
+    const double uStart = onCurve ? mesh.curveParam[v] : 0.0;
+    double duCurve = 0.0;
+
     const bool sliding = (mesh.nodeType[v] == QuadMesh::NodeSliding);
     if (sliding) {
         const Point &t = mesh.slideTangent[v];
@@ -443,7 +451,16 @@ Point TMOP::nodeStep(int v) {
         double ht = a * t[0] * t[0] + 2.0 * b * t[0] * t[1] + d * t[1] * t[1];
         const double floorH = options.hessianFloor * std::max(std::fabs(a) + std::fabs(d), 1e-300);
         if (!(ht > floorH)) ht = std::max(floorH, 1e-300);
-        dir = t * (-gt / ht);
+        // -gt/ht is a signed distance along the unit tangent: on a chord it is
+        // the displacement itself, on a curve it is an arc length to travel.
+        const double arc = -gt / ht;
+        dir = t * arc;
+        if (onCurve) {
+            double speed = 0.0;
+            mesh.curveTangent(v, uStart, &speed);
+            if (!(speed > 0.0)) return zero;
+            duCurve = arc / speed;
+        }
     } else {
         // Lift the smaller eigenvalue of the symmetric 2x2 to a positive floor,
         // so an indefinite local Hessian -- which a barrier metric does produce
@@ -467,44 +484,76 @@ Point TMOP::nodeStep(int v) {
         }
     }
 
-    dir = mesh.projectStep(v, dir);
+    // A node on a curve already has its step as an arc length along that
+    // curve's tangent; projecting it again would replace it with a chord of the
+    // curve and lose the parameter the backtracking below halves.
+    if (!onCurve) dir = mesh.projectStep(v, dir);
     const double len = normP(dir);
     if (!(len > 0.0) || !std::isfinite(len)) return zero;
 
     // Cap at a fraction of the shortest edge at this node, so one Newton step
     // can never carry a node across its own one-ring however wild the local
-    // curvature is.
+    // curvature is. On a curve the cap is on the arc length travelled, which to
+    // first order is what `len` measures.
     double shortest = kInf;
     for (int n : mesh.vertexNeighbors[v])
         shortest = std::min(shortest, normP(mesh.vertices[n] - mesh.vertices[v]));
     if (!std::isfinite(shortest) || shortest <= 0.0) shortest = meanEdge;
     const double cap = options.maxStepFraction * shortest;
-    if (len > cap) dir = dir * (cap / len);
+    if (len > cap) {
+        dir = dir * (cap / len);
+        duCurve *= cap / len;
+    }
 
     // Backtracking. The move is accepted only when this node's own patch energy
     // strictly falls; and if the patch was valid before, only when it still is
     // -- a non-barrier metric would otherwise happily fold an element to lower
     // its own number.
+    //
+    // A node on a curve backtracks in its **parameter**, not along the chord of
+    // the step it first asked for: halving a displacement would put the node
+    // beside the curve rather than back along it, and the guarantee this whole
+    // mechanism exists for is that a feature node is on its curve after every
+    // step, accepted, halved or refused.
     const Point origin = mesh.vertices[v];
     Point accepted = zero;
+    double acceptedU = uStart;
     double alpha = 1.0;
     for (int k = 0; k < options.maxLineSearch; ++k) {
-        const Point trial = dir * alpha;
+        Point trial = zero;
+        double uTrial = uStart;
+        if (onCurve) {
+            uTrial = mesh.clampParameter(v, uStart + alpha * duCurve);
+            trial = mesh.curvePoint(v, uTrial) - origin;
+        } else {
+            trial = dir * alpha;
+        }
         mesh.vertices[v] = origin + trial;
         double tauAfter = kInf;
         const double e = nodeEnergy(v, &tauAfter);
         const bool stillValid = !(tauBefore > 0.0) || tauAfter > 0.0;
-        if (std::isfinite(e) && e < e0 && stillValid) { accepted = trial; break; }
+        if (std::isfinite(e) && e < e0 && stillValid) {
+            accepted = trial;
+            acceptedU = uTrial;
+            break;
+        }
         alpha *= 0.5;
     }
     mesh.vertices[v] = origin;
+    if (newParam) *newParam = acceptedU;
     return accepted;
 }
 
 double TMOP::moveNode(int v) {
-    const Point step = nodeStep(v);
+    double u = 0.0;
+    const Point step = nodeStep(v, &u);
     const double len = normP(step);
-    if (len > 0.0) mesh.vertices[v] = mesh.vertices[v] + step;
+    if (!(len > 0.0)) return 0.0;
+    // On a curve the node is put at its new parameter rather than at the end of
+    // the displacement: the two differ by a rounding, and it is the curve that
+    // is authoritative.
+    if (mesh.isOnCurve(v)) mesh.setVertexParameter(v, u);
+    else mesh.vertices[v] = mesh.vertices[v] + step;
     return len;
 }
 
@@ -617,7 +666,18 @@ void TMOP::snapshotQuality(bool before) {
         report.slidingNodes = Q.slidingNodes;
         report.fixedNodes = Q.fixedNodes;
         report.movableNodes = Q.freeNodes + Q.slidingNodes;
+        report.featureCurves = static_cast<int>(mesh.featureCurves.size());
+        report.fittedCurves = 0;
+        report.curveBow = 0.0;
+        for (const QuadMesh::FeatureCurve &fc : mesh.featureCurves) {
+            if (fc.fitted) ++report.fittedCurves;
+            report.curveBow = std::max(report.curveBow, fc.deviation);
+        }
+        report.curveNodes = 0;
+        for (int v = 0; v < static_cast<int>(mesh.curveOf.size()); ++v)
+            if (mesh.isOnCurve(v)) ++report.curveNodes;
     } else {
+        report.curveDeviation = mesh.maxCurveDeviation();
         report.minScaledJacobianAfter = Q.minScaledJacobian;
         report.meanScaledJacobianAfter = Q.meanScaledJacobian;
         report.invertedAfter = Q.invertedQuads;

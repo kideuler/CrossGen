@@ -10,6 +10,10 @@
 #include <limits>
 #include <map>
 #include <iomanip>
+#include <stdexcept>
+
+#include "geom/Fitting.hxx"
+#include "geom/Polyline.hxx"
 
 namespace mesh {
 
@@ -129,6 +133,7 @@ void QuadMesh::buildTopology() {
     buildBoundaryLoops();
     markInterfaceEdges();
     classifyNodes();
+    buildFeatureCurves();
     computeSlideTangents();
     computeQuality();
 }
@@ -495,6 +500,161 @@ void QuadMesh::anchorFreeFeatureLoops() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// feature curves
+// ---------------------------------------------------------------------------
+
+std::vector<std::vector<int>> QuadMesh::featureChains() const {
+    const int nV = static_cast<int>(vertices.size());
+    std::vector<std::vector<int>> chains;
+    if (static_cast<int>(nodeType.size()) != nV) return chains;
+
+    const std::vector<std::vector<int>> fn = featureNeighbors(*this);
+    std::vector<bool> used(nV, false);   // sliding nodes already on a chain
+
+    // Runs start where sliding stops, so every one of them is bounded at both
+    // ends by a node that does not move. A closed feature loop has exactly one
+    // such node -- anchorFreeFeatureLoops() saw to that -- and comes back as a
+    // single run from that anchor round to itself.
+    for (int s = 0; s < nV; ++s) {
+        if (nodeType[s] == NodeSliding) continue;
+        for (int w : fn[s]) {
+            if (w < 0 || w >= nV) continue;
+            if (nodeType[w] != NodeSliding || used[w]) continue;
+
+            std::vector<int> chain{s};
+            int prev = s, cur = w;
+            while (cur >= 0 && nodeType[cur] == NodeSliding && !used[cur]) {
+                chain.push_back(cur);
+                used[cur] = true;
+                // A sliding node has exactly two feature neighbours: that is
+                // what classifyNodes() requires before it calls one sliding.
+                const std::array<int, 2> &f = featureNeighborOf[cur];
+                const int next = (f[0] == prev) ? f[1] : f[0];
+                prev = cur;
+                cur = next;
+            }
+            // The far end, which closes the run. It is missing only if the
+            // feature graph is malformed, and such a run is dropped: a curve
+            // with a loose end has no fixed geometry to be pinned to.
+            if (cur >= 0 && nodeType[cur] != NodeSliding) {
+                chain.push_back(cur);
+                chains.push_back(std::move(chain));
+            }
+        }
+    }
+    return chains;
+}
+
+int QuadMesh::buildFeatureCurves() {
+    featureCurves.clear();
+    curveOf.assign(vertices.size(), -1);
+    curveParam.assign(vertices.size(), 0.0);
+    if (options.curveSource == Options::CurveChord) return 0;
+    if (nodeType.size() != vertices.size()) return 0;
+
+    for (const std::vector<int> &chain : featureChains()) {
+        std::vector<Point> pts;
+        pts.reserve(chain.size());
+        for (int v : chain) pts.push_back(vertices[v]);
+
+        // The polyline is built whatever the source asks for: it is the
+        // fallback, it supplies the parameters, and its length is what the
+        // deviation test below is measured against.
+        const geom::Polyline<2> poly(pts);
+        if (!(poly.length() > 0.0) || poly.curve().empty()) continue;
+
+        FeatureCurve fc;
+        fc.chain = chain;
+        fc.closed = chain.front() == chain.back();
+        fc.length = poly.length();
+        fc.curve = poly.curve();
+        std::vector<double> param = poly.parameters();
+
+        if (options.curveSource == Options::CurveSpline && pts.size() >= 4) {
+            // Interpolation rather than a least-squares fit, so that binding
+            // the nodes moves none of them: the curve passes through every one
+            // at the parameter it is given here, and only *between* the nodes
+            // does it differ from the polyline -- which is the whole of what
+            // is wanted, the smooth curve the discretisation came from.
+            try {
+                const std::vector<double> sparam =
+                    geom::parameterize(pts, geom::Parameterization::ChordLength);
+                const geom::BSplineCurve<2> spline = geom::interpolateCurve(pts, 3);
+                // How far it bows from the polyline, measured where the two are
+                // furthest apart: at the middle of a segment, never at a node.
+                double bow = 0.0;
+                for (std::size_t i = 0; i + 1 < sparam.size(); ++i) {
+                    const double um = 0.5 * (sparam[i] + sparam[i + 1]);
+                    const Point mid{0.5 * (pts[i][0] + pts[i + 1][0]),
+                                    0.5 * (pts[i][1] + pts[i + 1][1])};
+                    bow = std::max(bow, normP(spline.evaluate(um) - mid));
+                }
+                const double meanSeg = poly.length() / static_cast<double>(pts.size() - 1);
+                if (bow <= options.curveMaxDeviation * meanSeg) {
+                    fc.curve = spline;
+                    fc.fitted = true;
+                    fc.deviation = bow;
+                    param = sparam;
+                }
+            } catch (const std::invalid_argument &) {
+                // Two chain vertices at one parameter: the run has a repeated
+                // point and cannot be interpolated. Its polyline still can.
+            }
+        }
+
+        const int index = static_cast<int>(featureCurves.size());
+        for (std::size_t i = 0; i < chain.size(); ++i) {
+            const int v = chain[i];
+            // Only the sliding nodes are bound. The two ends do not move, and
+            // on a closed run they are one vertex with two parameters, which
+            // there would be no way to hold.
+            if (nodeType[v] != NodeSliding) continue;
+            curveOf[v] = index;
+            curveParam[v] = param[i];
+        }
+        featureCurves.push_back(std::move(fc));
+    }
+    return static_cast<int>(featureCurves.size());
+}
+
+double QuadMesh::clampParameter(int v, double u) const {
+    if (!isOnCurve(v)) return u;
+    const geom::BSplineCurve<2> &c = featureCurves[curveOf[v]].curve;
+    return std::min(std::max(u, c.domainBegin()), c.domainEnd());
+}
+
+Point QuadMesh::curvePoint(int v, double u) const {
+    if (!isOnCurve(v)) return vertices[v];
+    return featureCurves[curveOf[v]].curve.evaluate(clampParameter(v, u));
+}
+
+Point QuadMesh::curveTangent(int v, double u, double *speed) const {
+    if (speed) *speed = 0.0;
+    if (!isOnCurve(v)) return Point{0.0, 0.0};
+    const Point d = featureCurves[curveOf[v]].curve.derivativeAt(clampParameter(v, u), 1);
+    const double s = normP(d);
+    if (speed) *speed = s;
+    if (!(s > 0.0)) return Point{0.0, 0.0};
+    return Point{d[0] / s, d[1] / s};
+}
+
+void QuadMesh::setVertexParameter(int v, double u) {
+    if (!isOnCurve(v)) return;
+    const double uc = clampParameter(v, u);
+    curveParam[v] = uc;
+    vertices[v] = featureCurves[curveOf[v]].curve.evaluate(uc);
+}
+
+double QuadMesh::maxCurveDeviation() const {
+    double worst = 0.0;
+    for (int v = 0; v < static_cast<int>(curveOf.size()); ++v) {
+        if (!isOnCurve(v)) continue;
+        worst = std::max(worst, normP(vertices[v] - curvePoint(v, curveParam[v])));
+    }
+    return worst;
+}
+
 void QuadMesh::updateSlideTangent(int v) {
     if (v < 0 || v >= static_cast<int>(vertices.size())) return;
     if (slideTangent.size() != vertices.size())
@@ -504,6 +664,15 @@ void QuadMesh::updateSlideTangent(int v) {
         nodeType[v] != NodeSliding) {
         slideTangent[v] = Point{0.0, 0.0};
         return;
+    }
+    // On a curve the tangent is the curve's own, at the parameter the node
+    // currently holds. It needs no refreshing against the neighbours -- the
+    // curve does not move when they do -- but it does have to follow the node
+    // along the curve, which is why it is taken here rather than once.
+    if (isOnCurve(v)) {
+        slideTangent[v] = curveTangent(v, curveParam[v]);
+        if (normP(slideTangent[v]) > 0.0) return;
+        // A cusp, or a curve of no length: fall through to the chord.
     }
     const std::array<int, 2> &fn = featureNeighborOf[v];
     if (fn[0] < 0 || fn[1] < 0) { slideTangent[v] = Point{0.0, 0.0}; return; }
@@ -521,15 +690,28 @@ void QuadMesh::computeSlideTangents() {
     for (int v = 0; v < static_cast<int>(vertices.size()); ++v) updateSlideTangent(v);
 }
 
-Point QuadMesh::projectStep(int v, const Point &displacement) const {
+Point QuadMesh::projectStep(int v, const Point &displacement, double *newParam) const {
+    if (newParam && v >= 0 && v < static_cast<int>(curveParam.size())) *newParam = curveParam[v];
     if (v < 0 || v >= static_cast<int>(nodeType.size())) return Point{0.0, 0.0};
     if (nodeType[v] == NodeFixed) return Point{0.0, 0.0};
-    if (nodeType[v] == NodeSliding) {
-        if (v >= static_cast<int>(slideTangent.size())) return Point{0.0, 0.0};
-        const Point &t = slideTangent[v];
-        return t * dotP(t, displacement);
+    if (nodeType[v] != NodeSliding) return displacement;
+    if (v >= static_cast<int>(slideTangent.size())) return Point{0.0, 0.0};
+
+    const Point &t = slideTangent[v];
+    if (isOnCurve(v)) {
+        // The tangential part of the step, read as an arc length, divided by
+        // the speed the parameter runs at to become a parameter step. First
+        // order in du -- the curve's own curvature is not corrected for -- but
+        // the node still lands exactly on the curve, and a Newton relaxation
+        // takes the length it did not travel on its next sweep.
+        double speed = 0.0;
+        const Point tc = curveTangent(v, curveParam[v], &speed);
+        if (!(speed > 0.0)) return Point{0.0, 0.0};
+        const double u = clampParameter(v, curveParam[v] + dotP(tc, displacement) / speed);
+        if (newParam) *newParam = u;
+        return curvePoint(v, u) - vertices[v];
     }
-    return displacement;
+    return t * dotP(t, displacement);
 }
 
 bool QuadMesh::markFeatureEdge(int edge) {
@@ -559,6 +741,7 @@ void QuadMesh::pinVertex(int v) {
 void QuadMesh::unpinAll() {
     pinned.assign(vertices.size(), false);
     classifyNodes();
+    buildFeatureCurves();
     computeSlideTangents();
 }
 

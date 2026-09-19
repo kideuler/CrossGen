@@ -44,16 +44,31 @@
 //
 // Whatever `QuadMesh::nodeType` says, through `QuadMesh::projectStep`: interior
 // nodes take their full 2-D Newton step, nodes on a smooth stretch of dS or of
-// a material interface slide along the feature polyline, corners, junctions,
-// caller pins and one anchor per otherwise-free feature loop do not move at
-// all. `slideTangent` is refreshed immediately before each node's own solve,
-// which is what makes a sliding node stay exactly on its segment even after its
-// neighbours have already moved in the same sweep.
+// a material interface slide along that feature, corners, junctions, caller
+// pins and one anchor per otherwise-free feature loop do not move at all.
 //
 // Sliding matters more than it looks. Pinning the whole boundary freezes its
 // discretisation density while the interior metric pulls towards its own ideal
 // spacing, and the whole mismatch lands in the one ring of elements touching
 // the boundary. See QuadMesh::Options::fixAllFeatureNodes.
+//
+// ## Sliding on a curve
+//
+// A feature node's degree of freedom is the **parameter** of the curve it sits
+// on (QuadMesh::Options::curveSource, the default), not a direction in the
+// plane. The local Newton system is still solved in the plane and still
+// restricted to the tangent, but what comes out is read as an arc length,
+// divided by |C'(u)| to become a step in u, and the node is placed at C(u + du)
+// -- so it is on the curve after the step, and after every halving of the step
+// the line search tries, since the backtracking halves du and not a chord.
+//
+// The alternative, and what this did before, is to move along the chord through
+// the node's two feature neighbours, refreshing that chord before each node's
+// own solve. That keeps the enclosed area exact but leaves the node one
+// sagitta off the feature every time, always on the inside of a turn: a
+// discretised circle relaxes towards its own inscribed polygon and keeps
+// going. It is still available (CurveChord) and is what the area invariant in
+// the Report below is written for.
 //
 // ## Untangling
 //
@@ -223,6 +238,21 @@ public:
         int movableNodes = 0;           // free + sliding
         int freeNodes = 0, slidingNodes = 0, fixedNodes = 0;
 
+        // Feature curves the mesh was bound to, how many of them are fitted
+        // splines rather than the runs' own polylines, and how many sliding
+        // nodes ride one. slidingNodes - curveNodes is how many fell back to
+        // the chord through their feature neighbours.
+        int featureCurves = 0;
+        int fittedCurves = 0;
+        int curveNodes = 0;
+        // The furthest any of those curves bows from the polyline of its own
+        // nodes, and the furthest any bound node ended up from its curve. The
+        // first is the geometry the smoother was allowed to recover; the second
+        // must be zero to rounding, and is the invariant that says the
+        // parameter and the position never came apart.
+        double curveBow = 0.0;
+        double curveDeviation = 0.0;
+
         // Energy per unit target area, so the number is comparable between
         // meshes and between targets. Both are measured with the main metric,
         // and are NaN when it is a barrier metric and the mesh is still tangled.
@@ -234,12 +264,21 @@ public:
         double worstAspectBefore = 0.0, worstAspectAfter = 0.0;
         double minAreaBefore = 0.0, minAreaAfter = 0.0;
 
-        // Total area of the mesh before and after. These should agree to
-        // rounding even when the whole boundary has redistributed, because a
-        // node sliding along the chord through its two feature neighbours moves
-        // parallel to the base of the only triangle the polygon's area depends
-        // on it through -- see QuadMesh::projectStep. A difference here is a
-        // real defect, not an accumulation of small ones.
+        // Total area of the mesh before and after.
+        //
+        // Under QuadMesh::Options::CurveChord these agree to rounding even when
+        // the whole boundary has redistributed, because a node sliding along
+        // the chord through its two feature neighbours moves parallel to the
+        // base of the only triangle the polygon's area depends on it through --
+        // see QuadMesh::projectStep -- and a difference is then a real defect
+        // rather than an accumulation of small ones.
+        //
+        // On a curve it is the curve, not the chord, that is conserved: a node
+        // moving along a discretised circle's interpolant sweeps the area
+        // between the polygon and the curve as it goes, so the mesh's area
+        // creeps towards the area the curve encloses. That is the correction
+        // being asked for, not drift; `curveDeviation` is the invariant to read
+        // instead.
         double areaBefore = 0.0, areaAfter = 0.0;
 
         // The largest distance any single node ended up from where it started,
@@ -295,7 +334,14 @@ public:
     // onto what its node type allows, capped, and backtracked until the node's
     // local energy strictly falls without inverting anything around it. Zero
     // when nothing was accepted. Leaves the mesh where it found it.
-    Point nodeStep(int v);
+    //
+    // `newParam`, when given, comes back with the curve parameter the accepted
+    // step lands on, for a node bound to a feature curve -- and with the
+    // parameter the node already has for every other node, so a caller can
+    // write it back unconditionally. Applying the displacement without it
+    // leaves the node's parameter stale and its next step wrong; moveNode()
+    // does both.
+    Point nodeStep(int v, double *newParam = nullptr);
     // The same, applied. Returns the distance moved.
     double moveNode(int v);
 

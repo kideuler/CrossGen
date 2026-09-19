@@ -159,6 +159,17 @@ double distanceToLine(const Point &p, const Point &a, const Point &b) {
     return std::fabs(cross2(d, p - a)) / L;
 }
 
+// The same to the segment rather than the whole line: what "still on the
+// polyline" means for a node that may have walked past a vertex of it.
+double distanceToSegment(const Point &p, const Point &a, const Point &b) {
+    const Point d = b - a;
+    const double L2 = dotP(d, d);
+    if (L2 <= 0.0) return normP(p - a);
+    double t = dotP(p - a, d) / L2;
+    t = std::min(std::max(t, 0.0), 1.0);
+    return normP(p - (a + d * t));
+}
+
 // ---------------------------------------------------------------------------
 // selfTest()
 // ---------------------------------------------------------------------------
@@ -581,7 +592,19 @@ int selfTest() {
     // -- 9. the annulus: rims redistribute, and stay circles ----------------
     heading("9  An annulus with unevenly spaced rims");
     {
-        mesh::QuadMesh ann = makeAnnulus(32, 4, 1.0, 2.0, 0.45);
+        const int nSeg = 32;
+        // The two figures this case is judged against. A rim node is a point of
+        // its circle whatever the smoother does with the spacing, so the area
+        // the *mesh* encloses is the inscribed nSeg-gon's -- and that is
+        // largest when the nodes are evenly spread, which is exactly what a
+        // shape metric on a rim of equal elements asks for. The sagitta is how
+        // far inside the circle the chord between two neighbouring rim nodes
+        // passes, which is the error the old chord projection left behind.
+        const double evenArea =
+            0.5 * nSeg * std::sin(2.0 * M_PI / nSeg) * (2.0 * 2.0 - 1.0 * 1.0);
+        const double sagitta = 2.0 * (1.0 - std::cos(M_PI / nSeg));
+
+        mesh::QuadMesh ann = makeAnnulus(nSeg, 4, 1.0, 2.0, 0.45);
         int anchor = -1;
         for (int v = 0; v < static_cast<int>(ann.vertices.size()); ++v)
             if (ann.nodeType[v] == mesh::QuadMesh::NodeFixed) { anchor = v; break; }
@@ -604,9 +627,18 @@ int selfTest() {
         verdict(normP(ann.vertices[anchor] - anchorAt) == 0.0,
                 "The anchor did not move a millimetre, so the rim kept its reference point");
 
-        // A rim node slides along a chord, so it drifts inside the true circle
-        // by at most the sagitta of one segment -- far less than the radius.
-        // What must not happen is a node leaving its rim altogether.
+        // Each rim is a closed feature loop with no corner on it, so it comes
+        // back as exactly one run -- from its anchor all the way round to the
+        // same anchor -- and that run is smooth enough to interpolate.
+        verdict(r.featureCurves == 2 && r.fittedCurves == 2,
+                "Each rim was bound to one interpolating curve of its own");
+        verdict(r.curveNodes == r.slidingNodes,
+                "and every sliding node rides one: none fell back to a chord");
+
+        // A node riding the interpolant of 32 points of a circle is on the
+        // circle to O(h^4), not merely within the chord's sagitta of it. This
+        // is the whole point of the change: under the chord projection the
+        // number here was the sagitta itself, and always on the inside.
         double worstInner = 0.0, worstOuter = 0.0;
         for (int v = 0; v < static_cast<int>(ann.vertices.size()); ++v) {
             if (ann.nodeType[v] == mesh::QuadMesh::NodeFree) continue;
@@ -614,26 +646,133 @@ int selfTest() {
             if (rr < 1.5) worstInner = std::max(worstInner, std::fabs(rr - 1.0));
             else worstOuter = std::max(worstOuter, std::fabs(rr - 2.0));
         }
-        const double sagitta = 2.0 * (1.0 - std::cos(M_PI / 32.0));
         std::cout << "  rim nodes drifted at most " << std::scientific << std::setprecision(2)
                   << std::max(worstInner, worstOuter) << " from their circle (one segment's "
                   << "sagitta is " << sagitta << ")" << std::defaultfloat << "\n";
-        verdict(std::max(worstInner, worstOuter) < sagitta,
-                "Every rim node is still on its own rim, within one chord's sagitta");
+        verdict(std::max(worstInner, worstOuter) < 0.05 * sagitta,
+                "Every rim node is on its circle, not merely within a chord's sagitta of it");
+        verdict(r.curveDeviation < 1e-12,
+                "and exactly on the curve it rides: parameter and position never came apart");
 
-        // The area is the one thing sliding conserves *exactly*: a node moving
-        // along the chord through its neighbours moves parallel to the base of
-        // the only triangle the enclosed area depends on it through. On a rim
-        // this curved, with nodes redistributing by a third of an edge each,
-        // any error in the projection would show up here first.
-        std::cout << "  area " << std::setprecision(12) << r.areaBefore << " -> "
-                  << r.areaAfter << std::defaultfloat << "\n";
-        verdict(std::fabs(r.areaAfter - r.areaBefore) < 1e-12 * r.areaBefore,
-                "The annulus encloses exactly the area it did before the rims moved");
+        // The area follows. Under the chord projection it was conserved to the
+        // last bit -- see the next case, which still checks that -- but what it
+        // conserved was the area of the *starting* polygon, unevenly spread
+        // nodes and all. Riding the curve, the nodes spread evenly along their
+        // circles and the mesh grows into the polygon those circles inscribe.
+        std::cout << "  area " << std::setprecision(12) << r.areaBefore << " -> " << r.areaAfter
+                  << " (evenly spread on both circles: " << evenArea << ")"
+                  << std::defaultfloat << "\n";
+        verdict(std::fabs(r.areaAfter - evenArea) < std::fabs(r.areaBefore - evenArea),
+                "The rims moved out towards their circles, not in towards their chords");
+        verdict(std::fabs(r.areaAfter - evenArea) < 1e-4 * evenArea,
+                "and stopped where 32 evenly spread points of those circles put them");
     }
 
-    // -- 10. the colouring, and the thread count ---------------------------
-    heading("10  Colouring: the answer does not depend on the thread count");
+    // -- 10. the curve layer itself ----------------------------------------
+    heading("10  What a node slides on: chord, polyline, interpolant");
+    {
+        // The same annulus under each of the three sources, so the three
+        // answers are comparable line for line.
+        const int nSeg = 32;
+
+        // How far the rim nodes of a smoothed annulus ended from their circles.
+        auto rimDrift = [](const mesh::QuadMesh &m) {
+            double worst = 0.0;
+            for (int v = 0; v < static_cast<int>(m.vertices.size()); ++v) {
+                if (m.nodeType[v] == mesh::QuadMesh::NodeFree) continue;
+                const double rr = normP(m.vertices[v]);
+                worst = std::max(worst, std::fabs(rr - (rr < 1.5 ? 1.0 : 2.0)));
+            }
+            return worst;
+        };
+
+        // CurveChord: no curves at all, and the exact-area invariant that
+        // projection is written for. A node moving along the chord through its
+        // two feature neighbours moves parallel to the base of the only
+        // triangle the enclosed area depends on it through, so the area cannot
+        // change however far the rims redistribute.
+        mesh::QuadMesh chord = makeAnnulus(nSeg, 4, 1.0, 2.0, 0.45);
+        chord.options.curveSource = mesh::QuadMesh::Options::CurveChord;
+        chord.buildTopology();
+        verdict(chord.featureCurves.empty(),
+                "CurveChord builds no curves and binds no node");
+        mesh::TMOP::Options co;
+        co.metric = mesh::TMOP::Shape002;
+        mesh::TMOP copt(chord, co);
+        copt.run();
+        const mesh::TMOP::Report &cr = copt.getReport();
+        std::cout << "  chord: area " << std::setprecision(12) << cr.areaBefore << " -> "
+                  << cr.areaAfter << std::defaultfloat << "\n";
+        verdict(std::fabs(cr.areaAfter - cr.areaBefore) < 1e-12 * cr.areaBefore,
+                "and still encloses exactly the area it did before the rims moved");
+        // The same annulus again on its interpolants, to have the two drifts
+        // side by side rather than against a guessed fraction of a sagitta.
+        mesh::QuadMesh spline = makeAnnulus(nSeg, 4, 1.0, 2.0, 0.45);
+        mesh::TMOP sopt(spline, co);
+        sopt.run();
+        const double chordDrift = rimDrift(chord), splineDrift = rimDrift(spline);
+        std::cout << "  rim nodes ended " << std::scientific << std::setprecision(2) << chordDrift
+                  << " off their circles on chords, " << splineDrift << " on interpolants"
+                  << std::defaultfloat << "\n";
+        verdict(chordDrift > 10.0 * splineDrift,
+                "Riding the curve leaves an order of magnitude less drift than the chord does");
+
+        // CurvePolyline: the run's own polyline, as a degree-1 curve. The node
+        // rides the geometry it was handed and never leaves it -- not to the
+        // inside as the chord does, nor to the outside as the interpolant may.
+        mesh::QuadMesh poly = makeAnnulus(nSeg, 4, 1.0, 2.0, 0.45);
+        poly.options.curveSource = mesh::QuadMesh::Options::CurvePolyline;
+        poly.buildTopology();
+        const std::vector<Point> polyStart = poly.vertices;
+        verdict(poly.featureCurves.size() == 2 &&
+                    !poly.featureCurves[0].fitted && !poly.featureCurves[1].fitted,
+                "CurvePolyline binds both rims, and fits nothing");
+        bool through = true;
+        for (const mesh::QuadMesh::FeatureCurve &fc : poly.featureCurves) {
+            verdict(fc.curve.degree() == 1, "Its curve is the degree-1 spline of the run");
+            verdict(fc.closed && fc.chain.front() == fc.chain.back(),
+                    "and runs from the rim's anchor round to the same anchor");
+        }
+        for (int v = 0; v < static_cast<int>(poly.vertices.size()); ++v)
+            if (poly.isOnCurve(v))
+                through = through && normP(poly.vertices[v] -
+                                           poly.curvePoint(v, poly.curveParam[v])) < 1e-12;
+        verdict(through, "Binding moved no node: each sits on its curve at the parameter it was given");
+
+        mesh::TMOP popt(poly, co);
+        popt.run();
+        // Every node is still on the polyline it started on: its distance to
+        // the nearest of that rim's original segments is zero to rounding.
+        double offPolyline = 0.0;
+        for (int v = 0; v < static_cast<int>(poly.vertices.size()); ++v) {
+            if (!poly.isOnCurve(v)) continue;
+            const std::vector<int> &chain = poly.featureCurves[poly.curveOf[v]].chain;
+            double best = std::numeric_limits<double>::infinity();
+            for (std::size_t i = 0; i + 1 < chain.size(); ++i)
+                best = std::min(best, distanceToSegment(poly.vertices[v], polyStart[chain[i]],
+                                                        polyStart[chain[i + 1]]));
+            offPolyline = std::max(offPolyline, best);
+        }
+        std::cout << "  polyline: nodes ended " << std::scientific << std::setprecision(2)
+                  << offPolyline << " off the polyline they started on" << std::defaultfloat << "\n";
+        verdict(offPolyline < 1e-12,
+                "A node on a polyline stays on that polyline exactly, through its vertices");
+
+        // The guard: a curve that bows further from its own polyline than
+        // curveMaxDeviation allows is refused and the run keeps its polyline.
+        // Setting the tolerance to zero refuses every curved run, which is the
+        // mechanism, tested without having to draw a chain that rings.
+        mesh::QuadMesh strict = makeAnnulus(nSeg, 4, 1.0, 2.0, 0.45);
+        strict.options.curveMaxDeviation = 0.0;
+        strict.buildTopology();
+        bool anyFitted = false;
+        for (const mesh::QuadMesh::FeatureCurve &fc : strict.featureCurves) anyFitted |= fc.fitted;
+        verdict(strict.featureCurves.size() == 2 && !anyFitted,
+                "A run whose interpolant bows too far falls back to its polyline");
+    }
+
+    // -- 11. the colouring, and the thread count ---------------------------
+    heading("11  Colouring: the answer does not depend on the thread count");
     {
         mesh::QuadMesh a = makeGrid(20, 20, 20.0, 20.0, 0.35);
         mesh::QuadMesh b = makeGrid(20, 20, 20.0, 20.0, 0.35);
@@ -714,6 +853,9 @@ void usage(const char *argv0) {
         "  --pin-features    pin every boundary and interface node instead of sliding\n"
         "  --no-interfaces   do not treat material interfaces as features\n"
         "  --corner-angle D  the turn a feature node must make to count as a corner\n"
+        "  --curves K        what a feature node slides on: spline (the interpolant of its\n"
+        "                    smooth run, the default), polyline (the run itself, exactly),\n"
+        "                    or chord (the line through its two feature neighbours)\n"
         "  --out F.obj       write the smoothed mesh\n"
         "  --vtu F.vtu       write it with per-element quality and per-node type\n"
         "  --mfem F.mesh     write it as an MFEM mesh with materials as attributes\n";
@@ -756,6 +898,13 @@ int main(int argc, char **argv) {
         else if (a == "--pin-features")            mo.fixAllFeatureNodes = true;
         else if (a == "--no-interfaces")           mo.interfacesAreFeatures = false;
         else if (a == "--corner-angle" && i + 1 < argc) mo.cornerAngle = std::stod(argv[++i]);
+        else if (a == "--curves" && i + 1 < argc) {
+            const std::string k = argv[++i];
+            if (k == "chord")         mo.curveSource = mesh::QuadMesh::Options::CurveChord;
+            else if (k == "polyline") mo.curveSource = mesh::QuadMesh::Options::CurvePolyline;
+            else if (k == "spline")   mo.curveSource = mesh::QuadMesh::Options::CurveSpline;
+            else { std::cerr << "Unknown --curves: " << k << "\n"; usage(argv[0]); return 1; }
+        }
         else if (a == "--out" && i + 1 < argc)     objOut = argv[++i];
         else if (a == "--vtu" && i + 1 < argc)     vtuOut = argv[++i];
         else if (a == "--mfem" && i + 1 < argc)    mfemOut = argv[++i];
@@ -786,6 +935,23 @@ int main(int argc, char **argv) {
     heading("Degrees of freedom");
     std::cout << "  " << m.quality.freeNodes << " free, " << m.quality.slidingNodes
               << " sliding on a feature, " << m.quality.fixedNodes << " fixed\n";
+    if (m.featureCurves.empty()) {
+        std::cout << "  No feature curves: a sliding node moves along the chord through its "
+                  << "two feature neighbours\n";
+    } else {
+        int fitted = 0, bound = 0;
+        double bow = 0.0;
+        for (const mesh::QuadMesh::FeatureCurve &fc : m.featureCurves) {
+            if (fc.fitted) ++fitted;
+            bow = std::max(bow, fc.deviation);
+        }
+        for (int v = 0; v < static_cast<int>(m.curveOf.size()); ++v)
+            if (m.isOnCurve(v)) ++bound;
+        std::cout << "  " << m.featureCurves.size() << " feature curve(s), " << fitted
+                  << " of them interpolants; " << bound << " node(s) bound, bowing at most "
+                  << std::scientific << std::setprecision(2) << bow
+                  << " from their own polylines" << std::defaultfloat << "\n";
+    }
     int witness = -1;
     if (hasUnanchoredFeatureLoop(m, &witness))
         std::cout << "  " << kWarn << " a feature loop through vertex " << witness
@@ -821,8 +987,18 @@ int main(int argc, char **argv) {
     verdict(r.invertedAfter == 0, "No element of the smoothed mesh is inverted");
     verdict(r.minScaledJacobianAfter >= r.minScaledJacobianBefore - 1e-12,
             "The worst element is no worse than it was");
-    verdict(std::fabs(r.areaAfter - r.areaBefore) <= 1e-9 * std::fabs(r.areaBefore),
-            "The domain has the area it started with");
+    // The area is exact only when the nodes slide along chords; on a curve the
+    // mesh grows into the curve as the boundary redistributes, and what has to
+    // hold instead is that no node ever left the curve it rides.
+    if (r.curveNodes > 0) {
+        std::cout << "  Off-curve: " << std::scientific << std::setprecision(2)
+                  << r.curveDeviation << std::defaultfloat << "\n";
+        verdict(r.curveDeviation <= 1e-9 * std::max(m.quality.meanEdge, 1e-300),
+                "Every feature node is still on the curve it slides on");
+    } else {
+        verdict(std::fabs(r.areaAfter - r.areaBefore) <= 1e-9 * std::fabs(r.areaBefore),
+                "The domain has the area it started with");
+    }
     // Not a failure. A Gauss-Seidel sweep contracts the error by a roughly
     // constant factor, so the tail is long; running out of sweeps means the
     // mesh is still improving, not that anything went wrong.

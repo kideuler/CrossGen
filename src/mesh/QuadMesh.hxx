@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdint>
 #include "Mesh.hxx"
+#include "geom/BSpline.hxx"
 
 // A standalone quadrilateral mesh, the quad counterpart of `Mesh`: positions,
 // cells, the topology derived from them, and the per-node bookkeeping a
@@ -48,6 +49,7 @@
 // | which nodes an element touches | `quads[q]` |
 // | which elements a node touches, and *at which corner* | `vertexQuads` |
 // | which nodes may move, and how | `nodeType`, `slideTangent` |
+// | the curve a feature node is confined to | `featureCurves`, `curveOf`, `curveParam` |
 // | a step legal for that node | `projectStep` |
 // | one-ring stencil for a local/Gauss-Seidel sweep | `vertexNeighbors` |
 // | current quality, to accept or reject a step | `scaledJacobian`, `quality` |
@@ -147,6 +149,53 @@ public:
         // a smoother is free to drag an element across an interface, which
         // destroys the per-element material assignment the mesh carries.
         bool interfacesAreFeatures = true;
+
+        // What a sliding node slides *on*.
+        //
+        // The three answers differ in where the node is after a step, and the
+        // difference is the whole of this setting:
+        //
+        //   * Chord takes the direction of the chord through the node's two
+        //     feature neighbours and moves along it. The node is then off the
+        //     feature by that chord's sagitta -- on a straight run, nothing; on
+        //     a discretised circle, r(1 - cos(theta/2)) *inwards*, every step,
+        //     never recovered. A rim of such nodes erodes towards its own
+        //     chords, which is the polygonalisation seen on ATLAS's meshes of
+        //     the disk models.
+        //   * Polyline binds each smooth run of the feature to its own
+        //     polyline, carried as the degree-1 B-spline geom::Polyline builds,
+        //     and moves the node in that curve's parameter. The node lands on
+        //     the input polyline exactly, however many steps it takes, and
+        //     passes through the input's own vertices rather than cutting them.
+        //     The geometry is unchanged from the mesh it was handed.
+        //   * Spline binds the run to a C2 cubic interpolating its nodes
+        //     (geom::interpolateCurve, so the curve passes through every one of
+        //     them and binding moves nothing). Between them the curve is the
+        //     smooth curve the discretisation was sampled from, so a node
+        //     sliding on it rounds a discretised circle out towards the circle
+        //     instead of in towards the polygon. **The default.**
+        //
+        // Feature corners, junctions, ends and pins are NodeFixed and are the
+        // ends of these runs, so no curve is ever fitted across a corner and
+        // none of them moves. A run whose interpolant bows further from its own
+        // polyline than curveMaxDeviation falls back to Polyline: that is the
+        // guard against a cubic ringing through a turn that cornerAngle let
+        // past.
+        enum CurveSource : std::uint8_t {
+            CurveChord    = 0,
+            CurvePolyline = 1,
+            CurveSpline   = 2
+        };
+        CurveSource curveSource = CurveSpline;
+
+        // How far a fitted curve may bow from the polyline of the same nodes,
+        // as a fraction of that run's mean segment length, before the run falls
+        // back to its polyline. A circle cut into n segments bows by about
+        // pi^2 / (2 n^2) of a segment -- 0.03 at the 15 degrees per vertex
+        // bubbles.geo asks for, and less on anything finer -- so 0.25 passes
+        // every genuinely curved run in the corpus and still refuses the
+        // overshoot a cubic makes at a 45 degree turn.
+        double curveMaxDeviation = 0.25;
     };
 
     // Element quality, computed on demand by `computeQuality()`. Nothing here
@@ -173,6 +222,21 @@ public:
         int boundaryEdges = 0;
         int boundaryLoops = 0;
         bool allCounterClockwise = false;
+    };
+
+    // One smooth run of a feature, as a curve: the geometry the sliding nodes
+    // on it are confined to. `chain` is the run's vertices in parameter order,
+    // its first and last being the NodeFixed ends that bound it -- the same
+    // vertex twice when the run is a closed loop, which is exactly the case
+    // anchorFreeFeatureLoops() guarantees by fixing one node on any feature
+    // loop that had none. So no curve here is periodic and no parameter wraps.
+    struct FeatureCurve {
+        geom::BSplineCurve<2> curve;
+        std::vector<int> chain;
+        bool closed = false;      // chain.front() == chain.back()
+        bool fitted = false;      // an interpolating cubic, not the polyline
+        double deviation = 0.0;   // how far it bows from the chain's polyline
+        double length = 0.0;      // of that polyline
     };
 
     QuadMesh() = default;
@@ -295,6 +359,22 @@ public:
     // whether a vertex may move; this says only what it is joined to.
     std::vector<std::array<int, 2>> featureNeighborOf;
 
+    // The feature curves, one per smooth run, and the binding of the sliding
+    // nodes to them: curveOf[v] indexes featureCurves and is -1 for every node
+    // that is not bound (interior, fixed, or Options::curveSource == CurveChord),
+    // curveParam[v] is that node's parameter on its curve.
+    //
+    // The parameter is the node's degree of freedom, not a cache of its
+    // position: a bound node is moved by changing it and evaluating the curve
+    // there (setVertexParameter), which is what keeps the node on the curve to
+    // the last bit however far it travels. `vertices[v]` and
+    // `curve.evaluate(curveParam[v])` therefore agree by construction, and a
+    // caller that writes `vertices[v]` directly is expected to rebind or to
+    // stop using the curve.
+    std::vector<FeatureCurve> featureCurves;
+    std::vector<int> curveOf;
+    std::vector<double> curveParam;
+
     // ---- TMOP targets ----------------------------------------------------
 
     // Target (ideal) Jacobian W per quad, row-major as Jacobian2. The identity
@@ -317,10 +397,16 @@ public:
     // ---- construction ----------------------------------------------------
 
     // Rebuild everything derived from vertices/quads/quadMatId: edges,
-    // adjacency, boundary, loops, the CSR, features and node types. Safe to
-    // call again after the connectivity changes. A smoother that only moves
-    // vertices does not need it -- no member here depends on position except
-    // `slideTangent` and `quality`, which have their own refresh calls.
+    // adjacency, boundary, loops, the CSR, features, node types and the feature
+    // curves. Safe to call again after the connectivity changes. A smoother
+    // that only moves vertices does not need it -- no member here depends on
+    // position except `slideTangent`, `quality` and the feature curves, each of
+    // which has its own refresh call.
+    //
+    // Note that the curves are built from the positions as they are *now*: they
+    // are the geometry the mesh was handed, and rebuilding them from a mesh a
+    // smoother has already moved would let the boundary walk away one rebuild
+    // at a time. Smooth, then rebuild only if the connectivity changed.
     void buildTopology();
 
     // Reorder any quad whose signed area is negative so every element is CCW.
@@ -333,8 +419,9 @@ public:
     // A thin loop over updateSlideTangent().
     void computeSlideTangents();
 
-    // Recompute slideTangent[v] alone, in O(1), from the current positions of
-    // v's two feature neighbours.
+    // Recompute slideTangent[v] alone, in O(1): the unit tangent of v's feature
+    // curve at its current parameter when it is bound to one, and otherwise the
+    // chord through the current positions of v's two feature neighbours.
     //
     // A Gauss-Seidel sweep has to call this immediately before each node's own
     // local solve: the neighbours may already have moved earlier in the same
@@ -344,18 +431,27 @@ public:
     void updateSlideTangent(int v);
 
     // The displacement node `v` is actually allowed to take, given a
-    // displacement a solver would like it to take: zero for NodeFixed, the
-    // component along slideTangent[v] for NodeSliding, unchanged for NodeFree.
+    // displacement a solver would like it to take: zero for NodeFixed,
+    // unchanged for NodeFree, and for NodeSliding the part of it the node's
+    // constraint permits.
     //
-    // On a curved feature the chord through the two neighbours does not contain
-    // the node, so a sliding step does move it a little off the polyline -- by
-    // at most one segment's sagitta, and no further however many steps it
-    // takes, because each step starts from wherever the node then is. What the
-    // chord does give exactly is the **area**: a node moving parallel to the
-    // line through its neighbours leaves the triangle they span unchanged, and
-    // that triangle is the polygon's only dependence on the node. So the domain
-    // a sliding boundary encloses is conserved to rounding, however far the
-    // nodes redistribute along it.
+    // For a node bound to a feature curve that means travelling along the
+    // curve: the tangential part of the displacement is read as an arc length,
+    // turned into a parameter step by dividing by |C'(u)|, and the node goes to
+    // C(u + du) -- so the returned displacement is a chord of the curve, and
+    // the node lands **on** the curve rather than on its tangent. `newParam`,
+    // when given, comes back with that u + du, which is what a caller applying
+    // the step must write into curveParam[v]; setVertexParameter() does both.
+    //
+    // For an unbound sliding node (Options::CurveChord, or a run no curve could
+    // be built for) it is the component along slideTangent[v], the chord through
+    // the node's two feature neighbours. The node is then off the feature by
+    // that chord's sagitta, but the enclosed **area** is exact: a node moving
+    // parallel to the line through its neighbours leaves the triangle they span
+    // unchanged, and that triangle is the polygon's only dependence on the
+    // node. A node on a curve trades that exactness for staying on the
+    // geometry -- the area it encloses then follows the curve's, not the
+    // polyline's, which on a discretised circle is the point.
     //
     // This is the one place the mobility constraint lives, so an optimizer's
     // inner loop never re-derives it per call site. It is a post-hoc
@@ -363,7 +459,36 @@ public:
     // in the tangent direction -- the same accept-a-displacement shape the
     // hand-rolled smoothers in DiskTemplate::smooth() and
     // TORSION::relaxToKernel() already use.
-    Point projectStep(int v, const Point &displacement) const;
+    Point projectStep(int v, const Point &displacement, double *newParam = nullptr) const;
+
+    // ---- feature curves --------------------------------------------------
+
+    // Cut the feature graph into its smooth runs, build a curve for each per
+    // Options::curveSource, and bind the sliding nodes on it. Returns the
+    // number of curves built. Called by buildTopology() after classifyNodes(),
+    // and safe to call again -- it rebuilds from scratch. Does nothing but
+    // clear the binding when curveSource is CurveChord.
+    int buildFeatureCurves();
+
+    // Whether v's steps are taken on a curve rather than along a chord.
+    bool isOnCurve(int v) const {
+        return v >= 0 && v < static_cast<int>(curveOf.size()) && curveOf[v] >= 0;
+    }
+    // The point of v's curve at parameter u, and the unit tangent there with
+    // (optionally) |C'(u)|, the speed the parameter runs at. The node's own
+    // position and {0,0} for a vertex that is not bound.
+    Point curvePoint(int v, double u) const;
+    Point curveTangent(int v, double u, double *speed = nullptr) const;
+    // u brought into the domain of v's curve.
+    double clampParameter(int v, double u) const;
+    // Put a bound node at parameter u: sets curveParam[v] and vertices[v] to
+    // the curve's own evaluation there, so the node sits on the curve exactly
+    // rather than at the far end of an accumulated displacement.
+    void setVertexParameter(int v, double u);
+    // How far each bound node is from the curve it is bound to, at most. Zero
+    // to rounding on a mesh nothing has moved off its curve; this is the
+    // invariant a smoother is checked against.
+    double maxCurveDeviation() const;
 
     // Classify nodes into Free / Sliding / Fixed from the feature flags and
     // Options::cornerAngle, fill featureNeighborOf, and anchor any feature loop
@@ -555,6 +680,9 @@ private:
     // already. Run at the end of classifyNodes(); see the .cxx for why it is
     // unconditional rather than an Options flag.
     void anchorFreeFeatureLoops();
+    // The feature graph cut at every node that cannot slide: each run is
+    // [fixed, sliding..., fixed], and carries at least one sliding node.
+    std::vector<std::vector<int>> featureChains() const;
 
     // Caller-pinned vertices, kept across a rebuild so classifyNodes() can
     // re-apply them.

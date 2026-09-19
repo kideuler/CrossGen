@@ -798,6 +798,9 @@ void usage(const char *prog) {
               << "  --mesh-no-smooth      no Winslow pass on the folded blocks\n"
               << "  --mesh-tmop <n>       then TMOP (mesh::TMOP's defaults, sampled at the corners) for at\n"
               << "                        most n sweeps\n"
+              << "  --mesh-curves <k>     what a feature node slides on: spline (the interpolant of its\n"
+              << "                        run, the default), polyline (the run itself), or chord (the\n"
+              << "                        line through its two feature neighbours)\n"
               << "  --mesh-obj <f.obj>    write the mesh (after TMOP when that ran)\n";
 }
 
@@ -818,6 +821,7 @@ int main(int argc, char **argv) {
     BlockMesh::Options meshOpts;
     meshOpts.targetEdgeLength = 0.0;   // no mesh unless --mesh
     int meshTMOP = 0;
+    mesh::QuadMesh::Options meshNodeOpts;
     std::string meshOut;
 
     for (int i = 2; i < argc; ++i) {
@@ -872,6 +876,13 @@ int main(int argc, char **argv) {
         else if (a == "--mesh-max" && i + 1 < argc)       meshOpts.maxIntervals = std::stoi(argv[++i]);
         else if (a == "--mesh-no-smooth")                 meshOpts.smoothingPasses = 0;
         else if (a == "--mesh-tmop" && i + 1 < argc)      meshTMOP = std::stoi(argv[++i]);
+        else if (a == "--mesh-curves" && i + 1 < argc) {
+            const std::string k = argv[++i];
+            if (k == "chord")         meshNodeOpts.curveSource = mesh::QuadMesh::Options::CurveChord;
+            else if (k == "polyline") meshNodeOpts.curveSource = mesh::QuadMesh::Options::CurvePolyline;
+            else if (k == "spline")   meshNodeOpts.curveSource = mesh::QuadMesh::Options::CurveSpline;
+            else { std::cerr << "Unknown --mesh-curves: " << k << "\n"; usage(argv[0]); return 1; }
+        }
         else if (a == "--mesh-obj" && i + 1 < argc)       meshOut = argv[++i];
         else { std::cerr << "Unknown option: " << a << "\n"; usage(argv[0]); return 1; }
     }
@@ -1057,7 +1068,7 @@ int main(int argc, char **argv) {
         BlockMesh bm(pipe.getCover(), meshOpts);
         printMesh(bm);
         meshValid = bm.getReport().valid;
-        mesh::QuadMesh qm = mesh::QuadMesh::from(bm);
+        mesh::QuadMesh qm = mesh::QuadMesh::from(bm, meshNodeOpts);
         if (meshTMOP > 0) {
             // Sampled at the corners, as the viewer's ATLAS mode does: the
             // barrier then guards the corner Jacobians Sec. 9.1 judges an
@@ -1075,6 +1086,13 @@ int main(int argc, char **argv) {
                       << " -> " << tr.minScaledJacobianAfter << " worst, " << tr.meanScaledJacobianBefore << " -> "
                       << tr.meanScaledJacobianAfter << " mean, folds " << tr.invertedBefore << " -> "
                       << tr.invertedAfter << std::defaultfloat << "\n";
+            std::cout << "  Feature nodes: " << tr.curveNodes << " of " << tr.slidingNodes
+                      << " sliding on " << tr.featureCurves << " curve(s), " << tr.fittedCurves
+                      << " of them interpolants (bow " << std::scientific << std::setprecision(2)
+                      << tr.curveBow << ", off-curve " << tr.curveDeviation << ")"
+                      << std::defaultfloat << "\n";
+            verdict(tr.curveDeviation < 1e-9 * std::max(1.0, bm.getReport().modelExtent),
+                    "Every feature node ended on the curve it was bound to");
             verdict(improved && tr.invertedAfter == 0, "TMOP left the mesh better than it found it, nothing folded");
             // The mesh handed on is the smoothed one: it is what must not fold.
             meshValid = tr.invertedAfter == 0;
