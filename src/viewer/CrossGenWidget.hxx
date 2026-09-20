@@ -282,6 +282,15 @@ enum class PipelinePhase {
 //              corner takes out of Sec. 4's identity -- which is the cone
 //              index the pipelines would give a boundary cone there.
 //
+//   Field      Stage 1b, ReferenceField: the DualMBO cross field of either
+//              pipeline's Stage 0, solved on the input with TORSION's
+//              settings, drawn as they draw theirs -- a cross per triangle and
+//              a disk at every cone. Nothing is integrated from it: it is the
+//              prior the searches are scored against
+//              (docs/atlas_crossfield_guidance.md), so this is the one phase
+//              that shows what the layout is being asked for before any of it
+//              has been decided. ATLAS::run() solves it again for itself.
+//
 //   Carrier    Stage 2, SquareCarrier: the three-quad split of the input,
 //              valid by construction, with every vertex whose valence is not
 //              the regular one drawn as a disk in the cones' colours. On any
@@ -309,11 +318,12 @@ enum class PipelinePhase {
 enum class ATLASPhase {
     MeshOnly = 1,
     Domain   = 2,
-    Carrier  = 3,
-    Search   = 4,
-    Blocks   = 5,
-    Mesh     = 6,
-    Smoothed = 7,
+    Field    = 3,
+    Carrier  = 4,
+    Search   = 5,
+    Blocks   = 6,
+    Mesh     = 7,
+    Smoothed = 8,
 };
 
 // OASIS is a one-shot solve driven by a parameter dialog rather than a
@@ -576,6 +586,13 @@ private:
     void runATLASDomain();
     void runATLASCarrier();
 
+    // Stage 1b on its own, the same way: the reference cross field, which the
+    // search will solve again for itself. Not milliseconds -- 0.3 s median and
+    // 1.8 s worst over the corpus -- but the phase is the only place the field
+    // can be looked at, and paying for it twice keeps every ATLAS phase built
+    // from its own inputs, as the pipelines' are.
+    void runATLASField();
+
     // Stages 1 to 6, ATLAS::run(): every search, in parallel threads. Blocking,
     // and announced a frame ahead like the Ricci solve.
     void runATLAS();
@@ -828,6 +845,10 @@ private:
     // copies what it needs from the chosen cover and holds nothing of atlas_,
     // but it is meaningless without it and is cleared with it.
     std::unique_ptr<PlanarDomain>  atlasDomain_;
+    // Stage 1b, between the two: it reads the domain's interface edges, and
+    // nothing after it in the viewer reads it -- the searches inside atlas_
+    // score against atlas_'s own copy, not this one.
+    std::unique_ptr<ReferenceField> atlasField_;
     std::unique_ptr<SquareCarrier> atlasCarrier_;
     std::unique_ptr<ATLAS>         atlas_;
     std::optional<BlockMesh>       atlasMesh_;
@@ -931,6 +952,10 @@ private:
     // frame ahead; the mesh dialog, like Stage 10's, counts as asked once it
     // has opened.
     bool atlasDomainAttempted_  = false;
+    // The field solve blocks for up to a couple of seconds, so it is announced
+    // a frame ahead as run() is, and built on the frame after.
+    bool atlasFieldAnnounced_   = false;
+    bool atlasFieldAttempted_   = false;
     bool atlasCarrierAttempted_ = false;
     bool atlasAnnounced_        = false;
     bool atlasAttempted_        = false;

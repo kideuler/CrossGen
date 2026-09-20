@@ -37,7 +37,12 @@
 // search and which one won. Exit codes: 0 valid, 2 the mesh did not load, 3
 // the pipeline threw, 4 the domain failed Stage 1, 5 the carrier failed Stage
 // 2, 7 no valid cover, 8 valid but coarser than --max-blocks allows, 9 the
-// --mesh asked for folds (after TMOP, when --mesh-tmop asked for that too).
+// --mesh asked for folds (after TMOP, when --mesh-tmop asked for that too), 10
+// that mesh's worst element is below --min-sj.
+//
+// The searches are scored against a DualMBO reference cross field by default
+// (docs/atlas_crossfield_guidance.md); --field harmonic --no-signed-defects
+// --no-patch-topology is ATLAS as it was before it.
 
 #include <algorithm>
 #include <cmath>
@@ -45,6 +50,7 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -61,6 +67,9 @@ const char *kFail = "\033[31m[FAIL]\033[0m";
 const char *kWarn = "\033[33m[WARN]\033[0m";
 
 int failures = 0;
+
+// Print the reference field's diagnostics (--field-report, or a DualMBO run).
+bool showField = false;
 
 void verdict(bool ok, const std::string &what) {
     std::cout << "  " << (ok ? kPass : kFail) << " " << what << "\n";
@@ -615,6 +624,158 @@ int selfTest() {
         }
     }
 
+    // -----------------------------------------------------------------
+    heading("Case 14  The reference cross field (docs/atlas_crossfield_guidance.md)");
+    // -----------------------------------------------------------------
+    {
+        ATLAS::Options fo = quietOptions();
+        fo.field.reference = ATLAS::Options::Field::Reference::DualMBO;
+        const ReferenceField::SingularityWeights &w = fo.field.singularity;
+
+        // A rectangle turned 30 degrees: the field is its axes everywhere, so
+        // the angle conventions -- the field's, the cell's own cross, the
+        // average -- agree end to end or this fails.
+        const double a = M_PI / 6.0, ca = std::cos(a), sa = std::sin(a);
+        std::vector<Point> box;
+        for (const Point &p : std::vector<Point>{{0.0, 0.0}, {2.0, 0.0}, {2.0, 1.0}, {0.0, 1.0}}) {
+            box.push_back({ca * p[0] - sa * p[1], sa * p[0] + ca * p[1]});
+        }
+        auto rmesh = meshLoops({box}, {0}, 0.08);
+        ReferenceField F(rmesh, {}, ReferenceField::Options());
+        double rho = 0.0;
+        const double th = F.crossAt({ca * 1.0 - sa * 0.5, sa * 1.0 + ca * 0.5}, &rho);
+        std::cout << "  rotated rectangle: " << F.cones().size() << " cone(s), cross at the centre "
+                  << std::setprecision(4) << th * 180.0 / M_PI << " deg, coherence " << rho << std::setprecision(6)
+                  << ", " << F.getReport().levels << " tau level(s), " << F.getReport().seconds << " s\n";
+        check(F.built() && F.cones().empty(), "the rectangle's field has no cones");
+        check(std::fabs(th - a) < M_PI / 180.0 && rho > 0.99, "its cross at the centre is the rectangle's, 30 degrees");
+        {
+            ATLAS pipe(rmesh, fo);
+            const bool ok = pipe.run();
+            summary(pipe);
+            check(ok && pipe.hasCover() && pipe.getCover().getReport().blocks == 1, "one block with the field on");
+            if (pipe.hasCover()) {
+                const double e = F.directionEnergy(pipe.getCarrier());
+                std::cout << "  E_dir of the block " << e << "\n";
+                check(e < 1e-3, "E_dir of the block is below 1e-3: its cells follow the field");
+            }
+        }
+
+        // E_sing's matching, on hand-placed units (r0 = 0.1 of the diagonal).
+        {
+            const double r0 = w.r0 * F.diagonal();
+            auto unit = [](double x, double y, int sign, bool boundary) {
+                ReferenceField::Singularity s;
+                s.x = {x, y};
+                s.sign = sign;
+                s.boundary = boundary;
+                return s;
+            };
+            const std::vector<ReferenceField::Singularity> none, conePlus{unit(0.0, 0.0, 1, false)};
+            const double e1 = F.singularityEnergy({unit(0.2 * r0, 0.0, 1, false)}, conePlus, w);
+            const double e2 = F.singularityEnergy({unit(0.0, 0.0, 1, true)}, conePlus, w);
+            const double e3 = F.singularityEnergy(none, conePlus, w);
+            const double e4 = F.singularityEnergy({unit(0.0, 0.0, 1, false), unit(0.3 * r0, 0.0, -1, false)}, none, w);
+            const double e5 = F.singularityEnergy({unit(0.0, 0.0, -1, false)}, conePlus, w);
+            const double e6 = F.singularityEnergy({unit(0.0, 0.0, -1, true)}, none, w);
+            std::cout << "  E_sing: near " << e1 << ", pushed to dS " << e2 << ", missing " << e3 << ", dipole " << e4
+                      << ", wrong sign " << e5 << ", -1/4 on dS " << e6 << "\n";
+            check(std::fabs(e1 - 0.2 * w.wPos) < 1e-12, "a singularity 0.2 r0 from its cone costs 0.2 wPos");
+            check(std::fabs(e2 - w.wEdgePlus) < 1e-12, "a cone pushed onto dS costs wEdge+ and is not also missing");
+            check(std::fabs(e3 - w.wMissing) < 1e-12, "a cone with nothing at it costs wMissing");
+            check(std::fabs(e4 - 0.3 * w.wPos) < 1e-12, "a carrier dipole 0.3 r0 wide cancels at 0.3 wPos");
+            check(std::fabs(e5 - w.wExtra - w.wMissing) < 1e-12, "opposite signs never match");
+            check(std::fabs(e6 - w.wEdgeMinus) < 1e-12, "a -1/4 on dS costs wEdge-");
+        }
+
+        // A disk: the four cones on the diagonals (DualMBO pins the centre),
+        // the O-grid laid on them, and Sec. 4.3's invariance.
+        {
+            auto dmesh = TestHelper::createCircle(0.0, 0.0, 1.0, 0.08);
+            ATLAS pipe(dmesh, fo);
+            const bool ok = pipe.run();
+            summary(pipe);
+            const ReferenceField *D = pipe.getField();
+            check(D != nullptr, "ATLAS built the field after Stage 1");
+            if (D) {
+                int plus = 0, minus = 0;
+                double worst = 0.0, radius = 0.0;
+                for (const ReferenceField::Singularity &s : D->cones()) {
+                    (s.sign > 0 ? plus : minus)++;
+                    const double ang = std::atan2(s.x[1], s.x[0]);
+                    const double k = std::round((ang - M_PI_4) / M_PI_2);
+                    worst = std::max(worst, std::fabs(ang - M_PI_4 - k * M_PI_2));
+                    radius += normP(s.x) / 4.0;
+                }
+                std::cout << "  disk: cones +" << plus << "/-" << minus << ", worst " << worst * 180.0 / M_PI
+                          << " deg off a diagonal, mean radius " << radius << "\n";
+                check(plus == 4 && minus == 0, "four +1/4 cones");
+                check(worst < 5.0 * M_PI / 180.0, "each within 5 degrees of a diagonal");
+            }
+            check(ok && pipe.hasCover() && pipe.getCover().getReport().blocks == 5, "a five-block O-grid");
+            if (fineSearch(pipe).templates && !fineSearch(pipe).templates->getReport().attempts.empty()) {
+                const ExplicitTemplates::Attempt &at = fineSearch(pipe).templates->getReport().attempts.back();
+                check(at.accepted && at.family == "O-grid" && at.conePlaced, "Stage 3 placed the O-grid on the cones");
+                check(at.singPlus == 4 && at.edgePlus == 0 && at.edgeMinus == 0,
+                      "its four three-valent vertices are the singular ones, nothing on dS");
+            }
+            if (D && ok && pipe.hasCover()) {
+                const SquareCarrier &C = pipe.getCarrier();
+                ReferenceField::SingularityReport sr;
+                const double es = D->singularityEnergy(C, fo.field.singularity, &sr);
+                std::cout << "  E_sing " << es << ": " << sr.matched << " matched, mean " << sr.meanDistance << " r0\n";
+                check(sr.matched == 4 && sr.missing == 0 && sr.extra == 0 && es < 2.0 * w.wPos * 0.25,
+                      "every cone matched, each within a quarter of r0");
+                // The split rays on the diagonals: the four block corners on the circle.
+                double off = 0.0;
+                int onCircle = 0;
+                for (int v : pipe.getCover().getMacroVertices()) {
+                    if (!C.boundaryVertex[v]) continue;
+                    ++onCircle;
+                    const double ang = std::atan2(C.vertices[v][1], C.vertices[v][0]);
+                    const double k = std::round((ang - M_PI_4) / M_PI_2);
+                    off = std::max(off, std::fabs(ang - M_PI_4 - k * M_PI_2));
+                }
+                std::cout << "  split rays: " << onCircle << " on the circle, worst " << off * 180.0 / M_PI
+                          << " deg off a diagonal\n";
+                check(onCircle == 4 && off < 8.0 * M_PI / 180.0, "the split rays run on the diagonals");
+                // Sec. 4.3: sum over blocks of their cells' misalignment is the
+                // carrier's, whatever the cover -- which is why it is not in cost(P).
+                double byBlock = 0.0;
+                for (const BlockCover::Block &b : pipe.getCover().getBlocks()) {
+                    for (int q : b.cert.cells) byBlock += D->misalignment(C, q);
+                }
+                const double whole = D->directionEnergy(C) * D->area();
+                std::cout << "  misalignment by block " << byBlock << ", of the carrier " << whole << "\n";
+                check(std::fabs(byBlock - whole) <= 1e-9 * std::max(1.0, whole),
+                      "cover invariance: the blocks' sum is the carrier's (Sec. 4.3)");
+            }
+        }
+
+        // The half disk again: with the field, Stage 3 builds both the half
+        // O-grid and the O-grid and keeps the half O-grid on score -- the
+        // dispatch rule of Case 13, reached without being written down.
+        {
+            std::vector<Point> loop;
+            const int n = 36;
+            for (int i = 0; i <= n; ++i) loop.push_back({std::cos(M_PI * i / n), std::sin(M_PI * i / n)});
+            // At h = 0.1 Sec. 7.3's O-grid certifies on it too (at 0.08 one
+            // of its rays misses the core), so there is a choice to make.
+            auto hmesh = meshLoops({loop}, {0}, 0.1);
+            ATLAS pipe(hmesh, fo);
+            const bool ok = pipe.run();
+            summary(pipe);
+            check(ok && pipe.hasCover(), "the pipeline returns a valid blocking");
+            if (fineSearch(pipe).templates && !fineSearch(pipe).templates->getReport().attempts.empty()) {
+                const ExplicitTemplates::Attempt &at = fineSearch(pipe).templates->getReport().attempts.back();
+                std::cout << "  " << at.family << ": score " << at.score << " (E_sing " << at.eSing << ", cones +"
+                          << at.conesPlus << "/-" << at.conesMinus << "); also built: " << at.alternatives << "\n";
+                check(at.accepted && at.family == "half O-grid" && at.alternatives.find("O-grid") != std::string::npos,
+                      "both families built, the half O-grid kept on score");
+            }
+        }
+    }
+
     heading("Self-test result");
     if (failures == 0) {
         std::cout << "  " << kPass << " Every check held.\n";
@@ -677,13 +838,24 @@ void printSearch(const ATLAS::Search &s, bool chosen) {
                 std::cout << "kept (" << a.reason << ")";
             }
             std::cout << "\n";
+            if (a.scored) {
+                std::cout << "       field: cones +" << a.conesPlus << "/-" << a.conesMinus << "; template +"
+                          << a.singPlus << "/-" << a.singMinus << " inside, +" << a.edgePlus << "/-" << a.edgeMinus
+                          << " on dS; E_dir " << std::fixed << std::setprecision(4) << a.eDir << ", E_sing "
+                          << std::setprecision(2) << a.eSing << ", score " << a.score << std::defaultfloat
+                          << (a.conePlaced ? "; placed on the cones" : "");
+                if (!a.alternatives.empty()) std::cout << "; also built: " << a.alternatives;
+                std::cout << "\n";
+            }
         }
         verdict(s.templatesValid, "The carrier still validates after every replacement");
     }
     if (!s.history.empty()) {
         std::cout << "  " << std::setw(6) << "round" << std::setw(9) << "cells" << std::setw(9) << "defect"
                   << std::setw(11) << "irregular" << std::setw(12) << "candidates" << std::setw(9) << "blocks"
-                  << std::setw(10) << "rewrites" << std::setw(7) << "rings" << std::setw(9) << "sec" << "\n";
+                  << std::setw(10) << "rewrites" << std::setw(7) << "rings" << std::setw(9) << "sec";
+        if (showField) std::cout << std::setw(9) << "score" << std::setw(8) << "E_dir" << std::setw(8) << "E_sing";
+        std::cout << "\n";
         const size_t n = s.history.size();
         for (size_t k = 0; k < n; ++k) {
             // Long searches: the first rounds, the best one and the last.
@@ -695,8 +867,13 @@ void printSearch(const ATLAS::Search &s, bool chosen) {
             std::cout << "  " << std::setw(6) << r.round << std::setw(9) << r.cells << std::setw(9) << r.defect
                       << std::setw(11) << r.irregular << std::setw(12) << r.candidates << std::setw(9) << r.blocks
                       << std::setw(10) << r.committed << std::setw(7) << r.rings << std::setw(9) << std::fixed
-                      << std::setprecision(2) << r.seconds << std::defaultfloat
-                      << (r.round == s.bestRound ? "  <- best" : "") << "\n";
+                      << std::setprecision(2) << r.seconds << std::defaultfloat;
+            if (showField) {
+                std::cout << std::fixed << std::setprecision(2) << std::setw(9) << r.score << std::setprecision(3)
+                          << std::setw(8) << r.eDir << std::setprecision(2) << std::setw(8) << r.eSing
+                          << std::defaultfloat;
+            }
+            std::cout << (r.round == s.bestRound ? "  <- best" : "") << "\n";
         }
     }
     if (s.rewrite) {
@@ -705,6 +882,10 @@ void printSearch(const ATLAS::Search &s, bool chosen) {
                   << wr.gridFills << " grid, " << wr.starFills << " star); defect " << wr.defectBefore << " -> "
                   << wr.defectAfter << ", irregular " << wr.irregularBefore << " -> " << wr.irregularAfter
                   << ", cells " << wr.cellsBefore << " -> " << wr.cellsAfter << "\n";
+        if (wr.fieldChoices > 0 || wr.conePlacedStars > 0) {
+            std::cout << "  Field in the greedy rounds: " << wr.fieldChoices << " fill(s) chosen over the first "
+                      << "certified, " << wr.conePlacedStars << " star(s) centred on a cone\n";
+        }
         if (!wr.rejections.empty()) {
             std::cout << "  Rejected:";
             for (const auto &kv : wr.rejections) std::cout << " " << kv.second << " " << kv.first << ";";
@@ -718,6 +899,10 @@ void printSearch(const ATLAS::Search &s, bool chosen) {
                       << ar.energyBefore << " -> " << ar.energyAfter << ", base patches " << ar.blocksBefore
                       << " -> " << ar.blocksAfter << "; " << ar.seconds << " s" << std::defaultfloat
                       << (ar.timedOut ? " (hit the time cap)" : "") << "\n";
+            if (ar.directed > 0 || ar.conePlacedStars > 0) {
+                std::cout << "  Field-directed: " << ar.directed << " witness(es) where the field disagrees, "
+                          << ar.conePlacedStars << " star fill(s) centred on a cone\n";
+            }
         }
         verdict(s.rewritesValid, "The carrier validated after every round of rewrites");
     }
@@ -831,7 +1016,10 @@ void usage(const char *prog) {
               << "  --anneal <n>          moves of annealed search per coarse carrier, 0 = off (default 15000)\n"
               << "  --seed <n>            the annealer's random seed\n"
               << "  --realise-size <h>    fine edge length of the realisation (default: the input's mean)\n"
-              << "  --realise-sweeps <n>  TMOP sweeps on the realisation, 0 = none       (default 100)\n\n"
+              << "  --realise-sweeps <n>  TMOP sweeps on the realisation, 0 = none       (default 100)\n"
+              << "  --realisations <n>    a coarse search's layouts tried, best first, until one\n"
+              << "                        realises                                        (default 4)\n"
+              << "  --last-resort <n>     ... and up to n when no coarse search realised in those (default 16)\n\n"
               << "Output\n"
               << "  --initial <f.obj>     the Stage 2 carrier\n"
               << "  --templated <f.obj>   the chosen search's carrier after Stage 3\n"
@@ -856,7 +1044,39 @@ void usage(const char *prog) {
               << "  --mesh-curves <k>     what a feature node slides on: spline (the interpolant of its\n"
               << "                        run, the default), polyline (the run itself), or chord (the\n"
               << "                        line through its two feature neighbours)\n"
-              << "  --mesh-obj <f.obj>    write the mesh (after TMOP when that ran)\n";
+              << "  --mesh-obj <f.obj>    write the mesh (after TMOP when that ran)\n"
+              << "  --mesh-frac <f>       as --mesh, at f times the bounding-box diagonal\n\n"
+              << "The reference cross field (docs/atlas_crossfield_guidance.md)\n"
+              << "  --field <k>           dualmbo (the default): a DualMBO field on the input, scored by\n"
+              << "                        Stages 3, 5 and 6; harmonic: the annealer's old term only; none\n"
+              << "  --field-report        E_dir, E_sing and the cone match of the answer, per-search scores,\n"
+              << "                        and a SUMMARY line (a field is solved for it if the run had none)\n"
+              << "  --w-dir <w>           blocks per unit of E_dir                        (default 10)\n"
+              << "  --w-edge <w>          blocks per +1/4 defect on dS                    (default 1.5)\n"
+              << "  --w-edge-minus <w>    blocks per -1/4 defect on dS                    (default 0.25)\n"
+              << "  --w-pos <w>           an interior singularity r0 or more from its cone (default 0.5)\n"
+              << "  --w-extra <w>         an interior singularity with no cone            (default 1)\n"
+              << "  --w-missing <w>       a cone with no singularity                      (default 1)\n"
+              << "  --r0 <f>              E_sing's length scale, fraction of the diagonal (default 0.1)\n"
+              << "  --no-field-templates  Stage 3 without the field\n"
+              << "  --no-cone-placement   Stage 3: no template parameters from the cones\n"
+              << "  --no-field-choice     Stage 3: the first family that validates, not the best score\n"
+              << "  --no-field-anneal     Stage 6's annealer without the field\n"
+              << "  --no-field-greedy     Stage 6's greedy rounds without the field\n"
+              << "  --field-greedy-fine   ... and with it on the fine carrier too (default: coarse only)\n"
+              << "  --no-directed         no field-directed witnesses or cone-centred stars\n"
+              << "  --directed <f>        fraction of the annealer's witnesses the field picks (default 0.3)\n"
+              << "  --no-field-arbiter    rounds and searches compared on Stage 5's objective alone\n"
+              << "  --signed-defects <p> <m>  the annealer's weight of a +1/4 and a -1/4 boundary defect\n"
+              << "                        (default 4.5 1.5)\n"
+              << "  --greedy-signed <p> <m>  Stage 6's greedy rounds on coarse carriers: a +1/4 and a -1/4\n"
+              << "                        boundary defect against an interior one's 1 (default 1.5 0.5)\n"
+              << "  --no-signed-defects   both of the above back to the symmetric weights\n"
+              << "  --arbiter-shape <w>   the arbiter's weight on the worst carrier cell below SJ 0.35\n"
+              << "  --no-patch-topology   the annealer counts a base patch round a hole as one block, not\n"
+              << "                        the three or more it needs (as before 2026-09-19)\n"
+              << "  --min-sj <s>          exit 10 unless the --mesh (after TMOP, when that ran) has worst\n"
+              << "                        scaled Jacobian at least s\n";
 }
 
 } // namespace
@@ -878,6 +1098,9 @@ int main(int argc, char **argv) {
     int meshTMOP = 0;
     mesh::QuadMesh::Options meshNodeOpts;
     std::string meshOut;
+    bool fieldReport = false;
+    double meshFrac = 0.0;
+    double minSJ = -2.0;
 
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
@@ -915,6 +1138,8 @@ int main(int argc, char **argv) {
         else if (a == "--anneal" && i + 1 < argc)         opts.anneal.maxMoves = std::stoi(argv[++i]);
         else if (a == "--seed" && i + 1 < argc)           opts.anneal.seed = static_cast<unsigned>(std::stoul(argv[++i]));
         else if (a == "--realise-size" && i + 1 < argc)   opts.realisation.size = std::stod(argv[++i]);
+        else if (a == "--realisations" && i + 1 < argc)   opts.maxRealisations = std::stoi(argv[++i]);
+        else if (a == "--last-resort" && i + 1 < argc)    opts.maxRealisationsLastResort = std::stoi(argv[++i]);
         else if (a == "--realise-sweeps" && i + 1 < argc) opts.realisation.smoothingSweeps = std::stoi(argv[++i]);
         else if (a == "--coarse" && i + 1 < argc)         coarseOut = argv[++i];
         else if (a == "--coarse-blocks" && i + 1 < argc)  coarseBlocksOut = argv[++i];
@@ -940,6 +1165,47 @@ int main(int argc, char **argv) {
             else { std::cerr << "Unknown --mesh-curves: " << k << "\n"; usage(argv[0]); return 1; }
         }
         else if (a == "--mesh-obj" && i + 1 < argc)       meshOut = argv[++i];
+        else if (a == "--mesh-frac" && i + 1 < argc)      meshFrac = std::stod(argv[++i]);
+        else if (a == "--field" && i + 1 < argc) {
+            const std::string k = argv[++i];
+            if (k == "harmonic")     opts.field.reference = ATLAS::Options::Field::Reference::Harmonic;
+            else if (k == "dualmbo") opts.field.reference = ATLAS::Options::Field::Reference::DualMBO;
+            else if (k == "none")    opts.field.reference = ATLAS::Options::Field::Reference::None;
+            else { std::cerr << "Unknown --field: " << k << "\n"; usage(argv[0]); return 1; }
+        }
+        else if (a == "--field-report")                   fieldReport = true;
+        else if (a == "--w-dir" && i + 1 < argc)          opts.field.wDir = std::stod(argv[++i]);
+        else if (a == "--w-edge" && i + 1 < argc)         opts.field.singularity.wEdgePlus = std::stod(argv[++i]);
+        else if (a == "--w-edge-minus" && i + 1 < argc)   opts.field.singularity.wEdgeMinus = std::stod(argv[++i]);
+        else if (a == "--w-pos" && i + 1 < argc)          opts.field.singularity.wPos = std::stod(argv[++i]);
+        else if (a == "--w-extra" && i + 1 < argc)        opts.field.singularity.wExtra = std::stod(argv[++i]);
+        else if (a == "--w-missing" && i + 1 < argc)      opts.field.singularity.wMissing = std::stod(argv[++i]);
+        else if (a == "--r0" && i + 1 < argc)             opts.field.singularity.r0 = std::stod(argv[++i]);
+        else if (a == "--no-field-templates")             opts.field.templates = false;
+        else if (a == "--no-cone-placement")              opts.templates.conePlacement = false;
+        else if (a == "--no-field-choice")                opts.templates.chooseByField = false;
+        else if (a == "--no-field-anneal")                opts.field.anneal = false;
+        else if (a == "--no-field-greedy")                opts.field.greedy = false;
+        else if (a == "--field-greedy-fine")              opts.field.greedyOnFine = true;
+        else if (a == "--no-field-arbiter")               opts.field.arbiter = false;
+        else if (a == "--no-directed")                    opts.field.directedMoves = false;
+        else if (a == "--directed" && i + 1 < argc)       opts.field.directedFraction = std::stod(argv[++i]);
+        else if (a == "--signed-defects" && i + 2 < argc) {
+            opts.anneal.wBoundaryDefectPlus = std::stod(argv[++i]);
+            opts.anneal.wBoundaryDefectMinus = std::stod(argv[++i]);
+        }
+        else if (a == "--arbiter-shape" && i + 1 < argc)  opts.arbiterShape = std::stod(argv[++i]);
+        else if (a == "--patch-topology")                 opts.anneal.patchTopology = true;
+        else if (a == "--no-patch-topology")              opts.anneal.patchTopology = false;
+        else if (a == "--no-signed-defects") {
+            opts.anneal.wBoundaryDefectPlus = opts.anneal.wBoundaryDefectMinus = -1.0;
+            opts.rewrite.boundaryPlusWeight = opts.rewrite.boundaryMinusWeight = 1.0;
+        }
+        else if (a == "--min-sj" && i + 1 < argc)         minSJ = std::stod(argv[++i]);
+        else if (a == "--greedy-signed" && i + 2 < argc) {
+            opts.rewrite.boundaryPlusWeight = std::stod(argv[++i]);
+            opts.rewrite.boundaryMinusWeight = std::stod(argv[++i]);
+        }
         else { std::cerr << "Unknown option: " << a << "\n"; usage(argv[0]); return 1; }
     }
 
@@ -951,6 +1217,17 @@ int main(int argc, char **argv) {
     } catch (const std::exception &e) {
         std::cout << kFail << " Failed to load mesh: " << e.what() << "\n";
         return 2;
+    }
+
+    showField = fieldReport || opts.field.reference == ATLAS::Options::Field::Reference::DualMBO ||
+                opts.arbiterShape > 0.0;
+    if (meshFrac > 0.0 && !mesh->vertices.empty()) {
+        Point lo = mesh->vertices[0], hi = lo;
+        for (const Point &p : mesh->vertices) {
+            lo[0] = std::min(lo[0], p[0]); lo[1] = std::min(lo[1], p[1]);
+            hi[0] = std::max(hi[0], p[0]); hi[1] = std::max(hi[1], p[1]);
+        }
+        meshOpts.targetEdgeLength = meshFrac * std::hypot(hi[0] - lo[0], hi[1] - lo[1]);
     }
 
     std::cout << "ATLAS -- square-transport blocking (docs/square_transport_2d_theory_and_implementation.md)\n";
@@ -1118,12 +1395,66 @@ int main(int argc, char **argv) {
     }
 
     // ---------------------------------------------------------------------
+    // The reference field against the chosen answer (the guidance note's
+    // Sec. 2 probe). With --field harmonic|none a field is solved here for
+    // the report only; the searches never saw it.
+    std::ostringstream summary;
+    if (showField) {
+        heading("The reference cross field (docs/atlas_crossfield_guidance.md)");
+        std::unique_ptr<ReferenceField> own;
+        const ReferenceField *F = pipe.getField();
+        if (!F) {
+            std::vector<int> interfaces;
+            const PlanarDomain &D = pipe.getDomain();
+            for (int e = 0; e < static_cast<int>(D.interfaceEdge.size()); ++e) if (D.interfaceEdge[e]) interfaces.push_back(e);
+            own = std::make_unique<ReferenceField>(mesh, interfaces, opts.field.solve);
+            F = own.get();
+            std::cout << "  Solved for this report only: the searches ran without it\n";
+        }
+        const ReferenceField::Report &fr = F->getReport();
+        std::cout << "  DualMBO: " << fr.levels << " tau level(s), " << fr.steps << " MBO step(s), "
+                  << (fr.converged ? "converged" : "not converged") << ", " << std::fixed << std::setprecision(2)
+                  << fr.seconds << " s" << std::defaultfloat << "; lookup grid " << fr.gridNx << " x " << fr.gridNy << "\n";
+        std::cout << "  Cones: +" << fr.rawPlus << "/-" << fr.rawMinus << ", " << fr.dipoleUnits
+                  << " dipole(s) cancelled -> +" << fr.conesPlus << "/-" << fr.conesMinus << "\n";
+        ReferenceField::SingularityReport sr;
+        const double eDir = F->directionEnergy(C);
+        const double eSing = F->singularityEnergy(C, opts.field.singularity, &sr);
+        std::cout << "  The answer: E_dir " << std::fixed << std::setprecision(4) << eDir << " (x w_dir "
+                  << std::setprecision(1) << opts.field.wDir << " = " << std::setprecision(2) << opts.field.wDir * eDir
+                  << " block(s)), E_sing " << eSing << std::defaultfloat << "\n";
+        std::cout << "  Singular vertices: +" << sr.interiorPlus << "/-" << sr.interiorMinus << " inside, +"
+                  << sr.boundaryPlus << "/-" << sr.boundaryMinus << " on dS; " << sr.matched
+                  << " matched to a cone (mean " << std::fixed << std::setprecision(2) << sr.meanDistance
+                  << " r0), " << sr.absorbed << " cone(s) pushed to dS, " << sr.missing << " missing, "
+                  << sr.extra << " extra, " << sr.dipoles << " carrier dipole(s)" << std::defaultfloat << "\n";
+        for (int i = 0; i < pipe.numSearches(); ++i) {
+            const ATLAS::Search &sx = pipe.getSearch(i);
+            if (!sx.succeeded()) continue;
+            std::cout << "  " << sx.name << ": " << sx.finalCover()->getReport().blocks << " block(s), objective "
+                      << std::fixed << std::setprecision(2) << sx.finalCover()->getReport().objective << ", score "
+                      << sx.finalScore << " (E_dir " << std::setprecision(3) << sx.finalDir << ", E_sing "
+                      << std::setprecision(2) << sx.finalSing << ", shape " << sx.finalShape << ")"
+                      << std::defaultfloat << (i == st.chosen ? "  <- chosen" : "") << "\n";
+        }
+        summary << std::fixed << std::setprecision(4) << " eDir=" << eDir << " eSing=" << eSing
+                << " iPlus=" << sr.interiorPlus << " iMinus=" << sr.interiorMinus << " bPlus=" << sr.boundaryPlus
+                << " bMinus=" << sr.boundaryMinus << " matched=" << sr.matched << " missing=" << sr.missing
+                << " extra=" << sr.extra << " conesPlus=" << fr.conesPlus << " conesMinus=" << fr.conesMinus
+                << " fieldSec=" << fr.seconds;
+    }
+
+    // ---------------------------------------------------------------------
     bool meshValid = true;
+    double tfiWorst = 0.0, tmopWorst = 0.0;
+    int tfiFolded = -1, tmopFolded = -1;
     if (meshOpts.targetEdgeLength > 0.0) {
         heading("A quadrilateral mesh on the blocks (Secs. 11.2, 11.3)");
         BlockMesh bm(pipe.getCover(), meshOpts);
         printMesh(bm);
         meshValid = bm.getReport().valid;
+        tfiWorst = bm.getReport().minScaledJacobian;
+        tfiFolded = bm.getReport().invertedQuads;
         mesh::QuadMesh qm = mesh::QuadMesh::from(bm, meshNodeOpts);
         if (meshTMOP > 0) {
             // Sampled at the corners, as the viewer's ATLAS mode does: the
@@ -1152,6 +1483,8 @@ int main(int argc, char **argv) {
             verdict(improved && tr.invertedAfter == 0, "TMOP left the mesh better than it found it, nothing folded");
             // The mesh handed on is the smoothed one: it is what must not fold.
             meshValid = tr.invertedAfter == 0;
+            tmopWorst = tr.minScaledJacobianAfter;
+            tmopFolded = tr.invertedAfter;
         }
         if (!meshOut.empty()) {
             if (qm.writeOBJ(meshOut)) std::cout << "  Wrote the mesh to " << meshOut << "\n";
@@ -1159,9 +1492,20 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (showField) {
+        // One line for corpus sweeps.
+        std::cout << "\nSUMMARY model=" << path << " blocks=" << br.blocks << std::fixed << std::setprecision(4)
+                  << " objective=" << br.objective << " score=" << st.bestScore << " search=\"" << chosen.name
+                  << "\" carrierSJ=" << C.getReport().minScaledJacobian << summary.str();
+        if (tfiFolded >= 0) std::cout << " tfiSJ=" << tfiWorst << " tfiFolds=" << tfiFolded;
+        if (tmopFolded >= 0) std::cout << " tmopSJ=" << tmopWorst << " tmopFolds=" << tmopFolded;
+        std::cout << " searchSec=" << st.secondsSearch << " fieldStageSec=" << st.secondsField
+                  << std::defaultfloat << "\n";
+    }
+
     heading("Result");
     for (const std::string &m : st.messages) {
-        if (m.rfind("Stopping", 0) == 0 || m.rfind("Stages 4-6", 0) == 0) warn(m);
+        if (m.rfind("Stopping", 0) == 0 || m.rfind("Stages 4-6", 0) == 0 || m.rfind("Stage 1b", 0) == 0) warn(m);
     }
     if (ok) {
         if (br.singletonBlocks == br.blocks) {
@@ -1180,5 +1524,14 @@ int main(int argc, char **argv) {
         if (!coarse) return 8;
     }
     if (ok && !meshValid) return 9;
+    if (ok && minSJ > -2.0) {
+        const double worst = tmopFolded >= 0 ? tmopWorst : tfiWorst;
+        const bool good = tfiFolded >= 0 && worst >= minSJ;
+        std::ostringstream os;
+        os << "The mesh's worst scaled Jacobian " << std::fixed << std::setprecision(3) << worst << " is at least "
+           << minSJ << " (--min-sj)";
+        verdict(good, os.str());
+        if (!good) return 10;
+    }
     return ok ? 0 : 7;
 }

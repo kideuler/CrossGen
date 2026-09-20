@@ -202,6 +202,8 @@ add_library(PolyVector SHARED
     src/ATLAS/CavityRewrite.cxx
     src/ATLAS/CoarseDomain.hxx
     src/ATLAS/CoarseDomain.cxx
+    src/ATLAS/ReferenceField.hxx
+    src/ATLAS/ReferenceField.cxx
     src/ATLAS/Realisation.hxx
     src/ATLAS/Realisation.cxx
     src/ATLAS/BlockMesh.hxx
@@ -605,6 +607,17 @@ foreach(ATLAS_CASE "singlemat/geom007 30" "singlemat/geom021 20" "singlemat/geom
              COMMAND TestATLAS ${CMAKE_CURRENT_SOURCE_DIR}/data/meshes/${ATLAS_MODEL}.obj --max-blocks ${ATLAS_MAX})
     set_tests_properties(ATLAS_Coarse_${ATLAS_CASE_NAME} PROPERTIES TIMEOUT 600)
 endforeach()
+
+# The reference cross field (docs/atlas_crossfield_guidance.md). geom025, a
+# rounded plate with a V notch, is where ATLAS put three of the field's four
+# interior +1/4 cones on the arcs as block corners: 4 blocks, each corner one
+# cell spanning pi, TMOP worst 0.25-0.36 over three seeds. With the field and
+# the sign-aware boundary defects the cones stay inside: 12 blocks, TMOP worst
+# 0.82-0.85. Exit 8 above 16 blocks, 10 below 0.6.
+add_test(NAME ATLAS_Field_singlemat_geom025
+         COMMAND TestATLAS ${CMAKE_CURRENT_SOURCE_DIR}/data/meshes/singlemat/geom025.obj
+                 --max-blocks 16 --mesh-frac 0.025 --mesh-tmop 100 --min-sj 0.6)
+set_tests_properties(ATLAS_Field_singlemat_geom025 PROPERTIES TIMEOUT 600)
 
 # End-to-end on a single- and a multi-material model. The exit code is the
 # validity of the blocking, which the fine fallback also satisfies; how coarse

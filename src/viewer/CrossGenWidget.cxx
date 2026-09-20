@@ -130,7 +130,8 @@ PipelinePhase nextPipelinePhase(PipelinePhase p) {
 ATLASPhase nextATLASPhase(ATLASPhase p) {
     switch (p) {
         case ATLASPhase::MeshOnly: return ATLASPhase::Domain;
-        case ATLASPhase::Domain:   return ATLASPhase::Carrier;
+        case ATLASPhase::Domain:   return ATLASPhase::Field;
+        case ATLASPhase::Field:    return ATLASPhase::Carrier;
         case ATLASPhase::Carrier:  return ATLASPhase::Search;
         case ATLASPhase::Search:   return ATLASPhase::Blocks;
         case ATLASPhase::Blocks:   return ATLASPhase::Mesh;
@@ -228,11 +229,12 @@ const char *atlasPhaseName(ATLASPhase p) {
     switch (p) {
         case ATLASPhase::MeshOnly: return "1) mesh";
         case ATLASPhase::Domain:   return "2) planar domain (Stage 1, Sec. 1.1)";
-        case ATLASPhase::Carrier:  return "3) three-quad carrier (Stage 2, Sec. 3)";
-        case ATLASPhase::Search:   return "4) search and rewrite (Stages 3-6, Secs. 7, 8)";
-        case ATLASPhase::Blocks:   return "5) blocks on the input (Stages 4-5, Secs. 5, 6)";
-        case ATLASPhase::Mesh:     return "6) quadrilateral mesh (Secs. 11.2, 11.3)";
-        case ATLASPhase::Smoothed: return "7) TMOP smoothing (mesh::TMOP)";
+        case ATLASPhase::Field:    return "3) reference cross field (Stage 1b, guidance note Sec. 3)";
+        case ATLASPhase::Carrier:  return "4) three-quad carrier (Stage 2, Sec. 3)";
+        case ATLASPhase::Search:   return "5) search and rewrite (Stages 3-6, Secs. 7, 8)";
+        case ATLASPhase::Blocks:   return "6) blocks on the input (Stages 4-5, Secs. 5, 6)";
+        case ATLASPhase::Mesh:     return "7) quadrilateral mesh (Secs. 11.2, 11.3)";
+        case ATLASPhase::Smoothed: return "8) TMOP smoothing (mesh::TMOP)";
     }
     return "?";
 }
@@ -802,6 +804,7 @@ void CrossGenWidget::doReset() {
     atlasMesh_.reset();
     atlas_.reset();
     atlasCarrier_.reset();
+    atlasField_.reset();
     atlasDomain_.reset();
     atlasShowInitial_ = false;
     atlasMultiMaterial_ = false;
@@ -885,6 +888,8 @@ void CrossGenWidget::doReset() {
     tmopAttempted_         = false;
     disksAttempted_        = false;
     atlasDomainAttempted_  = false;
+    atlasFieldAnnounced_   = false;
+    atlasFieldAttempted_   = false;
     atlasCarrierAttempted_ = false;
     atlasAnnounced_        = false;
     atlasAttempted_        = false;
@@ -4455,6 +4460,91 @@ void CrossGenWidget::runATLASDomain() {
                  "takes out of Sec. 4's identity -- a cone's index, in the cones' colours");
 }
 
+// Stage 1b on its own: the reference cross field
+// (docs/atlas_crossfield_guidance.md, Sec. 3). The solve is either pipeline's
+// Stage 0 -- DualMBO with the orthogonal penalty, gamma = 10 and the
+// tau-continuation -- on the input mesh with the domain's interfaces as
+// aligned edges, and it is the same solve ATLAS::run() will do for itself at
+// this stage. Nothing downstream in the viewer reads what is built here: it is
+// built so that the phase has something to draw, and so that the console says
+// what the search is about to be asked for before it is asked for it.
+void CrossGenWidget::runATLASField() {
+    atlasFieldAttempted_ = true;
+    atlasField_.reset();
+    if (!atlasDomain_ || !atlasDomain_->getReport().valid) {
+        blockPipeline("Stage 1b not built", "Stage 1 did not validate the domain");
+        return;
+    }
+    const ATLAS::Options o;
+    if (o.field.reference != ATLAS::Options::Field::Reference::DualMBO) {
+        console_.log("[Field] Stage 1b: ATLAS is configured for the harmonic reference, so there is "
+                     "no DualMBO field to show; the searches score their layouts against "
+                     "CoarseDomain::crossAngle");
+        return;
+    }
+    pipelineBlocked_.clear();
+
+    std::vector<int> interfaceEdges;
+    for (int e = 0; e < static_cast<int>(atlasDomain_->interfaceEdge.size()); ++e) {
+        if (atlasDomain_->interfaceEdge[e]) interfaceEdges.push_back(e);
+    }
+    try {
+        atlasField_ = std::make_unique<ReferenceField>(mesh_, interfaceEdges, o.field.solve);
+    } catch (const std::exception &e) {
+        atlasField_.reset();
+        console_.log(std::string("[Field] Stage 1b failed: ") + e.what() +
+                     "; the searches would run without a field");
+        return;
+    }
+
+    const ReferenceField::Report &r = atlasField_->getReport();
+    for (const std::string &m : r.messages) console_.log("[Field] " + m);
+    if (!r.built) {
+        std::ostringstream oss;
+        oss << "[Field] Stage 1b: no reference field (" << r.reason
+            << "); the searches would run without one";
+        console_.log(oss.str());
+        atlasField_.reset();
+        return;
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Field] Stage 1b: DualMBO on " << r.triangles << " triangles, " << r.levels
+            << " tau level(s), " << r.steps << " step(s), " << (r.converged ? "converged" : "not converged")
+            << ", " << formatMs(1000.0 * r.seconds);
+        console_.log(oss.str());
+    }
+    {
+        // The dipole count is worth its line: a +1/-1 pair the smoothest field
+        // happens to carry leaves every region's index where it was, and a
+        // carrier asked to reproduce it would have to carry a dislocation --
+        // the defect v1 of ATLAS stalled on (CavityRewrite's header).
+        std::ostringstream oss;
+        oss << "[Field] cones: +" << r.rawPlus << " / -" << r.rawMinus << " found";
+        if (r.dipoleUnits > 0)
+            oss << ", " << r.dipoleUnits << " cancelled as dipoles -> +" << r.conesPlus << " / -" << r.conesMinus;
+        console_.log(oss.str());
+    }
+    {
+        // The scale the two terms are read on, said once here rather than at
+        // every search: E_dir is area-normalised so that the coarse carriers,
+        // their realisations and the fine one are comparable, and w_dir turns
+        // it into the annealer's unit, which is blocks.
+        std::ostringstream oss;
+        oss << "[Field] lookup grid " << r.gridNx << " x " << r.gridNy
+            << "; E_dir is area-normalised (0.01 is the whole domain about 3 degrees off) and weighted "
+            << "by w_dir = " << std::fixed << std::setprecision(1) << o.field.wDir << " block(s)";
+        console_.log(oss.str());
+    }
+    console_.log("[Field] a cross per triangle, and a disk at every cone the layout is asked to "
+                 "reproduce: blue where a valence-3 vertex belongs, red where a valence-5 one does. "
+                 "A +1/4 that ends up on the boundary instead is a block corner on a smooth arc, "
+                 "which is what E_sing's weights exist to stop. Stage 1's corners are off while "
+                 "this is drawn: a convex corner is a blue disk too, and the two would not be "
+                 "tellable apart");
+    std::cerr << "[Viewer] [Field] Stage 1b: +" << r.conesPlus << " / -" << r.conesMinus << " cone(s)\n";
+}
+
 // Stage 2 on its own: the three-quad split, which is the guaranteed incumbent.
 void CrossGenWidget::runATLASCarrier() {
     atlasCarrierAttempted_ = true;
@@ -4835,6 +4925,23 @@ void CrossGenWidget::renderATLAS() {
 
     if (matFill) viewer::drawMaterialFill(*mesh_, 0.28f);
     viewer::drawMesh(*mesh_);
+    // Stage 1b over the model, as either pipeline draws its Stage 0: the
+    // crosses first and the cones over them, so a cone is not hidden by the
+    // arms of the crosses around it.
+    //
+    // Stage 1's corners are left off while it is drawn, and that is deliberate
+    // rather than tidiness: a protected convex corner and a +1/4 cone are both
+    // drawn as a blue disk -- they are the same index, and the layout has to
+    // put a block corner at both -- so with the two layers on top of each
+    // other there is no reading which disk came from which stage. The phase
+    // before this one is the corners, and nothing in this one is anything but
+    // the field.
+    if (atlasPhase_ == ATLASPhase::Field && atlasField_) {
+        viewer::drawBoundaryEdges(*mesh_);
+        viewer::drawReferenceField(*mesh_, *atlasField_, scale_);
+        viewer::drawReferenceCones(*atlasField_, 0.5 * avgEdge_);
+        return;
+    }
     if (atlasPhase_ >= ATLASPhase::Domain && atlasDomain_) {
         viewer::drawBoundaryEdges(*mesh_);
         viewer::drawPlanarDomain(*atlasDomain_, 0.5 * avgEdge_);
@@ -5746,6 +5853,18 @@ void CrossGenWidget::runComputations() {
     // entered before its input existed.
     if (mode_ == Mode::ATLAS && atlasPhase_ >= ATLASPhase::Domain && !atlasDomainAttempted_)
         runATLASDomain();
+    // Stage 1b is the one ATLAS stage nothing downstream reads -- the searches
+    // solve their own -- so it is built only while its own phase is on screen,
+    // and skipped outright if 'c' has already carried the viewer past it.
+    if (mode_ == Mode::ATLAS && atlasPhase_ == ATLASPhase::Field && !atlasFieldAttempted_) {
+        if (!atlasFieldAnnounced_) {
+            console_.log("[Field] Stage 1b: solving the reference cross field (DualMBO, TORSION's "
+                         "Stage 0 settings); this blocks...");
+            atlasFieldAnnounced_ = true;
+        } else {
+            runATLASField();
+        }
+    }
     if (mode_ == Mode::ATLAS && atlasPhase_ >= ATLASPhase::Carrier && !atlasCarrierAttempted_)
         runATLASCarrier();
     if (mode_ == Mode::ATLAS && atlasPhase_ >= ATLASPhase::Search && !atlasAttempted_) {
@@ -7031,7 +7150,9 @@ void CrossGenWidget::drawLegends() {
     // ATLAS: the corners' key at Stage 1, the defects' at the two carrier
     // phases; none once the blocks replace the carrier.
     if (mode_ == Mode::ATLAS) {
-        if (atlasPhase_ == ATLASPhase::Domain && atlasDomain_)
+        if (atlasPhase_ == ATLASPhase::Field && atlasField_)
+            viewer::drawReferenceFieldLegend(fbw(), fbh());
+        else if (atlasPhase_ == ATLASPhase::Domain && atlasDomain_)
             viewer::drawATLASLegend(fbw(), fbh(), true);
         else if ((atlasPhase_ == ATLASPhase::Carrier && atlasCarrier_) ||
                  (atlasPhase_ == ATLASPhase::Search && atlas_ && atlas_->hasCover()))

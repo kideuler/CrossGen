@@ -12,6 +12,7 @@
 #include "ATLAS/BlockCover.hxx"
 #include "ATLAS/BlockMesh.hxx"
 #include "ATLAS/PlanarDomain.hxx"
+#include "ATLAS/ReferenceField.hxx"
 #include "ATLAS/SquareCarrier.hxx"
 #include "MERIDIAN/Arrangement.hxx"
 #include "MERIDIAN/DiskTemplate.hxx"
@@ -582,6 +583,21 @@ void drawInclusionCircles(const std::vector<DiskTemplate::Inclusion> &inclusions
 // corner takes out of Sec. 4's identity -- a convex right angle +1, a reflex
 // one -1, a straight protected vertex (an interface landing, say) 0 in grey.
 void drawPlanarDomain(const PlanarDomain &D, double radius);
+
+// Stage 1b, the one thing in ATLAS that *is* a cross field: the reference
+// DualMBO solve the searches are scored against
+// (docs/atlas_crossfield_guidance.md, Sec. 3). Drawn exactly as either
+// pipeline draws its own Stage 0 field, since it is the same solve on the same
+// mesh: a cross per triangle from u = exp(4i phi), and the cones as disks in
+// the cones' colours (+1/4 blue, -1/4 red). A cell of the carrier that ends up
+// across one of these crosses is what E_dir charges for, and a block corner
+// that ends up away from one of these disks is what E_sing charges for, so
+// this picture is the whole of what the field contributes, before any of it
+// has been spent.
+void drawReferenceField(const Mesh &m, const ReferenceField &F, double scale);
+void drawReferenceCones(const ReferenceField &F, double radius);
+// Its key, in the place the other legends take.
+void drawReferenceFieldLegend(int fbw, int fbh);
 
 // A carrier as the quad mesh it is -- edges in the colours drawQuadMesh gives
 // a mesh, a non-convex cell filled red -- and every vertex whose valence is

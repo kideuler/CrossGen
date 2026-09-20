@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <functional>
+#include <iomanip>
 #include <map>
 #include <numeric>
 #include <set>
@@ -211,7 +212,48 @@ bool ExplicitTemplates::attempt(const Region &R, Attempt &A) {
     for (int h : R.holes) for (int v : R.B.loops[h]) if (isNode(v)) ++K;
     A.corners = K;
 
+    // The region's cones, for the families' parameters and their scores.
+    regionCones_.clear();
+    if (opts_.field) {
+        std::vector<Point> outer;
+        for (int v : L) outer.push_back(C_.vertices[v]);
+        std::vector<std::vector<Point>> holes;
+        for (int h : R.holes) {
+            holes.emplace_back();
+            for (int v : R.B.loops[h]) holes.back().push_back(C_.vertices[v]);
+        }
+        regionCones_ = opts_.field->conesIn(outer, holes);
+        for (const ReferenceField::Singularity &s : regionCones_) (s.sign > 0 ? A.conesPlus : A.conesMinus)++;
+    }
+    const bool choose = opts_.field && opts_.chooseByField;
+
     std::vector<std::string> reasons;
+    auto commit = [&](const Patch &P, Attempt &trial, double minSJ) {
+        SquareCarrier::Edit ed;
+        ed.removeCells = R.cells;
+        ed.newVertices = P.newVertices;
+        ed.newOrigin = P.newOrigin;
+        ed.newSourceEdge = P.newSourceEdge;
+        ed.cells = P.cells;
+        ed.material = R.material;
+        ed.designate = P.designated;
+        ed.cellOrigin = SquareCarrier::CellOrigin::Template;
+        ed.group = group_++;
+        C_.apply({ed});
+        trial.accepted = true;
+        trial.newCells = static_cast<int>(P.cells.size());
+        trial.minScaledJacobian = minSJ;
+        trial.blocks = P.blocks;
+        A = trial;
+    };
+    // Without chooseByField a family that certifies is committed at once, in
+    // the fixed order; with it, it is kept and the order only breaks ties.
+    struct Built {
+        Patch P;
+        Attempt trial;
+        double minSJ = 0.0;
+    };
+    std::vector<Built> built;
     auto run = [&](const char *family, bool (ExplicitTemplates::*fn)(const Region &, Patch &, Attempt &)) {
         Patch P;
         Attempt trial = A;
@@ -229,22 +271,30 @@ bool ExplicitTemplates::attempt(const Region &R, Attempt &A) {
             reasons.push_back(std::string(family) + ": " + V.reason);
             return false;
         }
-        SquareCarrier::Edit ed;
-        ed.removeCells = R.cells;
-        ed.newVertices = P.newVertices;
-        ed.newOrigin = P.newOrigin;
-        ed.newSourceEdge = P.newSourceEdge;
-        ed.cells = P.cells;
-        ed.material = R.material;
-        ed.designate = P.designated;
-        ed.cellOrigin = SquareCarrier::CellOrigin::Template;
-        ed.group = group_++;
-        C_.apply({ed});
-        trial.accepted = true;
-        trial.newCells = static_cast<int>(P.cells.size());
-        trial.minScaledJacobian = V.minScaledJacobian;
-        trial.blocks = P.blocks;
-        A = trial;
+        if (opts_.field) score(R, P, trial);
+        if (!choose) {
+            commit(P, trial, V.minScaledJacobian);
+            return true;
+        }
+        built.push_back({std::move(P), trial, V.minScaledJacobian});
+        return false;
+    };
+    // The least score among the families built; the earliest on a tie.
+    auto chooseBest = [&]() {
+        if (built.empty()) return false;
+        size_t best = 0;
+        for (size_t k = 1; k < built.size(); ++k) {
+            if (built[k].trial.score < built[best].trial.score - 1e-9) best = k;
+        }
+        std::ostringstream alt;
+        alt << std::setprecision(3);
+        for (size_t k = 0; k < built.size(); ++k) {
+            if (k == best) continue;
+            if (alt.tellp() > 0) alt << "; ";
+            alt << built[k].trial.family << " " << built[k].trial.score;
+        }
+        built[best].trial.alternatives = alt.str();
+        commit(built[best].P, built[best].trial, built[best].minSJ);
         return true;
     };
 
@@ -266,7 +316,9 @@ bool ExplicitTemplates::attempt(const Region &R, Attempt &A) {
                 std::sort(fan.begin(), fan.end());
                 if (!tried.insert(fan).second) continue;
                 chords_ = fan;
+                const size_t before = built.size();
                 if (run("sections", &ExplicitTemplates::trySections)) { chords_.clear(); return true; }
+                if (built.size() > before) break;   // the first fan that certifies, as without a field
             }
             chords_.clear();
             // One reason for the whole family is enough.
@@ -278,6 +330,7 @@ bool ExplicitTemplates::attempt(const Region &R, Attempt &A) {
         // still there behind it.
         if (opts_.halfOGrids && K == 2 && run("half O-grid", &ExplicitTemplates::tryHalfOGrid)) return true;
         if (opts_.ogrids && K <= 2 && run("O-grid", &ExplicitTemplates::tryOGrid)) return true;
+        if (chooseBest()) return true;
         if (reasons.empty()) {
             std::ostringstream os;
             os << K << " corner(s), " << reflex << " reflex: no family applies";
@@ -285,6 +338,7 @@ bool ExplicitTemplates::attempt(const Region &R, Attempt &A) {
         }
     } else if (R.holes.size() == 1) {
         if (opts_.annuli && run("annulus", &ExplicitTemplates::tryAnnulus)) return true;
+        if (chooseBest()) return true;
         if (reasons.empty()) reasons.push_back("annulus: disabled");
     } else {
         std::ostringstream os;
@@ -300,6 +354,46 @@ bool ExplicitTemplates::attempt(const Region &R, Attempt &A) {
 }
 
 // ---------------------------------------------------------------------------
+// A certified template against the field, on a copy of the carrier with it
+// applied. Only the vertices whose every cell is the template's own count
+// towards E_sing: a vertex on an interface also has cells of the region across
+// it, which may still be the fine split's, and its valence says nothing about
+// this template.
+void ExplicitTemplates::score(const Region &R, const Patch &P, Attempt &A) const {
+    const ReferenceField &F = *opts_.field;
+    SquareCarrier T = C_;
+    SquareCarrier::Edit ed;
+    ed.removeCells = R.cells;
+    ed.newVertices = P.newVertices;
+    ed.newOrigin = P.newOrigin;
+    ed.newSourceEdge = P.newSourceEdge;
+    ed.cells = P.cells;
+    ed.material = R.material;
+    ed.designate = P.designated;
+    ed.cellOrigin = SquareCarrier::CellOrigin::Template;
+    const int trialGroup = 1 << 29;
+    ed.group = trialGroup;
+    T.apply({ed});
+    double m = 0.0;
+    for (int q = 0; q < T.numCells(); ++q) if (T.cellGroup[q] == trialGroup) m += F.misalignment(T, q);
+    std::vector<char> own(T.numVertices(), 0);
+    for (int v = 0; v < T.numVertices(); ++v) {
+        if (T.valence[v] == 0) continue;
+        bool all = true;
+        for (int r = T.ringPtr[v]; r < T.ringPtr[v + 1] && all; ++r) all = T.cellGroup[T.ringCell[r]] == trialGroup;
+        own[v] = all ? 1 : 0;
+    }
+    ReferenceField::SingularityReport sr;
+    A.eSing = F.singularityEnergy(ReferenceField::carrierSingularities(T, &own), regionCones_, opts_.singularity, &sr);
+    A.eDir = m / F.area();
+    A.singPlus = sr.interiorPlus;
+    A.singMinus = sr.interiorMinus;
+    A.edgePlus = sr.boundaryPlus;
+    A.edgeMinus = sr.boundaryMinus;
+    A.score = P.blocks + opts_.wDir * A.eDir + A.eSing;
+    A.scored = true;
+}
+
 bool ExplicitTemplates::arcSplittable(const std::vector<int> &ids) const {
     if (!opts_.splitBoundary) return false;
     for (size_t k = 0; k + 1 < ids.size(); ++k) {
@@ -759,7 +853,25 @@ bool ExplicitTemplates::tryStar(const Region &R, Patch &P, Attempt &A) {
     std::vector<Point> poly;
     for (int v : L) poly.push_back(C_.vertices[v]);
     Point c = CavityFill::kernelCenter(poly, CavityFill::areaCentroid(poly));
-    if (!(CavityFill::kernelDepth(poly, c) > 1e-6 * R.h)) return fail("the region is not star-shaped about any point found");
+    const double depth = CavityFill::kernelDepth(poly, c);
+    if (!(depth > 1e-6 * R.h)) return fail("the region is not star-shaped about any point found");
+    // The field's one cone of the centre's sign -- +1/4 for three blocks,
+    // -1/4 for five -- is where the centre belongs, if it is well inside the
+    // kernel (a quarter of the deepest point's depth).
+    if (opts_.field && opts_.conePlacement) {
+        const int sign = K == 3 ? 1 : -1;
+        const ReferenceField::Singularity *only = nullptr;
+        int count = 0;
+        for (const ReferenceField::Singularity &s : regionCones_) {
+            if (s.sign != sign) continue;
+            ++count;
+            only = &s;
+        }
+        if (count == 1 && CavityFill::kernelDepth(poly, only->x) > 0.25 * depth) {
+            c = only->x;
+            A.conePlaced = true;
+        }
+    }
     std::vector<int> mid;
     int center = 0;
     if (!CavityFill::star(C_, P, arc, sigma, c, Origin::Template, &mid, &center)) {
@@ -805,6 +917,31 @@ bool ExplicitTemplates::tryOGrid(const Region &R, Patch &P, Attempt &A) {
         const Point d = e1 * (sx[k] * w1) + e2 * (sy[k] * w2);
         ideal[k] = std::atan2(d[1], d[0]);
     }
+    // A region holding exactly four +1/4 cones of the field and no -1/4 is the
+    // disk-like case, and there the principal axes are degenerate: on a disk
+    // they pick the orientation by rounding. The field's cones sit on the
+    // diagonals of the cross at the centre (DualMBO::setPinDiskCenters), so
+    // they give the split rays, and the core corners go where they are.
+    std::array<Point, 4> cone;
+    bool fromCones = false;
+    if (opts_.field && opts_.conePlacement) {
+        std::vector<Point> plus;
+        int minus = 0;
+        for (const ReferenceField::Singularity &s : regionCones_) {
+            if (s.sign > 0) plus.push_back(s.x);
+            else ++minus;
+        }
+        if (plus.size() == 4 && minus == 0) {
+            std::sort(plus.begin(), plus.end(), [&](const Point &u, const Point &w) {
+                return std::atan2(u[1] - c[1], u[0] - c[0]) < std::atan2(w[1] - c[1], w[0] - c[0]);
+            });
+            for (int k = 0; k < 4; ++k) {
+                cone[k] = plus[k];
+                ideal[k] = std::atan2(plus[k][1] - c[1], plus[k][0] - c[0]);
+            }
+            fromCones = true;
+        }
+    }
     std::vector<double> theta(N);
     for (int i = 0; i < N; ++i) theta[i] = std::atan2(X[i][1] - c[1], X[i][0] - c[0]);
     auto angDist = [](double a, double b) {
@@ -812,7 +949,7 @@ bool ExplicitTemplates::tryOGrid(const Region &R, Patch &P, Attempt &A) {
         return std::min(d, 2.0 * M_PI - d);
     };
 
-    int bestI0 = -1, bestA = -1;
+    int bestI0 = -1, bestA = -1, bestRot = 0;
     double bestScore = 1e300;
     const int half = N / 2;
     for (int i0 = 0; i0 < half; ++i0) {
@@ -829,7 +966,7 @@ bool ExplicitTemplates::tryOGrid(const Region &R, Patch &P, Attempt &A) {
                     const double dd = angDist(theta[p[k]], ideal[(k + rot) % 4]);
                     s += dd * dd;
                 }
-                if (s < bestScore) { bestScore = s; bestI0 = i0; bestA = a; }
+                if (s < bestScore) { bestScore = s; bestI0 = i0; bestA = a; bestRot = rot; }
             }
         }
     }
@@ -839,9 +976,23 @@ bool ExplicitTemplates::tryOGrid(const Region &R, Patch &P, Attempt &A) {
     const int cnt[4] = {a, b, a, b};
 
     // Core corners and their convexity.
-    const double alpha = opts_.coreFraction;
+    // The core's corners go on the split rays -- the shells' radial
+    // certificate needs the ray through each -- at Sec. 7.3's fraction, or at
+    // the cones' mean radius. One fraction for all four: taking each corner
+    // from its own cone skews the core, and on bubbles' disks that cost 0.707
+    // -> 0.60 in the template's worst cell for nothing E_sing can see.
+    double alpha = opts_.coreFraction;
+    if (fromCones) {
+        double f = 0.0;
+        for (int k = 0; k < 4; ++k) {
+            const double r = normP(X[p[k]] - c);
+            f += r > 0.0 ? normP(cone[(k + bestRot) % 4] - c) / r / 4.0 : alpha / 4.0;
+        }
+        alpha = std::clamp(f, 0.3, 0.75);
+    }
     std::array<Point, 4> q;
     for (int k = 0; k < 4; ++k) q[k] = c + (X[p[k]] - c) * alpha;
+    A.conePlaced = fromCones;
     for (int k = 0; k < 4; ++k) {
         if (!(cross2(q[(k + 1) % 4] - q[k], q[(k + 3) % 4] - q[k]) > 0.0)) return fail("the core quadrilateral is not convex");
     }
@@ -1061,7 +1212,32 @@ bool ExplicitTemplates::tryHalfOGrid(const Region &R, Patch &P, Attempt &A) {
         w1m = std::max(w1m, -dotP(d, e));
         w2 = std::max(w2, dotP(d, nrm));
     }
-    const double ideal2 = std::atan2(w2, w1p), ideal1 = M_PI - std::atan2(w2, w1m);
+    double ideal2 = std::atan2(w2, w1p), ideal1 = M_PI - std::atan2(w2, w1m);
+    // A half disk's field has two +1/4 cones, the mirror image's four cut
+    // back: when the region holds exactly those, the shells split on the rays
+    // through them and the core's top corners go where they are.
+    Point coneB{0.0, 0.0}, coneA{0.0, 0.0};
+    bool fromCones = false;
+    if (opts_.field && opts_.conePlacement) {
+        std::vector<Point> plus;
+        int minus = 0;
+        for (const ReferenceField::Singularity &s : regionCones_) {
+            if (s.sign > 0) plus.push_back(s.x);
+            else ++minus;
+        }
+        if (plus.size() == 2 && minus == 0) {
+            if (dotP(plus[0] - c, e) < dotP(plus[1] - c, e)) std::swap(plus[0], plus[1]);
+            const Point dB = plus[0] - c, dA = plus[1] - c;
+            if (dotP(dB, e) > 0.0 && dotP(dA, e) < 0.0 && dotP(dB, nrm) > 0.0 && dotP(dA, nrm) > 0.0) {
+                coneB = plus[0];
+                coneA = plus[1];
+                ideal2 = std::atan2(dotP(dB, nrm), dotP(dB, e));
+                ideal1 = std::atan2(dotP(dA, nrm), dotP(dA, e));
+                fromCones = true;
+            }
+        }
+    }
+    A.conePlaced = fromCones;
     std::vector<double> ub(D + 1);
     for (int k = 0; k <= D; ++k) ub[k] = dotP(C_.vertices[base[k]] - c, e);
 
@@ -1080,12 +1256,20 @@ bool ExplicitTemplates::tryHalfOGrid(const Region &R, Patch &P, Attempt &A) {
 
     struct Split { int j2, j1, i1, i2; double cost; };
     std::vector<Split> splits;
-    const double alpha = opts_.coreFraction;
     auto nearestArc = [&](double target) {
         int best = 1;
         for (int k = 1; k < Ar; ++k) if (std::fabs(th[k] - target) < std::fabs(th[best] - target)) best = k;
         return best;
     };
+    // How far along its ray each top corner sits: Sec. 7.3's fraction, or the
+    // two cones' mean radius over the arc's there -- one fraction for both,
+    // as the O-grid's, so the core stays the mirror image's.
+    double alpha = opts_.coreFraction;
+    if (fromCones) {
+        const double RB = normP(Xa[nearestArc(ideal2)] - c), RA = normP(Xa[nearestArc(ideal1)] - c);
+        if (RB > 0.0 && RA > 0.0) alpha = std::clamp(0.5 * (normP(coneB - c) / RB + normP(coneA - c) / RA), 0.3, 0.75);
+    }
+    auto alphaAt = [&](const Point &, bool) { return alpha; };
     const int j2c = nearestArc(ideal2), j1c = nearestArc(ideal1);
     const int window = 2;
     for (int j2 = std::max(1, j2c - window); j2 <= std::min(Ar - 2, j2c + window); ++j2) {
@@ -1094,7 +1278,7 @@ bool ExplicitTemplates::tryHalfOGrid(const Region &R, Patch &P, Attempt &A) {
         j1s.insert(Ar - j2);   // |B t2| = |t1 A| with nothing inserted on the arc
         for (int j1 : j1s) {
             if (j1 <= j2 || j1 > Ar - 1) continue;
-            const Point q2 = c + (Xa[j2] - c) * alpha, q1 = c + (Xa[j1] - c) * alpha;
+            const Point q2 = c + (Xa[j2] - c) * alphaAt(Xa[j2], true), q1 = c + (Xa[j1] - c) * alphaAt(Xa[j1], false);
             const double x2 = dotP(q2 - c, e), x1 = dotP(q1 - c, e);
             if (!(x1 < 0.0 && x2 > 0.0)) continue;
             // The core's feet go under its top corners, as in the mirrored O-grid.
@@ -1151,7 +1335,7 @@ bool ExplicitTemplates::tryHalfOGrid(const Region &R, Patch &P, Attempt &A) {
         }
         auto X = [&](int id) { return Q.at(C_, id); };
         const int s1 = bA.back(), s2 = bB.front(), t2 = aR.back(), t1 = aL.front();
-        const Point q2p = c + (X(t2) - c) * alpha, q1p = c + (X(t1) - c) * alpha;
+        const Point q2p = c + (X(t2) - c) * alphaAt(X(t2), true), q1p = c + (X(t1) - c) * alphaAt(X(t1), false);
         const std::array<Point, 4> quad = {X(s1), X(s2), q2p, q1p};
         for (int k = 0; k < 4; ++k) {
             if (!(cross2(quad[(k + 1) % 4] - quad[k], quad[(k + 3) % 4] - quad[k]) > 0.0)) {

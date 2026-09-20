@@ -2869,6 +2869,49 @@ void drawPlanarDomain(const PlanarDomain &D, double radius) {
     }
 }
 
+// Stage 1b. The same picture drawTriangleCrossField gives a DualMBO solve, off
+// ReferenceField's own copy of u rather than the solver's: the field is kept
+// as one value per input triangle (ReferenceField::triangleValues) and the
+// lookup grid it builds on top of that is an implementation detail of the
+// averaging, not something to draw. |u| falls to 0 at a cone, and u = 0 has no
+// angle to decode, so a triangle whose value has collapsed is skipped -- the
+// gap it leaves in the crosses is where a cone is, and drawReferenceCones
+// marks it.
+void drawReferenceField(const Mesh &m, const ReferenceField &F, double scale) {
+    viewer::lineWidth(2.5f);
+    const float br = 0.45f, bg = 0.05f, bb = 0.55f; // the pipelines' dark purple
+    const Eigen::VectorXcd &u = F.triangleValues();
+    for (int t = 0; t < static_cast<int>(m.triangles.size()); ++t) {
+        if (t >= u.size()) continue;
+        if (std::abs(u[t]) < 1e-14) continue;
+        const Triangle &tri = m.triangles[t];
+        const Point &p0 = m.vertices[tri[0]];
+        const Point &p1 = m.vertices[tri[1]];
+        const Point &p2 = m.vertices[tri[2]];
+        const Point c = {(p0[0] + p1[0] + p2[0]) / 3.0, (p0[1] + p1[1] + p2[1]) / 3.0};
+        const double theta = std::arg(u[t]) / 4.0;
+        for (int k = 0; k < 4; ++k) {
+            const double angle = theta + k * M_PI_2;
+            const Point dir{std::cos(angle), std::sin(angle)};
+            drawArrow(c, dir, scale, br, bg, bb);
+        }
+    }
+}
+
+// The cones the searches are asked to reproduce, after the dipole cancellation
+// of ReferenceField::findCones. A cone is one quarter turn, so its colour is
+// the colour of index +-1 and not of +-1/4: what the carrier has to put there
+// is a vertex of valence 3 or 5, which is what those colours mean everywhere
+// else in ATLAS mode.
+void drawReferenceCones(const ReferenceField &F, double radius) {
+    if (!(radius > 0.0)) return;
+    for (const ReferenceField::Singularity &s : F.cones()) {
+        float r, g, b;
+        atlasIndexColor(s.sign > 0 ? 1 : -1, r, g, b);
+        drawDisk3D(s.x, radius, r, g, b);
+    }
+}
+
 void drawSquareCarrier(const SquareCarrier &C, float lineWidth, double radius, bool materialFill) {
     drawQuadMeshArrays(C.vertices, C.cells, C.cellMaterial, {}, lineWidth, 0.0f, materialFill);
     drawCarrierDefects(C, radius);
@@ -2955,6 +2998,53 @@ void drawATLASLegend(int fbw, int fbh, bool corners) {
     glPopMatrix();
 
     for (int i = 0; i < 4; ++i) {
+        drawTextOverlay(fbw, fbh, rows[i].label, x0 + sw + 8.0f, y0 + i * lineH + 2.0f,
+                        0.8f, 0.8f, 0.8f);
+    }
+}
+
+// Stage 1b's key. Three rows rather than the other legends' four: the field
+// itself, and a cone of each sign. The swatch for the crosses is the colour
+// drawReferenceField draws them in, so the purple in the picture is named.
+void drawReferenceFieldLegend(int fbw, int fbh) {
+    struct Row { float r, g, b; const char *label; };
+    Row rows[3];
+    rows[0] = { 0.45f, 0.05f, 0.55f, "u = exp(4i phi), one cross per triangle" };
+    atlasIndexColor(1, rows[1].r, rows[1].g, rows[1].b);
+    rows[1].label = "+1/4 cone: a valence-3 vertex is wanted here";
+    atlasIndexColor(-1, rows[2].r, rows[2].g, rows[2].b);
+    rows[2].label = "-1/4 cone: a valence-5 vertex is wanted here";
+
+    const float x0 = 20.0f;
+    const float sw = 16.0f;
+    const float lineH = 22.0f;
+    const float y0 = static_cast<float>(fbh) - 190.0f;  // where the cone legend sits
+
+    glMatrixMode(GL_PROJECTION);
+    glPushMatrix();
+    glLoadIdentity();
+    glOrtho(0, fbw, fbh, 0, -1, 1); // top-left origin
+    glMatrixMode(GL_MODELVIEW);
+    glPushMatrix();
+    glLoadIdentity();
+
+    glBegin(GL_QUADS);
+    for (int i = 0; i < 3; ++i) {
+        viewer::color3f(rows[i].r, rows[i].g, rows[i].b);
+        const float y = y0 + i * lineH;
+        glVertex2f(x0, y);
+        glVertex2f(x0 + sw, y);
+        glVertex2f(x0 + sw, y + sw);
+        glVertex2f(x0, y + sw);
+    }
+    glEnd();
+
+    glMatrixMode(GL_PROJECTION);
+    glPopMatrix();
+    glMatrixMode(GL_MODELVIEW);
+    glPopMatrix();
+
+    for (int i = 0; i < 3; ++i) {
         drawTextOverlay(fbw, fbh, rows[i].label, x0 + sw + 8.0f, y0 + i * lineH + 2.0f,
                         0.8f, 0.8f, 0.8f);
     }

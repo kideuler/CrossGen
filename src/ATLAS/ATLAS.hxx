@@ -13,6 +13,7 @@
 #include "ATLAS/PlanarDomain.hxx"
 #include "ATLAS/Realisation.hxx"
 #include "ATLAS/RectangleCertifier.hxx"
+#include "ATLAS/ReferenceField.hxx"
 #include "ATLAS/SquareCarrier.hxx"
 #include "ATLAS/SquareTransport.hxx"
 #include "mesh/Mesh.hxx"
@@ -63,6 +64,19 @@
 // always competes, so a failure of every coarse search is still a valid (fine)
 // answer, which the report says it is.
 //
+// ### A reference cross field, as a prior
+//
+// With Options::field.reference = DualMBO, Stage 1b solves DualMBO on the
+// input (ReferenceField, TORSION's Stage 0 settings) before the searches
+// start, and every search reads it: Stage 3 places O-grid, half O-grid and
+// star parameters on its cones and picks among families by score, Stage 6's
+// annealer adds wDir E_dir + E_sing to its energy and aims some of its moves
+// at where the carrier and the field disagree, and the arbiter above ranks
+// rounds, realisations and searches by objective + wDir E_dir + E_sing
+// (docs/atlas_crossfield_guidance.md). The field only ever scores states and
+// sets template parameters; every state is still certified exactly as before,
+// so Sec. 14's guarantees do not depend on it.
+//
 // The contrast with MERIDIAN and TORSION is the spec's central idea: nothing
 // here is a cross field to be integrated and quantised afterwards. The carrier
 // already is a set of valid charts with integer transitions (Sec. 2.3), every
@@ -108,8 +122,9 @@ public:
         // the best realised one wins. They and the fine search run in
         // parallel threads.
         int coarseSeeds = 2;
-        // Score the annealer's layouts against the coarse domain's reference
-        // cross field (CoarseDomain::crossAngle) as well.
+        // Score the annealer's layouts against the coarse domain's harmonic
+        // reference cross field (CoarseDomain::crossAngle) as well; only with
+        // field.reference = Harmonic below.
         bool alignToField = true;
         bool parallel = true;
         CoarseDomain::Options coarseDomain;
@@ -121,8 +136,66 @@ public:
         CavityRewrite::AnnealOptions anneal;
         Realisation::Options realisation;
         // Candidate coarse layouts tried, best objective first, until one
-        // realises on the input.
+        // realises on the input; and, only when no coarse search realised in
+        // that many, how far each goes on down its list before the fine
+        // fallback is taken.
         int maxRealisations = 4;
+        int maxRealisationsLastResort = 16;
+
+        // ---- the reference cross field (docs/atlas_crossfield_guidance.md) ----
+        struct Field {
+            // DualMBO (the default since 2026-09-19): a ReferenceField solved
+            // once after Stage 1 and read by every search, with its terms
+            // wherever the switches below put them. Harmonic: the annealer's
+            // term against CoarseDomain::crossAngle (alignToField above) and
+            // nothing else, as before the field existed. None: no field.
+            // Measured over the singlemat corpus, 3 seeds, together with the
+            // sign-aware defects and patchTopology of CavityRewrite: blocks
+            // 678 -> 690, TFI worst SJ median 0.21 -> 0.32, TMOP worst below
+            // 0.3 on 5.3 -> 3.0 models, block corners on arcs 43 -> 13
+            // (docs/atlas_crossfield_guidance.md, Sec. 11).
+            enum class Reference { Harmonic, DualMBO, None };
+            Reference reference = Reference::DualMBO;
+            ReferenceField::Options solve;
+            ReferenceField::SingularityWeights singularity;
+            // Blocks per unit of E_dir: 10 makes a layout ~9 degrees off
+            // everywhere cost one block.
+            double wDir = 10.0;
+            // Stage 3: cone-placed O-grid, half O-grid and star parameters,
+            // and the family chosen by score (ExplicitTemplates::Options).
+            bool templates = true;
+            // Stage 6: the greedy rounds' choice among a witness's certified
+            // fills, and cone-centred stars (CavityRewrite::Options::field),
+            // on the coarse searches' carriers; greedyOnFine on the fine one
+            // too. Off there by default: on the multimat fine carriers it
+            // lowered E_dir by a fifth on every model (0.41 -> 0.33 on
+            // bubbles) and raised the block count by 10-30%.
+            bool greedy = true;
+            bool greedyOnFine = false;
+            // Stage 6: the annealer's energy (CavityRewrite::AnnealOptions).
+            bool anneal = true;
+            // The field-directed witnesses and cone-centred stars (R1).
+            bool directedMoves = true;
+            double directedFraction = 0.3;
+            // Stage 5's arbiter: where ATLAS compares different carriers --
+            // the best round of a search, the order a coarse search's
+            // layouts are realised in, and the winning search -- the score is
+            // the cover's objective + wDir E_dir + E_sing. Not in the cover's
+            // own cost(P): inside one carrier every exact cover has the same
+            // per-cell sum (guidance note, Sec. 4.3).
+            bool arbiter = true;
+        };
+        Field field;
+        // The arbiter's shape term, independent of the field: wShape (s0 -
+        // SJ) / s0 for the carrier's worst cell below s0. The arbiter is
+        // otherwise blind to geometry, which is how geom016's 3-block answer
+        // with a 0.06 cell wins; the annealer has scored shape all along.
+        // 0 = off.
+        double arbiterShape = 0.0;
+        double arbiterShapeFloor = 0.35;
+        // Apply rewrite.boundaryPlusWeight / boundaryMinusWeight in the fine
+        // search's greedy rounds too, not only the coarse searches'.
+        bool signedDefectsOnFine = false;
     };
 
     struct Round {
@@ -134,6 +207,11 @@ public:
         int blocks = 0;
         int macroVertices = 0;
         double objective = 0.0;
+        // What the arbiter ranks rounds by: the objective, plus the field's
+        // terms and the shape term when they are on (Options::field.arbiter,
+        // arbiterShape); equal to the objective otherwise.
+        double score = 0.0;
+        double eDir = 0.0, eSing = 0.0, shape = 0.0;
         bool valid = false;
         int committed = 0;      // Stage 6 rewrites after this round's cover
         int rings = 0;          // Stage 6's cavity radius in this round
@@ -166,6 +244,7 @@ public:
         // objective first, when the best one does not realise.
         struct Candidate {
             double objective = 0.0;
+            double score = 0.0;
             int round = -1;
             std::shared_ptr<SquareCarrier> carrier;
             std::shared_ptr<RectangleCertifier> rects;
@@ -191,6 +270,8 @@ public:
         const RectangleCertifier *finalRects() const { return coarse ? realisedRects.get() : bestRects.get(); }
         const BlockCover *finalCover() const { return coarse ? realisedCover.get() : bestCover.get(); }
         bool succeeded() const { return finalCover() && finalCover()->getReport().valid; }
+        // The arbiter's score of the final answer, on the input domain.
+        double finalScore = 0.0, finalDir = 0.0, finalSing = 0.0, finalShape = 0.0;
 
         std::vector<std::string> messages;
         double seconds = 0.0, secondsLoop = 0.0, secondsRealisation = 0.0;
@@ -206,7 +287,9 @@ public:
         int finalCells = 0;           // cells of the carrier the chosen cover is on
         int bestBlocks = 0;
         double bestObjective = 0.0;
+        double bestScore = 0.0;       // the arbiter's, = bestObjective with no field or shape term
         double secondsStage1 = 0.0, secondsStage2 = 0.0, secondsSearch = 0.0;
+        double secondsField = 0.0;
         std::vector<std::string> messages;
     };
 
@@ -237,15 +320,25 @@ public:
     const RectangleCertifier &getRectangles() const { return *getChosen().finalRects(); }
     const BlockCover &getCover() const { return *getChosen().finalCover(); }
 
+    // The reference field, when Options::field.reference is DualMBO and it
+    // was built; null otherwise.
+    const ReferenceField *getField() const { return field_ && field_->built() ? field_.get() : nullptr; }
+
 private:
     // Stages 3-6 on s.work; fills s.history and the best/first snapshots.
     void search(Search &s, bool rewrite, int rounds, int passes, int maxRings, bool anneal);
     void runCoarse(Search &s);
+    // Realise s's layouts on the input, resuming after its earlier attempts.
+    void realise(Search &s, int maxAttempts);
+    // The arbiter's additions to a cover's objective for carrier C: the
+    // field's terms and the shape term, each 0 when switched off.
+    double arbiterTerms(const SquareCarrier &C, double *eDir, double *eSing, double *shape) const;
 
     std::shared_ptr<Mesh> mesh_;
     Options opts_;
     Status status_;
     std::unique_ptr<PlanarDomain> domain_;
+    std::shared_ptr<ReferenceField> field_;
     std::vector<std::unique_ptr<Search>> searches_;
 };
 

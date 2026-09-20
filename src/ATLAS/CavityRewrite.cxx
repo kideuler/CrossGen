@@ -65,11 +65,17 @@ void CavityRewrite::propose(const Loop &L, std::vector<Proposal> &out) {
         const int t = C_.targetValence(L.ids[u]);
         const int f1 = std::abs(L.outside[u] + 1 - t);
         const int f2 = std::abs(L.outside[u] + 2 - t);
-        const double w = L.weight.empty() ? 1.0 : L.weight[u];
         base += f2;
-        wbase += w * f2;
         delta[u] = f1 - f2;
-        wdelta[u] = w * (f1 - f2);
+        if (L.weightPlus.empty()) {
+            const double w = L.weight.empty() ? 1.0 : L.weight[u];
+            wbase += w * f2;
+            wdelta[u] = w * (f1 - f2);
+        } else {
+            const double c1 = L.cost(u, L.outside[u] + 1, t), c2 = L.cost(u, L.outside[u] + 2, t);
+            wbase += c2;
+            wdelta[u] = c1 - c2;
+        }
         cornerGeo[u] = (L.angle[u] - M_PI_2) * (L.angle[u] - M_PI_2);
         sideGeo[u] = (L.angle[u] - M_PI) * (L.angle[u] - M_PI);
         geoBase += sideGeo[u];
@@ -216,6 +222,22 @@ bool CavityRewrite::realise(const Loop &L, const Proposal &p, Patch &P) const {
     Point c = CavityFill::kernelCenter(poly, g);
     // No kernel point: the centroid, and smoothing and the certificate decide.
     if (!(CavityFill::kernelDepth(poly, c) > 0.0)) c = g;
+    // Directed moves: a cone of the star's own sign (a 3-star's centre is
+    // +1/4, a 5-star's -1/4) in the kernel is where the centre belongs.
+    if (starTargets_) {
+        const int sign = K == 3 ? 1 : (K == 5 ? -1 : 0);
+        double best = 1e300;
+        const ReferenceField::Singularity *pick = nullptr;
+        for (const ReferenceField::Singularity &s : *starTargets_) {
+            if (s.sign != sign || !(CavityFill::kernelDepth(poly, s.x) > 0.0)) continue;
+            const double d = normP(s.x - g);
+            if (d < best) { best = d; pick = &s; }
+        }
+        if (pick) {
+            c = pick->x;
+            ++conePlacedStars_;
+        }
+    }
     P.kind = "star";
     P.blocks = K;
     return CavityFill::star(C_, P, arcs, p.sigma, c, Origin::Rewrite);
@@ -227,6 +249,10 @@ bool CavityRewrite::realise(const Loop &L, const Proposal &p, Patch &P) const {
 int CavityRewrite::round(const std::vector<int> &priority) {
     const auto t0 = std::chrono::steady_clock::now();
     ++report_.rounds;
+    // A star fill's centre on a cone of its sign, as the annealer's directed
+    // moves place it (realise()).
+    starTargets_ = opts_.field && opts_.coneStars ? &opts_.field->cones() : nullptr;
+    conePlacedStars_ = 0;
     const int NV = C_.numVertices(), NQ = C_.numCells();
 
     // Witnesses: Stage 4's first, then every vertex of wrong valence, worst
@@ -241,6 +267,7 @@ int CavityRewrite::round(const std::vector<int> &priority) {
     std::stable_sort(rest.begin(), rest.end(), [&](int a, int b) { return C_.defect(a) > C_.defect(b); });
     order.insert(order.end(), rest.begin(), rest.end());
 
+    const bool signedBoundary = opts_.boundaryPlusWeight != 1.0 || opts_.boundaryMinusWeight != 1.0;
     std::vector<char> lockedV(NV, 0), lockedQ(NQ, 0);
     std::vector<int> stampQ(NQ, 0), stampV(NV, 0);
     int stamp = 0;
@@ -302,11 +329,13 @@ int CavityRewrite::round(const std::vector<int> &priority) {
             if (!B.manifold || B.loops.size() != 1) { reject("cavity is not a disk"); continue; }
             bool ok = true;
             int oldDefect = 0;
+            double oldWeighted = 0.0;
             for (int w : B.interior) {
                 if (C_.protectedVertex[w] || C_.designatedVertex[w]) { reject("protected vertex inside"); ok = false; break; }
                 if (C_.boundaryVertex[w]) { reject("domain-boundary vertex inside"); ok = false; break; }
                 if (lockedV[w]) { reject("touches a committed cavity"); ok = false; break; }
                 oldDefect += C_.defect(w);
+                oldWeighted += C_.defect(w);
             }
             if (!ok) continue;
             Loop L;
@@ -316,10 +345,21 @@ int CavityRewrite::round(const std::vector<int> &priority) {
             const int N = static_cast<int>(L.ids.size());
             L.droppable.assign(N, 0);
             L.onBoundary.assign(N, 0);
+            if (signedBoundary) {
+                L.weightPlus.assign(N, 1.0);
+                L.weightMinus.assign(N, 1.0);
+            }
             for (int u = 0; u < N; ++u) {
                 const int w = L.ids[u];
                 if (lockedV[w]) { ok = false; break; }
                 oldDefect += C_.defect(w);
+                if (signedBoundary) {
+                    if (C_.boundaryVertex[w]) {
+                        L.weightPlus[u] = opts_.boundaryPlusWeight;
+                        L.weightMinus[u] = opts_.boundaryMinusWeight;
+                    }
+                    oldWeighted += L.cost(u, C_.valence[w], C_.targetValence(w));
+                }
                 L.droppable[u] = CavityFill::droppable(C_, w, inCav) ? 1 : 0;
                 L.onBoundary[u] = C_.boundaryEdge[B.loopEdges[0][u]] ? 1 : 0;
             }
@@ -329,7 +369,7 @@ int CavityRewrite::round(const std::vector<int> &priority) {
             std::vector<Proposal> props;
             propose(L, props);
             for (Proposal &p : props) {
-                const double dE = opts_.lambdaS * (p.defect - oldDefect) +
+                const double dE = opts_.lambdaS * (signedBoundary ? p.weighted - oldWeighted : p.defect - oldDefect) +
                                   opts_.lambdaQ * (p.cells - static_cast<int>(cav.size()));
                 if (dE < -1e-9) {
                     options.push_back({dE, p.geo, static_cast<int>(cavities.size()), std::move(p)});
@@ -344,20 +384,7 @@ int CavityRewrite::round(const std::vector<int> &priority) {
             return a.geo < b.geo;
         });
 
-        int tries = 0;
-        for (const Option &o : options) {
-            if (tries++ >= opts_.realisationsPerWitness) break;
-            Patch P;
-            if (!realise(loops[o.k], o.p, P)) { reject("the boundary could not be resubdivided"); continue; }
-            ++report_.realised;
-            double oldMin = 1.0;
-            for (int q : cavities[o.k]) oldMin = std::min(oldMin, C_.minScaledJacobian(q));
-            const double floor = std::min(opts_.minScaledJacobian, oldMin);
-            const CavityFill::Verdict V =
-                CavityFill::settle(C_, cavities[o.k], P, floor, opts_.smoothingIterations);
-            if (!V.valid) { reject(V.reason); continue; }
-            ++report_.certified;
-
+        auto commit = [&](const Option &o, const Patch &P) {
             SquareCarrier::Edit ed;
             ed.removeCells = cavities[o.k];
             ed.newVertices = P.newVertices;
@@ -373,10 +400,53 @@ int CavityRewrite::round(const std::vector<int> &priority) {
             }
             ++report_.committed;
             if (o.p.kind == 0) ++report_.gridFills; else ++report_.starFills;
-            break;
+        };
+        // With a field, every certified fill among the first few is kept and
+        // the one with the least dE + fieldWeight Delta E_dir committed; the
+        // defect still has to fall (dE < 0 for every option listed).
+        struct Certified {
+            Patch P;
+            int option;
+            double total;
+        };
+        std::vector<Certified> certified;
+        int tries = 0;
+        for (int oi = 0; oi < static_cast<int>(options.size()); ++oi) {
+            const Option &o = options[oi];
+            if (tries++ >= opts_.realisationsPerWitness) break;
+            Patch P;
+            if (!realise(loops[o.k], o.p, P)) { reject("the boundary could not be resubdivided"); continue; }
+            ++report_.realised;
+            double oldMin = 1.0;
+            for (int q : cavities[o.k]) oldMin = std::min(oldMin, C_.minScaledJacobian(q));
+            const double floor = std::min(opts_.minScaledJacobian, oldMin);
+            const CavityFill::Verdict V =
+                CavityFill::settle(C_, cavities[o.k], P, floor, opts_.smoothingIterations);
+            if (!V.valid) { reject(V.reason); continue; }
+            ++report_.certified;
+            if (!opts_.field) {
+                commit(o, P);
+                break;
+            }
+            double dm = 0.0;
+            for (const auto &c : P.cells) {
+                dm += opts_.field->misalignment({P.at(C_, c[0]), P.at(C_, c[1]), P.at(C_, c[2]), P.at(C_, c[3])});
+            }
+            for (int q : cavities[o.k]) dm -= opts_.field->misalignment(C_, q);
+            certified.push_back({std::move(P), oi, o.dE + opts_.fieldWeight * dm / opts_.field->area()});
+        }
+        if (!certified.empty()) {
+            size_t best = 0;
+            for (size_t k = 1; k < certified.size(); ++k) {
+                if (certified[k].total < certified[best].total - 1e-12) best = k;
+            }
+            if (certified[best].option != 0) ++report_.fieldChoices;
+            commit(options[certified[best].option], certified[best].P);
         }
     }
 
+    starTargets_ = nullptr;
+    report_.conePlacedStars += conePlacedStars_;
     if (!edits.empty()) C_.apply(edits);
     report_.defectAfter = totalDefect();
     report_.irregularAfter = irregularCount();
@@ -437,10 +507,19 @@ bool CavityRewrite::growCavity(const std::vector<int> &seeds, int rings, const s
 }
 
 double CavityRewrite::energy(const SquareCarrier &C, const AnnealOptions &ao, int *blocks) {
-    const int nb = RectangleCertifier::basePatchCount(C);
+    int holeDeficit = 0;
+    const int nb = RectangleCertifier::basePatchCount(C, ao.patchTopology ? &holeDeficit : nullptr) + 2 * holeDeficit;
+    const bool signedBoundary = ao.wBoundaryDefectPlus >= 0.0 || ao.wBoundaryDefectMinus >= 0.0;
+    const double wPlus = ao.wBoundaryDefectPlus >= 0.0 ? ao.wBoundaryDefectPlus : ao.wBoundaryDefect;
+    const double wMinus = ao.wBoundaryDefectMinus >= 0.0 ? ao.wBoundaryDefectMinus : ao.wBoundaryDefect;
     double d = 0.0;
     for (int v = 0; v < C.numVertices(); ++v) {
         if (C.valence[v] == 0) continue;
+        if (signedBoundary && C.boundaryVertex[v]) {
+            const int t = C.targetValence(v), q = C.valence[v];
+            d += wPlus * std::max(0, t - q) + wMinus * std::max(0, q - t);
+            continue;
+        }
         d += (C.boundaryVertex[v] ? ao.wBoundaryDefect : ao.wDefect) * C.defect(v);
     }
     double shape = 0.0;
@@ -449,6 +528,13 @@ double CavityRewrite::energy(const SquareCarrier &C, const AnnealOptions &ao, in
             const double sj = C.minScaledJacobian(q);
             if (sj < ao.shapeFloor) shape += (ao.shapeFloor - sj) / ao.shapeFloor;
         }
+    }
+    if (ao.reference) {
+        // The reference field's terms, in blocks, in place of `field`'s.
+        const double E = ao.wDir * ao.reference->directionEnergy(C) +
+                         ao.reference->singularityEnergy(C, ao.singularity);
+        if (blocks) *blocks = nb;
+        return ao.wBlocks * nb + d + ao.wCells * C.numCells() + ao.wShape * shape + E;
     }
     double align = 0.0;
     if (ao.field && ao.wAlign > 0.0) {
@@ -489,6 +575,37 @@ const CavityRewrite::AnnealReport &CavityRewrite::anneal(const AnnealOptions &ao
     std::vector<Proposal> props;
     checkpoints_.clear();
     double Echeck = 1e300;
+
+    // Field-directed witnesses (R1), recomputed whenever the carrier changes:
+    // every vertex where the field and the carrier disagree -- a boundary
+    // defect, an interior singularity no cone accounts for or one far from
+    // its cone -- and, for each cone no interior singularity sits on, the
+    // interior carrier vertex nearest it.
+    const bool directed = ao.reference && ao.directedFraction > 0.0;
+    std::vector<int> directedW;
+    bool directedStale = true;
+    auto refreshDirected = [&]() {
+        directedW.clear();
+        ReferenceField::SingularityReport sr;
+        ao.reference->singularityEnergy(C_, ao.singularity, &sr);
+        directedW = sr.looseVertices;
+        for (const Point &x : sr.looseCones) {
+            int best = -1;
+            double bd = 1e300;
+            for (int w = 0; w < C_.numVertices(); ++w) {
+                if (C_.valence[w] == 0 || C_.boundaryVertex[w]) continue;
+                const double dd = normP(C_.vertices[w] - x);
+                if (dd < bd) { bd = dd; best = w; }
+            }
+            if (best >= 0) directedW.push_back(best);
+        }
+        std::sort(directedW.begin(), directedW.end());
+        directedW.erase(std::unique(directedW.begin(), directedW.end()), directedW.end());
+        directedStale = false;
+    };
+    if (directed) starTargets_ = &ao.reference->cones();
+    conePlacedStars_ = 0;
+
     for (int move = 0; move < ao.maxMoves; ++move) {
         // The best state at each quarter of the schedule, kept for a caller
         // that finds the final one cannot be realised (see ATLAS).
@@ -507,7 +624,14 @@ const CavityRewrite::AnnealReport &CavityRewrite::anneal(const AnnealOptions &ao
         // A witness: a vertex of wrong valence mostly, any vertex sometimes --
         // aligning two singularities can need a move next to neither.
         int v = -1;
-        {
+        if (directed && U(rng) < ao.directedFraction) {
+            if (directedStale) refreshDirected();
+            if (!directedW.empty()) {
+                v = directedW[std::uniform_int_distribution<int>(0, static_cast<int>(directedW.size()) - 1)(rng)];
+                ++R.directed;
+            }
+        }
+        if (v < 0) {
             std::vector<int> W;
             for (int x = 0; x < C_.numVertices(); ++x) if (C_.valence[x] > 0 && C_.defect(x) > 0) W.push_back(x);
             if (!W.empty() && U(rng) < 0.85) {
@@ -558,9 +682,25 @@ const CavityRewrite::AnnealReport &CavityRewrite::anneal(const AnnealOptions &ao
         const int N = static_cast<int>(L.ids.size());
         L.weight.assign(N, 1.0);
         double oldWeighted = 0.0;
-        for (int u = 0; u < N; ++u) {
-            L.weight[u] = C_.boundaryVertex[L.ids[u]] ? ao.wBoundaryDefect / ao.wDefect : 1.0;
-            oldWeighted += L.weight[u] * C_.defect(L.ids[u]);
+        const bool signedBoundary = ao.wBoundaryDefectPlus >= 0.0 || ao.wBoundaryDefectMinus >= 0.0;
+        if (signedBoundary) {
+            const double wp = ao.wBoundaryDefectPlus >= 0.0 ? ao.wBoundaryDefectPlus : ao.wBoundaryDefect;
+            const double wm = ao.wBoundaryDefectMinus >= 0.0 ? ao.wBoundaryDefectMinus : ao.wBoundaryDefect;
+            L.weightPlus.assign(N, 1.0);
+            L.weightMinus.assign(N, 1.0);
+            for (int u = 0; u < N; ++u) {
+                const int w = L.ids[u];
+                if (C_.boundaryVertex[w]) {
+                    L.weightPlus[u] = wp / ao.wDefect;
+                    L.weightMinus[u] = wm / ao.wDefect;
+                }
+                oldWeighted += L.cost(u, C_.valence[w], C_.targetValence(w));
+            }
+        } else {
+            for (int u = 0; u < N; ++u) {
+                L.weight[u] = C_.boundaryVertex[L.ids[u]] ? ao.wBoundaryDefect / ao.wDefect : 1.0;
+                oldWeighted += L.weight[u] * C_.defect(L.ids[u]);
+            }
         }
         {
             std::unordered_set<int> onLoop(L.ids.begin(), L.ids.end());
@@ -623,6 +763,7 @@ const CavityRewrite::AnnealReport &CavityRewrite::anneal(const AnnealOptions &ao
                 ++R.accepted;
                 C_ = std::move(trial);
                 E = E2;
+                directedStale = true;
                 if (E < Ebest - 1e-9) {
                     best = C_;
                     Ebest = E;
@@ -633,6 +774,8 @@ const CavityRewrite::AnnealReport &CavityRewrite::anneal(const AnnealOptions &ao
             break;
         }
     }
+    starTargets_ = nullptr;
+    R.conePlacedStars = conePlacedStars_;
     C_ = std::move(best);
     R.energyAfter = Ebest;
     R.blocksAfter = blocksBest;

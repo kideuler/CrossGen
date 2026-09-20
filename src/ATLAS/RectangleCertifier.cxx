@@ -274,7 +274,7 @@ std::vector<std::vector<int>> RectangleCertifier::baseComplex(const std::vector<
     return patches;
 }
 
-int RectangleCertifier::basePatchCount(const SquareCarrier &C) {
+int RectangleCertifier::basePatchCount(const SquareCarrier &C, int *holeDeficit) {
     const int NE = C.numEdges(), NV = C.numVertices(), NQ = C.numCells();
     std::vector<char> cut(NE, 0);
     for (int e = 0; e < NE; ++e) cut[e] = C.isFeatureEdge(e) ? 1 : 0;
@@ -305,14 +305,31 @@ int RectangleCertifier::basePatchCount(const SquareCarrier &C) {
     std::vector<int> seen(NQ, 0);
     int patches = 0;
     std::vector<int> stack;
+    // For the patches' Euler characteristics: the last patch that counted
+    // each edge and vertex.
+    std::vector<int> edgeMark, vertexMark;
+    if (holeDeficit) {
+        *holeDeficit = 0;
+        edgeMark.assign(NE, 0);
+        vertexMark.assign(NV, 0);
+    }
     for (int s = 0; s < NQ; ++s) {
         if (seen[s]) continue;
         ++patches;
         stack.assign(1, s);
         seen[s] = 1;
+        int F = 0, E = 0, V = 0;
         while (!stack.empty()) {
             const int q = stack.back();
             stack.pop_back();
+            ++F;
+            if (holeDeficit) {
+                for (int i = 0; i < 4; ++i) {
+                    const int e = C.cellEdges[q][i], v = C.cells[q][i];
+                    if (edgeMark[e] != patches) { edgeMark[e] = patches; ++E; }
+                    if (vertexMark[v] != patches) { vertexMark[v] = patches; ++V; }
+                }
+            }
             for (int i = 0; i < 4; ++i) {
                 const int r = C.neighbor[q][i];
                 if (r < 0 || seen[r] || cut[C.cellEdges[q][i]]) continue;
@@ -320,6 +337,7 @@ int RectangleCertifier::basePatchCount(const SquareCarrier &C) {
                 stack.push_back(r);
             }
         }
+        if (holeDeficit) *holeDeficit += std::max(0, 1 - (V - E + F));
     }
     return patches;
 }

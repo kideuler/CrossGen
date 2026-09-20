@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "ATLAS/CavityFill.hxx"
+#include "ATLAS/ReferenceField.hxx"
 #include "ATLAS/SquareCarrier.hxx"
 
 // Stage 3 of docs/square_transport_2d_theory_and_implementation.md: attempt
@@ -123,6 +124,27 @@ public:
         int smoothingIterations = 60;
         // Sec. 8.4: may subdivide domain-boundary segments to reconcile counts.
         bool splitBoundary = true;
+
+        // The reference cross field (docs/atlas_crossfield_guidance.md, Sec.
+        // 4.2), or null for none. With it every attempt records the region's
+        // cones against the template's singular vertices, and:
+        //   * conePlacement: where a family has an obvious slot for the
+        //     cones, they fill it -- an O-grid's split rays and core corners
+        //     on a region with exactly four +1/4 cones, a half O-grid's two
+        //     core corners on one with two, a star's centre on the one cone
+        //     of its sign (+1/4 for three blocks, -1/4 for five). Geometry
+        //     alone leaves these to the principal axes, which on a disk are
+        //     degenerate and pick the orientation by rounding;
+        //   * chooseByField: every family that applies is built and the one
+        //     with the least blocks + wDir E_dir + E_sing over its cells is
+        //     committed, instead of the first that validates in the fixed
+        //     order below. The half O-grid's dispatch rule is the one case of
+        //     this that was written by hand.
+        const ReferenceField *field = nullptr;
+        bool conePlacement = true;
+        bool chooseByField = true;
+        double wDir = 10.0;
+        ReferenceField::SingularityWeights singularity;
     };
 
     struct Attempt {
@@ -139,6 +161,19 @@ public:
         int splits = 0;
         double minScaledJacobian = 0.0;
         std::string maps;   // bilinear / ruled / Coons / radial / polar, per block
+        // Against the reference field, when there is one: the region's cones,
+        // the template's singular vertices (inside, and defects on dS), its
+        // E_dir (over the domain's area) and E_sing, and blocks + wDir E_dir
+        // + E_sing. A count or sign mismatch here flags a template before
+        // anyone looks at a mesh.
+        bool scored = false;
+        int conesPlus = 0, conesMinus = 0;
+        int singPlus = 0, singMinus = 0;
+        int edgePlus = 0, edgeMinus = 0;
+        double eDir = 0.0, eSing = 0.0, score = 0.0;
+        bool conePlaced = false;
+        // chooseByField: the other families that validated, with their scores.
+        std::string alternatives;
     };
 
     struct Report {
@@ -178,6 +213,10 @@ private:
     bool tryHalfOGrid(const Region &R, CavityFill::Patch &P, Attempt &A);
     bool tryAnnulus(const Region &R, CavityFill::Patch &P, Attempt &A);
 
+    // A built, certified template against the field: fills the Attempt's
+    // scored fields on a copy of the carrier with it applied.
+    void score(const Region &R, const CavityFill::Patch &P, Attempt &A) const;
+
     bool isNode(int v) const;
     // The arc's ids with `extra` collinear points inserted on its domain
     // boundary segments, longest first; empty when that is not allowed.
@@ -193,6 +232,8 @@ private:
     // trySections adds to its reflex sections: how a convex region with an
     // even number K >= 6 of corners is cut into K/2 - 1 four-sided faces.
     std::vector<std::pair<int, int>> chords_;
+    // The cones of the region being attempted (empty without a field).
+    std::vector<ReferenceField::Singularity> regionCones_;
 };
 
 #endif // __EXPLICIT_TEMPLATES_HXX__

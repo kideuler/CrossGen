@@ -33,6 +33,23 @@ bool ATLAS::run() {
         return false;
     }
 
+    // ---- Stage 1b: the reference field, shared read-only by every search ----
+    field_.reset();
+    if (opts_.field.reference == Options::Field::Reference::DualMBO) {
+        t = Clock::now();
+        std::vector<int> interfaces;
+        for (int e = 0; e < static_cast<int>(domain_->interfaceEdge.size()); ++e) {
+            if (domain_->interfaceEdge[e]) interfaces.push_back(e);
+        }
+        field_ = std::make_shared<ReferenceField>(mesh_, interfaces, opts_.field.solve);
+        status_.secondsField = since(t);
+        if (!field_->built()) {
+            status_.messages.push_back("Stage 1b: no reference field (" + field_->getReport().reason +
+                                       "); the searches run without one");
+        }
+        for (const std::string &m : field_->getReport().messages) status_.messages.push_back("Stage 1b: " + m);
+    }
+
     // ---- Stage 2, and the fine search: the guaranteed incumbent ---------------
     t = Clock::now();
     auto fine = std::make_unique<Search>();
@@ -100,16 +117,51 @@ bool ATLAS::run() {
         for (size_t i = 1; i < searches_.size(); ++i) runCoarse(*searches_[i]);
         runFine();
     }
+    // The last resort before the fine fallback: when no coarse search's first
+    // maxRealisations layouts realised, each goes on down its list. Nothing
+    // changes when any coarse search succeeded, and a fallback costs
+    // thousands of blocks (geom030 with the field: 46650, or 63 on its
+    // sixth attempt).
+    if (coarseApplies && opts_.maxRealisationsLastResort > opts_.maxRealisations) {
+        bool any = false;
+        for (size_t i = 1; i < searches_.size(); ++i) any = any || searches_[i]->succeeded();
+        if (!any) {
+            auto more = [this](size_t i) {
+                Search &s = *searches_[i];
+                if (s.best && s.coarseDomain && s.coarseDomain->valid()) {
+                    const int before = s.realisationAttempts;
+                    realise(s, opts_.maxRealisationsLastResort);
+                    if (s.succeeded()) {
+                        s.messages.push_back("Realisation: no coarse search realised in " +
+                                             std::to_string(opts_.maxRealisations) + " attempts; this one did on attempt " +
+                                             std::to_string(s.realisationAttempts) + " (last resort, from " +
+                                             std::to_string(before) + ")");
+                    }
+                }
+            };
+            if (opts_.parallel && searches_.size() > 2) {
+                std::vector<std::thread> pool;
+                for (size_t i = 1; i < searches_.size(); ++i) pool.emplace_back(more, i);
+                for (std::thread &th : pool) th.join();
+            } else {
+                for (size_t i = 1; i < searches_.size(); ++i) more(i);
+            }
+        }
+    }
     status_.secondsSearch = since(searchStart);
 
     // ---- Pick the answer ------------------------------------------------------
+    // On the arbiter's score, computed on each search's final carrier -- the
+    // realised one for a coarse search, the geometry that is meshed.
     for (int i = 0; i < numSearches(); ++i) {
-        const Search &s = *searches_[i];
+        Search &s = *searches_[i];
         if (!s.succeeded()) continue;
         const double obj = s.finalCover()->getReport().objective;
-        if (status_.chosen < 0 || obj < status_.bestObjective - 1e-9) {
+        s.finalScore = obj + arbiterTerms(*s.finalCarrier(), &s.finalDir, &s.finalSing, &s.finalShape);
+        if (status_.chosen < 0 || s.finalScore < status_.bestScore - 1e-9) {
             status_.chosen = i;
             status_.bestObjective = obj;
+            status_.bestScore = s.finalScore;
             status_.bestBlocks = s.finalCover()->getReport().blocks;
         }
     }
@@ -118,6 +170,7 @@ bool ATLAS::run() {
         if (searches_[0]->bestCover) {
             status_.chosen = 0;
             status_.bestObjective = searches_[0]->bestCover->getReport().objective;
+            status_.bestScore = status_.bestObjective;
             status_.bestBlocks = searches_[0]->bestCover->getReport().blocks;
         } else {
             return false;
@@ -158,18 +211,27 @@ void ATLAS::runCoarse(Search &s) {
         return;
     }
 
-    // ---- Realise on the input domain: the best round first -------------------
-    // A layout can be valid on the coarse proxy and still not realise -- a
-    // block that is thin where the true curve bulges into it folds -- so the
-    // other rounds' layouts are tried in order of objective until one passes
-    // validate() on the input. The report keeps the first failure's reasons.
+    realise(s, opts_.maxRealisations);
+    s.seconds = since(t0);
+}
+
+// ---------------------------------------------------------------------------
+// Realise a coarse search's layouts on the input domain, best round first.
+// A layout can be valid on the coarse proxy and still not realise -- a block
+// that is thin where the true curve bulges into it folds -- so the other
+// rounds' layouts are tried in order of score until one passes validate() on
+// the input, up to maxAttempts in all; a second call resumes where the first
+// stopped. The report keeps the first failure's reasons.
+// ---------------------------------------------------------------------------
+void ATLAS::realise(Search &s, int maxAttempts) {
     const Clock::time_point tr = Clock::now();
     std::vector<Search::Candidate> order = s.candidates;
     std::stable_sort(order.begin(), order.end(),
-                     [](const Search::Candidate &a, const Search::Candidate &b) { return a.objective < b.objective; });
-    if (order.empty()) order.push_back({0.0, s.bestRound, s.best, s.bestRects, s.bestCover});
-    for (const Search::Candidate &cand : order) {
-        if (s.realisationAttempts >= std::max(1, opts_.maxRealisations)) break;
+                     [](const Search::Candidate &a, const Search::Candidate &b) { return a.score < b.score; });
+    if (order.empty()) order.push_back({0.0, 0.0, s.bestRound, s.best, s.bestRects, s.bestCover});
+    for (size_t k = static_cast<size_t>(s.realisationAttempts); k < order.size(); ++k) {
+        const Search::Candidate &cand = order[k];
+        if (s.realisationAttempts >= std::max(1, maxAttempts)) break;
         ++s.realisationAttempts;
         auto real = std::make_unique<Realisation>(*s.coarseDomain, *cand.carrier,
                                                   cand.cover && cand.cover->getReport().valid ? cand.cover.get()
@@ -203,8 +265,7 @@ void ATLAS::runCoarse(Search &s) {
         }
         break;
     }
-    s.secondsRealisation = since(tr);
-    s.seconds = since(t0);
+    s.secondsRealisation += since(tr);
 }
 
 // ---------------------------------------------------------------------------
@@ -213,9 +274,17 @@ void ATLAS::runCoarse(Search &s) {
 void ATLAS::search(Search &s, bool rewrite, int rounds, int passes, int maxRings, bool anneal) {
     SquareCarrier &work = *s.work;
 
+    const ReferenceField *field = getField();
+
     // ---- Stage 3 ------------------------------------------------------------
     if (opts_.runTemplates) {
-        s.templates = std::make_unique<ExplicitTemplates>(work, opts_.templates);
+        ExplicitTemplates::Options to = opts_.templates;
+        if (field && opts_.field.templates) {
+            to.field = field;
+            to.wDir = opts_.field.wDir;
+            to.singularity = opts_.field.singularity;
+        }
+        s.templates = std::make_unique<ExplicitTemplates>(work, to);
         const SquareCarrier::Report &r = work.validate();
         s.templatesValid = r.valid;
         if (!r.valid) {
@@ -229,8 +298,17 @@ void ATLAS::search(Search &s, bool rewrite, int rounds, int passes, int maxRings
     // ---- Stages 4 -> 5 -> 6 ---------------------------------------------------
     const Clock::time_point loopStart = Clock::now();
     CavityRewrite::Options ro = opts_.rewrite;
+    // Sign-aware greedy weights are for coarse carriers, where a handful of
+    // moves decide where the singularities end; on a fine carrier the rounds
+    // are clearing thousands and the weights only reshuffle that (measured on
+    // the multimat corpus: blocks +-20%, TFI folds 2 -> 3 models).
+    if (!s.coarse && !opts_.signedDefectsOnFine) ro.boundaryPlusWeight = ro.boundaryMinusWeight = 1.0;
+    if (field && opts_.field.greedy && (s.coarse || opts_.field.greedyOnFine)) {
+        ro.field = field;
+        ro.fieldWeight = opts_.field.wDir / std::max(1e-9, opts_.anneal.wDefect);
+    }
     if (rewrite) s.rewrite = std::make_unique<CavityRewrite>(work, ro);
-    double bestObjective = 0.0;
+    double bestScore = 0.0;
     // Stages 4 and 5 on a snapshot of the working carrier, recorded as round
     // r; returns Stage 4's witnesses as vertices of the working carrier.
     auto evaluate = [&](int r) {
@@ -248,6 +326,7 @@ void ATLAS::search(Search &s, bool rewrite, int rounds, int passes, int maxRings
         rd.blocks = cover->getReport().blocks;
         rd.macroVertices = cover->getReport().macroVertices;
         rd.objective = cover->getReport().objective;
+        rd.score = rd.objective + arbiterTerms(*snap, &rd.eDir, &rd.eSing, &rd.shape);
         rd.valid = cover->getReport().valid;
 
         std::vector<int> priority;
@@ -263,15 +342,15 @@ void ATLAS::search(Search &s, bool rewrite, int rounds, int passes, int maxRings
             s.firstRects = rects;
             s.firstCover = cover;
         }
-        if (s.coarse && rd.valid) s.candidates.push_back({rd.objective, r, snap, rects, cover});
+        if (s.coarse && rd.valid) s.candidates.push_back({rd.objective, rd.score, r, snap, rects, cover});
         const bool better = rd.valid && (!s.bestCover || !s.bestCover->getReport().valid ||
-                                         rd.objective < bestObjective - 1e-9);
+                                         rd.score < bestScore - 1e-9);
         if (better || !s.bestCover) {
             s.best = snap;
             s.bestRects = rects;
             s.bestCover = cover;
             s.bestRound = r;
-            bestObjective = rd.objective;
+            bestScore = rd.score;
         }
         rd.seconds = since(t);
         s.history.push_back(rd);
@@ -327,9 +406,16 @@ void ATLAS::search(Search &s, bool rewrite, int rounds, int passes, int maxRings
         if (s.best) work = *s.best;
         CavityRewrite::AnnealOptions ao = opts_.anneal;
         ao.seed = s.seed;
-        if (s.coarse && s.coarseDomain && opts_.alignToField) {
+        if (opts_.field.reference == Options::Field::Reference::Harmonic && s.coarse && s.coarseDomain &&
+            opts_.alignToField) {
             const CoarseDomain *cd = s.coarseDomain.get();
             ao.field = [cd](const Point &p, double *w) { return cd->crossAngle(p, w); };
+        }
+        if (field && opts_.field.anneal) {
+            ao.reference = field;
+            ao.wDir = opts_.field.wDir;
+            ao.singularity = opts_.field.singularity;
+            ao.directedFraction = opts_.field.directedMoves ? opts_.field.directedFraction : 0.0;
         }
         s.rewrite->anneal(ao);
         const SquareCarrier::Report &rep = work.validate();
@@ -350,4 +436,27 @@ void ATLAS::search(Search &s, bool rewrite, int rounds, int passes, int maxRings
         evaluate(++r);
     }
     s.secondsLoop = since(loopStart);
+}
+
+// ---------------------------------------------------------------------------
+// The arbiter's terms beyond Stage 5's objective (docs/atlas_crossfield_
+// guidance.md, Sec. 4.3). Exactly 0 when they are off, so the comparisons
+// they enter are the objective's own.
+// ---------------------------------------------------------------------------
+double ATLAS::arbiterTerms(const SquareCarrier &C, double *eDir, double *eSing, double *shape) const {
+    double add = 0.0;
+    *eDir = *eSing = *shape = 0.0;
+    const ReferenceField *field = getField();
+    if (field && opts_.field.arbiter) {
+        *eDir = field->directionEnergy(C);
+        *eSing = field->singularityEnergy(C, opts_.field.singularity);
+        add += opts_.field.wDir * *eDir + *eSing;
+    }
+    if (opts_.arbiterShape > 0.0 && opts_.arbiterShapeFloor > 0.0) {
+        double worst = 1.0;
+        for (int q = 0; q < C.numCells(); ++q) worst = std::min(worst, C.minScaledJacobian(q));
+        *shape = std::max(0.0, (opts_.arbiterShapeFloor - worst) / opts_.arbiterShapeFloor);
+        add += opts_.arbiterShape * *shape;
+    }
+    return add;
 }

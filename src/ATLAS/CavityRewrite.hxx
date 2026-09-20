@@ -10,6 +10,7 @@
 
 #include "ATLAS/CavityFill.hxx"
 #include "ATLAS/RectangleCertifier.hxx"
+#include "ATLAS/ReferenceField.hxx"
 #include "ATLAS/SquareCarrier.hxx"
 
 // Stage 6 of docs/square_transport_2d_theory_and_implementation.md: rewrite
@@ -91,6 +92,29 @@ public:
         double maxInsertFactor = 1.0;
         double lambdaS = 1.0;
         double lambdaQ = 0.002;
+        // Sign-aware boundary defect in round()'s score (guidance note, R3),
+        // relative to an interior unit: a +1/4 on dS (too few cells, a block
+        // corner on a smooth run) and a -1/4 there. At 1 and 1 the score is
+        // the plain defect count, and a move that carries an interior
+        // singularity onto dS changes nothing but the cell count, so any move
+        // that also saves cells is taken: that is how the field's interior
+        // cones ended up as block corners on arcs before the annealer ever
+        // saw the carrier (geom016: E_sing 2.8 -> 6 in two rounds). ATLAS
+        // applies them on coarse carriers only (signedDefectsOnFine).
+        double boundaryPlusWeight = 1.5;
+        double boundaryMinusWeight = 0.5;
+        // The reference field in round() (guidance note, Sec. 4.4), or null.
+        // Among a witness's certified fills -- the first
+        // realisationsPerWitness by score -- the one with the least
+        // dE + fieldWeight Delta E_dir is committed, rather than the first:
+        // equal-defect fills differ in which way their grid runs, and the
+        // greedy rounds, not the annealer, fix most of a coarse carrier's
+        // topology. fieldWeight is in defect units per unit of E_dir (the
+        // annealer's wDir over its wDefect). coneStars: a star fill's centre
+        // goes on a cone of its sign when one is in the cavity's kernel.
+        const ReferenceField *field = nullptr;
+        double fieldWeight = 5.0;
+        bool coneStars = true;
         double timeBudget = 60.0;   // seconds per round
     };
 
@@ -103,6 +127,8 @@ public:
         int certified = 0;
         int committed = 0;
         int gridFills = 0, starFills = 0;
+        int fieldChoices = 0;       // commits the field preferred over the first certified fill
+        int conePlacedStars = 0;    // star fills centred on a cone
         int defectBefore = 0, defectAfter = 0;
         int irregularBefore = 0, irregularAfter = 0;
         int cellsBefore = 0, cellsAfter = 0;
@@ -114,11 +140,13 @@ public:
     // carrier's energy
     //
     //     E = wBlocks N_B + sum_v w_v |q_v - t_v| + wCells N_Q
-    //         + wShape (cells below shapeFloor) + wAlign (misalignment),
+    //         + wShape (cells below shapeFloor) + wAlign (misalignment)
+    //         [+ wDir E_dir + E_sing against a ReferenceField],
     //
     // N_B the base complex's patch count (RectangleCertifier::basePatchCount),
-    // w_v wDefect inside and wBoundaryDefect on dS, the last two terms the
-    // proxies for geometry described with their options, and accepted by the
+    // w_v wDefect inside and wBoundaryDefect on dS, the next two terms the
+    // proxies for geometry described with their options, the last the
+    // reference field's (docs/atlas_crossfield_guidance.md), and accepted by the
     // Metropolis rule at a temperature falling geometrically from T0 to T1
     // ("include inverse or temporarily enlarging moves; requiring every
     // elementary move to reduce the number of cells can trap the search").
@@ -168,6 +196,35 @@ public:
         // diagonal scores as well as one parallel to its walls without it.
         std::function<double(const Point &, double *)> field;
         double wAlign = 0.5;
+        // Sign-aware boundary defect (docs/atlas_crossfield_guidance.md, R3):
+        // the weight of a unit of boundary defect with too few cells (+1/4:
+        // on a smooth run of dS, one cell spanning pi, TFI worst SJ 0.09-0.19
+        // on the four models that had them) and with too many (-1/4: three
+        // cells of 60 degrees, 0.46-0.70). Negative = wBoundaryDefect, the
+        // symmetric weight every layout was scored with before 2026-09-19.
+        double wBoundaryDefectPlus = 4.5;
+        double wBoundaryDefectMinus = 1.5;
+        // The reference cross field's terms (guidance note, Sec. 4.4):
+        // wDir E_dir + E_sing, both in blocks like N_B. Null = neither; it
+        // replaces `field` above when both are set.
+        const ReferenceField *reference = nullptr;
+        double wDir = 10.0;
+        ReferenceField::SingularityWeights singularity;
+        // Field-directed moves (guidance note, R1): this fraction of the
+        // witnesses is drawn from where the field disagrees with the carrier
+        // -- a boundary defect, an interior singularity no cone accounts for,
+        // the carrier vertex nearest a cone nothing sits on -- and a star
+        // fill puts its centre on a cone of its own sign when one lies in the
+        // cavity's kernel. 0 = the uniform draw above.
+        double directedFraction = 0.0;
+        // Charge a base patch that is not a disk -- a band round a hole that
+        // no line cuts -- as the 1 + 2 (1 - chi) blocks it takes at least
+        // (RectangleCertifier::basePatchCount's holeDeficit). Without it N_B
+        // counts such a band as one block, and a carrier with no singular
+        // vertex round a hole scores as a 3-block answer while Stage 5 can
+        // only cover it with singletons (geom021 with the field terms on: N_B
+        // 47 -> 3, blocks 176).
+        bool patchTopology = true;
         int maxRings = 3;
         // Proposals realised per move, the locally best first.
         int realisations = 2;
@@ -177,6 +234,8 @@ public:
     struct AnnealReport {
         int moves = 0, cavities = 0, proposals = 0, certified = 0;
         int accepted = 0, uphill = 0, improvements = 0;
+        int directed = 0;             // moves whose witness the field chose
+        int conePlacedStars = 0;      // star fills centred on a cone
         bool timedOut = false;
         double energyBefore = 0.0, energyAfter = 0.0;
         int blocksBefore = 0, blocksAfter = 0;
@@ -228,6 +287,16 @@ private:
         std::vector<char> droppable;
         std::vector<char> onBoundary;  // loop edge i -> i+1 is on dS
         std::vector<double> weight;    // of each vertex's defect (anneal)
+        // Sign-aware weights, when set: of a unit of defect with too few
+        // cells, and with too many (AnnealOptions::wBoundaryDefectPlus).
+        std::vector<double> weightPlus, weightMinus;
+        // Weighted defect of vertex u at valence `val`.
+        double cost(int u, int val, int target) const {
+            if (!weightPlus.empty()) {
+                return weightPlus[u] * std::max(0, target - val) + weightMinus[u] * std::max(0, val - target);
+            }
+            return (weight.empty() ? 1.0 : weight[u]) * std::abs(val - target);
+        }
     };
 
     // The cavity of `rings` rings round the seed vertices, never taking a cell
@@ -249,6 +318,10 @@ private:
     Report report_;
     AnnealReport annealReport_;
     std::vector<SquareCarrier> checkpoints_;
+    // During anneal() with directed moves: the cones a star fill may centre
+    // on (realise()).
+    const std::vector<ReferenceField::Singularity> *starTargets_ = nullptr;
+    mutable int conePlacedStars_ = 0;
 };
 
 #endif // __CAVITY_REWRITE_HXX__

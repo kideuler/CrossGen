@@ -145,7 +145,14 @@ public:
     // designated one -- without certifying any of them. It is the block
     // count Stages 4 and 5 start from, cheap enough for Stage 6 to evaluate
     // after every trial move on a coarse carrier (N_B of Sec. 8.3's score).
-    static int basePatchCount(const SquareCarrier &C);
+    //
+    // A patch need not be a disk: on a domain with holes, a carrier with no
+    // singular vertex round a hole has a band there that no line cuts, which
+    // counts as one patch and is no block at all -- single contact needs three
+    // to go round a hole (Sec. 6). When `holeDeficit` is given it receives
+    // sum over patches of (1 - chi), chi = V - E + F of the patch, so that a
+    // caller can charge for it (CavityRewrite::AnnealOptions::patchTopology).
+    static int basePatchCount(const SquareCarrier &C, int *holeDeficit = nullptr);
     // Distortion and complexity of a certified block.
     static void measure(const SquareCarrier &C, Certificate &cert);
 
