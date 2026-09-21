@@ -625,7 +625,93 @@ int selfTest() {
     }
 
     // -----------------------------------------------------------------
-    heading("Case 14  The reference cross field (docs/atlas_crossfield_guidance.md)");
+    heading("Case 14  A coarse search across a material interface (CoarseDomain)");
+    // -----------------------------------------------------------------
+    {
+        // A disk inside a square, two materials. The interface is a closed
+        // chain of the network with no node on it, which is the case that has
+        // to be sampled like a boundary loop rather than a chain between two
+        // corners, and the carrier the coarse layout is realised on has to put
+        // it back on the input's own circle, not on the chords the search saw.
+        //
+        // Before CoarseDomain carried interfaces, a domain with any of them
+        // had no coarse search at all and fell back on the fine carrier, where
+        // Stage 6 stalls: multimat/geom001 ended at 29054 blocks.
+        // The circle goes in as a constrained loop, not a hole, so the
+        // interface is a polyline of the mesh's own edges -- what a conformal
+        // .geo gives -- rather than the staircase a material tag laid over a
+        // free triangulation would make, whose every vertex is a real kink.
+        auto mesh = meshLoops({{{0.0, 0.0}, {2.0, 0.0}, {2.0, 2.0}, {0.0, 2.0}},
+                               circlePoints(1.0, 1.0, 0.6, 48)},
+                              {0, 0}, 0.06);
+        {
+            std::vector<int> mat(mesh->triangles.size(), 2);
+            for (size_t t = 0; t < mesh->triangles.size(); ++t) {
+                const Triangle &tr = mesh->triangles[t];
+                const Point c = (mesh->vertices[tr[0]] + mesh->vertices[tr[1]] + mesh->vertices[tr[2]]) / 3.0;
+                if (normP(c - Point{1.0, 1.0}) < 0.6) mat[t] = 1;
+            }
+            mesh = std::make_shared<Mesh>(mesh->vertices, mesh->triangles, mat);
+        }
+        ATLAS pipe(mesh, quietOptions());
+        const bool ok = pipe.run();
+        summary(pipe);
+        check(pipe.getDomain().getReport().interfaceEdges > 0, "Stage 1 finds the interface");
+        int withInterface = 0, realised = 0;
+        for (int i = 1; i < pipe.numSearches(); ++i) {
+            const ATLAS::Search &s = pipe.getSearch(i);
+            if (!s.coarseDomain || !s.coarseDomain->valid()) continue;
+            const CoarseDomain::Report &cr = s.coarseDomain->getReport();
+            if (cr.interfaceArcs > 0 && cr.interfaceSegments > 0) ++withInterface;
+            if (s.realised && s.realisedReport.valid) ++realised;
+        }
+        check(withInterface > 0, "the coarse domain carries the interface as a chain of its own");
+        check(realised > 0, "a coarse layout realises on the input and passes validate()");
+        check(ok, "the pipeline returns a valid blocking");
+        if (pipe.hasCover()) {
+            const SquareCarrier::Report &cr = pipe.getCarrier().getReport();
+            // Sec. 1.1's geometric preservation, for the interface as for dS:
+            // every carrier interface edge inside one input interface edge,
+            // and no input interface vertex lost. A realisation that kept the
+            // sampled chords would fail exactly here.
+            check(cr.interfacePreservationErrors == 0 && cr.missingInterfaceVertices == 0,
+                  "the carrier's interface is the input's, segment for segment");
+            const BlockCover::Report &br = pipe.getCover().getReport();
+            std::cout << "  " << br.blocks << " block(s), " << cr.interfaceEdges << " interface edge(s)\n";
+            check(br.blocks <= 40, "a coarse blocking: at most 40 blocks, not thousands");
+            check(br.interfaceInside == 0, "no block straddles the interface");
+
+            // The same cover, as the class MERIDIAN's and TORSION's own
+            // Stage 8 hand back too (mesh/BlockDecomposition.hxx): checked
+            // here against BlockCover's own bookkeeping, since a divergence
+            // between the two would mean the adapter, not the cover, is
+            // wrong.
+            const BlockDecomposition D = pipe.getCover().blockDecomposition();
+            check(static_cast<int>(D.blocks.size()) == br.blocks,
+                  "blockDecomposition() carries every block");
+            check(static_cast<int>(D.vertices.size()) == br.macroVertices,
+                  "... and every macrovertex");
+            check(static_cast<int>(D.edges.size()) == br.macroEdges, "... and every macro edge");
+            bool sidesOk = true, matOk = true;
+            for (size_t b = 0; b < D.blocks.size() && sidesOk; ++b) {
+                for (int s = 0; s < 4; ++s) {
+                    if (D.blocks[b].edges[s] < 0 ||
+                        D.sidePolyline(static_cast<int>(b), s).size() < 2) {
+                        sidesOk = false;
+                        break;
+                    }
+                }
+            }
+            for (const BlockDecomposition::MacroEdge &me : D.edges) {
+                if (me.interface && me.matLeft == me.matRight) matOk = false;
+            }
+            check(sidesOk, "every block's four sides are edges of the decomposition, with a polyline");
+            check(matOk, "an interface macro edge always separates two different materials");
+        }
+    }
+
+    // -----------------------------------------------------------------
+    heading("Case 15  The reference cross field (docs/atlas_crossfield_guidance.md)");
     // -----------------------------------------------------------------
     {
         ATLAS::Options fo = quietOptions();

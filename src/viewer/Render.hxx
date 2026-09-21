@@ -482,27 +482,19 @@ void drawSeparatrices(const Separatrices &sep, Separatrices::Space space,
 // Screen-space key for those four colours, under the cone legend.
 void drawSeparatrixLegend(int fbw, int fbh);
 
-// ── MERIDIAN: the blocks of Stages 8 and 9 ───────────────────────────────────
+// ── The block decomposition, however it was built ───────────────────────────
 //
-// The layout drawn on the model, which is the left half of the paper's Fig. 12:
-// every side of every patch in light blue, every node of the arrangement as a
-// green disk.
-//
-// Both live on S and only on S. Stage 8 is built there on purpose -- Psi
-// overlaps itself, so an arrangement computed in the image would invent
-// crossings -- and Stage 9's control points are fitted to the arcs' polylines
-// on S, so nothing here needs projecting.
-//
-// `fit` may be null, and where it is non-null a side is drawn as the fitted
-// spline sampled rather than as the polyline it was fitted to. The two differ
-// by the fit's deviation, which is smaller than the line is wide; what makes
-// the distinction worth keeping is that a side with no fit behind it is a side
-// of a face Stage 9 skipped, and drawing the raw arc there is honest about it.
-//
-// Only faces flagged `patch` are outlined. The unbounded face and the holes are
-// faces of the subdivision too, and they are not blocks.
-void drawLayoutPatches(const Arrangement &arr, const SplineFit *fit,
-                       double nodeRadius, float lineWidth, int samples = 16);
+// ATLAS, MERIDIAN and TORSION each reach a quadrilateral block decomposition
+// by a different route -- Sec. 6's exact cover over a square-transport
+// carrier for ATLAS, Stage 8's planar arrangement of the traced separatrices,
+// shared, for MERIDIAN and TORSION -- and hand it back as one
+// BlockDecomposition (mesh/BlockDecomposition.hxx), so there is one routine
+// to draw it: every macro edge in light blue, every macrovertex as a green
+// disk (no disks when nodeRadius <= 0). This is the picture the paper's
+// Fig. 12 shows for a layout and Sec. 13.1 shows for a macro complex --
+// the same picture either way, because by the time it is a
+// BlockDecomposition it is the same kind of object either way.
+void drawBlockDecomposition(const BlockDecomposition &decomp, double nodeRadius, float lineWidth);
 
 // MERIDIAN Stage 10: the quadrilateral mesh the interval assignment and the
 // transfinite interpolation produced, drawn on S as edges only.
@@ -607,10 +599,8 @@ void drawSquareCarrier(const SquareCarrier &C, float lineWidth, double radius,
 // The disks alone, for drawing over something laid on the carrier's edges.
 void drawCarrierDefects(const SquareCarrier &C, double radius);
 
-// Stages 4 and 5: the blocks of a cover as MERIDIAN's Patches phase draws its
-// layout, each block side in light blue and every macrovertex as a green disk
-// (no disks when nodeRadius <= 0).
-void drawBlockCover(const BlockCover &cover, double nodeRadius, float lineWidth);
+// Stages 4 and 5's cover, drawn as its BlockDecomposition
+// (BlockCover::blockDecomposition()) by drawBlockDecomposition above.
 
 // The key for drawPlanarDomain (corners) or drawSquareCarrier (defects), where
 // drawConeLegend puts the cones' key.

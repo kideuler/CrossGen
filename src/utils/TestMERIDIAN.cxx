@@ -1221,6 +1221,28 @@ int main(int argc, char **argv) {
     }
     for (const std::string &m : arep.messages) std::cout << "  " << kWarn << " " << m << "\n";
 
+    // The same layout, as the class ATLAS's Stage 5 hands back too
+    // (mesh/BlockDecomposition.hxx) -- checked against Arrangement's own
+    // counts here, so a driver run that already exercises Stage 8 on real
+    // models is also what exercises the shared representation, rather than
+    // leaving that to the viewer alone.
+    {
+        const BlockDecomposition D = arrangement.blockDecomposition(
+            pipeline.hasSplines() ? &pipeline.getSplines() : nullptr);
+        bool sidesOk = true;
+        for (size_t b = 0; b < D.blocks.size() && sidesOk; ++b) {
+            for (int s = 0; s < 4; ++s) {
+                if (D.blocks[b].edges[s] < 0 || D.sidePolyline(static_cast<int>(b), s).size() < 2) {
+                    sidesOk = false;
+                    break;
+                }
+            }
+        }
+        verdict(static_cast<int>(D.blocks.size()) == arep.simpleQuads,
+                "blockDecomposition() carries every simple quad patch as a block");
+        verdict(sidesOk, "... with all four sides valid macro edges");
+    }
+
     if (!arcsOut.empty()) {
         if (arrangement.writeOBJ(arcsOut)) {
             std::cout << "  Wrote the layout arcs to " << arcsOut << "\n";

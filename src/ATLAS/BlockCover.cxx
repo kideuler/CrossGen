@@ -6,6 +6,7 @@
 #include <map>
 #include <numeric>
 #include <set>
+#include <unordered_map>
 
 typedef RectangleCertifier::Certificate Certificate;
 
@@ -355,6 +356,78 @@ BlockCover::BlockCover(const RectangleCertifier &rects, const Options &opts)
         b.cert = std::move(c);
         blocks_.push_back(std::move(b));
     }
+}
+
+// ---------------------------------------------------------------------------
+// The macro complex as the shared representation of Sec. 13.2's decomposition
+// (mesh/BlockDecomposition.hxx). Every fact used here -- which carrier
+// vertices are macrovertices, which chain of carrier vertices is a macro
+// edge, which block sits on which side of it -- was already established by
+// analyze(); this only carries it over into a form MERIDIAN's and TORSION's
+// own adapter (Arrangement::blockDecomposition) also produces, so the viewer
+// and anything else downstream of "the block decomposition" need not know
+// which of the three pipelines built this one.
+// ---------------------------------------------------------------------------
+BlockDecomposition BlockCover::blockDecomposition() const {
+    BlockDecomposition D;
+    D.source = "ATLAS";
+
+    std::unordered_map<int, int> vidx;   // carrier vertex -> macrovertex
+    vidx.reserve(macroVertices_.size() * 2);
+    D.vertices.reserve(macroVertices_.size());
+    for (int v : macroVertices_) {
+        BlockDecomposition::MacroVertex mv;
+        mv.p = C_.vertices[v];
+        mv.onBoundary = C_.boundaryVertex[v];
+        mv.onInterface = C_.interfaceDegree[v] > 0;
+        vidx.emplace(v, static_cast<int>(D.vertices.size()));
+        D.vertices.push_back(mv);
+    }
+
+    // (block, side) -> macro edge, so the block loop below can look each of
+    // its four sides up rather than re-deriving which side of which block
+    // every macro edge is.
+    std::unordered_map<long long, int> atBlockSide;
+    D.edges.reserve(macroEdges_.size());
+    for (const MacroEdge &me : macroEdges_) {
+        BlockDecomposition::MacroEdge oe;
+        oe.from = vidx.at(me.chain.front());
+        oe.to = vidx.at(me.chain.back());
+        oe.points.reserve(me.chain.size());
+        for (int v : me.chain) oe.points.push_back(C_.vertices[v]);
+        oe.blockA = me.blockA;
+        oe.sideA = me.sideA;
+        oe.blockB = me.blockB;
+        oe.sideB = me.sideB;
+        oe.boundary = me.boundary;
+        oe.interface = me.interface;
+        oe.matLeft = me.blockA >= 0 ? blocks_[me.blockA].cert.material : 0;
+        oe.matRight = me.blockB >= 0 ? blocks_[me.blockB].cert.material : 0;
+        const int id = static_cast<int>(D.edges.size());
+        if (me.blockA >= 0) atBlockSide[static_cast<long long>(me.blockA) * 4 + me.sideA] = id;
+        if (me.blockB >= 0) atBlockSide[static_cast<long long>(me.blockB) * 4 + me.sideB] = id;
+        D.edges.push_back(std::move(oe));
+    }
+
+    D.blocks.resize(blocks_.size());
+    for (size_t b = 0; b < blocks_.size(); ++b) {
+        const Certificate &c = blocks_[b].cert;
+        BlockDecomposition::Block &ob = D.blocks[b];
+        ob.material = c.material;
+        for (int k = 0; k < 4; ++k) {
+            ob.corners[k] = vidx.at(c.corners[k]);
+            const auto it = atBlockSide.find(static_cast<long long>(b) * 4 + k);
+            if (it == atBlockSide.end()) continue;
+            ob.edges[k] = it->second;
+            ob.flip[k] = D.edges[it->second].blockB == static_cast<int>(b);
+        }
+    }
+
+    for (const BlockDecomposition::MacroEdge &oe : D.edges) {
+        if (oe.from >= 0) ++D.vertices[oe.from].valence;
+        if (oe.to >= 0) ++D.vertices[oe.to].valence;
+    }
+    return D;
 }
 
 bool BlockCover::writeOBJ(const std::string &path) const {

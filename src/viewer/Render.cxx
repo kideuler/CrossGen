@@ -2560,68 +2560,23 @@ void drawSeparatrices(const Separatrices &sep, Separatrices::Space space,
     }
 }
 
-void drawLayoutPatches(const Arrangement &arr, const SplineFit *fit,
-                       double nodeRadius, float lineWidth, int samples) {
-    const std::vector<Arrangement::Node> &nodes = arr.getNodes();
-    const std::vector<Arrangement::Arc> &arcs = arr.getArcs();
-    const std::vector<Arrangement::Face> &faces = arr.getFaces();
-    const std::vector<Arrangement::HalfEdge> &halves = arr.getHalfEdges();
-    if (arcs.empty() || halves.empty()) return;
-
-    // Every arc of a finished layout bounds two patches, so walking the faces
-    // would draw each side twice -- harmless on screen but not on the nodes,
-    // which are drawn as disks and would then be laid one over another. One
-    // pass, marking as it goes.
-    std::vector<char> drawn(arcs.size(), 0);
-    std::vector<char> seen(nodes.size(), 0);
-
-    const int steps = (samples < 2) ? 2 : samples;
-    std::vector<Point> poly;
+void drawBlockDecomposition(const BlockDecomposition &decomp, double nodeRadius, float lineWidth) {
+    if (decomp.edges.empty()) return;
 
     viewer::color3f(0.42f, 0.74f, 1.0f);
     viewer::lineWidth(lineWidth);
-    for (int f : arr.patchFaces()) {
-        if (f < 0 || f >= static_cast<int>(faces.size())) continue;
-        for (int h : faces[f].half) {
-            if (h < 0 || h >= static_cast<int>(halves.size())) continue;
-            const int a = halves[h].arc;
-            if (a < 0 || a >= static_cast<int>(arcs.size()) || drawn[a]) continue;
-            drawn[a] = 1;
-
-            const Arrangement::Arc &arc = arcs[a];
-            if (arc.from >= 0 && arc.from < static_cast<int>(nodes.size())) seen[arc.from] = 1;
-            if (arc.to   >= 0 && arc.to   < static_cast<int>(nodes.size())) seen[arc.to] = 1;
-
-            // The fitted spline where Stage 9 produced one, and the polyline it
-            // would have been fitted to where it did not.
-            poly.clear();
-            const SplineFit::Curve *c =
-                (fit && a < static_cast<int>(fit->curves().size()) &&
-                 fit->curves()[a].spline.size() >= 2)
-                    ? &fit->curves()[a]
-                    : nullptr;
-            if (c) {
-                poly.reserve(steps + 1);
-                for (int i = 0; i <= steps; ++i)
-                    poly.push_back(fit->evaluate(*c, static_cast<double>(i) / steps));
-            } else {
-                poly = arc.points;
-            }
-            if (poly.size() < 2) continue;
-
-            glBegin(GL_LINE_STRIP);
-            for (const Point &p : poly) glVertex2d(p[0], p[1]);
-            glEnd();
-        }
+    for (const BlockDecomposition::MacroEdge &me : decomp.edges) {
+        if (me.points.size() < 2) continue;
+        glBegin(GL_LINE_STRIP);
+        for (const Point &p : me.points) glVertex2d(p[0], p[1]);
+        glEnd();
     }
     viewer::lineWidth(1.0f);
 
-    // The nodes on top, so a disk is never buried under the side of the
-    // neighbouring patch that runs into it.
     if (nodeRadius <= 0.0) return;
-    for (size_t n = 0; n < nodes.size(); ++n) {
-        if (!seen[n]) continue;
-        drawDisk3D(nodes[n].p, nodeRadius, 0.15f, 0.88f, 0.30f);
+    for (const BlockDecomposition::MacroVertex &mv : decomp.vertices) {
+        if (mv.valence <= 0) continue;
+        drawDisk3D(mv.p, nodeRadius, 0.15f, 0.88f, 0.30f);
     }
 }
 
@@ -2926,27 +2881,6 @@ void drawCarrierDefects(const SquareCarrier &C, double radius) {
         float r, g, b;
         atlasIndexColor(index, r, g, b);
         drawDisk3D(C.vertices[v], radius, r, g, b);
-    }
-}
-
-void drawBlockCover(const BlockCover &cover, double nodeRadius, float lineWidth) {
-    const SquareCarrier &C = cover.getCarrier();
-    viewer::color3f(0.42f, 0.74f, 1.0f);
-    viewer::lineWidth(lineWidth);
-    for (const BlockCover::MacroEdge &me : cover.getMacroEdges()) {
-        if (me.chain.size() < 2) continue;
-        glBegin(GL_LINE_STRIP);
-        for (int v : me.chain) {
-            if (v < 0 || v >= C.numVertices()) continue;
-            glVertex2d(C.vertices[v][0], C.vertices[v][1]);
-        }
-        glEnd();
-    }
-    viewer::lineWidth(1.0f);
-    if (!(nodeRadius > 0.0)) return;
-    for (int v : cover.getMacroVertices()) {
-        if (v < 0 || v >= C.numVertices()) continue;
-        drawDisk3D(C.vertices[v], nodeRadius, 0.15f, 0.88f, 0.30f);
     }
 }
 

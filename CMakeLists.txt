@@ -131,6 +131,8 @@ add_library(PolyVector SHARED
     src/mesh/QuadMesh.hxx
     src/mesh/TMOP.cxx
     src/mesh/TMOP.hxx
+    src/mesh/BlockDecomposition.hxx
+    src/mesh/BlockDecomposition.cxx
     src/polyvector/PolyVectors.hxx
     src/polyvector/PolyVectors.cxx
     src/dualmbo/DualMBO.hxx
@@ -599,6 +601,23 @@ set_tests_properties(ATLAS_HalfOGrid_singlemat_geom002 PROPERTIES TIMEOUT 600)
 # carrier alone gives. A regression in the search shows up as a failure here
 # rather than as a still-valid fine fallback.
 foreach(ATLAS_CASE "singlemat/geom007 30" "singlemat/geom021 20" "singlemat/geom009 100")
+    string(REPLACE " " ";" ATLAS_ARGS ${ATLAS_CASE})
+    list(GET ATLAS_ARGS 0 ATLAS_MODEL)
+    list(GET ATLAS_ARGS 1 ATLAS_MAX)
+    string(REPLACE "/" "_" ATLAS_CASE_NAME ${ATLAS_MODEL})
+    add_test(NAME ATLAS_Coarse_${ATLAS_CASE_NAME}
+             COMMAND TestATLAS ${CMAKE_CURRENT_SOURCE_DIR}/data/meshes/${ATLAS_MODEL}.obj --max-blocks ${ATLAS_MAX})
+    set_tests_properties(ATLAS_Coarse_${ATLAS_CASE_NAME} PROPERTIES TIMEOUT 600)
+endforeach()
+
+# The same, on the multi-material models: until CoarseDomain carried the
+# interface network these had no coarse search at all and fell back on the
+# fine carrier, where Stage 6 stalls (geom001 29054 blocks against the 8 its
+# layout wants, geom012 43406, the corpus 225617). With it, each is a handful
+# to a few dozen. The ceilings are about three times what they reach now
+# (12, 12, 9, 30 on 2026-09-19), so annealer seed noise cannot trip them but a
+# lost coarse search will.
+foreach(ATLAS_CASE "multimat/geom001 40" "multimat/geom003 40" "multimat/geom012 40" "multimat/geom013 90")
     string(REPLACE " " ";" ATLAS_ARGS ${ATLAS_CASE})
     list(GET ATLAS_ARGS 0 ATLAS_MODEL)
     list(GET ATLAS_ARGS 1 ATLAS_MAX)

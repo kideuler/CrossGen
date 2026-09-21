@@ -392,7 +392,11 @@ public:
   enum class LoopType : int {
     Exterior = 0,
     Hole     = 1,
-    Region   = 2
+    Region   = 2,
+    // A constrained polyline that is not a loop at all: an internal feature
+    // the triangulation must respect (a material interface, a crack), with no
+    // inside of its own. It needs no seed point and may be a single segment.
+    Open     = 3
   };
 
   struct Options {
@@ -454,7 +458,7 @@ public:
   struct MeshInput {
     std::vector<std::array<double, 2>> vertlist;
     std::vector<std::vector<std::array<int, 2>>> segment_loops;
-    std::vector<int> type; // 0 exterior, 1 hole, 2 region
+    std::vector<int> type; // 0 exterior, 1 hole, 2 region, 3 open polyline
     double h = 0.0;
 
     // Recommended additions:
@@ -577,12 +581,15 @@ public:
       const int t = in.type[li];
       if (t != static_cast<int>(LoopType::Exterior) &&
           t != static_cast<int>(LoopType::Hole) &&
-          t != static_cast<int>(LoopType::Region))
+          t != static_cast<int>(LoopType::Region) &&
+          t != static_cast<int>(LoopType::Open))
       {
-        throw std::runtime_error("type[i] must be 0 (exterior), 1 (hole), or 2 (region).");
+        throw std::runtime_error("type[i] must be 0 (exterior), 1 (hole), 2 (region), or 3 (open).");
       }
 
-      if (t == static_cast<int>(LoopType::Exterior)) continue;
+      // Neither bounds an inside, so neither needs a seed point.
+      if (t == static_cast<int>(LoopType::Exterior) ||
+          t == static_cast<int>(LoopType::Open)) continue;
 
       std::array<double, 2> seed{};
       const bool has_user_seed = (!in.loop_seed.empty() && in.loop_seed.size() == in.segment_loops.size());
@@ -776,7 +783,12 @@ private:
     // Basic segment validation.
     for (std::size_t li = 0; li < in.segment_loops.size(); ++li) {
       const auto& loop = in.segment_loops[li];
-      if (loop.size() < 3) {
+      const bool is_open = !in.type.empty() &&
+                           in.type[li] == static_cast<int>(LoopType::Open);
+      if (loop.empty()) {
+        throw std::runtime_error("A segment loop is empty.");
+      }
+      if (!is_open && loop.size() < 3) {
         throw std::runtime_error("Each segment loop must have at least 3 segments.");
       }
       for (const auto& s : loop) {

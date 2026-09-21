@@ -71,7 +71,12 @@ public:
         Template,       // an interior vertex of a Stage 3 replacement
         BoundarySplit,  // a point inserted on a domain boundary segment (Sec. 8.4)
         Rewrite,        // an interior vertex of a Stage 6 rewrite
-        Realised        // an interior vertex of a coarse layout realised here (Realisation)
+        Realised,       // an interior vertex of a coarse layout realised here (Realisation)
+        // A point inserted along a material interface. It is an interior
+        // vertex of the domain, so nothing about dS applies to it, but it
+        // lies on a curve the layout must follow and so is held fixed by
+        // every repair, exactly as a BoundarySplit is.
+        InterfaceSplit
     };
 
     enum class CellOrigin : unsigned char { Split, Template, Rewrite, Realised };
@@ -142,6 +147,8 @@ public:
         bool boundaryParityEven = false;
         int boundaryPreservationErrors = 0;  // a boundary edge off every source segment
         int missingBoundaryVertices = 0;     // an input boundary vertex that vanished
+        int interfacePreservationErrors = 0; // the same two, for the interfaces
+        int missingInterfaceVertices = 0;
         int irregularInterior = 0;           // valence != 4
         int irregularBoundary = 0;           // valence != target on dS
         int totalDefect = 0;                 // sum |q_v - target_v|

@@ -650,6 +650,52 @@ const SquareCarrier::Report &SquareCarrier::validate() {
         for (int mv : mesh.boundaryVertices) if (!present[mv]) ++R.missingBoundaryVertices;
     }
 
+    // ---- Sec. 1.1: the same, for the material interfaces -------------------
+    //
+    // Sec. 1.1 asks for geometric preservation of "every boundary and
+    // interface segment", and the audit above is written for dS alone: an
+    // interface edge of the carrier must likewise lie inside one input
+    // interface edge, and no input interface vertex may vanish. This matters
+    // most for a carrier Realisation built from a coarse proxy, where the
+    // interface it searched on was a polygon inscribed in the input's curve
+    // and nothing else would notice if the layout kept the chords.
+    if (domain_->getOptions().materialInterfaces && domain_->getReport().interfaceEdges > 0) {
+        std::vector<std::vector<int>> iAt(mesh.vertices.size());
+        std::vector<char> inputInterface(mesh.edges.size(), 0);
+        for (int me = 0; me < static_cast<int>(mesh.edges.size()); ++me) {
+            if (!domain_->interfaceEdge[me]) continue;
+            inputInterface[me] = 1;
+            iAt[mesh.edges[me][0]].push_back(me);
+            iAt[mesh.edges[me][1]].push_back(me);
+        }
+        auto onSource = [&](int v, int me) {
+            if (sourceVertex[v] >= 0) {
+                return mesh.edges[me][0] == sourceVertex[v] || mesh.edges[me][1] == sourceVertex[v];
+            }
+            return sourceEdge[v] == me;
+        };
+        std::vector<int> cand;
+        for (int e = 0; e < NE; ++e) {
+            if (!interfaceEdge[e]) continue;
+            const int a = edges[e][0], b = edges[e][1];
+            cand.clear();
+            if (sourceEdge[a] >= 0) cand.push_back(sourceEdge[a]);
+            if (sourceVertex[a] >= 0) for (int me : iAt[sourceVertex[a]]) cand.push_back(me);
+            bool ok = false;
+            for (int me : cand) {
+                if (me >= 0 && inputInterface[me] && onSource(b, me)) { ok = true; break; }
+            }
+            if (!ok) ++R.interfacePreservationErrors;
+        }
+        std::vector<char> present(mesh.vertices.size(), 0);
+        for (int v = 0; v < NV; ++v) {
+            if (sourceVertex[v] >= 0 && interfaceDegree[v] > 0) present[sourceVertex[v]] = 1;
+        }
+        for (int mv = 0; mv < static_cast<int>(mesh.vertices.size()); ++mv) {
+            if (!iAt[mv].empty() && !present[mv]) ++R.missingInterfaceVertices;
+        }
+    }
+
     // ---- irregularity ------------------------------------------------------
     for (int v = 0; v < NV; ++v) {
         const int d = defect(v);
@@ -662,6 +708,7 @@ const SquareCarrier::Report &SquareCarrier::validate() {
               R.transportMismatches == 0 && R.angleSumViolations == 0 &&
               R.areaError <= opts_.areaTolerance && R.eulerHolds && R.boundaryParityEven &&
               R.boundaryPreservationErrors == 0 && R.missingBoundaryVertices == 0 &&
+              R.interfacePreservationErrors == 0 && R.missingInterfaceVertices == 0 &&
               (!initialSplit_ || R.jacobianBoundViolations == 0);
 
     auto msg = [&](bool bad, const std::string &m) { if (bad) R.messages.push_back("Stage 2: " + m); };
@@ -675,6 +722,10 @@ const SquareCarrier::Report &SquareCarrier::validate() {
     msg(!R.boundaryParityEven, "a component has an odd number of boundary edges");
     msg(R.boundaryPreservationErrors > 0, std::to_string(R.boundaryPreservationErrors) + " boundary edge(s) off the input boundary");
     msg(R.missingBoundaryVertices > 0, std::to_string(R.missingBoundaryVertices) + " input boundary vertex/vertices lost");
+    msg(R.interfacePreservationErrors > 0,
+        std::to_string(R.interfacePreservationErrors) + " interface edge(s) off the input interface");
+    msg(R.missingInterfaceVertices > 0,
+        std::to_string(R.missingInterfaceVertices) + " input interface vertex/vertices lost");
     msg(initialSplit_ && R.jacobianBoundViolations > 0,
         std::to_string(R.jacobianBoundViolations) + " corner determinant(s) off Sec. 3.1's 2A(1/4,1/6,1/12,1/6)");
     return R;

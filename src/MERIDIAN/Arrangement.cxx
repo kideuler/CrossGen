@@ -7,6 +7,14 @@
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
+
+// Only blockDecomposition() needs this, for SplineFit::Curve and evaluate();
+// SplineFit.hxx already includes Arrangement.hxx (Stage 9 is built on Stage
+// 8), so keeping that dependency the one direction it already runs is why
+// this is included here and not the other header -- see the forward
+// declaration's comment in Arrangement.hxx.
+#include "MERIDIAN/SplineFit.hxx"
 
 namespace {
 
@@ -1708,6 +1716,110 @@ std::vector<Arrangement::Side> Arrangement::patchSides(int face) const {
         out.push_back(Side{h.arc, h.forward});
     }
     return out;
+}
+
+// ---------------------------------------------------------------------------
+// The layout as the shared block-decomposition representation
+// (mesh/BlockDecomposition.hxx). Only faces already flagged `patch` and
+// `simple` become blocks -- exactly the faces patchFaces()/patchSides()
+// describe -- so a defect Sec. 4's validation would already have counted
+// (wrongCornerFaces, tJunctions) is not silently absorbed into one; it is
+// simply not represented here. Which curve a side is -- the fitted spline
+// where Stage 9 fitted one, its polyline otherwise -- is decided in one place
+// only, this function, so a decomposition and the picture drawn of it
+// (viewer::drawBlockDecomposition) never disagree about it.
+// ---------------------------------------------------------------------------
+BlockDecomposition Arrangement::blockDecomposition(const SplineFit *fit, int samples,
+                                                   const std::string &source) const {
+    BlockDecomposition D;
+    D.source = source;
+    const int steps = (samples < 2) ? 2 : samples;
+
+    std::vector<int> qualifying;
+    qualifying.reserve(patches.size());
+    for (int f : patches) {
+        if (f >= 0 && f < static_cast<int>(faces.size()) && faces[f].simple) qualifying.push_back(f);
+    }
+
+    std::unordered_map<int, int> vidx;   // node id -> macrovertex
+    auto macroVertex = [&](int n) {
+        const auto it = vidx.find(n);
+        if (it != vidx.end()) return it->second;
+        BlockDecomposition::MacroVertex mv;
+        mv.p = nodes[n].p;
+        mv.onBoundary = nodes[n].onBoundary;
+        mv.onInterface = nodes[n].kind == NodeKind::InterfaceNode ||
+                        nodes[n].kind == NodeKind::InterfaceHit;
+        const int id = static_cast<int>(D.vertices.size());
+        vidx.emplace(n, id);
+        D.vertices.push_back(mv);
+        return id;
+    };
+
+    std::vector<int> edgeOfArc(arcs.size(), -1);
+    D.blocks.resize(qualifying.size());
+    for (size_t bi = 0; bi < qualifying.size(); ++bi) {
+        const int f = qualifying[bi];
+        const Face &fc = faces[f];
+        const std::vector<Side> sides = patchSides(f);
+        BlockDecomposition::Block &ob = D.blocks[bi];
+        ob.material = fc.material;
+        for (int s = 0; s < 4 && s < static_cast<int>(sides.size()); ++s) {
+            ob.corners[s] = macroVertex(fc.corners[s]);
+            const Side &sd = sides[s];
+            int eid = (sd.arc >= 0 && sd.arc < static_cast<int>(edgeOfArc.size()))
+                          ? edgeOfArc[sd.arc]
+                          : -1;
+            if (eid < 0) {
+                const Arc &arc = arcs[sd.arc];
+                BlockDecomposition::MacroEdge oe;
+                oe.boundary = arc.kind == ArcKind::Boundary;
+                oe.interface = arc.kind == ArcKind::Interface;
+
+                std::vector<Point> poly;
+                const SplineFit::Curve *c =
+                    (fit && sd.arc < static_cast<int>(fit->curves().size()) &&
+                     fit->curves()[sd.arc].spline.size() >= 2)
+                        ? &fit->curves()[sd.arc]
+                        : nullptr;
+                if (c) {
+                    poly.reserve(steps + 1);
+                    for (int i = 0; i <= steps; ++i)
+                        poly.push_back(fit->evaluate(*c, static_cast<double>(i) / steps));
+                } else {
+                    poly = arc.points;
+                }
+                // patchSides()'s forward flag is "runs arc.from -> arc.to";
+                // this side of this block runs that way exactly when true.
+                if (!sd.forward) std::reverse(poly.begin(), poly.end());
+                oe.points = std::move(poly);
+                oe.from = macroVertex(sd.forward ? arc.from : arc.to);
+                oe.to = macroVertex(sd.forward ? arc.to : arc.from);
+                oe.blockA = static_cast<int>(bi);
+                oe.sideA = s;
+
+                eid = static_cast<int>(D.edges.size());
+                edgeOfArc[sd.arc] = eid;
+                D.edges.push_back(std::move(oe));
+            } else {
+                // The twin half-edge's own `forward` is the opposite of this
+                // one's, so the edge was already stored in this side's
+                // direction; only the second block needs recording.
+                D.edges[eid].blockB = static_cast<int>(bi);
+                D.edges[eid].sideB = s;
+            }
+            ob.edges[s] = eid;
+            ob.flip[s] = D.edges[eid].blockB == static_cast<int>(bi);
+        }
+    }
+
+    for (BlockDecomposition::MacroEdge &oe : D.edges) {
+        oe.matLeft = oe.blockA >= 0 ? D.blocks[oe.blockA].material : 0;
+        oe.matRight = oe.blockB >= 0 ? D.blocks[oe.blockB].material : 0;
+        if (oe.from >= 0) ++D.vertices[oe.from].valence;
+        if (oe.to >= 0) ++D.vertices[oe.to].valence;
+    }
+    return D;
 }
 
 // ---------------------------------------------------------------------------

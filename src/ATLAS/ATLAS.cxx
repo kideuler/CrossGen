@@ -71,11 +71,7 @@ bool ATLAS::run() {
     const Clock::time_point searchStart = Clock::now();
     // The coarse searches first: when one succeeds the fine one need not run
     // Stage 6 at all.
-    const bool coarseApplies = opts_.coarse && domain_->getReport().interfaceEdges == 0;
-    if (opts_.coarse && !coarseApplies) {
-        status_.messages.push_back("Coarse searches skipped: CoarseDomain does not yet carry material "
-                                   "interfaces, so a multi-material domain is searched on its fine carrier only");
-    }
+    const bool coarseApplies = opts_.coarse;
     // The coarse domains are built here, one per spacing and in turn (Triangle
     // is not re-entrant); every search after that only reads its domain, so
     // the searches -- one per spacing and seed, and the fine one -- run in

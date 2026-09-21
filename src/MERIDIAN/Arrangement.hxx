@@ -9,7 +9,15 @@
 #include "MERIDIAN/Immersion.hxx"
 #include "MERIDIAN/Separatrices.hxx"
 #include "MERIDIAN/SubdomainLabels.hxx"
+#include "mesh/BlockDecomposition.hxx"
 #include "mesh/Mesh.hxx"
+
+// Stage 9's fit is who supplies a smooth curve for a separatrix arc; only a
+// pointer to it crosses into this header, so it stays a forward declaration
+// and Arrangement.cxx is the one file that needs SplineFit.hxx -- the same
+// way blockDecomposition() below takes both without either header including
+// the other.
+class SplineFit;
 
 // Stage 8 of Shepherd, Gu and Hughes (2022): the arrangement of the traced
 // curves, and the quadrilateral layout read off it. (docs/shepherd2022.pdf,
@@ -389,6 +397,22 @@ public:
         bool forward = true;
     };
     std::vector<Side> patchSides(int face) const;
+
+    // The layout's quadrilaterals as the shared block-decomposition
+    // representation (mesh/BlockDecomposition.hxx): only the faces Sec. 4's
+    // validation already accepts as blocks -- flagged `patch` and `simple` --
+    // become one, exactly the faces `patchFaces()`/`patchSides()` describe. A
+    // face that did not come out four-sided or one-arc-per-side is still
+    // counted in Report::wrongCornerFaces; it is simply not a block here.
+    //
+    // `fit` supplies the fitted spline for a side where Stage 9 fitted one,
+    // sampled at `samples` steps; a side with no fit behind it -- carried
+    // exactly, or fit skipped -- is the arc's own polyline. `fit` may be
+    // null, for a decomposition read straight off Stage 8 before Stage 9 has
+    // run. `source` is carried through unchanged, for TORSION to pass
+    // "TORSION" where it shares this stage with MERIDIAN.
+    BlockDecomposition blockDecomposition(const SplineFit *fit = nullptr, int samples = 16,
+                                          const std::string &source = "MERIDIAN") const;
 
     // The arcs as polylines on S: the layout drawn on the model, which is the
     // left half of the paper's Fig. 12.

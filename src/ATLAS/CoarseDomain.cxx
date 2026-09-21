@@ -3,8 +3,12 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <functional>
 #include <limits>
+#include <queue>
 #include <unordered_map>
+#include <unordered_set>
+#include <utility>
 
 #include <Eigen/Sparse>
 
@@ -43,9 +47,11 @@ double minAngleOf(const Point &a, const Point &b, const Point &c) {
 // it that lowers the total boundary excess and leaves the best smallest
 // angle, never below minAngle.
 int flipBoundaryValences(const std::vector<Point> &V, std::vector<Triangle> &T, const std::vector<int> &target,
-                         double minAngle) {
+                         double minAngle, const std::vector<std::array<int, 2>> &frozen) {
     int flips = 0;
     auto key = [](int a, int b) { return (static_cast<long long>(std::min(a, b)) << 32) | std::max(a, b); };
+    std::unordered_set<long long> locked;
+    for (const auto &s : frozen) locked.insert(key(s[0], s[1]));
     for (int pass = 0; pass < 64; ++pass) {
         std::unordered_map<long long, std::vector<int>> edgeTris;
         std::vector<int> deg(V.size(), 0);
@@ -67,6 +73,7 @@ int flipBoundaryValences(const std::vector<Point> &V, std::vector<Triangle> &T, 
                 for (int j = 0; j < 3; ++j) if (T[t1][j] == v) k = j;
                 if (k < 0) continue;
                 const int w = T[t1][(k + 1) % 3], a = T[t1][(k + 2) % 3];   // T1 = (v, w, a)
+                if (locked.count(key(v, w))) continue;                       // an interface segment
                 const auto &sh = edgeTris[key(v, w)];
                 if (sh.size() != 2) continue;                                // a boundary edge
                 const int t2 = sh[0] == t1 ? sh[1] : sh[0];
@@ -109,6 +116,7 @@ CoarseDomain::CoarseDomain(const PlanarDomain &fine, const Options &opts) : fine
         return;
     }
     buildArcs();
+    buildInterfaceArcs();
     std::vector<std::vector<int>> samples;
     if (sample(samples) && triangulate(samples)) {
         buildField();
@@ -117,23 +125,127 @@ CoarseDomain::CoarseDomain(const PlanarDomain &fine, const Options &opts) : fine
     report_.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
 
+// Index every vertex of the arc just pushed, and measure it.
+void CoarseDomain::indexArc(int id) {
+    const Mesh &M = fine_.getMesh();
+    Arc &a = arcs_[id];
+    const int n = static_cast<int>(a.vertices.size());
+    const long long NV = static_cast<long long>(M.vertices.size());
+    a.s.assign(n, 0.0);
+    double acc = 0.0;
+    for (int i = 0; i < n; ++i) {
+        a.s[i] = acc;
+        if (a.closed || i + 1 < n) {
+            const int w = a.vertices[(i + 1) % n];
+            const double len = normP(M.vertices[w] - M.vertices[a.vertices[i]]);
+            featAdj_[a.vertices[i]].push_back({w, len});
+            featAdj_[w].push_back({a.vertices[i], len});
+            acc += len;
+        }
+        arcIndex_.emplace(static_cast<long long>(id) * NV + a.vertices[i], i);
+        arcsAt_[a.vertices[i]].push_back(id);
+    }
+    a.length = acc;
+}
+
 void CoarseDomain::buildArcs() {
     const Mesh &M = fine_.getMesh();
-    arcIndex_.assign(M.vertices.size(), -1);
+    arcIndex_.clear();
+    arcsAt_.assign(M.vertices.size(), {});
+    featAdj_.assign(M.vertices.size(), {});
     for (const PlanarDomain::Loop &L : fine_.loops) {
         Arc a;
         a.vertices = L.vertices;
         a.edges = L.edges;
-        const int n = static_cast<int>(L.vertices.size());
-        a.s.resize(n);
-        double acc = 0.0;
-        for (int i = 0; i < n; ++i) {
-            a.s[i] = acc;
-            acc += normP(M.vertices[L.vertices[(i + 1) % n]] - M.vertices[L.vertices[i]]);
-            arcIndex_[L.vertices[i]] = i;
-        }
-        a.length = acc;
+        a.closed = true;
         arcs_.push_back(std::move(a));
+        indexArc(static_cast<int>(arcs_.size()) - 1);
+    }
+    numBoundaryArcs_ = static_cast<int>(arcs_.size());
+}
+
+// ---------------------------------------------------------------------------
+// The interface network as arcs: one chain between each pair of its nodes.
+//
+// Stage 1 protects every interface vertex that is not a plain two-edge point
+// of one chain -- junctions, landings on dS, kinks, dangling ends -- so the
+// chains are exactly the runs of unprotected two-edge vertices between them,
+// and a component with no protected vertex at all (a circular inclusion that
+// neither meets dS nor turns sharply) is one closed chain.
+//
+// Each chain is walked so that the fine material on its left and on its right
+// are well defined; floodMaterials() seeds the coarse triangles from them.
+// ---------------------------------------------------------------------------
+void CoarseDomain::buildInterfaceArcs() {
+    const Mesh &M = fine_.getMesh();
+    if (fine_.getReport().interfaceEdges == 0) return;
+    const int NV = static_cast<int>(M.vertices.size());
+
+    // Interface edges at each vertex.
+    std::vector<std::vector<int>> at(NV);
+    std::vector<int> edgeList;
+    for (int e = 0; e < static_cast<int>(fine_.interfaceEdge.size()); ++e) {
+        if (!fine_.interfaceEdge[e]) continue;
+        at[M.edges[e][0]].push_back(e);
+        at[M.edges[e][1]].push_back(e);
+        edgeList.push_back(e);
+    }
+    auto isNode = [&](int v) { return at[v].size() != 2 || fine_.protectedVertex[v]; };
+
+    std::vector<char> used(M.edges.size(), 0);
+    // Walk from `v` along `e`, stopping at the next node (or back at the
+    // start, for a chain with none).
+    auto walk = [&](int v0, int e0) {
+        Arc a;
+        a.closed = false;
+        a.onInterface = true;
+        a.vertices.push_back(v0);
+        int v = v0, e = e0;
+        while (true) {
+            used[e] = 1;
+            a.edges.push_back(e);
+            const int w = M.edges[e][0] == v ? M.edges[e][1] : M.edges[e][0];
+            if (w == v0) {                       // came back round: a closed chain
+                a.closed = true;
+                break;
+            }
+            a.vertices.push_back(w);
+            if (isNode(w)) break;
+            const int next = at[w][0] == e ? at[w][1] : at[w][0];
+            v = w;
+            e = next;
+        }
+        arcs_.push_back(std::move(a));
+        indexArc(static_cast<int>(arcs_.size()) - 1);
+    };
+
+    for (int v = 0; v < NV; ++v) {
+        if (!isNode(v)) continue;
+        for (int e : at[v]) if (!used[e]) walk(v, e);
+    }
+    // Whatever is left is a chain with no node on it: start anywhere.
+    for (int e : edgeList) {
+        if (!used[e]) walk(M.edges[e][0], e);
+    }
+
+    // The materials either side, from the first edge of each chain: the
+    // triangle on the left of vertices[0] -> vertices[1] gives leftMaterial.
+    for (int a = numBoundaryArcs_; a < static_cast<int>(arcs_.size()); ++a) {
+        Arc &A = arcs_[a];
+        ++report_.interfaceArcs;
+        if (A.edges.empty() || A.vertices.size() < 2) continue;
+        const int e = A.edges[0];
+        const int t0 = M.edgeTriangles[e][0], t1 = M.edgeTriangles[e][1];
+        if (t0 < 0 || t1 < 0) continue;
+        // t0 is on the left of vertices[0] -> vertices[1] when the edge runs
+        // that way inside t0's counter-clockwise corner order.
+        const int p = A.vertices[0], q = A.vertices[1];
+        bool t0Left = false;
+        for (int k = 0; k < 3; ++k) {
+            if (M.triangles[t0][k] == p && M.triangles[t0][(k + 1) % 3] == q) t0Left = true;
+        }
+        A.leftMaterial = M.triangleMatId[t0Left ? t0 : t1];
+        A.rightMaterial = M.triangleMatId[t0Left ? t1 : t0];
     }
 }
 
@@ -151,17 +263,34 @@ std::vector<double> CoarseDomain::spacing(int l) const {
     // where both bounds below go to zero at the apex -- would otherwise ask
     // for an unbounded number of samples.
     const double hmin = std::max(0.01 * scale, 1e-12);
-    auto P = [&](int i) { return M.vertices[A.vertices[((i % n) + n) % n]]; };
-    auto seg = [&](int i) { return normP(P(i + 1) - P(i)); };
+    // An open arc has no vertex before its first or after its last: the
+    // windows below stop there instead of wrapping, and the missing segments
+    // have length zero.
+    auto wrapi = [&](int i) { return ((i % n) + n) % n; };
+    auto inside = [&](int i) { return A.closed || (i >= 0 && i < n); };
+    auto P = [&](int i) { return M.vertices[A.vertices[wrapi(i)]]; };
+    auto seg = [&](int i) {
+        if (!A.closed && (i < 0 || i >= n - 1)) return 0.0;
+        return normP(P(i + 1) - P(i));
+    };
 
     std::vector<double> h(n, hmax);
 
-    // Curvature: the turning of the loop per unit length over a window, the
-    // protected corners excluded (they are chain ends, not curvature).
+    // Curvature: the turning of the curve per unit length over a window, the
+    // protected corners excluded (they are chain ends, not curvature). On dS
+    // the turn is the input's own layout angle; along an interface chain it is
+    // the polyline's, since an interior interface vertex has no such angle.
     std::vector<double> turn(n, 0.0), share(n, 0.0);
     for (int i = 0; i < n; ++i) {
         const int v = A.vertices[i];
-        turn[i] = fine_.protectedVertex[v] ? 0.0 : std::fabs(M_PI - fine_.targetAngle[v]);
+        if (fine_.protectedVertex[v] || !inside(i - 1) || !inside(i + 1)) {
+            turn[i] = 0.0;
+        } else if (A.onInterface) {
+            const Point a = P(i - 1) - P(i), b = P(i + 1) - P(i);
+            turn[i] = std::fabs(M_PI - std::fabs(std::atan2(cross2(a, b), dotP(a, b))));
+        } else {
+            turn[i] = std::fabs(M_PI - fine_.targetAngle[v]);
+        }
         share[i] = 0.5 * (seg(i - 1) + seg(i));
     }
     const double W = std::min(0.5 * hmax, 0.25 * A.length);
@@ -169,51 +298,68 @@ std::vector<double> CoarseDomain::spacing(int l) const {
         double T = turn[i], S = share[i];
         double d = 0.0;
         for (int k = 1; k < n; ++k) {           // forward
+            if (!inside(i + k)) break;
             d += seg(i + k - 1);
             if (d > W) break;
-            const int j = (i + k) % n;
+            const int j = wrapi(i + k);
             T += turn[j];
             S += share[j];
         }
         d = 0.0;
         for (int k = 1; k < n; ++k) {           // backward
+            if (!inside(i - k)) break;
             d += seg(i - k);
             if (d > W) break;
-            const int j = ((i - k) % n + n) % n;
+            const int j = wrapi(i - k);
             T += turn[j];
             S += share[j];
         }
         if (T > 1e-9 && S > 0.0) h[i] = std::min(h[i], opts_.curvatureFraction * S / T);
     }
 
-    // Gap: the radius of the largest disk inside the domain that touches dS
-    // at this vertex, |w|^2 / (2 w.n) minimised over the other boundary
+    // Gap: the radius of the largest disk inside the domain that touches the
+    // curve at this vertex, |w|^2 / (2 w.n) minimised over the other feature
     // vertices in front of it -- across a narrow passage, half its width.
-    // Only vertices far from this one *along* the boundary count (another
-    // loop, or an arc more than three times the chord): near a convex corner
-    // the disk shrinks to nothing, but a corner is not a passage -- a block
-    // fits a right angle as it is -- and counting it would grade the samples
-    // down to the input's own boundary spacing there, making the coarse
-    // domain depend on the input triangulation (the dependence Sec. 13.3's
-    // last row asks to be rid of).
+    // Only vertices far from this one *along the feature network* count (more
+    // than three times the chord away): near a convex corner the disk shrinks
+    // to nothing, but a corner is not a passage -- a block fits a right angle
+    // as it is -- and counting it would grade the samples down to the input's
+    // own spacing there, making the coarse domain depend on the input
+    // triangulation (the dependence Sec. 13.3's last row asks to be rid of).
+    //
+    // The distance is the geodesic through dS *and* the interfaces, not the
+    // arc length of one loop, because the network's curves meet: an interface
+    // landing is a corner of the material region either side of it, and
+    // measured across the gap rather than along the network it would shrink
+    // the samples to nothing on both curves at every landing. Within one
+    // closed loop the geodesic is the arc length the other way round, so on a
+    // single-material domain this is the rule it replaces, unchanged.
+    //
+    // The walk stops at 3 hmax / gapFraction: past that a candidate cannot
+    // bind (it would ask for a spacing above hmax), so being unreachable and
+    // being far are the same answer there.
+    std::vector<double> dist;
+    std::vector<int> touched;
+    const double cap = 3.0 * hmax / std::max(opts_.gapFraction, 1e-6);
     for (int i = 0; i < n; ++i) {
         const Point x = P(i);
-        Point t = P(i + 1) - P(i - 1);
+        // One-sided at the ends of an open chain, where there is no vertex on
+        // the other side to difference against.
+        Point t = P(inside(i + 1) ? i + 1 : i) - P(inside(i - 1) ? i - 1 : i);
         const double tl = normP(t);
         if (tl <= 0.0) continue;
         t = t / tl;
         const Point nrm{-t[1], t[0]};
+        geodesic(A.vertices[i], cap, dist, touched);
         double r = std::numeric_limits<double>::infinity();
-        for (int m = 0; m < static_cast<int>(arcs_.size()); ++m) {
-            for (int f : arcs_[m].vertices) {
+        for (const Arc &B : arcs_) {
+            for (int f : B.vertices) {
                 if (f == A.vertices[i]) continue;
                 const Point w = M.vertices[f] - x;
-                if (m == l) {
-                    const double ds = std::fabs(arcs_[m].s[arcIndex_[f]] - A.s[i]);
-                    const double arc = std::min(ds, A.length - ds);
-                    if (arc <= 3.0 * normP(w)) continue;
-                }
-                const double dn = dotP(w, nrm);
+                if (dist[f] <= 3.0 * normP(w)) continue;
+                // An interface has the domain on both sides, so the passage
+                // may be either way; dS has it on one.
+                const double dn = A.onInterface ? std::fabs(dotP(w, nrm)) : dotP(w, nrm);
                 if (dn <= 1e-12 * scale) continue;
                 r = std::min(r, dotP(w, w) / (2.0 * dn));
             }
@@ -222,18 +368,56 @@ std::vector<double> CoarseDomain::spacing(int l) const {
     }
 
     for (double &x : h) x = std::max(x, hmin);
-    // Grading, round the loop twice each way.
+    // Grading, round the loop twice each way -- and on an open chain not past
+    // its ends, which are not neighbours.
     for (int pass = 0; pass < 2; ++pass) {
         for (int k = 0; k < 2 * n; ++k) {
             const int i = k % n, j = (k + 1) % n;
+            if (!A.closed && i == n - 1) continue;
             h[j] = std::min(h[j], h[i] + opts_.grading * seg(i));
         }
         for (int k = 2 * n; k > 0; --k) {
             const int i = k % n, j = (k - 1) % n;
+            if (!A.closed && j == n - 1) continue;
             h[j] = std::min(h[j], h[i] + opts_.grading * seg(j));
         }
     }
     return h;
+}
+
+// ---------------------------------------------------------------------------
+// Shortest path from one fine feature vertex through the feature network
+// (dS and the interfaces), stopping at `cap`. `dist` is infinity everywhere
+// else, and `touched` lists what to reset before the next call.
+// ---------------------------------------------------------------------------
+void CoarseDomain::geodesic(int source, double cap, std::vector<double> &dist,
+                            std::vector<int> &touched) const {
+    const double inf = std::numeric_limits<double>::infinity();
+    if (dist.size() != fine_.getMesh().vertices.size()) {
+        dist.assign(fine_.getMesh().vertices.size(), inf);
+        touched.clear();
+    }
+    for (int v : touched) dist[v] = inf;
+    touched.clear();
+
+    typedef std::pair<double, int> Item;   // (distance, vertex)
+    std::priority_queue<Item, std::vector<Item>, std::greater<Item>> q;
+    dist[source] = 0.0;
+    touched.push_back(source);
+    q.push({0.0, source});
+    while (!q.empty()) {
+        const Item top = q.top();
+        q.pop();
+        if (top.first > dist[top.second] + 1e-15) continue;
+        if (top.first > cap) break;
+        for (const auto &e : featAdj_[top.second]) {
+            const double d = top.first + e.second;
+            if (d > cap || d >= dist[e.first]) continue;
+            if (dist[e.first] == inf) touched.push_back(e.first);
+            dist[e.first] = d;
+            q.push({d, e.first});
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -248,8 +432,11 @@ bool CoarseDomain::sample(std::vector<std::vector<int>> &samples) {
     for (int l = 0; l < static_cast<int>(arcs_.size()); ++l) {
         const Arc &A = arcs_[l];
         const int n = static_cast<int>(A.vertices.size());
-        if (n < 3) {
-            report_.reason = "a boundary loop has fewer than three vertices";
+        // A closed curve needs three vertices to be a polygon; an open chain
+        // can legitimately be one straight segment between two of its nodes.
+        if (A.closed ? n < 3 : n < 2) {
+            report_.reason = A.closed ? "a closed feature curve has fewer than three vertices"
+                                      : "an interface chain has fewer than two vertices";
             return false;
         }
         const std::vector<double> h = spacing(l);
@@ -265,7 +452,19 @@ bool CoarseDomain::sample(std::vector<std::vector<int>> &samples) {
         for (int i = 0; i < n; ++i) if (fine_.protectedVertex[A.vertices[i]]) corners.push_back(i);
         struct Chain { int a, len; bool closed; std::vector<double> dens; int segs; };
         std::vector<Chain> chains;
-        if (corners.empty()) {
+        if (!A.closed) {
+            // An open chain runs between two nodes of the interface network,
+            // both protected, and any protected vertex between them (a kink)
+            // cuts it further. Its ends are not neighbours, so nothing wraps.
+            if (corners.size() < 2 || corners.front() != 0 || corners.back() != n - 1) {
+                corners.clear();
+                corners.push_back(0);
+                corners.push_back(n - 1);
+            }
+            for (size_t k = 0; k + 1 < corners.size(); ++k) {
+                chains.push_back({corners[k], corners[k + 1] - corners[k], false, {}, 0});
+            }
+        } else if (corners.empty()) {
             chains.push_back({0, n, true, {}, 0});
         } else {
             for (size_t k = 0; k < corners.size(); ++k) {
@@ -287,8 +486,9 @@ bool CoarseDomain::sample(std::vector<std::vector<int>> &samples) {
             c.segs = std::min(c.len, std::max(least, want));
             total += c.segs;
         }
-        // A loop needs three samples to be a polygon at all.
-        while (total < 3) {
+        // A closed curve needs three samples to be a polygon at all; an open
+        // chain is already one with its two ends.
+        while (A.closed && total < 3) {
             Chain *best = nullptr;
             for (Chain &c : chains) {
                 if (c.segs >= c.len) continue;
@@ -318,9 +518,126 @@ bool CoarseDomain::sample(std::vector<std::vector<int>> &samples) {
                 prev = k;
             }
         }
+        // On a closed curve the next chain's start closes the last one; an
+        // open chain has to carry its own far end.
+        if (!A.closed) samples[l].push_back(A.vertices[n - 1]);
         report_.chains += static_cast<int>(chains.size());
         report_.samples += static_cast<int>(samples[l].size());
     }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// The materials of the coarse triangles.
+//
+// Not by locating each coarse triangle in the input: in the sliver between a
+// sampled chord and the arc it cuts that answer is the wrong material, and the
+// coarse interface would then not be the polyline that was constrained. The
+// chains carry the answer themselves -- the input material on each side of
+// each one is known from the input triangles across its first edge -- so the
+// triangle on the left of a sampled segment takes the left material, the one
+// on its right the right, and the rest of each region follows across the
+// unconstrained edges. Every coarse triangle on one side is then of one
+// material by construction, whatever the sampling did to the geometry.
+//
+// A region the chains do not reach is a material component bounded by dS
+// alone; it keeps the material of the input triangle at one of its vertices.
+// ---------------------------------------------------------------------------
+bool CoarseDomain::floodMaterials(const std::vector<Point> &V, const std::vector<Triangle> &T,
+                                  const std::vector<std::array<int, 2>> &segments,
+                                  const std::vector<int> &segArc, std::vector<int> &matOut) {
+    const Mesh &M = fine_.getMesh();
+    const int NT = static_cast<int>(T.size());
+    const long long numVertices = static_cast<long long>(V.size());
+    const int fallback = M.triangleMatId.empty() ? 1 : M.triangleMatId[0];
+    matOut.assign(NT, fallback);
+    if (segments.empty()) return true;
+
+    auto key = [&](int a, int b) {
+        return static_cast<long long>(std::min(a, b)) * numVertices + std::max(a, b);
+    };
+    // The directed corner each triangle presents to each edge, so "the
+    // triangle on the left of a -> b" is a lookup.
+    std::unordered_map<long long, std::array<int, 2>> across;   // edge -> its triangles
+    std::unordered_map<long long, int> leftOf;                  // directed a -> b: the triangle
+    for (int t = 0; t < NT; ++t) {
+        for (int k = 0; k < 3; ++k) {
+            const int a = T[t][k], b = T[t][(k + 1) % 3];
+            leftOf.emplace(static_cast<long long>(a) * numVertices + b, t);
+            auto it = across.find(key(a, b));
+            if (it == across.end()) across.emplace(key(a, b), std::array<int, 2>{t, -1});
+            else it->second[1] = t;
+        }
+    }
+    std::unordered_set<long long> blocked;
+    for (const auto &s : segments) blocked.insert(key(s[0], s[1]));
+
+    std::vector<int> seed(NT, 0);
+    for (size_t i = 0; i < segments.size(); ++i) {
+        const Arc &A = arcs_[segArc[i]];
+        const int a = segments[i][0], b = segments[i][1];
+        auto L = leftOf.find(static_cast<long long>(a) * numVertices + b);
+        auto R = leftOf.find(static_cast<long long>(b) * numVertices + a);
+        if (L == leftOf.end() || R == leftOf.end()) {
+            report_.reason = "an interface segment is not an edge of the coarse triangulation";
+            return false;
+        }
+        seed[L->second] = A.leftMaterial;
+        seed[R->second] = A.rightMaterial;
+    }
+
+    // Flood each region from whatever seeds it contains, stopping at the
+    // constrained segments.
+    std::vector<int> region(NT, -1);
+    std::vector<int> stack;
+    int regions = 0;
+    for (int t0 = 0; t0 < NT; ++t0) {
+        if (region[t0] >= 0) continue;
+        const int r = regions++;
+        int mat = 0;
+        std::vector<int> members;
+        region[t0] = r;
+        stack.assign(1, t0);
+        while (!stack.empty()) {
+            const int t = stack.back();
+            stack.pop_back();
+            members.push_back(t);
+            if (seed[t] != 0) {
+                if (mat != 0 && mat != seed[t]) {
+                    report_.reason = "the sampled interface does not separate the materials";
+                    return false;
+                }
+                mat = seed[t];
+            }
+            for (int k = 0; k < 3; ++k) {
+                const int a = T[t][k], b = T[t][(k + 1) % 3];
+                if (blocked.count(key(a, b))) continue;
+                auto it = across.find(key(a, b));
+                if (it == across.end()) continue;
+                for (int u : it->second) {
+                    if (u < 0 || region[u] >= 0) continue;
+                    region[u] = r;
+                    stack.push_back(u);
+                }
+            }
+        }
+        if (mat == 0) {
+            // No chain touches this region: it is a whole material component
+            // of the input, bounded by dS alone, so the input's material at
+            // any point of it will do.
+            mat = fallback;
+            const Point c = (V[T[t0][0]] + V[T[t0][1]] + V[T[t0][2]]) / 3.0;
+            for (int f = 0; f < static_cast<int>(M.triangles.size()); ++f) {
+                const Point &a = M.vertices[M.triangles[f][0]], &b = M.vertices[M.triangles[f][1]],
+                            &d = M.vertices[M.triangles[f][2]];
+                if (cross2(b - a, c - a) < 0.0 || cross2(d - b, c - b) < 0.0 || cross2(a - d, c - d) < 0.0) continue;
+                mat = M.triangleMatId[f];
+                break;
+            }
+        }
+        for (int t : members) matOut[t] = mat;
+    }
+    report_.materialRegions = regions;
     return true;
 }
 
@@ -333,23 +650,58 @@ bool CoarseDomain::triangulate(const std::vector<std::vector<int>> &samples) {
     const Mesh &M = fine_.getMesh();
     TriangleMesher2D::MeshInput in;
     std::vector<int> fineOf;
+    // A sample may be on two curves at once -- a landing is on dS and on its
+    // interface chain, a junction on each of its branches -- and Triangle
+    // needs one point for it, not one per curve.
+    std::unordered_map<int, int> pointOf;
+    auto point = [&](int f) {
+        auto it = pointOf.find(f);
+        if (it != pointOf.end()) return it->second;
+        const int id = static_cast<int>(in.vertlist.size());
+        in.vertlist.push_back({M.vertices[f][0], M.vertices[f][1]});
+        fineOf.push_back(f);
+        pointOf.emplace(f, id);
+        return id;
+    };
+    // The interface segments, in their arc's own direction: no edge flip may
+    // touch one, and floodMaterials() seeds the triangles either side of them.
+    std::vector<std::array<int, 2>> ifaceSeg;
+    std::vector<int> ifaceArc;
     for (size_t l = 0; l < samples.size(); ++l) {
-        const int first = static_cast<int>(in.vertlist.size());
+        const Arc &A = arcs_[l];
         const int m = static_cast<int>(samples[l].size());
         std::vector<std::array<int, 2>> segs;
-        for (int k = 0; k < m; ++k) {
-            const Point &p = M.vertices[samples[l][k]];
-            in.vertlist.push_back({p[0], p[1]});
-            fineOf.push_back(samples[l][k]);
-            segs.push_back({first + k, first + (k + 1) % m});
+        // A closed curve's last sample joins back to its first; an open
+        // chain's does not, and Triangle takes it as a bare PSLG segment
+        // list, which needs no interior seed point (type 0).
+        const int last = A.closed ? m : m - 1;
+        for (int k = 0; k < last; ++k) {
+            const std::array<int, 2> s{point(samples[l][k]), point(samples[l][(k + 1) % m])};
+            segs.push_back(s);
+            if (A.onInterface) {
+                ifaceSeg.push_back(s);
+                ifaceArc.push_back(static_cast<int>(l));
+            }
         }
+        if (!A.closed) point(samples[l][m - 1]);
         in.segment_loops.push_back(std::move(segs));
-        in.type.push_back(fine_.loops[l].outer ? 0 : 1);
+        if (!A.closed) {
+            in.type.push_back(static_cast<int>(TriangleMesher2D::LoopType::Open));
+        } else if (!A.onInterface && !fine_.loops[l].outer) {
+            in.type.push_back(static_cast<int>(TriangleMesher2D::LoopType::Hole));
+        } else {
+            in.type.push_back(static_cast<int>(TriangleMesher2D::LoopType::Exterior));
+        }
     }
+    report_.interfaceSegments = static_cast<int>(ifaceSeg.size());
     in.h = opts_.maxSpacing * fine_.getReport().scale;
     TriangleMesher2D::Options o;
     o.min_angle_degrees = opts_.minAngle;
+    // -Y keeps Triangle off dS; with interfaces the same has to hold of them,
+    // which is -YY. Every feature vertex of the coarse mesh must be an input
+    // vertex, or Realisation has nowhere to put it back.
     o.suppress_boundary_splitting = true;
+    o.suppress_all_splitting = report_.interfaceArcs > 0;
     TriangleMesher2D mesher(o);
     TriangleMesher2D::MeshOutput out;
     try {
@@ -369,15 +721,23 @@ bool CoarseDomain::triangulate(const std::vector<std::vector<int>> &samples) {
         if (A < 0.0) std::swap(tris[t][1], tris[t][2]);
     }
     {
+        // Only vertices on dS have a boundary valence to chase; an interface
+        // sample is an interior vertex, whose carrier valence Stage 6 is the
+        // one to rewrite.
         std::vector<int> target(verts.size(), -1);
         for (size_t k = 0; k < fineOf.size() && k < verts.size(); ++k) {
+            if (fine_.loopOf[fineOf[k]] < 0) continue;
             const long t = std::lround(fine_.targetAngle[fineOf[k]] / M_PI_2);
             target[k] = static_cast<int>(std::max(1L, std::min(4L, t)));
         }
-        report_.flips = flipBoundaryValences(verts, tris, target, opts_.minFlipAngle * M_PI / 180.0);
+        // An interface segment is constrained: flipping one would take the
+        // interface off the curve it is a sampling of.
+        std::vector<std::array<int, 2>> frozen = ifaceSeg;
+        report_.flips = flipBoundaryValences(verts, tris, target, opts_.minFlipAngle * M_PI / 180.0, frozen);
     }
-    const int material = M.triangleMatId.empty() ? 1 : M.triangleMatId[0];
-    mesh_ = std::make_shared<Mesh>(verts, tris, std::vector<int>(tris.size(), material));
+    std::vector<int> material;
+    if (!floodMaterials(verts, tris, ifaceSeg, ifaceArc, material)) return false;
+    mesh_ = std::make_shared<Mesh>(verts, tris, material);
 
     const int NV = static_cast<int>(verts.size());
     fineVertex_.assign(NV, -1);
@@ -386,11 +746,19 @@ bool CoarseDomain::triangulate(const std::vector<std::vector<int>> &samples) {
 
     PlanarDomain::Options po = fine_.getOptions();
     po.angleOverride.assign(NV, std::numeric_limits<double>::quiet_NaN());
+    po.interfaceAngleOverride.assign(NV, std::numeric_limits<double>::quiet_NaN());
     po.extraCorners.clear();
     for (int k = 0; k < NV; ++k) {
         const int f = fineVertex_[k];
         if (f < 0) continue;
         po.angleOverride[k] = fine_.targetAngle[f];
+        // A sample interior to an interface chain is by construction not one
+        // of the input's kinks -- those are protected, and so are chain ends
+        // -- so the layout sees the chain running straight through it,
+        // whatever the chord the sampling drew turns by.
+        if (fine_.loopOf[f] < 0 && fine_.interfaceDegree[f] == 2 && !fine_.protectedVertex[f]) {
+            po.interfaceAngleOverride[k] = M_PI;
+        }
         if (fine_.protectedVertex[f]) po.extraCorners.push_back(k);
     }
     domain_ = std::make_unique<PlanarDomain>(*mesh_, po);
@@ -404,32 +772,83 @@ bool CoarseDomain::triangulate(const std::vector<std::vector<int>> &samples) {
         report_.reason = "the coarse triangulation has a different number of boundary loops";
         return false;
     }
-    // Every coarse boundary vertex must be a sample: a point Triangle added on
-    // a boundary segment would have no place on the fine boundary.
+    // Every coarse feature vertex must be a sample: a point Triangle added on
+    // a boundary or interface segment would have no place on the input's
+    // curve, and Realisation could not put it back.
     for (int v : mesh_->boundaryVertices) {
         if (fineVertex_[v] < 0) {
             report_.reason = "Triangle put a point on a boundary segment";
             return false;
         }
     }
+    for (int v = 0; v < NV; ++v) {
+        if (domain_->interfaceDegree[v] > 0 && fineVertex_[v] < 0) {
+            report_.reason = "Triangle put a point on an interface segment";
+            return false;
+        }
+    }
+    // The interface the flood fill produced must be the one that was sampled,
+    // segment for segment: any other is a material region the sampling moved.
+    if (domain_->getReport().interfaceEdges != report_.interfaceSegments) {
+        report_.reason = "the coarse interface has " + std::to_string(domain_->getReport().interfaceEdges) +
+                         " edge(s), not the " + std::to_string(report_.interfaceSegments) + " that were sampled";
+        return false;
+    }
+
+    // Which fine curve each coarse feature edge samples, and which way round.
     edgeFrom_.assign(mesh_->edges.size(), -1);
-    for (const PlanarDomain::Loop &L : domain_->loops) {
-        for (size_t i = 0; i < L.edges.size(); ++i) edgeFrom_[L.edges[i]] = L.vertices[i];
+    edgeArc_.assign(mesh_->edges.size(), -1);
+    for (size_t l = 0; l < domain_->loops.size(); ++l) {
+        const PlanarDomain::Loop &L = domain_->loops[l];
+        for (size_t i = 0; i < L.edges.size(); ++i) {
+            edgeFrom_[L.edges[i]] = L.vertices[i];
+            edgeArc_[L.edges[i]] = static_cast<int>(l);
+        }
         // The coarse loop must run the way its fine loop does.
         const int f0 = fineVertex_[L.vertices[0]];
-        if (f0 < 0 || arcIndex_[f0] < 0) {
+        if (f0 < 0 || arcIndex(static_cast<int>(l), f0) < 0) {
             report_.reason = "a coarse boundary loop has no fine counterpart";
             return false;
         }
+    }
+    std::unordered_map<long long, int> edgeOf;
+    if (!ifaceSeg.empty()) {
+        for (size_t e = 0; e < mesh_->edges.size(); ++e) {
+            const int a = mesh_->edges[e][0], b = mesh_->edges[e][1];
+            edgeOf.emplace(static_cast<long long>(std::min(a, b)) * NV + std::max(a, b), static_cast<int>(e));
+        }
+    }
+    for (size_t i = 0; i < ifaceSeg.size(); ++i) {
+        const int a = ifaceSeg[i][0], b = ifaceSeg[i][1];
+        auto it = edgeOf.find(static_cast<long long>(std::min(a, b)) * NV + std::max(a, b));
+        if (it == edgeOf.end() || !domain_->interfaceEdge[it->second]) {
+            report_.reason = "a sampled interface segment is not an interface edge of the coarse mesh";
+            return false;
+        }
+        edgeFrom_[it->second] = a;
+        edgeArc_[it->second] = ifaceArc[i];
     }
     return true;
 }
 
 // ---------------------------------------------------------------------------
+int CoarseDomain::arcIndex(int arc, int fineVertex) const {
+    if (arc < 0 || fineVertex < 0) return -1;
+    const long long NV = static_cast<long long>(fine_.getMesh().vertices.size());
+    auto it = arcIndex_.find(static_cast<long long>(arc) * NV + fineVertex);
+    return it == arcIndex_.end() ? -1 : it->second;
+}
+
+double CoarseDomain::positionOf(int arc, int fineVertex) const {
+    const int i = arcIndex(arc, fineVertex);
+    return i < 0 ? -1.0 : arcs_[arc].s[i];
+}
+
 double CoarseDomain::forward(int loop, double a, double b) const {
-    const double L = arcs_[loop].length;
-    double d = wrap(b - a, L);
-    if (d <= 1e-14 * L) d = L;
+    const Arc &A = arcs_[loop];
+    if (!A.closed) return std::max(0.0, std::min(A.length, b) - std::max(0.0, a));
+    double d = wrap(b - a, A.length);
+    if (d <= 1e-14 * A.length) d = A.length;
     return d;
 }
 
@@ -437,9 +856,10 @@ Point CoarseDomain::pointAt(int loop, double s, int *edge, int *index) const {
     const Arc &A = arcs_[loop];
     const Mesh &M = fine_.getMesh();
     const int n = static_cast<int>(A.vertices.size());
-    s = wrap(s, A.length);
+    // An open chain does not wrap: past either end is that end.
+    s = A.closed ? wrap(s, A.length) : std::max(0.0, std::min(A.length, s));
     int i = static_cast<int>(std::upper_bound(A.s.begin(), A.s.end(), s) - A.s.begin()) - 1;
-    i = std::max(0, std::min(n - 1, i));
+    i = std::max(0, std::min(A.closed ? n - 1 : n - 2, i));
     const double s0 = A.s[i];
     const double s1 = (i + 1 < n) ? A.s[i + 1] : A.length;
     const double t = s1 > s0 ? (s - s0) / (s1 - s0) : 0.0;
@@ -449,34 +869,50 @@ Point CoarseDomain::pointAt(int loop, double s, int *edge, int *index) const {
     return p + (q - p) * t;
 }
 
-CoarseDomain::Location CoarseDomain::locate(const SquareCarrier &C, int v) const {
-    Location out;
+void CoarseDomain::locateAll(const SquareCarrier &C, int v, std::vector<Location> &out) const {
+    out.clear();
     const Mesh &M = fine_.getMesh();
+    // A sample is its own input vertex, and lies on every curve through it.
     if (C.sourceVertex[v] >= 0) {
         const int f = fineVertex_[C.sourceVertex[v]];
-        if (f < 0) return out;
-        out.loop = fine_.loopOf[f];
-        if (out.loop < 0) return out;
-        out.s = arcs_[out.loop].s[arcIndex_[f]];
-        return out;
+        if (f < 0) return;
+        for (int a : arcsAt_[f]) {
+            Location L;
+            L.loop = a;
+            L.s = positionOf(a, f);
+            out.push_back(L);
+        }
+        return;
     }
+    // Anything else must sit inside one coarse feature edge, which came from
+    // exactly one curve: it goes at the same fraction of the input arc
+    // between that edge's two samples.
     const int e = C.sourceEdge[v];
-    if (e < 0 || e >= static_cast<int>(edgeFrom_.size()) || edgeFrom_[e] < 0) return out;
+    if (e < 0 || e >= static_cast<int>(edgeFrom_.size()) || edgeFrom_[e] < 0) return;
+    const int loop = edgeArc_[e];
+    if (loop < 0) return;
     const int a = edgeFrom_[e];
     const int b = mesh_->edges[e][0] == a ? mesh_->edges[e][1] : mesh_->edges[e][0];
     const int fa = fineVertex_[a], fb = fineVertex_[b];
-    if (fa < 0 || fb < 0) return out;
-    const int loop = fine_.loopOf[fa];
-    if (loop < 0 || fine_.loopOf[fb] != loop) return out;
+    if (fa < 0 || fb < 0) return;
+    const double sa = positionOf(loop, fa), sb = positionOf(loop, fb);
+    if (sa < 0.0 || sb < 0.0) return;
     const Point pa = M.vertices[fa], pb = M.vertices[fb];
     const Point d = pb - pa;
     const double L2 = dotP(d, d);
-    if (!(L2 > 0.0)) return out;
+    if (!(L2 > 0.0)) return;
     const double t = std::max(0.0, std::min(1.0, dotP(C.vertices[v] - pa, d) / L2));
-    const double sa = arcs_[loop].s[arcIndex_[fa]];
-    out.loop = loop;
-    out.s = wrap(sa + t * forward(loop, sa, arcs_[loop].s[arcIndex_[fb]]), arcs_[loop].length);
-    return out;
+    Location L;
+    L.loop = loop;
+    L.s = sa + t * forward(loop, sa, sb);
+    if (arcs_[loop].closed) L.s = wrap(L.s, arcs_[loop].length);
+    out.push_back(L);
+}
+
+CoarseDomain::Location CoarseDomain::locate(const SquareCarrier &C, int v) const {
+    std::vector<Location> all;
+    locateAll(C, v, all);
+    return all.empty() ? Location() : all.front();
 }
 
 // ---------------------------------------------------------------------------
@@ -491,10 +927,16 @@ void CoarseDomain::buildField() {
     int nu = 0;
     for (int v = 0; v < NV; ++v) {
         const int f = fineVertex_[v];
-        if (f >= 0 && !fine_.protectedVertex[f] && arcIndex_[f] >= 0) {
-            const Arc &A = arcs_[fine_.loopOf[f]];
-            const int n = static_cast<int>(A.vertices.size()), i = arcIndex_[f];
-            const Point t = M.vertices[A.vertices[(i + 1) % n]] - M.vertices[A.vertices[(i + n - 1) % n]];
+        // Every feature curve is aligned, dS and the interfaces alike: Sec.
+        // 1.1 asks the layout to run along both. A protected vertex is where
+        // the tangent jumps, so it is left free.
+        const int arc = (f >= 0 && !fine_.protectedVertex[f] && !arcsAt_[f].empty()) ? arcsAt_[f].front() : -1;
+        if (arc >= 0) {
+            const Arc &A = arcs_[arc];
+            const int n = static_cast<int>(A.vertices.size()), i = arcIndex(arc, f);
+            const int next = (i + 1 < n || A.closed) ? (i + 1) % n : i;
+            const int prev = (i > 0 || A.closed) ? (i + n - 1) % n : i;
+            const Point t = M.vertices[A.vertices[next]] - M.vertices[A.vertices[prev]];
             const double th = 4.0 * std::atan2(t[1], t[0]);
             u[v] = {std::cos(th), std::sin(th)};
         } else {

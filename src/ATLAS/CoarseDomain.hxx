@@ -3,6 +3,7 @@
 
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "ATLAS/PlanarDomain.hxx"
@@ -41,21 +42,46 @@
 //
 // ### What is kept exactly, and what is a proxy
 //
-// The coarse mesh's boundary vertices are input boundary vertices, sampled
-// along each chain of dS between protected corners, so every protected corner
-// is one and the coarse boundary is a polygon inscribed in the input's. That
+// The coarse mesh's feature vertices are input feature vertices, sampled along
+// each chain between protected corners, so every protected corner is one and
+// the coarse feature network is a polygon inscribed in the input's. That
 // polygon is only a proxy: the layout found on it is carried back to the
-// input's own boundary by Realisation, and certified there. Two things are
+// input's own curves by Realisation, and certified there. Two things are
 // transferred so the proxy does not mislead the search:
 //
 //   * the *layout* angle at a sample is the input's angle there
-//     (PlanarDomain::Options::angleOverride), so a circle sampled eight times
-//     is still a smooth curve with valence target 2 everywhere, not an octagon
-//     with eight corners;
-//   * every coarse boundary vertex has a location on the input boundary
+//     (PlanarDomain::Options::angleOverride, and interfaceAngleOverride along
+//     an interface), so a circle sampled eight times is still a smooth curve
+//     with valence target 2 everywhere, not an octagon with eight corners;
+//   * every coarse feature vertex has a location on the input's curve
 //     (locate()): a sample is its own input vertex, and a point Stages 2-6 put
-//     on a coarse boundary edge sits at the same fraction of the input arc
+//     on a coarse feature edge sits at the same fraction of the input arc
 //     between the edge's two samples.
+//
+// ### Features: dS and the interface network
+//
+// Sec. 1.1 asks the same two things of a material interface as of dS -- every
+// segment of it survives, and it is a union of macroedges -- so an interface
+// is sampled, constrained and carried back exactly as a boundary chain is, and
+// the only structural difference is that it has a material on both sides. So
+// the curves below ("arcs") are the boundary loops *and* the chains of the
+// interface network between its nodes (junctions, landings on dS, kinks,
+// dangling ends -- every interface vertex Stage 1 protects), a chain with no
+// node being closed like a loop.
+//
+// Without this, a multi-material domain had no coarse search at all and fell
+// back on the fine carrier, which is the case Stage 6 cannot finish: multimat/
+// geom001, a quarter disk in a square, ended at 29054 blocks against the 8 its
+// layout wants.
+//
+// The materials of the coarse triangles are *not* read off the input by point
+// location, which is wrong in the sliver between a sampled chord and the arc
+// it cuts. They are flooded out from the chains themselves: the coarse
+// triangle on the left of a sampled interface segment takes the material on
+// the left of that chain in the input, the one on its right the other, and the
+// flood stops at the constrained segments. Every coarse triangle on one side
+// of the network is then of one material by construction, whatever the
+// sampling did to the geometry.
 //
 // ### Sampling
 //
@@ -63,16 +89,17 @@
 // along the loop so it varies by at most Options::grading per unit length:
 //
 //   * a global one, Options::maxSpacing of the bounding-box diagonal;
-//   * the gap: gapFraction of the distance to the nearest boundary point that
+//   * the gap: gapFraction of the distance to the nearest feature point that
 //     is not a neighbour along the same curve, so a narrow passage between two
-//     holes, or between a hole and dS, is at least two coarse triangles wide;
+//     holes, or between a hole and dS, or between an interface and dS, is at
+//     least two coarse triangles wide;
 //   * the curvature: curvatureFraction of the local radius, so a chord never
 //     strays far from its arc (0.8 puts eight chords on a circle, whose
 //     sagitta is then 7.6% of the radius).
 //
-// Triangle then fills the interior with -Y (no point on a boundary segment:
-// those are all input vertices) and a quality bound, which grades the
-// interior to the boundary spacing on its own.
+// Triangle then fills the interior with -YY (no point on any segment, boundary
+// or interface: those are all input vertices) and a quality bound, which
+// grades the interior to the feature spacing on its own.
 //
 // ### Corners
 //
@@ -99,27 +126,40 @@ public:
         double minFlipAngle = 12.0;
     };
 
-    // A point on the fine boundary: its loop and arc-length position.
+    // A point on a fine feature curve: which arc, and the arc-length position
+    // along it. `loop` is an index into arcs().
     struct Location {
         int loop = -1;
         double s = 0.0;
     };
 
-    // One fine boundary loop, parameterised by arc length.
+    // One fine feature curve, parameterised by arc length: a boundary loop
+    // (closed, the domain on the left) or a chain of the interface network.
+    // A closed arc has one edge per vertex, the last running back to the
+    // first; an open one has n - 1 edges and s.back() == length.
     struct Arc {
         std::vector<int> vertices;       // fine vertex ids, the domain on the left
         std::vector<int> edges;          // fine edge i runs vertices[i] -> vertices[i+1]
         std::vector<double> s;           // arc length at vertices[i]
         double length = 0.0;
+        bool closed = true;
+        bool onInterface = false;        // a chain of the interface network, not dS
+        // The input materials either side of an interface chain, walking it
+        // from vertices[0]: what the flood fill seeds the coarse triangles on
+        // each side with. Both 0 on a boundary loop.
+        int leftMaterial = 0, rightMaterial = 0;
     };
 
     struct Report {
         bool valid = false;
         std::string reason;
         int chains = 0;
-        int samples = 0;                 // boundary vertices of the coarse mesh
+        int samples = 0;                 // feature vertices of the coarse mesh
         int vertices = 0, triangles = 0;
         int flips = 0;                   // boundary-valence edge flips
+        int interfaceArcs = 0;           // chains of the interface network
+        int interfaceSegments = 0;       // coarse interface edges they became
+        int materialRegions = 0;         // regions the flood fill separated
         double spacingMin = 0.0, spacingMax = 0.0;
         double seconds = 0.0;
     };
@@ -138,12 +178,22 @@ public:
     const std::vector<int> &fineVertexOf() const { return fineVertex_; }
 
     const std::vector<Arc> &arcs() const { return arcs_; }
-    // Fine boundary vertex -> its index in its Arc, -1 inside.
-    int arcIndex(int fineVertex) const { return arcIndex_[fineVertex]; }
-    int arcOf(int fineVertex) const { return fine_.loopOf[fineVertex]; }
+    // A fine vertex's index in one arc, -1 if it is not on that arc.
+    int arcIndex(int arc, int fineVertex) const;
+    // Its arc-length position there, or -1.
+    double positionOf(int arc, int fineVertex) const;
+    // The arc a coarse feature edge was sampled from, -1 if it is not one.
+    int edgeArc(int coarseEdge) const {
+        return coarseEdge >= 0 && coarseEdge < static_cast<int>(edgeArc_.size()) ? edgeArc_[coarseEdge] : -1;
+    }
 
-    // Where a boundary vertex of a carrier over getDomain() lies on the fine
-    // boundary. loop < 0 when it is not on a coarse boundary edge at all.
+    // Where a feature vertex of a carrier over getDomain() lies on the fine
+    // curves. A vertex Stages 2-6 put inside a coarse feature edge is on one
+    // arc; a sample is on every arc through its input vertex -- a landing is
+    // on dS and on its interface chain, a junction on each of its branches --
+    // so all of them are returned, and locate() gives the first.
+    void locateAll(const SquareCarrier &C, int v, std::vector<Location> &out) const;
+    // The first of them; loop < 0 when the vertex is on no feature curve.
     Location locate(const SquareCarrier &C, int v) const;
 
     // The smoothest boundary-aligned cross field, as a reference direction
@@ -156,8 +206,9 @@ public:
     // least, so it is returned as the weight. Returns theta in [0, pi/2).
     double crossAngle(const Point &p, double *weight) const;
 
-    // Forward arc length from a to b along a loop, in (0, length]; a == b
-    // gives the whole loop.
+    // Forward arc length from a to b along an arc. On a closed one it is in
+    // (0, length] and a == b gives the whole loop; on an open one it is
+    // simply b - a, clamped to the arc.
     double forward(int loop, double a, double b) const;
     // The point at arc position s, and the fine edge it lies on (the edge
     // starting at the vertex at or before s).
@@ -165,21 +216,40 @@ public:
 
 private:
     void buildArcs();
+    void buildInterfaceArcs();
+    void indexArc(int arc);
+    void geodesic(int source, double cap, std::vector<double> &dist, std::vector<int> &touched) const;
     std::vector<double> spacing(int loop) const;
     bool sample(std::vector<std::vector<int>> &samples);
     bool triangulate(const std::vector<std::vector<int>> &samples);
+    // Materials of the coarse triangles, flooded out from the sampled chains.
+    // Each segment is a consecutive pair of samples in its arc's own
+    // direction, so the triangle on its left takes that arc's leftMaterial.
+    bool floodMaterials(const std::vector<Point> &V, const std::vector<Triangle> &T,
+                        const std::vector<std::array<int, 2>> &segments, const std::vector<int> &segArc,
+                        std::vector<int> &matOut);
     void buildField();
 
     const PlanarDomain &fine_;
     Options opts_;
     Report report_;
     std::vector<Arc> arcs_;
-    std::vector<int> arcIndex_;
+    // (arc, fine vertex) -> index in that arc, as arc * numVertices + vertex.
+    std::unordered_map<long long, int> arcIndex_;
+    // Fine vertex -> the arcs through it, in arcs_ order.
+    std::vector<std::vector<int>> arcsAt_;
+    // The feature network as a weighted graph on the fine vertices: every
+    // boundary and interface edge, for the geodesic the gap bound measures
+    // "far along the curve" with.
+    std::vector<std::vector<std::pair<int, double>>> featAdj_;
+    int numBoundaryArcs_ = 0;
     std::shared_ptr<Mesh> mesh_;
     std::unique_ptr<PlanarDomain> domain_;
     std::vector<int> fineVertex_;
-    // Coarse boundary edge -> its start vertex in loop order.
+    // Coarse feature edge -> its start vertex walking its arc forward, and
+    // the arc it was sampled from.
     std::vector<int> edgeFrom_;
+    std::vector<int> edgeArc_;
     // The field on a regular lookup grid over the bounding box: u per node
     // (0 outside the domain), bilinear in between.
     std::vector<std::array<double, 2>> fieldGrid_;

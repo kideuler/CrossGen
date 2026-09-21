@@ -338,10 +338,12 @@ void PlanarDomain::tagCorners() {
             nbr[mesh_.edges[e][0]].push_back(mesh_.edges[e][1]);
             nbr[mesh_.edges[e][1]].push_back(mesh_.edges[e][0]);
         }
+        const bool override = static_cast<int>(opts_.interfaceAngleOverride.size()) == NV;
         for (int v = 0; v < NV; ++v) {
             if (nbr[v].size() != 2 || loopOf[v] >= 0) continue;
-            const double a = angleAt(mesh_.vertices[v], mesh_.vertices[nbr[v][0]],
-                                     mesh_.vertices[nbr[v][1]]);
+            double a = angleAt(mesh_.vertices[v], mesh_.vertices[nbr[v][0]],
+                               mesh_.vertices[nbr[v][1]]);
+            if (override && std::isfinite(opts_.interfaceAngleOverride[v])) a = opts_.interfaceAngleOverride[v];
             if (std::fabs(a - M_PI) > kinkTol) mark(v, CornerKind::InterfaceKink);
         }
     }

@@ -70,7 +70,7 @@ public:
         std::string reason;
         int coarseCells = 0, classes = 0, blocks = 0;
         int vertices = 0, cells = 0;
-        int boundarySplits = 0, snapped = 0;
+        int boundarySplits = 0, interfaceSplits = 0, snapped = 0;
         int invertedInterpolated = 0, inverted = 0;
         int invertedHarmonic = -1;      // -1: the harmonic map was not needed
         bool harmonic = false;          // the harmonic state replaced the interpolation

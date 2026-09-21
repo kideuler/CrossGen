@@ -4896,9 +4896,11 @@ void CrossGenWidget::renderATLAS() {
         return;
     }
 
-    // The blocks on the input, as MERIDIAN's Patches phase draws its layout.
+    // The blocks on the input, as the shared BlockDecomposition -- the same
+    // representation and the same routine MERIDIAN's and TORSION's Patches
+    // phase draws its layout with.
     if (atlasPhase_ >= ATLASPhase::Blocks && haveCover) {
-        viewer::drawBlockCover(atlas_->getCover(), 0.30 * avgEdge_, 3.0f);
+        viewer::drawBlockDecomposition(atlas_->getCover().blockDecomposition(), 0.30 * avgEdge_, 3.0f);
         return;
     }
 
@@ -4912,7 +4914,8 @@ void CrossGenWidget::renderATLAS() {
         if (C) {
             viewer::drawBoundaryEdges(*mesh_);
             viewer::drawSquareCarrier(*C, 1.25f, 0.0, matFill);
-            if (C == s.best.get() && s.bestCover) viewer::drawBlockCover(*s.bestCover, 0.0, 2.5f);
+            if (C == s.best.get() && s.bestCover)
+                viewer::drawBlockDecomposition(s.bestCover->blockDecomposition(), 0.0, 2.5f);
             viewer::drawCarrierDefects(*C, 0.3 * C->meanEdgeLength());
             return;
         }
@@ -6916,10 +6919,10 @@ void CrossGenWidget::renderNormal() {
             // drawn last so no wireframe edge crosses a patch side.
             if (pipePhase_ >= PipelinePhase::Mesh && quadMesh_.has_value()) {
                 // Stage 10 draws its own block walls off the blocks it built,
-                // so drawLayoutPatches would only lay a second, differently
-                // sourced copy of them over the first. A face Stage 10 could
-                // not mesh has no wall here, which is the point: the blank is
-                // where the mesh is not.
+                // so drawing the BlockDecomposition here too would only lay a
+                // second, differently sourced copy of them over the first. A
+                // face Stage 10 could not mesh has no wall here, which is the
+                // point: the blank is where the mesh is not.
                 //
                 // Where Stage 11 ran it is the merged mesh that is drawn, not
                 // Stage 10's: the templates are elements of that one mesh, and
@@ -6943,9 +6946,11 @@ void CrossGenWidget::renderNormal() {
                 else
                     viewer::drawQuadMesh(*quadMesh_, 1.0f, 2.5f, matFill);
             } else if (pipePhase_ >= PipelinePhase::Patches && arrangement_.has_value()) {
-                viewer::drawLayoutPatches(*arrangement_,
-                                          splines_.has_value() ? &*splines_ : nullptr,
-                                          0.30 * avgEdge_, 3.0f);
+                const std::string src = (mode_ == Mode::TORSION) ? "TORSION" : "MERIDIAN";
+                viewer::drawBlockDecomposition(
+                    arrangement_->blockDecomposition(splines_.has_value() ? &*splines_ : nullptr,
+                                                     16, src),
+                    0.30 * avgEdge_, 3.0f);
             }
             // Over the finished picture, and this is where it earns its place:
             // an element or a patch side that crosses one of these curves

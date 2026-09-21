@@ -92,12 +92,25 @@ Realisation::Realisation(const CoarseDomain &cd, const SquareCarrier &C, const B
         return static_cast<int>(Q.vertices.size()) - 1;
     };
 
-    // ---- 1. Every coarse boundary vertex on the fine boundary -----------------
+    // ---- 1. Every coarse feature vertex on the fine curve it samples ----------
+    //
+    // Both kinds of feature are carried the same way (Sec. 1.1 asks the same
+    // of dS and of an interface), so "feature" below is either: a vertex on
+    // dS, or one with an interface edge.
+    auto featureVertex = [&](int v) { return C.boundaryVertex[v] || C.interfaceDegree[v] > 0; };
     std::vector<CoarseDomain::Location> loc(NVc);
+    std::vector<std::vector<int>> onLoop(cd.arcs().size());
+    std::vector<CoarseDomain::Location> here;
     for (int v = 0; v < NVc; ++v) {
-        if (!C.boundaryVertex[v]) continue;
-        loc[v] = cd.locate(C, v);
-        if (loc[v].loop < 0) { fail("a coarse boundary vertex has no place on the fine boundary"); return; }
+        if (!featureVertex(v)) continue;
+        cd.locateAll(C, v, here);
+        if (here.empty()) { fail("a coarse feature vertex has no place on the input's curves"); return; }
+        loc[v] = here.front();
+        if (C.valence[v] == 0) continue;
+        // A sample is on every curve through its input vertex, and takes part
+        // in the ordering of each; anything else is inside one coarse feature
+        // edge and so on one curve only.
+        for (const CoarseDomain::Location &L : here) onLoop[L.loop].push_back(v);
     }
     // Snap onto input vertices: the exact samples first (they sit on one), then
     // the rest in loop order. A snap must keep the loop order -- a point
@@ -105,15 +118,17 @@ Realisation::Realisation(const CoarseDomain &cd, const SquareCarrier &C, const B
     // whole loop -- and never puts two coarse vertices on one input vertex.
     std::vector<int> snappedTo(NVc, -1);
     std::vector<int> claimed(M.vertices.size(), -1);
-    std::vector<double> eff(NVc, 0.0);   // effective arc position
-    std::vector<std::vector<int>> onLoop(cd.arcs().size());
-    for (int v = 0; v < NVc; ++v) {
-        if (!C.boundaryVertex[v] || C.valence[v] == 0) continue;
-        eff[v] = loc[v].s;
-        onLoop[loc[v].loop].push_back(v);
-    }
-    for (auto &list : onLoop) {
-        std::sort(list.begin(), list.end(), [&](int a, int b) { return loc[a].s < loc[b].s; });
+    // Where a coarse feature vertex sits on a given arc. A sample is its own
+    // input vertex, on every curve through it; anything else is on the one
+    // curve its coarse edge samples, and moves only if it snaps.
+    auto posOn = [&](int l, int v) {
+        if (C.sourceVertex[v] >= 0) return cd.positionOf(l, cd.fineVertexOf()[C.sourceVertex[v]]);
+        if (snappedTo[v] >= 0) return cd.positionOf(l, snappedTo[v]);
+        return loc[v].s;
+    };
+    for (int l = 0; l < static_cast<int>(onLoop.size()); ++l) {
+        std::vector<int> &list = onLoop[l];
+        std::sort(list.begin(), list.end(), [&](int a, int b) { return posOn(l, a) < posOn(l, b); });
     }
     for (int pass = 0; pass < 2; ++pass) {
         for (int l = 0; l < static_cast<int>(onLoop.size()); ++l) {
@@ -121,7 +136,10 @@ Realisation::Realisation(const CoarseDomain &cd, const SquareCarrier &C, const B
             const CoarseDomain::Arc &A = cd.arcs()[l];
             const int n = static_cast<int>(A.vertices.size()), m = static_cast<int>(list.size());
             const double Ltot = A.length;
+            // An open chain does not wrap: its two ends are not neighbours,
+            // and nothing may be ordered past them.
             auto wrapHalf = [&](double d) {
+                if (!A.closed) return d;
                 d = std::fmod(d, Ltot);
                 if (d > 0.5 * Ltot) d -= Ltot;
                 if (d <= -0.5 * Ltot) d += Ltot;
@@ -130,28 +148,30 @@ Realisation::Realisation(const CoarseDomain &cd, const SquareCarrier &C, const B
             for (int k = 0; k < m; ++k) {
                 const int v = list[k];
                 if ((C.sourceVertex[v] >= 0) != (pass == 0)) continue;
+                const double s = posOn(l, v);
+                if (s < 0.0) continue;
                 int i = 0;
-                cd.pointAt(l, loc[v].s, nullptr, &i);
+                cd.pointAt(l, s, nullptr, &i);
                 const double s0 = A.s[i], s1 = (i + 1 < n) ? A.s[i + 1] : A.length;
                 const double seg = s1 - s0;
-                const double d0 = loc[v].s - s0, d1 = s1 - loc[v].s;
+                const double d0 = s - s0, d1 = s1 - s;
                 const int j = d0 <= d1 ? i : (i + 1) % n;
                 const double dist = std::min(d0, d1);
                 const int f = A.vertices[j];
                 const bool exact = dist <= 1e-12 * std::max(1.0, A.length);
                 // Offsets from v's own position: the candidate, and the two
-                // neighbours along the loop where they are now.
-                const double dc = wrapHalf(A.s[j] - loc[v].s);
-                const double dp = m > 1 ? wrapHalf(eff[list[(k + m - 1) % m]] - loc[v].s) : -0.5 * Ltot;
-                const double dn = m > 1 ? wrapHalf(eff[list[(k + 1) % m]] - loc[v].s) : 0.5 * Ltot;
+                // neighbours along the curve where they are now.
+                const double dc = wrapHalf(A.s[j] - s);
+                const bool first = !A.closed && k == 0, last = !A.closed && k == m - 1;
+                const double dp = (m > 1 && !first) ? wrapHalf(posOn(l, list[(k + m - 1) % m]) - s) : -Ltot;
+                const double dn = (m > 1 && !last) ? wrapHalf(posOn(l, list[(k + 1) % m]) - s) : Ltot;
                 const bool ordered = exact || (dp < dc && dc < dn);
                 if ((exact || dist <= opts.snap * seg) && ordered && claimed[f] < 0) {
                     claimed[f] = v;
                     snappedTo[v] = f;
-                    eff[v] = A.s[j];
                     ++report_.snapped;
-                } else if (exact) {
-                    fail("two coarse boundary vertices land on one input vertex");
+                } else if (exact && snappedTo[v] != f) {
+                    fail("two coarse feature vertices land on one input vertex");
                     return;
                 }
             }
@@ -176,14 +196,16 @@ Realisation::Realisation(const CoarseDomain &cd, const SquareCarrier &C, const B
             }
         }
         for (int e = 0; e < NEc; ++e) {
-            if (C.boundaryEdge[e] && !onMacroE[e]) { fail("a boundary edge is on no block side"); return; }
+            // Sec. 1.1 wants dS and every interface to be unions of
+            // macroedges, so neither may run through the inside of a block.
+            if (C.isFeatureEdge(e) && !onMacroE[e]) { fail("a feature edge is on no block side"); return; }
         }
     }
     vertexMap_.assign(NVc, -1);
     std::vector<int> fineIdOfInput(M.vertices.size(), -1);
     for (int v = 0; v < NVc; ++v) {
         if (C.valence[v] == 0 || !onMacroV[v]) continue;
-        if (C.boundaryVertex[v]) {
+        if (featureVertex(v)) {
             if (snappedTo[v] >= 0) {
                 const int f = snappedTo[v];
                 vertexMap_[v] = addV(M.vertices[f], Origin::MeshVertex, f, -1);
@@ -191,8 +213,17 @@ Realisation::Realisation(const CoarseDomain &cd, const SquareCarrier &C, const B
             } else {
                 int e = -1;
                 const Point p = cd.pointAt(loc[v].loop, loc[v].s, &e);
-                vertexMap_[v] = addV(p, Origin::BoundarySplit, -1, e);
-                ++report_.boundarySplits;
+                // A point inserted along dS is a boundary split, which
+                // validate() audits against the input's segments; one along an
+                // interface is an ordinary interior vertex of the realisation,
+                // and it sits on the input's polyline all the same.
+                if (C.boundaryVertex[v]) {
+                    vertexMap_[v] = addV(p, Origin::BoundarySplit, -1, e);
+                    ++report_.boundarySplits;
+                } else {
+                    vertexMap_[v] = addV(p, Origin::InterfaceSplit, -1, e);
+                    ++report_.interfaceSplits;
+                }
             }
         } else {
             vertexMap_[v] = addV(C.vertices[v], Origin::Realised, -1, -1);
@@ -215,32 +246,71 @@ Realisation::Realisation(const CoarseDomain &cd, const SquareCarrier &C, const B
         }
     }
 
-    // The input vertices strictly inside each coarse boundary edge, in loop
-    // order from the edge's start in loop order.
+    // The input vertices strictly inside each coarse feature edge, in curve
+    // order from the edge's start. Which curve an edge samples is the edge's
+    // own property, not its ends' -- a junction of the interface network is on
+    // every branch at once -- so CoarseDomain::edgeArc is what answers it.
     std::vector<std::vector<int>> chain(NEc);
-    std::vector<int> loopStart(NEc, -1);
+    std::vector<int> loopStart(NEc, -1), arcOfEdge(NEc, -1);
     std::vector<double> length(NEc, 0.0);
     for (int e = 0; e < NEc; ++e) {
         const int a = C.edges[e][0], b = C.edges[e][1];
-        if (!C.boundaryEdge[e]) {
+        if (!C.isFeatureEdge(e)) {
             length[e] = normP(posOf(b) - posOf(a));
             continue;
         }
         const int q = C.edgeCell[e][0], i = C.edgeSide[e][0];
-        const int from = C.cells[q][i], to = C.cells[q][(i + 1) & 3];
-        loopStart[e] = from;
-        const int l = loc[from].loop;
-        if (loc[to].loop != l) { fail("a coarse boundary edge joins two boundary loops"); return; }
+        int from = C.cells[q][i], to = C.cells[q][(i + 1) & 3];
+        // Which of the edge's two ends the arc runs from. A carrier edge is
+        // inside one coarse mesh edge, whose arc and direction are known; for
+        // a boundary edge of the initial split that direction is the loop's.
+        int l = -1;
+        if (C.sourceEdge[from] >= 0) l = cd.edgeArc(C.sourceEdge[from]);
+        if (l < 0 && C.sourceEdge[to] >= 0) l = cd.edgeArc(C.sourceEdge[to]);
+        if (l < 0) {
+            // Both ends are samples, so the edge spans a whole coarse feature
+            // edge: take the curve they share, and the shortest way along it
+            // if they share more than one.
+            std::vector<CoarseDomain::Location> la, lb;
+            cd.locateAll(C, from, la);
+            cd.locateAll(C, to, lb);
+            double best = std::numeric_limits<double>::infinity();
+            for (const CoarseDomain::Location &x : la) {
+                for (const CoarseDomain::Location &y : lb) {
+                    if (x.loop != y.loop) continue;
+                    const double d = cd.forward(x.loop, x.s, y.s);
+                    if (d < best) { best = d; l = x.loop; }
+                }
+            }
+        }
+        if (l < 0) { fail("a coarse feature edge lies on no input curve"); return; }
         const CoarseDomain::Arc &A = cd.arcs()[l];
+        if (!C.boundaryEdge[e]) {
+            // A boundary edge inherits its direction from its one cell, whose
+            // counter-clockwise corner order is the loop's. An interface has a
+            // cell on both sides, so edgeCell[e][0] is arbitrary and says
+            // nothing: the chain's own direction is what decides, and getting
+            // it backwards would take the "inside" of the edge the long way
+            // round a closed chain -- most of a bubble's circle, not the one
+            // arc between two samples.
+            const double sf = posOn(l, from), st = posOn(l, to);
+            const bool reversed = A.closed ? cd.forward(l, sf, st) > cd.forward(l, st, sf) : st < sf;
+            if (reversed) std::swap(from, to);
+        }
+        loopStart[e] = from;
+        arcOfEdge[e] = l;
         const int n = static_cast<int>(A.vertices.size());
-        const double span = cd.forward(l, eff[from], eff[to]);
+        const double sFrom = posOn(l, from), sTo = posOn(l, to);
+        if (sFrom < 0.0 || sTo < 0.0) { fail("a coarse feature edge has an end off its input curve"); return; }
+        const double span = cd.forward(l, sFrom, sTo);
         length[e] = span;
         const double eps = 1e-12 * std::max(1.0, A.length);
         int i0 = 0;
-        cd.pointAt(l, eff[from], nullptr, &i0);
+        cd.pointAt(l, sFrom, nullptr, &i0);
         for (int k = 1; k <= n; ++k) {
             const int j = (i0 + k) % n;
-            const double d = cd.forward(l, eff[from], A.s[j]);
+            if (!A.closed && i0 + k >= n) break;
+            const double d = cd.forward(l, sFrom, A.s[j]);
             if (d >= span - eps || d >= A.length - eps) break;
             if (d <= eps) continue;
             chain[e].push_back(A.vertices[j]);
@@ -251,7 +321,10 @@ Realisation::Realisation(const CoarseDomain &cd, const SquareCarrier &C, const B
     std::vector<int> members(NEc, 0);
     for (int e = 0; e < NEc; ++e) {
         const int r = find(e);
-        if (C.boundaryEdge[e]) required[r] = std::max(required[r], static_cast<int>(chain[e].size()) + 1);
+        // Every input vertex on dS or on an interface must survive (Sec. 1.1's
+        // geometric preservation), so the class needs at least one fine edge
+        // per input segment the coarse edge spans.
+        if (C.isFeatureEdge(e)) required[r] = std::max(required[r], static_cast<int>(chain[e].size()) + 1);
         lenSum[r] += length[e];
         ++members[r];
     }
@@ -270,22 +343,29 @@ Realisation::Realisation(const CoarseDomain &cd, const SquareCarrier &C, const B
         const int n = count[find(e)];
         const int a = C.edges[e][0], b = C.edges[e][1];
         std::vector<int> L;
-        if (C.boundaryEdge[e]) {
+        if (C.isFeatureEdge(e)) {
             const int from = loopStart[e];
             const int to = from == a ? b : a;
-            const int l = loc[from].loop;
+            const int l = arcOfEdge[e];
             const CoarseDomain::Arc &A = cd.arcs()[l];
+            const bool onBoundary = C.boundaryEdge[e];
             L.push_back(vertexMap_[from]);
             for (int f : chain[e]) {
                 if (fineIdOfInput[f] < 0) fineIdOfInput[f] = addV(M.vertices[f], Origin::MeshVertex, f, -1);
                 L.push_back(fineIdOfInput[f]);
             }
             L.push_back(vertexMap_[to]);
-            // The input edge each piece lies on.
+            // The input edge each piece lies on. Every input vertex between
+            // the ends is in L by now, so a piece is inside one input segment
+            // and its midpoint is on the curve, not a chord across it.
+            auto isSplit = [&](int x) {
+                return Q.origin[x] == Origin::BoundarySplit || Q.origin[x] == Origin::InterfaceSplit;
+            };
             auto pieceEdge = [&](int p, int q) {
-                if (Q.origin[p] == Origin::BoundarySplit) return Q.sourceEdge[p];
-                if (Q.origin[q] == Origin::BoundarySplit) return Q.sourceEdge[q];
-                return A.edges[cd.arcIndex(Q.sourceVertex[p])];
+                if (isSplit(p)) return Q.sourceEdge[p];
+                if (isSplit(q)) return Q.sourceEdge[q];
+                const int i = Q.sourceVertex[p] >= 0 ? cd.arcIndex(l, Q.sourceVertex[p]) : -1;
+                return i >= 0 && i < static_cast<int>(A.edges.size()) ? A.edges[i] : -1;
             };
             int extra = n - (static_cast<int>(L.size()) - 1);
             while (extra-- > 0) {
@@ -296,9 +376,10 @@ Realisation::Realisation(const CoarseDomain &cd, const SquareCarrier &C, const B
                     if (len > bestLen) { bestLen = len; best = static_cast<int>(k); }
                 }
                 const int p = L[best], q = L[best + 1];
-                const int id = addV((Q.vertices[p] + Q.vertices[q]) * 0.5, Origin::BoundarySplit, -1,
+                const int id = addV((Q.vertices[p] + Q.vertices[q]) * 0.5,
+                                    onBoundary ? Origin::BoundarySplit : Origin::InterfaceSplit, -1,
                                     pieceEdge(p, q));
-                ++report_.boundarySplits;
+                if (onBoundary) ++report_.boundarySplits; else ++report_.interfaceSplits;
                 L.insert(L.begin() + best + 1, id);
             }
             if (from != a) std::reverse(L.begin(), L.end());

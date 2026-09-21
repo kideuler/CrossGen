@@ -69,6 +69,14 @@ public:
         // would put a block corner at every one of them. The curve itself has
         // no corner there, and the fine mesh's angle says so.
         std::vector<double> angleOverride;
+        // The same, for the angle the layout sees *along an interface* at a
+        // vertex with two interface edges: the kink test reads this where it
+        // is finite and the polyline's own turn where it is not. A coarse
+        // re-triangulation needs it for the same reason as angleOverride --
+        // an interface arc sampled eight times is a polygon that turns at
+        // every sample, and believing those turns would protect all eight as
+        // kinks and force a block corner at each.
+        std::vector<double> interfaceAngleOverride;
         // A triangle whose area is below this fraction of the squared bounding
         // box diagonal is degenerate.
         double degenerateArea = 1e-14;

@@ -8,6 +8,7 @@
 
 #include "ATLAS/RectangleCertifier.hxx"
 #include "ATLAS/SquareCarrier.hxx"
+#include "mesh/BlockDecomposition.hxx"
 
 // Stage 5 of docs/square_transport_2d_theory_and_implementation.md: select a
 // conforming cover.
@@ -102,6 +103,12 @@ public:
     const std::vector<MacroEdge> &getMacroEdges() const { return macroEdges_; }
     const std::vector<int> &getMacroVertices() const { return macroVertices_; }
     const Report &getReport() const { return report_; }
+
+    // The macro complex as the shared block-decomposition representation
+    // (mesh/BlockDecomposition.hxx): Sec. 13.2's gates already ran in
+    // analyze(), so this only reshapes what passed them into the class every
+    // pipeline's Blocks/Patches phase draws and can be written out with.
+    BlockDecomposition blockDecomposition() const;
 
     // The macro edges as OBJ polylines over the carrier's vertices (Sec. 13.1).
     bool writeOBJ(const std::string &path) const;
