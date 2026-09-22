@@ -89,6 +89,15 @@ public:
         // Rays ended by arriving at the corner another ray was launched from,
         // rather than by leaving the model -- see setArrivalTolerance().
         int arrivals = 0;
+        // Rays launched to carry an iso-line through an interface it ended on,
+        // one per landing. Zero on a single-material model. They are counted in
+        // `motorcycles` as well, being rays like any other; this says how many
+        // of them nobody's corner asked for.
+        int continuations = 0;
+        // Continuations refused for arriving at the generation cap. Nonzero
+        // means a line crossed more interfaces than the cap allows, which on
+        // these models means it was going round in circles.
+        int continuationsDropped = 0;
         int nodes = 0;         // corners, exits and crossings of the block structure
         int blocks = 0;
         int mergedSlivers = 0;  // blocks the mesh could not resolve, folded into a neighbour
@@ -97,7 +106,9 @@ public:
     };
 
     // The polysquare must have been solved; its corners and its (u, v) are
-    // what the tracing follows.
+    // what the tracing follows. On a multi-material model it also carries the
+    // interfaces, and those change the structure in two ways -- see
+    // launchFeatureSectors() and floodBlocks().
     explicit MotorcycleGraph(const Polysquare &ps);
 
     // How close a ray that is already lost has to pass to the corner another
@@ -201,6 +212,15 @@ public:
     // The model the blocks were cut out of.
     const Mesh& getMesh() const { return *mesh; }
 
+    // The material interfaces the tracing treated as walls, as mesh edge
+    // indices. Empty on a single-material model. The block structure has to
+    // carry these as sides of its own -- see BlockLayout -- since a ray ends
+    // on one and a block never crosses one.
+    const std::vector<int>& getFeatureEdges() const { return poly->getFeatureEdges(); }
+    bool isFeatureEdge(int e) const {
+        return e >= 0 && e < static_cast<int>(edgeIsFeature.size()) && edgeIsFeature[e];
+    }
+
     // The input mesh with the block index as cell data.
     //
     // A ray crosses triangles rather than following their edges, so a triangle
@@ -229,6 +249,28 @@ private:
     };
 
     void launch();
+    // The rays a multi-material domain needs on top of those.
+    //
+    // Sec. 5 sends a ray inward from every reflex corner, because cutting a
+    // rectilinear domain into rectangles is done from its reflex corners and
+    // nowhere else. On a multi-material domain the domain to be cut up is not
+    // S but each material region, and the corners of those are the corners of
+    // dS *and* every place an interface turns, meets another interface, or
+    // lands on dS. A region whose reflex corners were not fired from is a
+    // region that does not come out as quadrilaterals.
+    //
+    // The sectors are read off the image rather than off the frame field's
+    // corner index, which is what the boundary path above uses. Both say the
+    // same thing where the polysquare is sound -- the image angle of a sector
+    // is q quarter turns and the index is 2 - q -- and reading the image is
+    // what makes this independent of how the corner index was accumulated
+    // along a chain, which on an interface is a per-side question with two
+    // answers rather than dS's one.
+    //
+    // A vertex with no interface on it is left entirely to launch(), so a
+    // single-material model takes this path nowhere and comes out bit for bit
+    // as it did.
+    void launchFeatureSectors();
     void run();
     void findNodes();
     void floodBlocks();
@@ -246,6 +288,13 @@ private:
     const Mesh *mesh = nullptr;      // the original mesh
     const Mesh *cut = nullptr;       // M_C, same triangles
     const std::vector<Point> *uv = nullptr;
+
+    // The material interfaces, as a flag per mesh edge and per vertex. They
+    // are walls for the flood and sector boundaries for the launch, and they
+    // are empty on a single-material model.
+    std::vector<char> edgeIsFeature;
+    std::vector<char> vertexOnFeature;
+    bool multiMaterial = false;
 
     std::vector<Motorcycle> bikes;
     std::vector<std::vector<Point>> traces;

@@ -133,6 +133,8 @@ add_library(PolyVector SHARED
     src/mesh/TMOP.hxx
     src/mesh/BlockDecomposition.hxx
     src/mesh/BlockDecomposition.cxx
+    src/mesh/BlockQuadMesh.hxx
+    src/mesh/BlockQuadMesh.cxx
     src/polyvector/PolyVectors.hxx
     src/polyvector/PolyVectors.cxx
     src/dualmbo/DualMBO.hxx
@@ -218,8 +220,6 @@ add_library(PolyVector SHARED
     src/UMBER/MotorcycleGraph.cxx
     src/UMBER/BlockLayout.hxx
     src/UMBER/BlockLayout.cxx
-    src/UMBER/ChordCollapse.hxx
-    src/UMBER/ChordCollapse.cxx
     src/tracing/FieldTracer.hxx
     src/tracing/FieldTracer.cxx
     src/tracing/SeparatrixTrace.hxx
@@ -313,6 +313,9 @@ target_link_libraries(TestGeom PRIVATE CrossGenGeom)
 # Test the UMBER frame field optimization (Wang et al. 2022, Secs. 4.1-4.2)
 add_executable(TestUMBER src/utils/TestUMBER.cxx)
 target_link_libraries(TestUMBER PRIVATE PolyVector)
+# The driver writes its VTK output into the working directory, so it runs in
+# the build tree rather than beside the meshes.
+set_target_properties(TestUMBER PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 
 # Test MERIDIAN Stages 1-9 (Shepherd, Gu and Hughes 2022, Secs. 3.1-3.3, 4 and
 # 5): cone singularities, cutting graph, Gauss-Bonnet, discrete Ricci flow, the
@@ -525,6 +528,29 @@ set_tests_properties(MERIDIAN_Templates_multimat_bubbles PROPERTIES TIMEOUT 2400
 # is movement for no reason; the disk has 2 pi of boundary turning to move and
 # what is known of it is the target, K = Kbar to rounding on a metric that is
 # still realisable.
+# UMBER end to end: the frame field of Sec. 4.2, the polysquare of Sec. 4.3,
+# the motorcycle graph of Sec. 5, the chord collapse, and then the two stages
+# every method now shares -- the block decomposition (mesh/BlockDecomposition)
+# and the quadrilateral mesh on it (mesh/BlockQuadMesh).
+#
+# What the exit code asserts is the structural part and only that: every side
+# of every block resolves to a macro edge, every interface macro edge separates
+# two materials, no block sits in two materials, and the mesh is conforming.
+# The flips, the internal singularities and the boundary turn count are printed
+# and not asserted, because whether a given shape has a polysquare at all is a
+# fact about the shape.
+#
+# Two models: geom012, the heaviest single-material layout in the corpus (ten
+# holes, 107 blocks), and multimat/geom001, the quarter disk in a square, which
+# is the smallest domain on which the interfaces have to be features of the
+# field, the deformation and the block structure alike.
+add_test(NAME UMBER_Polysquare_singlemat_geom012
+         COMMAND TestUMBER ${CMAKE_CURRENT_SOURCE_DIR}/data/meshes/singlemat/geom012.obj)
+add_test(NAME UMBER_Polysquare_multimat_geom001
+         COMMAND TestUMBER ${CMAKE_CURRENT_SOURCE_DIR}/data/meshes/multimat/geom001.obj)
+set_tests_properties(UMBER_Polysquare_singlemat_geom012
+                     UMBER_Polysquare_multimat_geom001 PROPERTIES TIMEOUT 2400)
+
 add_test(NAME TORSION_SelfTest COMMAND TestTORSION --selftest)
 
 # End-to-end on the same four models MERIDIAN_Layout uses, with psi_0 integrated

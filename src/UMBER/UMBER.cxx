@@ -50,6 +50,72 @@ UMBER::UMBER(std::shared_ptr<Mesh> meshIn,
 }
 
 // ---------------------------------------------------------------------------
+void UMBER::setFeatureEdges(const std::vector<int> &edges) {
+    featureEdges.clear();
+    featureEdgeKeys.clear();
+    featureEdges.reserve(edges.size());
+    for (const int e : edges) {
+        if (e < 0 || e >= static_cast<int>(mesh->edges.size())) continue;
+        featureEdges.push_back(e);
+        featureEdgeKeys.insert(EdgeKey(mesh->edges[e][0], mesh->edges[e][1]));
+    }
+    initialized = false;   // the quadrature of Eq. (4) has changed
+}
+
+// ---------------------------------------------------------------------------
+// buildRegions()
+//
+// The material regions: components of the triangles when the feature edges are
+// walls. A vertex strictly inside one gets its label; a vertex whose incident
+// triangles disagree sits on an interface and gets -1, which never matches
+// anything, so nothing on an interface is ever paired by the dipole rule.
+//
+// Without feature edges every triangle is in region 0 and every vertex is
+// labelled 0, which is the right answer: a single-material model is one
+// region, and a +1/-1 pair in it is a pair in one region.
+// ---------------------------------------------------------------------------
+void UMBER::buildRegions() {
+    const int nT = static_cast<int>(mesh->triangles.size());
+    const int nV = static_cast<int>(mesh->vertices.size());
+    std::vector<int> triRegion(nT, -1);
+
+    std::vector<char> isFeature(mesh->edges.size(), 0);
+    for (const int e : featureEdges)
+        if (e >= 0 && e < static_cast<int>(isFeature.size())) isFeature[e] = 1;
+
+    int regions = 0;
+    std::vector<int> stack;
+    for (int t = 0; t < nT; ++t) {
+        if (triRegion[t] >= 0) continue;
+        const int r = regions++;
+        stack.assign(1, t);
+        triRegion[t] = r;
+        while (!stack.empty()) {
+            const int c = stack.back();
+            stack.pop_back();
+            for (int i = 0; i < 3; ++i) {
+                const int nb = mesh->triangleAdjacency[c][i];
+                if (nb < 0 || triRegion[nb] >= 0) continue;
+                const int e = mesh->triangleEdges[c][i];
+                if (e >= 0 && isFeature[e]) continue;
+                triRegion[nb] = r;
+                stack.push_back(nb);
+            }
+        }
+    }
+
+    vertexRegion.assign(nV, -2);   // -2: not seen yet
+    for (int t = 0; t < nT; ++t) {
+        for (int i = 0; i < 3; ++i) {
+            const int v = mesh->triangles[t][i];
+            if (vertexRegion[v] == -2) vertexRegion[v] = triRegion[t];
+            else if (vertexRegion[v] != triRegion[t]) vertexRegion[v] = -1;
+        }
+    }
+    for (int v = 0; v < nV; ++v) if (vertexRegion[v] == -2) vertexRegion[v] = -1;
+}
+
+// ---------------------------------------------------------------------------
 // tau of Eq. (3) and its Jacobian
 //
 // For a unit v = (cos t, sin t) this is (cos 4t, sin 4t), but it is written as
@@ -112,36 +178,54 @@ void UMBER::initialize() {
         smoothEdges.push_back(se);
     }
 
-    // --- Boundary edges of Eq. (4) ------------------------------------------
+    // --- Feature edges of Eq. (4): dS, and the interfaces where there are any
+    //
     // sigma_e is the polar angle of the edge; the l1 norm of R(-sigma_e) v is
     // invariant under sigma_e -> sigma_e + pi/2, so the edge orientation and
     // the choice of which cross direction v represents are both irrelevant
     // here.
+    //
+    // A boundary edge contributes one term, for its one triangle. An interface
+    // edge contributes one per side: both triangles are asked for the same
+    // axis, which is what makes the frame agree across the interface rather
+    // than merely follow it from one material. See setFeatureEdges.
     alignEdges.clear();
-    alignEdges.reserve(mesh->boundaryEdges.size());
+    alignEdges.reserve(mesh->boundaryEdges.size() + 2 * featureEdges.size());
     totalBoundaryLength = 0.0;
 
-    std::vector<double> edgeLen(mesh->boundaryEdges.size(), 0.0);
-    for (size_t i = 0; i < mesh->boundaryEdges.size(); ++i) {
-        const int e = mesh->boundaryEdges[i];
-        const Point &pa = mesh->vertices[mesh->edges[e][0]];
-        const Point &pb = mesh->vertices[mesh->edges[e][1]];
-        const double dx = pb[0] - pa[0], dy = pb[1] - pa[1];
-        edgeLen[i] = std::sqrt(dx * dx + dy * dy);
+    struct Side { int edge; int face; };
+    std::vector<Side> sides;
+    sides.reserve(mesh->boundaryEdges.size() + 2 * featureEdges.size());
+    for (const int e : mesh->boundaryEdges) {
+        const int f = mesh->edgeTriangles[e][0] >= 0 ? mesh->edgeTriangles[e][0]
+                                                     : mesh->edgeTriangles[e][1];
+        if (f >= 0) sides.push_back({e, f});
+    }
+    for (const int e : featureEdges) {
+        if (e < 0 || e >= static_cast<int>(mesh->edges.size())) continue;
+        if (mesh->isBoundaryEdge[e]) continue;   // already carried above
+        for (int k = 0; k < 2; ++k) {
+            const int f = mesh->edgeTriangles[e][k];
+            if (f >= 0) sides.push_back({e, f});
+        }
+    }
+
+    std::vector<double> edgeLen(sides.size(), 0.0);
+    for (size_t i = 0; i < sides.size(); ++i) {
+        const Point &pa = mesh->vertices[mesh->edges[sides[i].edge][0]];
+        const Point &pb = mesh->vertices[mesh->edges[sides[i].edge][1]];
+        edgeLen[i] = normP(pb - pa);
         totalBoundaryLength += edgeLen[i];
     }
 
-    for (size_t i = 0; i < mesh->boundaryEdges.size(); ++i) {
-        const int e = mesh->boundaryEdges[i];
-        const int f = mesh->edgeTriangles[e][0];
-        if (f < 0 || edgeLen[i] < 1e-14 || totalBoundaryLength <= 0.0) continue;
-
-        const Point &pa = mesh->vertices[mesh->edges[e][0]];
-        const Point &pb = mesh->vertices[mesh->edges[e][1]];
+    for (size_t i = 0; i < sides.size(); ++i) {
+        if (edgeLen[i] < 1e-14 || totalBoundaryLength <= 0.0) continue;
+        const Point &pa = mesh->vertices[mesh->edges[sides[i].edge][0]];
+        const Point &pb = mesh->vertices[mesh->edges[sides[i].edge][1]];
         const double dx = pb[0] - pa[0], dy = pb[1] - pa[1];
 
         AlignEdge ae;
-        ae.face = f;
+        ae.face = sides[i].face;
         ae.cosSigma = dx / edgeLen[i];
         ae.sinSigma = dy / edgeLen[i];
         ae.weight = edgeLen[i] / totalBoundaryLength; // l_e / l_dM
@@ -149,6 +233,9 @@ void UMBER::initialize() {
     }
 
     // --- Initial field ------------------------------------------------------
+    // The regions first: singularitySeams() needs them to tell a pair that may
+    // annihilate from one that may not.
+    buildRegions();
     combInitialField();
 
     x.resize(2 * nT);
@@ -267,13 +354,36 @@ std::unordered_set<UMBER::EdgeKey, UMBER::EdgeKeyHash> UMBER::singularitySeams()
         adj[e[1]].emplace_back(e[0], w);
     }
 
-    // Multi-source Dijkstra out of the boundary: dist[v] is the distance to the
-    // nearest boundary vertex and prev[v] the next step towards it.
+    // Where a defect is allowed to leave: dS, and -- on a multi-material model
+    // -- the interfaces too.
+    //
+    // An interface is a curve the layout has to follow, so it is a curve the
+    // layout is allowed to *turn* on, exactly as dS is, and a defect that
+    // reaches one becomes a corner of the interface rather than a corner of
+    // the boundary. Routing to dS alone is what forces it past the interface
+    // and out to the far edge of the model, and that is not a slightly worse
+    // placement: on data/meshes/multimat/geom001 the +1 the field puts inside
+    // the quarter disk is the whole of that region's deficit -- its boundary
+    // makes three quarter turns and needs four -- so its destination is the
+    // middle of the arc and nowhere else. Sent to dS instead it invents a
+    // corner on the square and leaves the arc with no corner at all, which is
+    // a quarter disk that cannot be one quadrilateral.
+    std::vector<char> isExit(nV, 0);
+    for (const int v : mesh->boundaryVertices) isExit[v] = 1;
+    for (const int e : featureEdges) {
+        if (e < 0 || e >= static_cast<int>(mesh->edges.size())) continue;
+        isExit[mesh->edges[e][0]] = 1;
+        isExit[mesh->edges[e][1]] = 1;
+    }
+
+    // Multi-source Dijkstra out of those: dist[v] is the distance to the
+    // nearest one and prev[v] the next step towards it.
     std::vector<double> dist(nV, std::numeric_limits<double>::max());
     std::vector<int> prev(nV, -1);
     std::priority_queue<std::pair<double, int>, std::vector<std::pair<double, int>>,
                         std::greater<std::pair<double, int>>> queue;
-    for (int v : mesh->boundaryVertices) {
+    for (int v = 0; v < nV; ++v) {
+        if (!isExit[v]) continue;
         dist[v] = 0.0;
         queue.emplace(0.0, v);
     }
@@ -290,10 +400,100 @@ std::unordered_set<UMBER::EdgeKey, UMBER::EdgeKeyHash> UMBER::singularitySeams()
         }
     }
 
-    for (const auto &[v, quarters] : sing) {
-        int cur = v;
+    // --- The pairs that annihilate rather than leave ------------------------
+    //
+    // A +1/-1 pair inside one material region contributes nothing to that
+    // region's count and is a property of the smoothest field, not of the
+    // layout -- so the cut between them is what it wants, and the two defects
+    // meet and vanish instead of inventing two corners on dS. See
+    // setCancelDipoles for the topology and for the rule that a pair spanning
+    // an interface is never one of these.
+    //
+    // Greedy closest-first over the shortest paths between them, which is
+    // MERIDIAN::ConeSingularities::cancelDipoles' own order: what goes is the
+    // tightest cluster.
+    //
+    // Only on a multi-material model, which is MERIDIAN's own gate
+    // (MERIDIAN.cxx runs cancelDipoles under multiMaterial()) and for its
+    // reason: the pair this removes is the one interface alignment put there.
+    // On a single-material model a +1/-1 pair is not that artefact, and
+    // cancelling it measurably loses -- over data/meshes/singlemat it takes
+    // geom007 from one flipped triangle in the parameterization to three and
+    // geom010 from eleven to thirteen, and moves no model the other way.
+    dipoles.clear();
+    std::vector<char> paired(sing.size(), 0);
+    if (cancelDipoles && !featureEdges.empty() && sing.size() >= 2 && !vertexRegion.empty()) {
+        // One Dijkstra per singularity, over the same primal graph. There are
+        // a handful of these on any model in data/meshes, so the quadratic
+        // pairing below costs nothing worth avoiding.
+        const int n = static_cast<int>(sing.size());
+        std::vector<std::vector<double>> dTo(n);
+        std::vector<std::vector<int>> pTo(n);
+        for (int i = 0; i < n; ++i) {
+            dTo[i].assign(nV, std::numeric_limits<double>::max());
+            pTo[i].assign(nV, -1);
+            std::priority_queue<std::pair<double, int>, std::vector<std::pair<double, int>>,
+                                std::greater<std::pair<double, int>>> q;
+            dTo[i][sing[i].first] = 0.0;
+            q.emplace(0.0, sing[i].first);
+            while (!q.empty()) {
+                const auto [d, v] = q.top();
+                q.pop();
+                if (d > dTo[i][v]) continue;
+                for (const auto &[nb, w] : adj[v]) {
+                    if (dTo[i][v] + w < dTo[i][nb]) {
+                        dTo[i][nb] = dTo[i][v] + w;
+                        pTo[i][nb] = v;
+                        q.emplace(dTo[i][nb], nb);
+                    }
+                }
+            }
+        }
+
+        struct Candidate { double d; int i; int j; };
+        std::vector<Candidate> cands;
+        for (int i = 0; i < n; ++i) {
+            for (int j = i + 1; j < n; ++j) {
+                // Only a single quarter against a single anti-quarter: a
+                // higher-order defect would need as many jumps as its index
+                // and one cut cannot carry them.
+                if (sing[i].second + sing[j].second != 0) continue;
+                if (std::abs(sing[i].second) != 1) continue;
+                const int ri = vertexRegion[sing[i].first];
+                const int rj = vertexRegion[sing[j].first];
+                if (ri < 0 || ri != rj) continue;   // on, or across, an interface
+                const double d = dTo[i][sing[j].first];
+                if (!(d < std::numeric_limits<double>::max())) continue;
+                cands.push_back({d, i, j});
+            }
+        }
+        std::sort(cands.begin(), cands.end(),
+                  [](const Candidate &a, const Candidate &b) { return a.d < b.d; });
+        for (const Candidate &c : cands) {
+            if (paired[c.i] || paired[c.j]) continue;
+            int cur = sing[c.j].first;
+            int guard = 0;
+            bool ok = true;
+            std::vector<EdgeKey> path;
+            while (cur != sing[c.i].first && guard++ < nV) {
+                const int nxt = pTo[c.i][cur];
+                if (nxt < 0) { ok = false; break; }
+                path.emplace_back(cur, nxt);
+                cur = nxt;
+            }
+            if (!ok || path.empty()) continue;
+            for (const EdgeKey &k : path) seams.insert(k);
+            paired[c.i] = paired[c.j] = 1;
+            dipoles.emplace_back(sing[c.i].first, sing[c.j].first);
+        }
+    }
+
+    // --- Everything else keeps its route to dS ------------------------------
+    for (size_t i = 0; i < sing.size(); ++i) {
+        if (paired[i]) continue;
+        int cur = sing[i].first;
         int guard = 0;
-        while (cur >= 0 && !mesh->isBoundaryVertex[cur] && guard++ < nV) {
+        while (cur >= 0 && !isExit[cur] && guard++ < nV) {
             const int nxt = prev[cur];
             if (nxt < 0) break; // unreachable: leave this one to the traversal
             seams.insert(EdgeKey(cur, nxt));
@@ -881,6 +1081,201 @@ std::vector<std::pair<int, int>> UMBER::boundarySingularities() const {
                                                               : incidentBoundary[v][1];
             prevEdge = e;
             v = otherEnd(e, v);
+        }
+    }
+
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// sectorFan() / sectorMeasure()
+//
+// The star walk boundarySingularities() does, written once and against a pair
+// of feature edges rather than against dS, so that the interfaces are measured
+// by the same code and cannot drift from it.
+//
+// The sweep starts in the triangle on the left of the directed edge
+// (far end of eIn) -> v, and steps from triangle to triangle through the
+// edges at v until it arrives at eOut. Starting on the left is the whole of
+// what picks the side: an interface has a fan on each side of it, and which
+// one is measured is which way the caller is walking the chain.
+// ---------------------------------------------------------------------------
+std::vector<int> UMBER::sectorFan(int v, int eIn, int eOut) const {
+    std::vector<int> fan;
+    if (eIn < 0 || eOut < 0) return fan;
+    const int w = (mesh->edges[eIn][0] == v) ? mesh->edges[eIn][1] : mesh->edges[eIn][0];
+
+    // The triangle with the sector on its left when w -> v is walked.
+    int cur = -1;
+    for (int k = 0; k < 2; ++k) {
+        const int t = mesh->edgeTriangles[eIn][k];
+        if (t < 0) continue;
+        const Triangle &tri = mesh->triangles[t];
+        int c = -1;
+        for (int i = 0; i < 3; ++i) if (tri[i] != v && tri[i] != w) c = tri[i];
+        if (c < 0) continue;
+        if (cross2(mesh->vertices[v] - mesh->vertices[w],
+                   mesh->vertices[c] - mesh->vertices[w]) > 0.0) { cur = t; break; }
+    }
+    if (cur < 0) return fan;
+
+    int entry = eIn;
+    const int guard = mesh->vertexTriangles.vertexDegree(v) + 1;
+    while (cur >= 0) {
+        fan.push_back(cur);
+        int next = -1;
+        for (int i = 0; i < 3; ++i) {
+            const int e = mesh->triangleEdges[cur][i];
+            if (e < 0 || e == entry) continue;
+            if (mesh->edges[e][0] == v || mesh->edges[e][1] == v) { next = e; break; }
+        }
+        if (next < 0) { fan.clear(); break; }
+        if (next == eOut) return fan;
+
+        const int nb = (mesh->edgeTriangles[next][0] == cur) ? mesh->edgeTriangles[next][1]
+                                                             : mesh->edgeTriangles[next][0];
+        if (nb < 0 || static_cast<int>(fan.size()) > guard) { fan.clear(); break; }
+        entry = next;
+        cur = nb;
+    }
+    fan.clear();   // the sweep ran off the model without reaching eOut
+    return fan;
+}
+
+void UMBER::sectorMeasure(int v, const std::vector<int> &fan, double &omega,
+                          double &theta) const {
+    omega = 0.0;
+    theta = 0.0;
+    for (const int t : fan) {
+        const Triangle &tri = mesh->triangles[t];
+        int i0 = -1;
+        for (int i = 0; i < 3; ++i) if (tri[i] == v) i0 = i;
+        if (i0 < 0) continue;
+        const Point a = mesh->vertices[tri[(i0 + 1) % 3]] - mesh->vertices[v];
+        const Point b = mesh->vertices[tri[(i0 + 2) % 3]] - mesh->vertices[v];
+        omega += std::fabs(std::atan2(cross2(a, b), dotP(a, b)));
+    }
+    for (size_t i = 0; i + 1 < fan.size(); ++i) {
+        const int tCur = fan[i], tNext = fan[i + 1];
+        double thetaNext = angles[tNext];
+        const int e = sharedEdge(tCur, tNext);
+        if (e >= 0 &&
+            cutEdges.find(EdgeKey(mesh->edges[e][0], mesh->edges[e][1])) != cutEdges.end()) {
+            thetaNext += find_rotation_matrix(thetaNext, angles[tCur]) * M_PI_2;
+        }
+        theta += wrap_pi(thetaNext - angles[tCur]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// interfaceCorners()
+//
+// The interface network cut into chains -- a run of interface edges between
+// two vertices where the network is not simply two edges meeting -- and each
+// chain walked in both directions, since an interface has a layout on each
+// side of it and the two need not turn the same way.
+//
+// The accumulation is boundarySingularities()'s, for its reason: a corner is
+// spread over the vertices it takes the frame to swing across, and rounding
+// each on its own loses it. A chain is open rather than cyclic, so the
+// telescoping identity that makes the boundary sum to 4 chi does not apply
+// here and the running total is a smoothing rather than an exact count.
+// ---------------------------------------------------------------------------
+void UMBER::buildInterfaceChains() const {
+    chainsBuilt = true;
+    chains.clear();
+    if (featureEdges.empty()) return;
+
+    const int nV = static_cast<int>(mesh->vertices.size());
+    std::vector<std::vector<int>> atVertex(nV);
+    for (const int e : featureEdges) {
+        if (e < 0 || e >= static_cast<int>(mesh->edges.size())) continue;
+        if (mesh->isBoundaryEdge[e]) continue;
+        atVertex[mesh->edges[e][0]].push_back(e);
+        atVertex[mesh->edges[e][1]].push_back(e);
+    }
+    auto otherEnd = [&](int e, int v) {
+        return (mesh->edges[e][0] == v) ? mesh->edges[e][1] : mesh->edges[e][0];
+    };
+    // A vertex the chain may not run through: an end, a junction of three or
+    // more branches, or a landing on dS, where which pair of edges continues
+    // is not a question the network answers on its own.
+    auto isChainNode = [&](int v) {
+        return atVertex[v].size() != 2 || mesh->isBoundaryVertex[v];
+    };
+
+    std::vector<char> used(mesh->edges.size(), 0);
+    auto walkFrom = [&](int v, int e) {
+        FeatureChain fc;
+        int cur = v, ce = e;
+        fc.verts.push_back(v);
+        while (ce >= 0 && !used[ce]) {
+            used[ce] = 1;
+            fc.edges.push_back(ce);
+            const int nxt = otherEnd(ce, cur);
+            fc.verts.push_back(nxt);
+            if (isChainNode(nxt)) break;
+            const int e2 = (atVertex[nxt][0] != ce) ? atVertex[nxt][0] : atVertex[nxt][1];
+            cur = nxt;
+            ce = e2;
+        }
+        if (fc.edges.empty()) return;
+        fc.closed = fc.verts.front() == fc.verts.back();
+        chains.push_back(std::move(fc));
+    };
+    // Open chains first, from their ends, so that a closed loop is only what
+    // is left over after every branch has been taken.
+    for (int v = 0; v < nV; ++v) {
+        if (!isChainNode(v)) continue;
+        for (const int e : atVertex[v]) if (!used[e]) walkFrom(v, e);
+    }
+    for (const int e : featureEdges) {
+        if (e < 0 || e >= static_cast<int>(mesh->edges.size()) || used[e]) continue;
+        if (mesh->isBoundaryEdge[e]) continue;
+        walkFrom(mesh->edges[e][0], e);
+    }
+}
+
+const std::vector<UMBER::FeatureChain>& UMBER::interfaceChains() const {
+    if (!chainsBuilt) buildInterfaceChains();
+    return chains;
+}
+
+std::vector<UMBER::FeatureCorner> UMBER::interfaceCorners() const {
+    std::vector<FeatureCorner> result;
+    if (uField.empty() || featureEdges.empty()) return result;
+
+    // --- Each chain, each way round ----------------------------------------
+    for (const FeatureChain &fc : interfaceChains()) {
+        if (fc.edges.size() < 2) continue;
+        const bool closed = fc.closed;
+
+        for (int dir = 0; dir < 2; ++dir) {
+            std::vector<int> ce = fc.edges, cv = fc.verts;
+            if (dir == 1) {
+                std::reverse(ce.begin(), ce.end());
+                std::reverse(cv.begin(), cv.end());
+            }
+            double running = 0.0;
+            long handedOut = 0;
+            const size_t last = closed ? ce.size() : ce.size() - 1;
+            for (size_t i = 0; i < last; ++i) {
+                const int v = cv[i + 1];
+                const int eIn = ce[i];
+                const int eOut = ce[(i + 1) % ce.size()];
+                const std::vector<int> fan = sectorFan(v, eIn, eOut);
+                if (!fan.empty()) {
+                    double omega = 0.0, theta = 0.0;
+                    sectorMeasure(v, fan, omega, theta);
+                    running += (theta + M_PI - omega) / M_PI_2;
+                }
+                const long want = std::lround(running);
+                if (want != handedOut) {
+                    result.push_back(FeatureCorner{v, eIn, eOut,
+                                                   static_cast<int>(want - handedOut)});
+                    handedOut = want;
+                }
+            }
         }
     }
 

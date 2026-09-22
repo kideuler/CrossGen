@@ -101,6 +101,36 @@ public:
           const std::vector<Point> &initialField,
           const std::unordered_set<EdgeKey, EdgeKeyHash> &cuts);
 
+    // Interior edges the frame is to be aligned to on top of dS: the material
+    // interfaces of a multi-material domain. Mesh edge indices; call before
+    // initialize(), and an empty set is the single-material behaviour.
+    //
+    // Sec. 4.2 knows only one kind of feature, dS, because the paper's models
+    // have only one. An interface is the same kind of thing and for the same
+    // reason: it is a curve the output has to keep, since an element
+    // straddling it carries two materials and no analysis code can integrate
+    // that (MERIDIAN::Interfaces says this at length for Pipeline A). A frame
+    // that is not tangent to it cannot produce a polysquare whose blocks
+    // follow it, so the alignment has to see it here or nothing downstream
+    // can.
+    //
+    // An interface edge is *two* terms of Eq. (4) and not one: it has a
+    // triangle on each side and both are asked for the same axis, where a
+    // boundary edge asks its one triangle. That is the same treatment
+    // DualMBO::setAlignedInteriorEdges gives the field this one starts from,
+    // and it has to be, or the two sides of the interface agree about the
+    // curve and disagree about the frame on it.
+    //
+    // The normalization of Eq. (4) is over the features' total length, so
+    // adding interfaces dilutes the weight each boundary edge carries. That is
+    // deliberate: E_align is one term about one set of curves the field must
+    // follow, and dS is not privileged among them.
+    void setFeatureEdges(const std::vector<int> &edges);
+
+    // Whether any were given: the one thing downstream has to branch on.
+    bool hasFeatureEdges() const { return !featureEdges.empty(); }
+    const std::vector<int>& getFeatureEdges() const { return featureEdges; }
+
     // w_a of Eq. (1). The paper's 0.1, found experimentally (Sec. 7.1,
     // Fig. 14): too small and the field is smooth but ignores the boundary,
     // too large and the smoothness term is overpowered and the field turns
@@ -132,6 +162,40 @@ public:
     // small one is what actually snaps the boundary onto an axis. Passing a
     // single value disables the continuation.
     void setSmoothingSchedule(const std::vector<double> &schedule) { l1Schedule = schedule; }
+
+    // Let a +1/-1 pair of input singularities annihilate each other instead of
+    // both leaving through dS.
+    //
+    // The branch cuts of the comb decide where the defects go, and by default
+    // each runs to the nearest boundary, so every quarter singularity of the
+    // input becomes a corner of the polysquare. For a pair of *opposite* sign
+    // that is the wrong destination and, on a multi-material model, actively
+    // harmful: a cross field aligned to a curved interface puts a +1/-1 pair
+    // on the concave side of every strongly curved stretch of it, the pair
+    // contributes nothing to any Gauss-Bonnet count, and pushing both members
+    // out invents two corners the shape does not have -- which E_cor of the
+    // deformation then insists on realising. This is the same fact
+    // MERIDIAN::ConeSingularities::cancelDipoles is written against, and the
+    // same rule applies: a pair in one material region may cancel, a pair that
+    // *spans* an interface never may, because each of those two is the whole
+    // of its own region's deficit.
+    //
+    // A cut between the two is topologically sound where a cut between a
+    // same-sign pair is not: a loop around a +1/-1 pair has no holonomy and
+    // crosses the cut twice in opposite directions, so the two jumps cancel,
+    // which is exactly right. A loop around a +1/+1 pair has 180 degrees and
+    // needs one crossing per singularity -- see singularitySeams() -- so
+    // same-sign pairs are never joined.
+    //
+    // On by default. Off restores the behaviour where every input singularity
+    // is routed to dS.
+    void setCancelDipoles(bool on) { cancelDipoles = on; }
+    bool getCancelDipoles() const { return cancelDipoles; }
+
+    // Pairs annihilated by the above at the last initialize(), as the two
+    // vertices of each. Empty when there were none, which is every
+    // single-material model in data/meshes whose field carries no such pair.
+    const std::vector<std::pair<int, int>>& cancelledDipoles() const { return dipoles; }
 
     // Stopping criteria per continuation stage. The paper stops L-BFGS at a
     // gradient magnitude of 1e-6 (Sec. 7.1).
@@ -262,6 +326,62 @@ public:
     // the free transitions carry part of the total and the sum need not match.
     std::vector<std::pair<int, int>> boundarySingularities() const;
 
+    // ── The same reading, taken along the material interfaces ───────────────
+    //
+    // boundarySingularities() answers "where does the frame put a corner of
+    // the polysquare boundary". On a multi-material domain the interfaces ask
+    // the same question of themselves: an interface is a curve the layout has
+    // to follow, so where the frame turns against it is a corner of the
+    // structure just as surely as a corner of dS is, and Eq. (12) needs the
+    // number there for the same reason it needs it on dS.
+    //
+    // The measurement is the same one. At a vertex, the two feature edges
+    // meeting there cut the star into the sector on the left of the walk
+    // edgeIn -> v -> edgeOut; over that sector the frame turns by Theta and
+    // the model subtends Omega, and
+    //
+    //     quarters = round( (Theta + pi - Omega) / (pi/2) )
+    //
+    // is how far the image curve turns there, in quarter turns, positive to
+    // the left. A straight run followed by the frame reads 0; a square corner
+    // of the sector reads +1. On dS, walked with the material on its left, it
+    // is exactly what boundarySingularities() reports.
+    //
+    // The difference is that an interface has two sides, so it appears twice
+    // -- once per direction of the walk -- with the sector measured always on
+    // the left. A caller walking a branch with material m on its left takes
+    // the entry whose `edgeIn`/`edgeOut` run that way.
+    //
+    // As on dS, the quarter turns are accumulated along each chain rather than
+    // rounded vertex by vertex: a corner is spread over the two or three
+    // vertices it takes the frame to swing across, and rounding each on its
+    // own reports a corner split 0.35/0.45/0.20 as no corner at all.
+    //
+    // Empty unless setFeatureEdges() was given something.
+    struct FeatureCorner {
+        int vertex = -1;
+        int edgeIn = -1;    // the feature edge arriving at `vertex`
+        int edgeOut = -1;   // the one leaving it
+        int quarters = 0;
+    };
+    std::vector<FeatureCorner> interfaceCorners() const;
+
+    // The interface network cut into chains: each a run of interface edges
+    // between two places the network is not simply two edges carrying on --
+    // an end, a junction of three or more branches, or a landing on dS, none
+    // of which the network itself says how to continue through.
+    //
+    // Exposed because interfaceCorners() measures along these, and a stage
+    // consuming those corners has to walk the same chains in the same order
+    // or the corner it looks up is not the corner it is at. Built once, on
+    // first use, and empty without setFeatureEdges().
+    struct FeatureChain {
+        std::vector<int> edges;   // mesh edges, in order along the chain
+        std::vector<int> verts;   // edges.size() + 1 of them, in the same order
+        bool closed = false;      // verts.front() == verts.back()
+    };
+    const std::vector<FeatureChain>& interfaceChains() const;
+
     // Energy at the current field, split into the terms of Eq. (1). Valid
     // after initialize() (the initial field) and after optimize() (the
     // result), so comparing the two shows what the optimization bought.
@@ -358,6 +478,25 @@ private:
     // The edge two triangles of a vertex star share, -1 if they share none.
     int sharedEdge(int ta, int tb) const;
 
+    // Fills `chains` from `featureEdges`. Cheap, and done once.
+    void buildInterfaceChains() const;
+
+    // One label per vertex: which material region it is strictly inside, or -1
+    // on an interface. Empty (and the whole mesh one region) without feature
+    // edges, which is what makes the dipole rule a no-op there.
+    void buildRegions();
+
+    // The triangles of `v`'s star swept from feature edge `eIn` to feature
+    // edge `eOut`, on the left of the walk (far end of eIn) -> v -> (far end
+    // of eOut). Empty when the sweep does not reach eOut, which is a star the
+    // mesh cannot fan -- a pinch, or a non-manifold vertex.
+    std::vector<int> sectorFan(int v, int eIn, int eOut) const;
+
+    // Omega and Theta over such a fan: how far the model subtends at `v` and
+    // how far the frame turns across it, the k*90-degree transitions on the
+    // cuts undone as everywhere else.
+    void sectorMeasure(int v, const std::vector<int> &fan, double &omega, double &theta) const;
+
     // tau of Eq. (3): the spin-4 representation (cos 4t, sin 4t) written as a
     // quartic polynomial in v, so that it stays differentiable in the
     // unknowns rather than going through the angle.
@@ -367,6 +506,22 @@ private:
 
     std::shared_ptr<Mesh> mesh;
     std::unordered_set<EdgeKey, EdgeKeyHash> cutEdges;
+    // Interior feature edges, as mesh edge indices and as the keyed set the
+    // per-vertex walks below test membership against.
+    std::vector<int> featureEdges;
+    std::unordered_set<EdgeKey, EdgeKeyHash> featureEdgeKeys;
+    // Derived from featureEdges on first use; `mutable` because asking for
+    // them changes nothing about the field.
+    mutable std::vector<FeatureChain> chains;
+    mutable bool chainsBuilt = false;
+
+    // Material region per vertex, for the dipole rule: two singularities may
+    // only cancel if they carry the same non-negative label. A vertex whose
+    // incident triangles disagree sits *on* an interface and gets -1, which
+    // never matches anything.
+    std::vector<int> vertexRegion;
+    bool cancelDipoles = true;
+    mutable std::vector<std::pair<int, int>> dipoles;
 
     std::vector<Point> initialDirections; // per triangle, before combing
     std::vector<Point> uField;            // per triangle, unit v

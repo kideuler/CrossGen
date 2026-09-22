@@ -103,10 +103,12 @@ UMBERPhase nextUMBERPhase(UMBERPhase p) {
         case UMBERPhase::Stepping:   return UMBERPhase::Frames;
         case UMBERPhase::Frames:     return UMBERPhase::Polysquare;
         case UMBERPhase::Polysquare: return UMBERPhase::Blocks;
-        case UMBERPhase::Blocks:     return UMBERPhase::Simplified;
-        case UMBERPhase::Simplified: return UMBERPhase::Simplified;
+        case UMBERPhase::Blocks:     return UMBERPhase::Decomposition;
+        case UMBERPhase::Decomposition: return UMBERPhase::Mesh;
+        case UMBERPhase::Mesh:       return UMBERPhase::Smoothed;
+        case UMBERPhase::Smoothed:   return UMBERPhase::Smoothed;
     }
-    return UMBERPhase::Simplified;
+    return UMBERPhase::Smoothed;
 }
 
 PipelinePhase nextPipelinePhase(PipelinePhase p) {
@@ -193,7 +195,9 @@ const char *umberPhaseName(UMBERPhase p) {
         case UMBERPhase::Frames:     return "4) UMBER frame field";
         case UMBERPhase::Polysquare: return "5) polysquare (Sec. 4.3)";
         case UMBERPhase::Blocks:     return "6) block structure (Sec. 5)";
-        case UMBERPhase::Simplified: return "7) chord collapse";
+        case UMBERPhase::Decomposition: return "7) block decomposition";
+        case UMBERPhase::Mesh:       return "8) quad mesh";
+        case UMBERPhase::Smoothed:   return "9) TMOP smoothing";
     }
     return "?";
 }
@@ -481,6 +485,15 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
                 atlasPhase_ = ATLASPhase::Mesh;
             }
         }
+        // And UMBER's.
+        if (mode_ == Mode::UMBER && umberPhase_ >= UMBERPhase::Mesh &&
+            umberDecomp_.has_value() && !umberDecomp_->blocks.empty()) {
+            umberMeshAttempted_ = true;
+            if (promptUMBERMesh()) {
+                runUMBERMesh();
+                umberPhase_ = UMBERPhase::Mesh;
+            }
+        }
         break;
 
     case Qt::Key_I:
@@ -488,7 +501,7 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
         // either pipeline, which is what makes it useful and also what makes a
         // key to hide it necessary: at the mesh phase it lies on top of the
         // elements it is there to be compared against.
-        if (inPipeline() && interfaces_.has_value() &&
+        if ((inPipeline() || mode_ == Mode::UMBER) && interfaces_.has_value() &&
             interfaces_->multiMaterial()) {
             showInterfaces_ = !showInterfaces_;
             console_.log(showInterfaces_ ? "[Interfaces] network shown"
@@ -502,11 +515,15 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
         // edge. Off by default because it competes with the conformal factor
         // and the flat metric for the same triangles.
         if ((inPipeline() && interfaces_.has_value() && interfaces_->multiMaterial()) ||
-            (mode_ == Mode::ATLAS && atlasMultiMaterial_)) {
+            (mode_ == Mode::ATLAS && atlasMultiMaterial_) ||
+            (mode_ == Mode::UMBER && umberDecompReport_.materials > 1)) {
             showMaterialFill_ = !showMaterialFill_;
             if (mode_ == Mode::ATLAS)
                 console_.log(showMaterialFill_ ? "[ATLAS] cells and elements filled by material"
                                                : "[ATLAS] material fill off");
+            else if (mode_ == Mode::UMBER)
+                console_.log(showMaterialFill_ ? "[UMBER] elements filled by material"
+                                               : "[UMBER] material fill off");
             else
                 console_.log(showMaterialFill_ ? "[Interfaces] triangles filled by material"
                                                : "[Interfaces] material fill off");
@@ -788,7 +805,9 @@ void CrossGenWidget::doReset() {
     umber_.reset();
     umberCut_.reset();
     polysquare_.reset();
-    chordCollapse_.reset();
+    umberMesh_.reset();
+    umberDecomp_.reset();
+    umberDecompReport_ = BlockLayout::DecompositionReport{};
     blockLayout_.reset();
     blocks_.reset();
     umberCorners_.clear();
@@ -865,6 +884,7 @@ void CrossGenWidget::doReset() {
     dualMBOStepCount_        = 0;
     umberAnnounced_       = false;
     umberAttempted_       = false;
+    umberMeshAttempted_   = false;
     polysquareAnnounced_  = false;
     polysquareAttempted_  = false;
     blocksAttempted_      = false;
@@ -1233,6 +1253,11 @@ void CrossGenWidget::runUMBER() {
     auto t0 = Clock::now();
     try {
         umber_.emplace(*dualMBOField_, *umberCut_);
+        // The interfaces are features of Eq. (4) in exactly the sense dS is;
+        // everything after this -- the deformation, the iso-lines, the blocks
+        // -- reads them back off the frame field rather than being told again.
+        if (interfaces_.has_value() && interfaces_->multiMaterial())
+            umber_->setFeatureEdges(interfaces_->interfaceEdges());
         umber_->setMaxIterations(UMBER_LBFGS_ITERATIONS);
         umber_->initialize();
         before = umber_->energy();
@@ -1345,9 +1370,12 @@ void CrossGenWidget::runBlocks() {
     blocksAttempted_ = true;
     if (!polysquare_.has_value()) return;
 
-    // Both of these point into blocks_, so they go before it is replaced.
-    chordCollapse_.reset();
+    // This points into blocks_, so it goes before it is replaced, and
+    // everything read off it goes with it.
     blockLayout_.reset();
+    umberDecomp_.reset();
+    umberMesh_.reset();
+    umberMeshAttempted_ = false;
 
     auto t0 = Clock::now();
     try {
@@ -1371,7 +1399,7 @@ void CrossGenWidget::runBlocks() {
                  "cyan = crossing");
 }
 
-// ── chord collapse ───────────────────────────────────────────────────────────
+// ── the blocks as a graph, and as the shared decomposition ───────────────────
 
 void CrossGenWidget::buildBlockLayout() {
     if (blockLayout_.has_value() || !blocks_.has_value()) return;
@@ -1395,153 +1423,249 @@ void CrossGenWidget::buildBlockLayout() {
         << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
     console_.log(oss.str());
     // A block that did not come out four-sided is a place the tracing left
-    // open, and no chord can be walked through one, so it is worth saying
-    // before the dialog reports fewer chords than the model looks like it has.
+    // open: it cannot become a block of the decomposition, so the part of the
+    // model it covers is the part the mesh will be missing.
     if (r.badFaces > 0 || r.arcCrossings > 0) {
         std::ostringstream bad;
         bad << "[BlockLayout] " << r.badFaces << " block(s) not four-sided, " << r.arcCrossings
-            << " side(s) crossing: chords through them are blocked";
+            << " side(s) crossing";
+        console_.log(bad.str());
+    }
+    buildUMBERDecomposition();
+}
+
+// ── the structure as the one representation all three methods share ─────────
+//
+// The traced layout read as a BlockDecomposition. Everything after this point
+// reads that and not the layout: the picture, the mesh and the smoothed mesh
+// are then all of the same structure by construction rather than by three
+// routines agreeing about it.
+void CrossGenWidget::buildUMBERDecomposition() {
+    umberDecomp_.reset();
+    umberDecompReport_ = BlockLayout::DecompositionReport{};
+    // The mesh standing on the old structure goes with it.
+    umberMesh_.reset();
+    smoothMesh_.reset();
+    umberMeshAttempted_ = false;
+    tmopAttempted_ = false;
+    if (!blockLayout_.has_value() || !mesh_) return;
+
+    umberDecomp_.emplace(
+        BlockLayout::blockDecompositionOf(blockLayout_->getLayout(), *mesh_,
+                                          &umberDecompReport_, "UMBER"));
+
+    const BlockLayout::DecompositionReport &d = umberDecompReport_;
+    std::ostringstream oss;
+    oss << "[Decomposition] " << d.blocks << " block(s) of " << d.faces << " face(s), "
+        << umberDecomp_->edges.size() << " macro edge(s), " << umberDecomp_->vertices.size()
+        << " macrovertex/-ices, " << d.materials << " material(s)";
+    if (d.notFourSided > 0) oss << ", " << d.notFourSided << " not four-sided";
+    if (d.multiArcSides > 0) oss << ", " << d.multiArcSides << " with a split side";
+    console_.log(oss.str());
+
+    // The one number that says whether the picture is of the model or of part
+    // of it. A refused face is not drawn in another colour, it is a piece of
+    // the model with no block on it, and the mesh will have a hole exactly
+    // there -- so this is said every time, and said loudly when it is not all
+    // of the model.
+    const double coverage = BlockLayout::coverageOf(d);
+    std::ostringstream cov;
+    cov << std::fixed << std::setprecision(1) << "[Decomposition] covering "
+        << 100.0 * coverage << "% of the model";
+    if (coverage < 0.999)
+        cov << " -- the grey outline underneath is the rest, and it gets no elements";
+    console_.log(cov.str());
+    // A block that straddles an interface is an element no analysis code can
+    // integrate, so it is said plainly rather than left in a count: it is the
+    // one thing about a multi-material layout that the picture will not show.
+    if (d.straddlingBlocks > 0) {
+        std::ostringstream bad;
+        bad << "[Decomposition] " << d.straddlingBlocks
+            << " block(s) sit in more than one material -- the layout does not follow the "
+               "interfaces there, and the elements in them will straddle one";
         console_.log(bad.str());
     }
 }
 
-// The dialog reports what the settings would do before they are applied, which
-// is the only way to choose the width: the number itself means nothing, and
-// "how many chords does it let through, and how much thinner would the next one
-// need me to be" is the question actually being asked. Enumerating the chords
-// is a walk over the sides of the structure, so it is cheap enough to redo on
-// every keystroke.
-bool CrossGenWidget::promptChordCollapseParameters() {
-    if (!blockLayout_.has_value()) return false;
-    const QuadLayout &layout = blockLayout_->getLayout();
+// ── UMBER: the quadrilateral mesh on the blocks, and the smoothing ──────────
+//
+// Stage 10's dialog, on Stage 10's settings object, because the number it asks
+// for means the same thing here: a target edge length in the units of the
+// model. Sharing it is what makes "mesh this model with UMBER and with
+// MERIDIAN at 0.05" a comparison of two layouts rather than of two targets.
+bool CrossGenWidget::promptUMBERMesh() {
+    if (!umberDecomp_.has_value() || umberDecomp_->blocks.empty() || !mesh_) return false;
+
+    Point lo{std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity()};
+    Point hi{-lo[0], -lo[1]};
+    for (const Point &p : mesh_->vertices) {
+        lo[0] = std::min(lo[0], p[0]); lo[1] = std::min(lo[1], p[1]);
+        hi[0] = std::max(hi[0], p[0]); hi[1] = std::max(hi[1], p[1]);
+    }
+    const double diag = std::hypot(hi[0] - lo[0], hi[1] - lo[1]);
+    const double extent = (diag > 0.0) ? diag : 1.0;
 
     QDialog dlg(this);
-    dlg.setWindowTitle("Chord collapse");
+    dlg.setWindowTitle("UMBER — quadrilateral mesh on the blocks");
 
-    auto *widthBox = new QDoubleSpinBox(&dlg);
-    widthBox->setRange(0.0, 10.0);
-    widthBox->setDecimals(3);
-    widthBox->setSingleStep(0.05);
-    widthBox->setValue(chordSettings_.maxWidth);
-    widthBox->setToolTip(
-        "Rule 1. A chord is collapsed only if every one of its rungs is\n"
-        "shorter than this, in units of the mean side length of the block\n"
-        "structure. Well under 1: a chord as wide as a block is a partition\n"
-        "of the model and not a sliver.");
+    auto *targetBox = new QDoubleSpinBox(&dlg);
+    targetBox->setRange(1e-4, 10.0);
+    targetBox->setDecimals(4);
+    targetBox->setSingleStep(0.01);
+    targetBox->setValue(meshSettings_.target);
+    targetBox->setToolTip(
+        "Target length of a mesh edge, in the units of the model.\n"
+        "The same number the MERIDIAN, TORSION and ATLAS mesh dialogs take,\n"
+        "and shared with them, so the layouts can be meshed alike.");
 
-    auto *aspectBox = new QDoubleSpinBox(&dlg);
-    aspectBox->setRange(0.0, 100.0);
-    aspectBox->setDecimals(1);
-    aspectBox->setSingleStep(0.5);
-    aspectBox->setValue(chordSettings_.minAspect);
-    aspectBox->setToolTip(
-        "Rule 1 from the other side: how many times longer than wide a chord\n"
-        "has to be. A short fat chord and a long thin one can have the same\n"
-        "rungs and only the second is a sliver. 0 turns it off.");
+    auto *derived = new QLabel(&dlg);
+    derived->setTextFormat(Qt::PlainText);
+    const int blocks = static_cast<int>(umberDecomp_->blocks.size());
+    const int edges = static_cast<int>(umberDecomp_->edges.size());
+    auto updateDerived = [targetBox, derived, extent, blocks, edges]() {
+        const double h = targetBox->value();
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(4)
+            << "diagonal of S                 = " << extent << "\n"
+            << "edges across it   diag / h    = " << std::setprecision(1) << (extent / h) << "\n"
+            << blocks << " block(s) and " << edges << " macro edge(s) to mesh";
+        derived->setText(QString::fromStdString(oss.str()));
+    };
+    QObject::connect(targetBox, &QDoubleSpinBox::valueChanged, &dlg, updateDerived);
+    updateDerived();
+
+    auto *minBox = new QSpinBox(&dlg);
+    minBox->setRange(1, 64);
+    minBox->setValue(meshSettings_.minEdges);
+    minBox->setToolTip("Fewest edges any chord may be given.");
 
     auto *maxBox = new QSpinBox(&dlg);
-    maxBox->setRange(0, 100000);
-    maxBox->setValue(chordSettings_.maxCollapses);
-    maxBox->setToolTip("Cap on how many chords the greedy loop takes.\n"
-                       "0 leaves the structure alone, for comparison.");
-
-    auto *preview = new QLabel(&dlg);
-    preview->setTextFormat(Qt::PlainText);
-
-    auto updatePreview = [&layout, widthBox, aspectBox, preview]() {
-        ChordCollapse::Settings s;
-        s.maxWidth = widthBox->value();
-        s.minAspect = aspectBox->value();
-        ChordCollapse probe(layout, s);
-        probe.enumerateChords();
-        const ChordCollapse::Report &r = probe.getReport();
-
-        // The thinnest chord the width rule is currently turning away, which is
-        // exactly how far the threshold would have to move to take one more.
-        double nextWidth = -1.0;
-        for (const auto &c : probe.getChords()) {
-            if (c.block != ChordCollapse::Block::TooThick) continue;
-            if (nextWidth < 0.0 || c.width < nextWidth) nextWidth = c.width;
-        }
-
-        std::ostringstream oss;
-        oss << std::fixed << std::setprecision(3)
-            << "mean side = " << probe.getWidthScale() << " in model units\n"
-            << r.blocksBefore << " block(s), " << r.chordsSeen << " chord(s), "
-            << r.collapsible << " collapsible here";
-        for (int i = 1; i < static_cast<int>(ChordCollapse::Block::Count); ++i) {
-            if (r.blockCount[i] == 0) continue;
-            oss << "\n  " << r.blockCount[i] << " "
-                << ChordCollapse::blockName(static_cast<ChordCollapse::Block>(i));
-        }
-        if (nextWidth >= 0.0)
-            oss << "\nthe next one needs a width of " << nextWidth;
-        preview->setText(QString::fromStdString(oss.str()));
-    };
-    QObject::connect(widthBox, &QDoubleSpinBox::valueChanged, &dlg, updatePreview);
-    QObject::connect(aspectBox, &QDoubleSpinBox::valueChanged, &dlg, updatePreview);
-    updatePreview();
+    maxBox->setRange(0, 4096);
+    maxBox->setValue(meshSettings_.maxEdges);
+    maxBox->setSpecialValueText("none");
+    maxBox->setToolTip("Most edges any chord may be given. 0 for no ceiling.");
 
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    buttons->button(QDialogButtonBox::Ok)->setText("Mesh");
     QObject::connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
     QObject::connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
 
     auto *form = new QFormLayout(&dlg);
-    form->addRow("max rung width (mean sides)", widthBox);
-    form->addRow("min length / width", aspectBox);
-    form->addRow("max collapses", maxBox);
-    form->addRow("at these settings", preview);
-    form->addRow(new QLabel("A chord is refused whole if any rung joins two\n"
-                            "boundaries or pinches one; a rung with one end on\n"
-                            "the boundary always contracts onto that end.",
-                            &dlg));
+    form->addRow("target edge length", targetBox);
+    form->addRow("implied sizing", derived);
+    form->addRow("fewest edges per chord", minBox);
+    form->addRow("most edges per chord", maxBox);
+    form->addRow(new QLabel("Transfinite interpolation of the four sides per block.\n"
+                            "Only a block that folds is smoothed, by Stage 10's\n"
+                            "Winslow pass.", &dlg));
     form->addRow(buttons);
 
     if (dlg.exec() != QDialog::Accepted) return false;
 
-    chordSettings_.maxWidth = widthBox->value();
-    chordSettings_.minAspect = aspectBox->value();
-    chordSettings_.maxCollapses = maxBox->value();
+    meshSettings_.target   = targetBox->value();
+    meshSettings_.minEdges = minBox->value();
+    meshSettings_.maxEdges = maxBox->value();
     return true;
 }
 
-void CrossGenWidget::runChordCollapse() {
-    if (!blockLayout_.has_value()) return;
+// BlockQuadMesh at the dialog's settings, reported line for line as ATLAS's
+// mesh and Stage 10's are.
+void CrossGenWidget::runUMBERMesh() {
+    if (!umberDecomp_.has_value() || umberDecomp_->blocks.empty()) {
+        blockPipeline("the mesh not built",
+                      "the tracing left no four-sided block to mesh");
+        return;
+    }
+    umberMeshAttempted_ = true;
+    umberMesh_.reset();
+    // TMOP stood on the mesh that is about to be replaced.
+    smoothMesh_.reset();
+    tmopAttempted_ = false;
+    pipelineBlocked_.clear();
+
+    BlockQuadMesh::Options mo;
+    mo.targetEdgeLength = meshSettings_.target;
+    mo.minIntervals     = meshSettings_.minEdges;
+    mo.maxIntervals     = meshSettings_.maxEdges;
+    // Stage 10's selective Winslow pass at the pipelines' setting, so the mesh
+    // TMOP is handed and the quality reported here are the same kind of thing
+    // for all three methods.
+    mo.smoothingPasses    = TORSION::Options().quadSmoothingPasses;
+    mo.smoothingThreshold = TORSION::Options().quadSmoothingThreshold;
 
     auto t0 = Clock::now();
-    // From the structure the tracing left, every time: the settings are a
-    // heuristic being tuned, and collapsing on top of the last result would
-    // mean the answer depended on which thresholds had been tried before it.
-    chordCollapse_.emplace(blockLayout_->getLayout(), chordSettings_);
-    chordCollapse_->run();
+    try {
+        umberMesh_.emplace(*umberDecomp_, mo);
+    } catch (const std::exception &e) {
+        umberMesh_.reset();
+        blockPipeline("the mesh failed", e.what());
+        return;
+    }
     auto t1 = Clock::now();
 
-    const ChordCollapse::Report &r = chordCollapse_->getReport();
-    std::ostringstream oss;
-    oss << "[Collapse] " << r.blocksBefore << " -> " << r.blocksAfter << " block(s) over "
-        << r.collapses << " chord collapse(s), widest " << std::fixed << std::setprecision(2)
-        << r.widestCollapsed << " of a mean side, "
-        << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
-    console_.log(oss.str());
-
-    std::ostringstream why;
-    why << "[Collapse] " << r.chordsSeen << " chord(s) left, " << r.collapsible
-        << " still collapsible";
-    for (int i = 1; i < static_cast<int>(ChordCollapse::Block::Count); ++i) {
-        if (r.blockCount[i] == 0) continue;
-        why << ", " << r.blockCount[i] << " "
-            << ChordCollapse::blockName(static_cast<ChordCollapse::Block>(i));
+    const BlockQuadMesh::Report &r = umberMesh_->getReport();
+    {
+        std::ostringstream oss;
+        oss << "[Mesh] " << r.quads << " quad(s) on " << r.vertices << " vertices over "
+            << r.blocks << " block(s), "
+            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
     }
-    console_.log(why.str());
-    if (r.rolledBack > 0) {
-        std::ostringstream rb;
-        rb << "[Collapse] " << r.rolledBack << " collapse(s) undone for leaving a broken layout ("
-           << r.rbBlocks << " block count, " << r.rbBad << " not four-sided, " << r.rbCrossings
-           << " crossing, " << r.rbArea << " area)";
-        console_.log(rb.str());
+    {
+        std::ostringstream oss;
+        oss << "[Mesh] " << r.chords << " chord(s) over " << r.edgesAssigned << " macro edge(s), "
+            << r.minIntervals << " to " << r.maxIntervals << " edges each (mean " << std::fixed
+            << std::setprecision(2) << r.meanIntervals << ")";
+        if (r.clampedChords > 0) oss << ", " << r.clampedChords << " clamped by a bound";
+        console_.log(oss.str());
     }
-    console_.log("[Collapse] grey = the structure before, red = after; "
-                 "press 'c' to try other settings");
+    {
+        std::ostringstream oss;
+        oss << "[Mesh] edges " << std::fixed << std::setprecision(4) << r.minEdge << " to "
+            << r.maxEdge << " against a target of " << r.target << " (worst "
+            << std::setprecision(2) << r.worstEdgeRatio << "x, rms log ratio "
+            << std::setprecision(3) << r.edgeRatioRms << ")";
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Mesh] scaled Jacobian " << std::fixed << std::setprecision(4)
+            << r.minScaledJacobian << " worst, " << r.meanScaledJacobian << " mean";
+        if (r.smoothedBlocks > 0) {
+            oss << " (Winslow on " << r.smoothedBlocks << " folded block(s): " << r.invertedBefore
+                << " fold(s), " << r.minScaledJacobianBefore << " worst before)";
+        }
+        if (r.invertedQuads > 0) oss << " -- " << r.invertedQuads << " element(s) fold";
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Mesh] every boundary node on dS, the edges between them within " << std::fixed
+            << std::setprecision(4) << r.boundaryDeviation << " of it (" << std::setprecision(3)
+            << (r.target > 0.0 ? r.boundaryDeviation / r.target : 0.0) << " of the target)";
+        if (r.materials > 1) {
+            oss << "; " << r.materials << " materials meeting on " << r.interfaceEdges
+                << " element edge(s), within " << std::setprecision(4) << r.interfaceDeviation
+                << " of the interfaces";
+        }
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Mesh] " << r.interiorEdges << " interior and " << r.boundaryEdges
+            << " boundary edge(s), " << r.nonManifoldEdges << " used a third time, " << r.cracks
+            << " crack(s): " << (r.conforming ? "conforming [PASS]" : "not conforming [FAIL]");
+        console_.log(oss.str());
+    }
+    for (const std::string &m : r.messages) console_.log("[Mesh] " + m);
+    {
+        std::ostringstream oss;
+        oss << "[Mesh] the mesh " << (r.valid ? "validates [PASS]" : "does not validate [FAIL]");
+        console_.log(oss.str());
+        std::cerr << "[Viewer] " << oss.str() << "\n";
+    }
+    console_.log("[Mesh] transfinite grid: grey is a mesh edge, blue a block wall, red a folded "
+                 "element. Press 'c' to smooth it, 'e' to mesh again at another target");
 }
 
 // ── MERIDIAN: Shepherd, Gu and Hughes (2022), Stages 0b-3 ────────────────────
@@ -4258,15 +4382,21 @@ bool CrossGenWidget::promptTMOP() {
 // different scale: a thousand sweeps over a mesh of this size is a fraction of
 // a second, so it is not announced a frame ahead the way the Ricci solve is.
 void CrossGenWidget::runTMOP() {
-    // ATLAS keeps its own settings; see atlasTmopSettings_.
-    TMOPSettings &ts = (mode_ == Mode::ATLAS) ? atlasTmopSettings_ : tmopSettings_;
-    // The pipelines number this Stage 12 after their Stage 10; ATLAS's stages
-    // stop at 6, so there it is named for what it smooths.
+    // ATLAS and UMBER keep their own settings; see atlasTmopSettings_ and
+    // umberTmopSettings_, which differ from the pipelines' in one default for
+    // one reason -- both smooth transfinite grids on a block decomposition.
     const bool atlas = (mode_ == Mode::ATLAS);
-    const std::string stage = atlas ? "TMOP" : "Stage 12";
+    const bool umber = (mode_ == Mode::UMBER);
+    TMOPSettings &ts = atlas ? atlasTmopSettings_
+                             : (umber ? umberTmopSettings_ : tmopSettings_);
+    // The pipelines number this Stage 12 after their Stage 10; ATLAS's stages
+    // stop at 6 and UMBER's at the chord collapse, so there it is named for
+    // what it smooths.
+    const std::string stage = (atlas || umber) ? "TMOP" : "Stage 12";
     if (!haveFinishedMesh()) {
-        blockPipeline(stage + " not run", atlas ? "there is no TFI mesh to smooth"
-                                                : "Stage 10 produced no mesh to smooth");
+        blockPipeline(stage + " not run",
+                      (atlas || umber) ? "there is no TFI mesh to smooth"
+                                       : "Stage 10 produced no mesh to smooth");
         return;
     }
     tmopAttempted_ = true;
@@ -4320,7 +4450,7 @@ void CrossGenWidget::runTMOP() {
 
     {
         std::ostringstream oss;
-        oss << "[TMOP] " << (atlas ? "" : "Stage 12: ") << tr.sweeps << " sweep(s)";
+        oss << "[TMOP] " << ((atlas || umber) ? "" : "Stage 12: ") << tr.sweeps << " sweep(s)";
         if (tr.untangleSweeps > 0) oss << " after " << tr.untangleSweeps << " untangling";
         oss << " over " << tr.colors << " colour(s) on " << tr.threads << " thread(s)"
             << (tr.openMP ? "" : " (no OpenMP)") << ", "
@@ -4381,15 +4511,16 @@ void CrossGenWidget::runTMOP() {
     for (const std::string &m : tr.messages) console_.log("[TMOP] " + m);
     {
         std::ostringstream oss;
-        oss << "[TMOP] " << (atlas ? "the smoother " : "Stage 12 ")
+        oss << "[TMOP] " << ((atlas || umber) ? "the smoother " : "Stage 12 ")
             << (ok ? "left the mesh better than it found it [PASS]" : "did not improve the mesh [FAIL]");
         console_.log(oss.str());
         std::cerr << "[Viewer] " << oss.str() << "\n";
     }
-    console_.log(atlas ? "[TMOP] the same picture as the TFI mesh, with the nodes where the solve "
-                         "left them. Press 'c' to smooth the TFI mesh again at other settings"
-                       : "[TMOP] the same picture as Stage 10, with the nodes where the solve "
-                         "left them. Press 'c' to smooth the Stage 10 mesh again at other settings");
+    console_.log((atlas || umber)
+                     ? "[TMOP] the same picture as the TFI mesh, with the nodes where the solve "
+                       "left them. Press 'c' to smooth the TFI mesh again at other settings"
+                     : "[TMOP] the same picture as Stage 10, with the nodes where the solve "
+                       "left them. Press 'c' to smooth the Stage 10 mesh again at other settings");
 }
 
 // The mesh Stage 12 is handed, whichever stage finished it. In ATLAS mode it
@@ -4397,11 +4528,13 @@ void CrossGenWidget::runTMOP() {
 // reset could not be smoothed in its place.
 bool CrossGenWidget::haveFinishedMesh() const {
     if (mode_ == Mode::ATLAS) return atlasMesh_.has_value();
+    if (mode_ == Mode::UMBER) return umberMesh_.has_value();
     return quadMesh_.has_value();
 }
 
 mesh::QuadMesh CrossGenWidget::finishedMesh(const mesh::QuadMesh::Options &o) const {
     if (mode_ == Mode::ATLAS) return mesh::QuadMesh::from(*atlasMesh_, o);
+    if (mode_ == Mode::UMBER) return mesh::QuadMesh::from(*umberMesh_, o);
     return diskFill_.has_value() ? mesh::QuadMesh::from(*diskFill_, o)
                                  : mesh::QuadMesh::from(*quadMesh_, o);
 }
@@ -5281,17 +5414,18 @@ void CrossGenWidget::advancePhase() {
         if (umberPhase_ != old)
             std::cerr << "[Viewer] UMBER Phase " << umberPhaseName(umberPhase_) << "\n";
 
-        // The last phase is a dialog rather than a picture to press on to, and
-        // it stays that way: 'c' at it re-opens the dialog, so a threshold can
-        // be tried, looked at, and tried again.
-        if (umberPhase_ == UMBERPhase::Simplified) {
-            // The blocks are normally built lazily by the frame after the one
-            // that asked for them, so make sure they are there rather than
-            // assuming a frame has been drawn since.
-            if (!blocksAttempted_) runBlocks();
-            buildBlockLayout();
-            if (blockLayout_.has_value() && promptChordCollapseParameters())
-                runChordCollapse();
+        // The last two phases as the pipelines and ATLAS have them: the mesh
+        // dialog on the way into Mesh, the TMOP one on the way into Smoothed
+        // and on every 'c' there, each marked as asked before it opens so that
+        // the catch-up in runComputations() does not open a second one on top.
+        if (old == UMBERPhase::Decomposition && umberPhase_ == UMBERPhase::Mesh &&
+            umberDecomp_.has_value() && !umberDecomp_->blocks.empty()) {
+            umberMeshAttempted_ = true;
+            if (promptUMBERMesh()) runUMBERMesh();
+        }
+        if (umberPhase_ == UMBERPhase::Smoothed && umberMesh_.has_value()) {
+            tmopAttempted_ = true;
+            if (promptTMOP()) runTMOP();
         }
     } else if (inPipeline()) {
         PipelinePhase old = pipePhase_;
@@ -5637,7 +5771,8 @@ void CrossGenWidget::runComputations() {
         // TORSION needs this more than MERIDIAN does rather than less: it
         // integrates the field, so an interface the field ran straight through
         // is an interface the *map* runs straight through.
-        if (inPipeline() && interfaces_.has_value() && interfaces_->multiMaterial()) {
+        if ((inPipeline() || mode_ == Mode::UMBER) && interfaces_.has_value() &&
+            interfaces_->multiMaterial()) {
             dualMBOField_->setAlignedInteriorEdges(interfaces_->interfaceEdges());
         }
         dualMBOField_->initialize();
@@ -5707,12 +5842,39 @@ void CrossGenWidget::runComputations() {
         runBlocks();
     }
 
+    // ── UMBER: the layout, and the decomposition read off it ─────────────────
+    //
+    // 'c' pressed twice in quick succession can land a later phase while the
+    // structure it stands on has not been built, and then the dialog that
+    // belongs to that phase never opens. The three catch-ups below are that
+    // case, and each follows the pipelines' discipline: marked as asked
+    // *before* a dialog opens, since the dialog runs a nested event loop and
+    // that loop paints and painting comes back here. Cancelling counts as
+    // having been asked; 'e' and 'c' re-open them.
+    if (mode_ == Mode::UMBER && umberPhase_ >= UMBERPhase::Decomposition &&
+        blocks_.has_value() && !blockLayout_.has_value()) {
+        buildBlockLayout();
+    }
+    if (mode_ == Mode::UMBER && umberPhase_ == UMBERPhase::Mesh && umberDecomp_.has_value() &&
+        !umberDecomp_->blocks.empty() && !umberMeshAttempted_) {
+        umberMeshAttempted_ = true;
+        if (promptUMBERMesh()) runUMBERMesh();
+    }
+    if (mode_ == Mode::UMBER && umberPhase_ == UMBERPhase::Smoothed && umberMesh_.has_value() &&
+        !tmopAttempted_) {
+        tmopAttempted_ = true;
+        if (promptTMOP()) runTMOP();
+    }
+
     // ── Both pipelines: Stage 0b, the material interfaces ────────────────────
     //
     // At the first phase, not the cone one: it reads the tags and nothing else,
     // and the picture of what the layout will have to keep is worth having in
     // front of the field rather than after it.
-    if (inPipeline() && !interfacesAttempted_) {
+    // UMBER needs it for the same reason and at the same moment: its field,
+    // its frame, its deformation and its block structure all have to know the
+    // interfaces are there, and every one of them is built from this.
+    if ((inPipeline() || mode_ == Mode::UMBER) && !interfacesAttempted_) {
         runMERIDIANInterfaces();
     }
 
@@ -6653,28 +6815,58 @@ void CrossGenWidget::renderNormal() {
         } else {
             viewer::drawMesh(*mesh_);
         }
-    } else if (mode_ == Mode::UMBER && umberPhase_ >= UMBERPhase::Simplified &&
+    } else if (mode_ == Mode::UMBER && umberPhase_ >= UMBERPhase::Mesh &&
+               umberMesh_.has_value()) {
+        // ── The mesh, and after TMOP the same mesh drawn the same way ───────
+        //
+        // The pipelines' Mesh and Smoothed pictures exactly: one routine, the
+        // walls taken off the blocks either way, so that the only difference
+        // between the two frames is where the nodes are.
+        viewer::drawAxis(view_);
+        const bool matFill = showMaterialFill_ && umberDecompReport_.materials > 1;
+        if (umberPhase_ == UMBERPhase::Smoothed && smoothMesh_.has_value())
+            viewer::drawQuadMesh(*smoothMesh_, *umberMesh_, 1.0f, 2.5f, matFill);
+        else
+            viewer::drawQuadMesh(*umberMesh_, 1.0f, 2.5f, matFill);
+    } else if (mode_ == Mode::UMBER && umberPhase_ >= UMBERPhase::Decomposition &&
                blockLayout_.has_value()) {
         // ── The structure the tracing left, against what the collapse made ──
         //
         // Both over the one mesh at the one scale, so that a chord that went is
-        // a grey line with no red on it and everything else is red over grey.
-        // The parameter domain is dropped here: the operation happens in the
-        // model, and the picture that answers "which blocks did that remove"
-        // is this one.
+        // a grey line with nothing on it and everything else is drawn over
+        // grey. The parameter domain is dropped here: the operation happens in
+        // the model, and the picture that answers "which blocks did that
+        // remove" is this one.
+        //
+        // What stands afterwards is drawn as the shared BlockDecomposition and
+        // not as a QuadLayout, by the routine ATLAS's Blocks phase and the
+        // pipelines' Patches phase draw theirs with -- light-blue sides, green
+        // macrovertices. The three methods reach a decomposition by three
+        // unrelated routes and the picture of one should not say which, and it
+        // is also the structure the Mesh phase actually meshes, which the
+        // layout underneath it is not: a face the collapse left with a split
+        // side is in the layout and is not a block.
         viewer::drawAxis(view_);
         viewer::drawMesh(*mesh_);
         if (umberCut_.has_value() && !umberCut_->getCutEdges().empty())
             viewer::drawEdgeSetOnMesh(*mesh_, umberCut_->getCutEdges(), 1.0f, 0.2f, 0.9f, 2.0f);
 
+        // The interface network over it: an input rather than a result, so the
+        // question the picture answers is whether the blue sides still run
+        // along these curves.
+        if (showInterfaces_ && interfaces_.has_value() && interfaces_->multiMaterial())
+            viewer::drawInterfaceNetwork(*interfaces_, 0.4 * avgEdge_, 3.0f);
+
         viewer::drawQuadLayoutArcs(blockLayout_->getLayout(), 2.0f, 0.45f, 0.45f, 0.5f);
-        const QuadLayout &shown = chordCollapse_.has_value() ? chordCollapse_->getLayout()
-                                                             : blockLayout_->getLayout();
-        viewer::drawQuadLayoutArcs(shown, 4.0f, 0.95f, 0.25f, 0.2f);
-        // view_.zoom is 1.0 at fit and shrinks as the view zooms in, so scaling
-        // the radius by it keeps the markers the same size on screen instead of
-        // swallowing a block once you zoom in on one.
-        viewer::drawQuadLayoutNodes(shown, 0.12 * avgEdge_ * view_.zoom);
+        if (umberDecomp_.has_value()) {
+            // view_.zoom is 1.0 at fit and shrinks as the view zooms in, so
+            // scaling the radius by it keeps the markers the same size on
+            // screen instead of swallowing a block once you zoom in on one.
+            viewer::drawBlockDecomposition(*umberDecomp_, 0.12 * avgEdge_ * view_.zoom, 4.0f);
+        } else {
+            viewer::drawQuadLayoutArcs(blockLayout_->getLayout(), 4.0f, 0.95f, 0.25f, 0.2f);
+            viewer::drawQuadLayoutNodes(blockLayout_->getLayout(), 0.12 * avgEdge_ * view_.zoom);
+        }
     } else if (mode_ == Mode::UMBER && umberPhase_ >= UMBERPhase::Polysquare &&
                polysquare_.has_value()) {
         // ── Split-screen: left = mesh and frame, right = the polysquare ─────
@@ -7085,6 +7277,17 @@ void CrossGenWidget::renderNormal() {
              ? std::string("press 'm' to fill the elements by material\n")
              : std::string());
 
+    // UMBER's own, on the same footing: whatever refused, and the material
+    // fill where the blocks landed in more than one material.
+    const std::string umberKeys =
+        (pipelineBlocked_.empty() ? std::string() : pipelineBlocked_ + "\n") +
+        ((mode_ == Mode::UMBER && interfaces_.has_value() && interfaces_->multiMaterial())
+             ? std::string("press 'i' to show/hide the interface network\n")
+             : std::string()) +
+        ((umberDecompReport_.materials > 1)
+             ? std::string("press 'm' to fill the elements by material\n")
+             : std::string());
+
     if (mode_ == Mode::Unselected) {
         renderOverlay("press '1' for PolyVector mode\npress '2' for MBO mode\n"
                       "press '3' for Medial Axis mode\npress '4' for TORSION mode\n"
@@ -7138,9 +7341,17 @@ void CrossGenWidget::renderNormal() {
         renderOverlay((meridianKeys + "press 'c' to mesh the patches (Stage 10)\n"
                        "press 'n' to change the connectivity settings and trace again\n"
                        "press 'r' to restart\npress 'q' to quit").c_str());
-    } else if (mode_ == Mode::UMBER && umberPhase_ == UMBERPhase::Simplified) {
-        renderOverlay("press 'c' to change the collapse settings\n"
-                      "press 'r' to restart\npress 'q' to quit");
+    } else if (mode_ == Mode::UMBER && umberPhase_ == UMBERPhase::Decomposition) {
+        renderOverlay((umberKeys + "press 'c' to mesh the blocks\n"
+                       "press 'r' to restart\npress 'q' to quit").c_str());
+    } else if (mode_ == Mode::UMBER && umberPhase_ == UMBERPhase::Mesh) {
+        renderOverlay((umberKeys + "press 'c' to smooth the mesh with TMOP\n"
+                       "press 'e' to mesh again at another target edge length\n"
+                       "press 'r' to restart\npress 'q' to quit").c_str());
+    } else if (mode_ == Mode::UMBER && umberPhase_ == UMBERPhase::Smoothed) {
+        renderOverlay((umberKeys + "press 'c' to smooth again at other TMOP settings\n"
+                       "press 'e' to mesh again at another target edge length\n"
+                       "press 'r' to restart\npress 'q' to quit").c_str());
     } else {
         renderOverlay((meridianKeys + "press 'c' to continue\npress 'r' to restart\n"
                                       "press 'q' to quit").c_str());
@@ -7174,7 +7385,7 @@ void CrossGenWidget::drawLegends() {
     const bool sepLegendShown = (inPipeline() && cones_.has_value() &&
                                  pipePhase_ == PipelinePhase::Separatrices &&
                                  separatrices_.has_value());
-    if (inPipeline() && showInterfaces_ && interfaces_.has_value() &&
+    if ((inPipeline() || mode_ == Mode::UMBER) && showInterfaces_ && interfaces_.has_value() &&
         interfaces_->multiMaterial()) {
         viewer::drawInterfaceLegend(fbw(), fbh(), sepLegendShown);
     }

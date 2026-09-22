@@ -2,10 +2,100 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <unordered_map>
 #include <unordered_set>
 
 namespace {
+
+// ---------------------------------------------------------------------------
+// Which triangle of the model a point of the model is in.
+//
+// Only one question is ever asked of this -- what material does this block sit
+// in -- and it is asked once per block, so a uniform grid over the triangle
+// bounding boxes is the right structure: built in one pass, and on a mesh of
+// any size the cell a query lands in holds a handful of triangles.
+//
+// It answers -1 for a point outside every triangle rather than snapping to the
+// nearest, because the two cases mean different things to the caller: a sample
+// that missed is a sample to ignore, and a block whose every sample missed is
+// a block whose outline does not lie on the model, which is worth reporting
+// rather than papering over.
+// ---------------------------------------------------------------------------
+class TriangleGrid {
+public:
+    explicit TriangleGrid(const Mesh &m) : mesh(&m) {
+        lo = Point{std::numeric_limits<double>::infinity(),
+                   std::numeric_limits<double>::infinity()};
+        hi = Point{-lo[0], -lo[1]};
+        for (const Point &p : m.vertices) {
+            lo[0] = std::min(lo[0], p[0]); lo[1] = std::min(lo[1], p[1]);
+            hi[0] = std::max(hi[0], p[0]); hi[1] = std::max(hi[1], p[1]);
+        }
+        const int nT = static_cast<int>(m.triangles.size());
+        if (nT == 0 || !(hi[0] > lo[0]) || !(hi[1] > lo[1])) return;
+
+        // About one triangle per cell, which is where a uniform grid's build
+        // cost and its query cost cross over.
+        const double area = (hi[0] - lo[0]) * (hi[1] - lo[1]);
+        cell = std::sqrt(area / static_cast<double>(nT));
+        if (!(cell > 0.0)) cell = std::max(hi[0] - lo[0], hi[1] - lo[1]);
+        nx = std::max(1, static_cast<int>((hi[0] - lo[0]) / cell) + 1);
+        ny = std::max(1, static_cast<int>((hi[1] - lo[1]) / cell) + 1);
+        cells.assign(static_cast<size_t>(nx) * ny, {});
+
+        for (int t = 0; t < nT; ++t) {
+            const Triangle &tri = m.triangles[t];
+            Point tlo{std::numeric_limits<double>::infinity(),
+                      std::numeric_limits<double>::infinity()};
+            Point thi{-tlo[0], -tlo[1]};
+            for (int k = 0; k < 3; ++k) {
+                const Point &p = m.vertices[tri[k]];
+                tlo[0] = std::min(tlo[0], p[0]); tlo[1] = std::min(tlo[1], p[1]);
+                thi[0] = std::max(thi[0], p[0]); thi[1] = std::max(thi[1], p[1]);
+            }
+            const int i0 = clampi(static_cast<int>((tlo[0] - lo[0]) / cell), nx);
+            const int i1 = clampi(static_cast<int>((thi[0] - lo[0]) / cell), nx);
+            const int j0 = clampi(static_cast<int>((tlo[1] - lo[1]) / cell), ny);
+            const int j1 = clampi(static_cast<int>((thi[1] - lo[1]) / cell), ny);
+            for (int j = j0; j <= j1; ++j)
+                for (int i = i0; i <= i1; ++i)
+                    cells[static_cast<size_t>(j) * nx + i].push_back(t);
+        }
+    }
+
+    int locate(const Point &q) const {
+        if (cells.empty()) return -1;
+        const int i = clampi(static_cast<int>((q[0] - lo[0]) / cell), nx);
+        const int j = clampi(static_cast<int>((q[1] - lo[1]) / cell), ny);
+        for (const int t : cells[static_cast<size_t>(j) * nx + i])
+            if (inside(t, q)) return t;
+        return -1;
+    }
+
+private:
+    static int clampi(int v, int n) { return std::max(0, std::min(n - 1, v)); }
+
+    bool inside(int t, const Point &q) const {
+        const Triangle &tri = mesh->triangles[t];
+        const Point &a = mesh->vertices[tri[0]];
+        const Point &b = mesh->vertices[tri[1]];
+        const Point &c = mesh->vertices[tri[2]];
+        // Signs against the triangle's own orientation, so a mesh stored
+        // clockwise is not reported empty everywhere.
+        const double s0 = cross2(b - a, q - a);
+        const double s1 = cross2(c - b, q - b);
+        const double s2 = cross2(a - c, q - c);
+        return (s0 >= 0.0 && s1 >= 0.0 && s2 >= 0.0) ||
+               (s0 <= 0.0 && s1 <= 0.0 && s2 <= 0.0);
+    }
+
+    const Mesh *mesh = nullptr;
+    Point lo{0.0, 0.0}, hi{0.0, 0.0};
+    double cell = 1.0;
+    int nx = 0, ny = 0;
+    std::vector<std::vector<int>> cells;
+};
 
 // The point of a polyline at p = (index of the point before it) + (fraction of
 // the way along that step).
@@ -101,6 +191,75 @@ void BlockLayout::buildBoundaryLoops() {
 }
 
 // ---------------------------------------------------------------------------
+// buildInterfaceChains()
+//
+// The interface network, cut at every vertex the network does not simply carry
+// on through: a junction of three or more branches, a free end, or a landing
+// on dS. Each chain is a run of vertices, and each mesh edge belongs to
+// exactly one of them -- which is why the lookup below is keyed by edge and
+// the boundary's is keyed by vertex. A vertex can be on two chains; that is
+// what a junction is.
+// ---------------------------------------------------------------------------
+void BlockLayout::buildInterfaceChains() {
+    ichains.clear();
+    ichainClosed.clear();
+    ichainOfEdge.assign(mesh->edges.size(), {-1, -1});
+    ichainPosOfVertex.assign(mesh->vertices.size(), {});
+
+    const std::vector<int> &featureEdges = graph->getFeatureEdges();
+    if (featureEdges.empty()) return;
+
+    const int nV = static_cast<int>(mesh->vertices.size());
+    std::vector<std::vector<int>> atVertex(nV);
+    for (const int e : featureEdges) {
+        if (e < 0 || e >= static_cast<int>(mesh->edges.size())) continue;
+        if (mesh->isBoundaryEdge[e]) continue;
+        atVertex[mesh->edges[e][0]].push_back(e);
+        atVertex[mesh->edges[e][1]].push_back(e);
+    }
+    auto otherEnd = [&](int e, int v) {
+        return (mesh->edges[e][0] == v) ? mesh->edges[e][1] : mesh->edges[e][0];
+    };
+    auto isChainNode = [&](int v) {
+        return atVertex[v].size() != 2 || mesh->isBoundaryVertex[v];
+    };
+
+    std::vector<char> used(mesh->edges.size(), 0);
+    auto walkFrom = [&](int v, int e) {
+        std::vector<int> verts{v};
+        std::vector<int> chainEdges;
+        int cur = v, ce = e;
+        while (ce >= 0 && !used[ce]) {
+            used[ce] = 1;
+            chainEdges.push_back(ce);
+            const int nxt = otherEnd(ce, cur);
+            verts.push_back(nxt);
+            if (isChainNode(nxt)) break;
+            const int e2 = (atVertex[nxt][0] != ce) ? atVertex[nxt][0] : atVertex[nxt][1];
+            cur = nxt;
+            ce = e2;
+        }
+        if (chainEdges.empty()) return;
+        const int idx = static_cast<int>(ichains.size());
+        for (size_t i = 0; i < chainEdges.size(); ++i)
+            ichainOfEdge[chainEdges[i]] = {idx, static_cast<int>(i)};
+        for (size_t i = 0; i < verts.size(); ++i)
+            ichainPosOfVertex[verts[i]].emplace_back(idx, static_cast<int>(i));
+        ichainClosed.push_back(verts.front() == verts.back() ? 1 : 0);
+        ichains.push_back(std::move(verts));
+    };
+    for (int v = 0; v < nV; ++v) {
+        if (!isChainNode(v)) continue;
+        for (const int e : atVertex[v]) if (!used[e]) walkFrom(v, e);
+    }
+    for (const int e : featureEdges) {
+        if (e < 0 || e >= static_cast<int>(mesh->edges.size()) || used[e]) continue;
+        if (mesh->isBoundaryEdge[e]) continue;
+        walkFrom(mesh->edges[e][0], e);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // addNode() / findNode()
 // ---------------------------------------------------------------------------
 int BlockLayout::findNode(const Point &pos) const {
@@ -168,9 +327,31 @@ void BlockLayout::collectNodes() {
 
     splitsOfRay.assign(traces.size(), {});
     splitsOfLoop.assign(loops.size(), {});
+    splitsOfChain.assign(ichains.size(), {});
+
+    // A node on an interface chain: the same job placeOnLoop does for dS, on a
+    // run of vertices instead of a ring. The edge says which chain and which
+    // step, and whether the chain runs the edge's way.
+    auto placeOnChain = [&](int node, int e, double along) {
+        if (e < 0 || e >= static_cast<int>(ichainOfEdge.size())) return false;
+        const auto [c, i] = ichainOfEdge[e];
+        if (c < 0) return false;
+        const std::vector<int> &chain = ichains[c];
+        if (i + 1 >= static_cast<int>(chain.size())) return false;
+        const int va = mesh->edges[e][0];
+        const double p = (chain[i] == va) ? i + along : i + (1.0 - along);
+        splitsOfChain[c].push_back(Split{p, node});
+        return true;
+    };
 
     auto placeOnLoop = [&](int node, int boundaryEdge, double along) {
         if (boundaryEdge < 0) { ++report_.unplacedNodes; return; }
+        // A ray that stopped on an interface exits through an interface edge,
+        // not a boundary one, and its node belongs on that chain.
+        if (!mesh->isBoundaryEdge[boundaryEdge]) {
+            if (!placeOnChain(node, boundaryEdge, along)) ++report_.unplacedNodes;
+            return;
+        }
         const int va = mesh->edges[boundaryEdge][0], vb = mesh->edges[boundaryEdge][1];
         if (va >= static_cast<int>(loopOfVertex.size()) ||
             vb >= static_cast<int>(loopOfVertex.size())) { ++report_.unplacedNodes; return; }
@@ -197,14 +378,24 @@ void BlockLayout::collectNodes() {
             switch (mn.kind) {
                 case MotorcycleGraph::Node::Corner: {
                     const int id = addNode(mn.xy, QuadLayout::NodeKind::BoundaryCorner);
+                    bool placed = false;
                     if (mn.vertex >= 0 && mn.vertex < static_cast<int>(loopOfVertex.size()) &&
                         loopOfVertex[mn.vertex].first >= 0) {
                         const auto &lv = loopOfVertex[mn.vertex];
                         splitsOfLoop[lv.first].push_back(
                             Split{static_cast<double>(lv.second), id});
-                    } else {
-                        ++report_.unplacedNodes;
+                        placed = true;
                     }
+                    // A ray launched from an interface sector starts on the
+                    // interface, not on dS, and its corner splits every chain
+                    // it sits on -- both of them at a junction.
+                    if (mn.vertex >= 0 && mn.vertex < static_cast<int>(ichainPosOfVertex.size())) {
+                        for (const auto &[c, i] : ichainPosOfVertex[mn.vertex]) {
+                            splitsOfChain[c].push_back(Split{static_cast<double>(i), id});
+                            placed = true;
+                        }
+                    }
+                    if (!placed) ++report_.unplacedNodes;
                     break;
                 }
                 case MotorcycleGraph::Node::BoundaryEnd: {
@@ -221,6 +412,37 @@ void BlockLayout::collectNodes() {
                             splitsOfRay[mn.ray[k]].push_back(Split{mn.param[k], id});
                     break;
                 }
+            }
+        }
+    }
+
+    // The ends of every interface chain are nodes of the structure: a landing
+    // on dS, or a junction where three or more materials meet. Each goes in as
+    // a corner -- and a landing is filed on its boundary loop too, or the two
+    // sides of dS there are one arc running straight past the interface and
+    // the blocks either side of it have no side between them.
+    //
+    // "Each is a corner of every region around it" is a claim about the image
+    // and it holds only because MotorcycleGraph::launchFeatureSectors() makes
+    // it hold: a sector of q quarter turns at one of these gets q - 1 rays, so
+    // after the launch every sector here spans exactly one quarter and every
+    // one of them is a corner. Where that launch fails the claim fails with it
+    // and the face comes out with a corner too many, which is a face the
+    // decomposition refuses and the report counts -- the right way round, since
+    // the fault is upstream.
+    for (size_t c = 0; c < ichains.size(); ++c) {
+        if (ichains[c].size() < 2) continue;
+        const int ends[2] = {ichains[c].front(), ichains[c].back()};
+        const double params[2] = {0.0, static_cast<double>(ichains[c].size() - 1)};
+        for (int k = 0; k < 2; ++k) {
+            const int v = ends[k];
+            const int id = addNode(mesh->vertices[v], QuadLayout::NodeKind::BoundaryCorner);
+            splitsOfChain[c].push_back(Split{params[k], id});
+            // A closed chain has one vertex at both ends, so the split is
+            // filed at both parameters and the ring is cut there once.
+            if (v < static_cast<int>(loopOfVertex.size()) && loopOfVertex[v].first >= 0) {
+                const auto &lv = loopOfVertex[v];
+                splitsOfLoop[lv.first].push_back(Split{static_cast<double>(lv.second), id});
             }
         }
     }
@@ -317,17 +539,229 @@ void BlockLayout::buildBoundaryArcs() {
 }
 
 // ---------------------------------------------------------------------------
+// buildInterfaceArcs()
+//
+// Each chain cut at the nodes on it, exactly as a boundary loop is. The arcs
+// are not flagged onBoundary: an interface is interior to the model, and the
+// face walk uses that flag to tell the unbounded side from a block. What makes
+// an interface a side of the structure is that it is an arc at all.
+// ---------------------------------------------------------------------------
+void BlockLayout::buildInterfaceArcs() {
+    for (size_t c = 0; c < ichains.size(); ++c) {
+        const std::vector<int> &chain = ichains[c];
+        const int n = static_cast<int>(chain.size());
+        if (n < 2) continue;
+
+        auto splits = splitsOfChain[c];
+        std::sort(splits.begin(), splits.end(),
+                  [](const Split &x, const Split &y) { return x.p < y.p; });
+        splits.erase(std::unique(splits.begin(), splits.end(),
+                                 [](const Split &x, const Split &y) {
+                                     return x.node == y.node || std::fabs(x.p - y.p) < 1e-12;
+                                 }),
+                     splits.end());
+        if (splits.size() < 2) continue;
+
+        auto pointAt = [&](double p) {
+            const int i = std::min(n - 2, static_cast<int>(std::floor(p)));
+            if (i < 0) return mesh->vertices[chain[0]];
+            const double t = p - i;
+            return mesh->vertices[chain[i]] * (1.0 - t) + mesh->vertices[chain[i + 1]] * t;
+        };
+
+        for (size_t i = 0; i + 1 < splits.size(); ++i) {
+            const double p0 = splits[i].p, p1 = splits[i + 1].p;
+            std::vector<Point> pts;
+            pts.push_back(pointAt(p0));
+            for (int k = static_cast<int>(std::floor(p0)) + 1;
+                 k <= static_cast<int>(std::ceil(p1)); ++k) {
+                if (k <= p0 + 1e-12 || k >= p1 - 1e-12) continue;
+                if (k >= 0 && k < n) pts.push_back(mesh->vertices[chain[k]]);
+            }
+            pts.push_back(pointAt(p1));
+            const int id = addArc(std::move(pts), splits[i].node, splits[i + 1].node, -1, false);
+            if (id >= 0) {
+                if (static_cast<int>(arcIsInterface.size()) <= id)
+                    arcIsInterface.resize(id + 1, 0);
+                arcIsInterface[id] = 1;
+            }
+        }
+    }
+    arcIsInterface.resize(arcs.size(), 0);
+}
+
+// ---------------------------------------------------------------------------
 // build()
 // ---------------------------------------------------------------------------
 void BlockLayout::build() {
     nodes.clear();
     arcs.clear();
+    arcIsInterface.clear();
     report_ = Report{};
 
     buildBoundaryLoops();
+    buildInterfaceChains();
     collectNodes();
     buildRayArcs();
     buildBoundaryArcs();
+    buildInterfaceArcs();
 
     layout_.rebuild(nodes, arcs);
+}
+
+// ---------------------------------------------------------------------------
+// blockDecompositionOf()
+//
+// The layout re-read as the shared representation. Nothing is recomputed: the
+// arcs are already the sides, the nodes already the macrovertices, and the
+// face walk already decided which sectors are corners. What this does is
+// choose which faces qualify, put each arc down once in the direction its
+// first claimant walks it, and hand the second claimant the same arc with a
+// flip -- which is what makes a side shared full length rather than shared to
+// a tolerance.
+//
+// The material is the one thing that is not already in the layout. It is read
+// off the model by locating a point inside each block, and several points
+// rather than one, because a block that straddles an interface is exactly the
+// defect worth reporting on a multi-material model and a single sample cannot
+// see it.
+// ---------------------------------------------------------------------------
+BlockDecomposition BlockLayout::blockDecompositionOf(const QuadLayout &layout, const Mesh &mesh,
+                                                     DecompositionReport *out,
+                                                     const std::string &source) {
+    BlockDecomposition D;
+    D.source = source;
+    DecompositionReport rep;
+
+    const std::vector<QuadLayout::Node> &lnodes = layout.getNodes();
+    const std::vector<QuadLayout::Arc> &larcs = layout.getArcs();
+    const std::vector<QuadLayout::Face> &lfaces = layout.getFaces();
+    rep.faces = static_cast<int>(lfaces.size());
+
+    std::vector<int> qualifying;
+    qualifying.reserve(lfaces.size());
+    for (size_t f = 0; f < lfaces.size(); ++f) {
+        const QuadLayout::Face &fc = lfaces[f];
+        rep.totalArea += fc.area;
+        if (fc.corners != 4 || fc.sides.size() != 4) { ++rep.notFourSided; continue; }
+        bool oneArcPerSide = true;
+        for (const std::vector<int> &sd : fc.sides) if (sd.size() != 1) oneArcPerSide = false;
+        if (!oneArcPerSide) { ++rep.multiArcSides; continue; }
+        rep.coveredArea += fc.area;
+        qualifying.push_back(static_cast<int>(f));
+    }
+
+    std::vector<int> vidx(lnodes.size(), -1);
+    auto macroVertex = [&](int n) {
+        if (n < 0 || n >= static_cast<int>(lnodes.size())) return -1;
+        if (vidx[n] >= 0) return vidx[n];
+        BlockDecomposition::MacroVertex mv;
+        mv.p = lnodes[n].pos;
+        mv.onBoundary = lnodes[n].kind == QuadLayout::NodeKind::BoundaryCorner ||
+                        lnodes[n].kind == QuadLayout::NodeKind::BoundaryHit;
+        vidx[n] = static_cast<int>(D.vertices.size());
+        D.vertices.push_back(mv);
+        return vidx[n];
+    };
+
+    std::vector<int> edgeOfArc(larcs.size(), -1);
+    D.blocks.resize(qualifying.size());
+    for (size_t bi = 0; bi < qualifying.size(); ++bi) {
+        const QuadLayout::Face &fc = lfaces[qualifying[bi]];
+        BlockDecomposition::Block &ob = D.blocks[bi];
+        for (int s = 0; s < 4; ++s) {
+            const int dart = fc.sides[s][0];
+            const int a = QuadLayout::arcOfDart(dart);
+            const bool forward = (dart & 1) == 0;
+            const QuadLayout::Arc &arc = larcs[a];
+            ob.corners[s] = macroVertex(forward ? arc.a : arc.b);
+
+            int eid = edgeOfArc[a];
+            if (eid < 0) {
+                BlockDecomposition::MacroEdge oe;
+                oe.boundary = arc.onBoundary;
+                oe.points = arc.pts;
+                if (!forward) std::reverse(oe.points.begin(), oe.points.end());
+                oe.from = macroVertex(forward ? arc.a : arc.b);
+                oe.to = macroVertex(forward ? arc.b : arc.a);
+                oe.blockA = static_cast<int>(bi);
+                oe.sideA = s;
+                eid = static_cast<int>(D.edges.size());
+                edgeOfArc[a] = eid;
+                D.edges.push_back(std::move(oe));
+            } else {
+                // The twin dart runs the other way, so the polyline already
+                // stored is this side read backwards; only the block needs
+                // recording.
+                D.edges[eid].blockB = static_cast<int>(bi);
+                D.edges[eid].sideB = s;
+            }
+            ob.edges[s] = eid;
+            ob.flip[s] = D.edges[eid].blockB == static_cast<int>(bi);
+        }
+    }
+
+    // --- materials, read off the model ------------------------------------
+    //
+    // Nine samples of the parameter square plus a guaranteed interior point.
+    // The majority is the block's material and a disagreement is the report's:
+    // on a single-material model every sample agrees trivially and nothing
+    // below costs anything.
+    bool multiMaterial = false;
+    for (size_t t = 1; t < mesh.triangleMatId.size(); ++t)
+        if (mesh.triangleMatId[t] != mesh.triangleMatId[0]) { multiMaterial = true; break; }
+
+    if (!mesh.triangles.empty()) {
+        const TriangleGrid grid(mesh);
+        std::unordered_set<int> seenMaterials;
+        for (size_t b = 0; b < D.blocks.size(); ++b) {
+            std::unordered_map<int, int> votes;
+            Point q;
+            if (D.interiorPoint(static_cast<int>(b), q)) {
+                const int t = grid.locate(q);
+                if (t >= 0) votes[mesh.triangleMatId[t]] += 2;   // the sure one counts double
+            }
+            if (multiMaterial) {
+                for (int j = 1; j <= 3; ++j) {
+                    for (int i = 1; i <= 3; ++i) {
+                        const int t = grid.locate(
+                            D.coonsPoint(static_cast<int>(b), i / 4.0, j / 4.0));
+                        if (t >= 0) votes[mesh.triangleMatId[t]] += 1;
+                    }
+                }
+            }
+            int best = 0, bestVotes = -1;
+            for (const auto &[m, v] : votes) if (v > bestVotes) { best = m; bestVotes = v; }
+            D.blocks[b].material = best;
+            if (votes.size() > 1) ++rep.straddlingBlocks;
+            if (bestVotes >= 0) seenMaterials.insert(best);
+        }
+        rep.materials = static_cast<int>(seenMaterials.size());
+    }
+
+    for (BlockDecomposition::MacroEdge &oe : D.edges) {
+        oe.matLeft = oe.blockA >= 0 ? D.blocks[oe.blockA].material : 0;
+        oe.matRight = oe.blockB >= 0 ? D.blocks[oe.blockB].material : 0;
+        // An interface is not a flag the layout carries; it is what an edge
+        // with a different material on each side *is*. Reading it back this
+        // way rather than plumbing a flag through keeps the two from ever
+        // disagreeing.
+        oe.interface = !oe.boundary && oe.blockA >= 0 && oe.blockB >= 0 &&
+                       oe.matLeft != oe.matRight;
+        if (oe.blockB < 0) ++rep.unmatchedSides;
+        if (oe.from >= 0) {
+            ++D.vertices[oe.from].valence;
+            if (oe.boundary) D.vertices[oe.from].onBoundary = true;
+            if (oe.interface) D.vertices[oe.from].onInterface = true;
+        }
+        if (oe.to >= 0) {
+            ++D.vertices[oe.to].valence;
+            if (oe.boundary) D.vertices[oe.to].onBoundary = true;
+            if (oe.interface) D.vertices[oe.to].onInterface = true;
+        }
+    }
+
+    rep.blocks = static_cast<int>(D.blocks.size());
+    if (out) *out = rep;
+    return D;
 }

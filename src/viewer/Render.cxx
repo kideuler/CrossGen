@@ -2810,6 +2810,13 @@ std::vector<GridRef> gridsOf(const BlockMesh &bm) {
     return g;
 }
 
+std::vector<GridRef> gridsOf(const BlockQuadMesh &bm) {
+    std::vector<GridRef> g;
+    g.reserve(bm.blocks().size());
+    for (const BlockQuadMesh::Block &b : bm.blocks()) g.push_back({ b.ns, b.nt, &b.vert });
+    return g;
+}
+
 } // namespace
 
 void drawPlanarDomain(const PlanarDomain &D, double radius) {
@@ -2990,6 +2997,18 @@ void drawQuadMesh(const BlockMesh &bm, float lineWidth, float blockLineWidth, bo
 }
 
 void drawQuadMesh(const mesh::QuadMesh &sm, const BlockMesh &bm, float lineWidth,
+                  float blockLineWidth, bool materialFill) {
+    drawQuadMeshArrays(sm.vertices, sm.quads, sm.quadMatId, gridsOf(bm),
+                       lineWidth, blockLineWidth, materialFill);
+}
+
+void drawQuadMesh(const BlockQuadMesh &bm, float lineWidth, float blockLineWidth,
+                  bool materialFill) {
+    drawQuadMeshArrays(bm.vertices(), bm.quads(), bm.quadMaterials(), gridsOf(bm),
+                       lineWidth, blockLineWidth, materialFill);
+}
+
+void drawQuadMesh(const mesh::QuadMesh &sm, const BlockQuadMesh &bm, float lineWidth,
                   float blockLineWidth, bool materialFill) {
     drawQuadMeshArrays(sm.vertices, sm.quads, sm.quadMatId, gridsOf(bm),
                        lineWidth, blockLineWidth, materialFill);

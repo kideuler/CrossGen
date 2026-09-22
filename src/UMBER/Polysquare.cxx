@@ -62,6 +62,26 @@ Polysquare::Polysquare(const UMBER &frames, const HarmonicCut &cut) {
     for (const auto &[v, k] : frames.boundarySingularities()) {
         if (v >= 0 && v < static_cast<int>(boundaryCorner.size())) boundaryCorner[v] = k;
     }
+
+    // The interfaces the frame was aligned to, carried through so that the
+    // measurement below asks of them exactly what it asks of dS. They are read
+    // off the frame field and never passed separately: a deformation that
+    // followed a curve the field was not aligned to would be asking the two
+    // terms of Eq. (9) to pull against each other by construction.
+    featureEdges = frames.getFeatureEdges();
+    edgeIsFeature.assign(orig->edges.size(), 0);
+    for (const int e : featureEdges)
+        if (e >= 0 && e < static_cast<int>(edgeIsFeature.size())) edgeIsFeature[e] = 1;
+
+    // theta_i of Eq. (12) where the curve is an interface: the frame field's
+    // own corner index, keyed by the directed pair of edges it was measured
+    // across. An interface has a layout on each side and the two need not turn
+    // the same way, which is why the key is directed and not a vertex.
+    featureChains = frames.interfaceChains();
+    const long long nE = static_cast<long long>(orig->edges.size());
+    for (const UMBER::FeatureCorner &fc : frames.interfaceCorners()) {
+        interfaceCorner[static_cast<long long>(fc.edgeIn) * nE + fc.edgeOut] = fc.quarters;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -297,6 +317,107 @@ void Polysquare::buildTopology() {
     totalBoundaryLength = 0.0;
     for (const auto &be : bEdges) totalBoundaryLength += be.length;
     if (totalBoundaryLength <= 0.0) throw std::runtime_error("Polysquare: mesh has no boundary");
+
+    buildFeatureChains();
+
+    totalFeatureLength = totalBoundaryLength;
+    for (const auto &fe : fEdges) totalFeatureLength += fe.length;
+}
+
+// ---------------------------------------------------------------------------
+// buildFeatureChains()
+//
+// The material interfaces as edges of Eq. (11) and pairs of Eq. (12), exactly
+// as dS is. An interface is a curve the output has to keep, so the image has
+// to put it on an axis and turn it only where the frame says to -- and if the
+// deformation is not asked for that, nothing downstream can follow it: the
+// iso-lines of the image are what cut the model into blocks, and an interface
+// that is not one of them is an interface every block across it straddles.
+//
+// Three differences from the boundary, all forced by what an interface is:
+//
+//  * It is interior, so it has one image rather than two banks. The copies are
+//    taken from the triangle on the left of the walk, which is the bank a walk
+//    with that material on its left would use, and is the side the frame
+//    field measured its corner on.
+//
+//  * A chain is open unless the network closes on itself, so the pairs of
+//    Eq. (12) do not wrap: the first and last edges of an open chain have a
+//    neighbour on one side only, and where the chain ends -- a junction, a
+//    landing on dS -- what the layout does is the junction's business and not
+//    this chain's.
+//
+//  * theta_i comes from UMBER::interfaceCorners() rather than from
+//    boundaryCorner, since the corner an interface turns is a property of the
+//    side being walked.
+// ---------------------------------------------------------------------------
+void Polysquare::buildFeatureChains() {
+    fEdges.clear();
+    chainStart.clear();
+    chainClosed.clear();
+    if (featureChains.empty()) return;
+
+    const long long nE = static_cast<long long>(orig->edges.size());
+    for (const UMBER::FeatureChain &fc : featureChains) {
+        if (fc.edges.size() < 2 || fc.verts.size() != fc.edges.size() + 1) continue;
+
+        const int base = static_cast<int>(fEdges.size());
+        bool ok = true;
+        std::vector<BoundaryEdge> built;
+        built.reserve(fc.edges.size());
+        for (size_t i = 0; i < fc.edges.size(); ++i) {
+            const int a = fc.verts[i], b = fc.verts[i + 1];
+            const int f = leftTriangleOf(a, b);
+            if (f < 0) { ok = false; break; }
+            BoundaryEdge be;
+            be.ca = cornerOf(f, a);
+            be.cb = cornerOf(f, b);
+            if (be.ca < 0 || be.cb < 0) { ok = false; break; }
+            be.length = normP(orig->vertices[b] - orig->vertices[a]);
+            be.sharedOrigVertex = b;
+            // The pair (this edge, the next) meets at b; the target is what
+            // the frame turns there, walked this way.
+            const int eIn = fc.edges[i];
+            const int eOut = fc.edges[(i + 1) % fc.edges.size()];
+            const auto it = interfaceCorner.find(static_cast<long long>(eIn) * nE + eOut);
+            be.targetTurn = (it != interfaceCorner.end()) ? it->second * M_PI_2 : 0.0;
+            be.cornerPair = true;
+            built.push_back(be);
+        }
+        if (!ok || built.size() < 2) continue;
+
+        chainStart.push_back(base);
+        chainClosed.push_back(fc.closed ? 1 : 0);
+        for (auto &be : built) fEdges.push_back(be);
+    }
+    chainStart.push_back(static_cast<int>(fEdges.size()));
+
+    // A cut crossing an interface puts the two edges either side of the
+    // crossing on different copies of the shared vertex, exactly as it does on
+    // dS, and the answer is the same: carry the transition into the target
+    // angle, or drop the pair where neither copy is the dependent one and
+    // there is nothing to compare.
+    for (size_t c = 0; c + 1 < chainStart.size(); ++c) {
+        const int f0 = chainStart[c], f1 = chainStart[c + 1];
+        const int n = f1 - f0;
+        if (n < 2) continue;
+        const bool closed = chainClosed[c] != 0;
+        for (int i = 0; i < n; ++i) {
+            if (!closed && i == n - 1) { fEdges[f0 + i].cornerPair = false; continue; }
+            BoundaryEdge &ei = fEdges[f0 + i];
+            const BoundaryEdge &ej = fEdges[f0 + (i + 1) % n];
+            if (ei.cb == ej.ca) continue;
+            if (varOf[ej.ca] == -1) {
+                ei.seamTurn = -transitionK[depCut[ej.ca]] * M_PI_2;
+            } else if (varOf[ei.cb] == -1) {
+                ei.seamTurn = transitionK[depCut[ei.cb]] * M_PI_2;
+            } else {
+                ei.cornerPair = false;
+                continue;
+            }
+            ei.targetTurn += ei.seamTurn;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -525,12 +646,15 @@ double Polysquare::evaluate(const Eigen::VectorXd &state, Eigen::VectorXd &grad,
     // is normalized so the term measures the angle and not the length.
     double eL1 = 0.0;
     const double eps2 = l1Eps * l1Eps;
-    for (const auto &be : bEdges) {
+    // dS and the interfaces alike: the term asks a curve the output has to
+    // keep to lie on an axis, and which kind of curve it is does not enter.
+    auto axisTerm = [&](const BoundaryEdge &be, double scale) {
+        if (scale <= 0.0) return;
         const Point d = uv[be.cb] - uv[be.ca];
         const double n2 = dotP(d, d);
-        if (n2 < 1e-24) continue;
+        if (n2 < 1e-24) return;
         const double n = std::sqrt(n2);
-        const double w = be.length / totalBoundaryLength;
+        const double w = scale * be.length / totalFeatureLength;
 
         const double sx = std::sqrt(d[0] * d[0] + eps2);
         const double sy = std::sqrt(d[1] * d[1] + eps2);
@@ -541,32 +665,30 @@ double Polysquare::evaluate(const Eigen::VectorXd &state, Eigen::VectorXd &grad,
                       w * ((d[1] / sy) / n - S * d[1] / (n2 * n))};
         gradUV[be.cb] = gradUV[be.cb] + g * l1Weight;
         gradUV[be.ca] = gradUV[be.ca] - g * l1Weight;
-    }
+    };
+    for (const auto &be : bEdges) axisTerm(be, 1.0);
+    for (const auto &fe : fEdges) axisTerm(fe, interfaceWeight);
 
     // --- E_cor, Eq. (12): where the boundary is allowed to turn ------------
     double eCor = 0.0;
     if (corWeight > 0.0) {
-        for (size_t l = 0; l + 1 < loopStart.size(); ++l) {
-            const int b0 = loopStart[l], b1 = loopStart[l + 1];
-            const int n = b1 - b0;
-            if (n < 2) continue;
-
-            for (int i = 0; i < n; ++i) {
-                const BoundaryEdge &ei = bEdges[b0 + i];
-                const BoundaryEdge &ej = bEdges[b0 + (i + 1) % n];
-                if (!ei.cornerPair) continue;
+        // One pair of consecutive edges, wherever the two curves meet. Written
+        // once and applied to dS's loops and the interfaces' chains alike, so
+        // that "do not turn here" means the same thing on both.
+        auto cornerTerm = [&](const BoundaryEdge &ei, const BoundaryEdge &ej, double scale) {
+                if (!ei.cornerPair || scale <= 0.0) return;
 
                 const Point di = uv[ei.cb] - uv[ei.ca];
                 const Point dj = uv[ej.cb] - uv[ej.ca];
                 const double ni2 = dotP(di, di), nj2 = dotP(dj, dj);
-                if (ni2 < 1e-24 || nj2 < 1e-24) continue;
+                if (ni2 < 1e-24 || nj2 < 1e-24) return;
                 const double ni = std::sqrt(ni2), nj = std::sqrt(nj2);
                 const Point ui = di / ni, uj = dj / nj;
 
                 const double ct = std::cos(ei.targetTurn), st = std::sin(ei.targetTurn);
                 const Point rui{ct * ui[0] - st * ui[1], st * ui[0] + ct * ui[1]};
 
-                const double wgeom = (ei.length + ej.length) / totalBoundaryLength;
+                const double wgeom = scale * (ei.length + ej.length) / totalFeatureLength;
                 const double w = corWeight * wgeom;
                 const Point diff = rui - uj;
                 eCor += wgeom * dotP(diff, diff);
@@ -584,7 +706,24 @@ double Polysquare::evaluate(const Eigen::VectorXd &state, Eigen::VectorXd &grad,
                 gradUV[ei.ca] = gradUV[ei.ca] - gi * w;
                 gradUV[ej.cb] = gradUV[ej.cb] + gj * w;
                 gradUV[ej.ca] = gradUV[ej.ca] - gj * w;
-            }
+        };
+
+        for (size_t l = 0; l + 1 < loopStart.size(); ++l) {
+            const int b0 = loopStart[l], b1 = loopStart[l + 1];
+            const int n = b1 - b0;
+            if (n < 2) continue;
+            for (int i = 0; i < n; ++i)
+                cornerTerm(bEdges[b0 + i], bEdges[b0 + (i + 1) % n], 1.0);
+        }
+        // An open chain's last edge has no successor on it -- buildFeatureChains
+        // clears its cornerPair -- so the wrap below only ever fires on a
+        // closed one.
+        for (size_t c = 0; c + 1 < chainStart.size(); ++c) {
+            const int f0 = chainStart[c], f1 = chainStart[c + 1];
+            const int n = f1 - f0;
+            if (n < 2) continue;
+            for (int i = 0; i < n; ++i)
+                cornerTerm(fEdges[f0 + i], fEdges[f0 + (i + 1) % n], interfaceWeight);
         }
     }
 
@@ -1230,6 +1369,36 @@ void Polysquare::measure() {
     report_.meanAlignDeg = bEdges.empty() ? 0.0 : devSum / bEdges.size();
     report_.maxAlignDeg = devMax;
     report_.lengthRatio = imageLen / totalBoundaryLength;
+
+    // The same reading on the interfaces. An interface edge is interior, so it
+    // has one image and not two banks -- unless a cut happens to run along it,
+    // and then the two triangles disagree and the edge is read from the one on
+    // the left, which is the bank a walk with the material on its left would
+    // take.
+    report_.interfaceEdges = 0;
+    report_.meanInterfaceAlignDeg = 0.0;
+    report_.maxInterfaceAlignDeg = 0.0;
+    {
+        double sum = 0.0, worst = 0.0;
+        int n = 0;
+        for (const int e : featureEdges) {
+            if (e < 0 || e >= static_cast<int>(orig->edges.size())) continue;
+            const int a = orig->edges[e][0], b = orig->edges[e][1];
+            const int f = leftTriangleOf(a, b);
+            if (f < 0) continue;
+            const int ca = cornerOf(f, a), cb = cornerOf(f, b);
+            if (ca < 0 || cb < 0) continue;
+            const Point d = uv[cb] - uv[ca];
+            if (normP(d) < 1e-18) continue;
+            const double dev = std::fabs(axisDeviation(d[0], d[1])) * 180.0 / M_PI;
+            sum += dev;
+            worst = std::max(worst, dev);
+            ++n;
+        }
+        report_.interfaceEdges = n;
+        report_.meanInterfaceAlignDeg = n ? sum / n : 0.0;
+        report_.maxInterfaceAlignDeg = worst;
+    }
 
     // Eq. (8) holds by construction, so there is nothing to measure there.
     // What is worth measuring is the assumption underneath it: that a single

@@ -25,6 +25,7 @@
 #include "MERIDIAN/QuadMesh.hxx"
 #include "MERIDIAN/SplineFit.hxx"
 #include "MERIDIAN/SubdomainLabels.hxx"
+#include "mesh/BlockQuadMesh.hxx"
 #include "mesh/QuadMesh.hxx"
 #include "Parameterization/CutMesh.hxx"
 #ifdef CROSSGEN_WITH_COMISO
@@ -612,6 +613,15 @@ void drawATLASLegend(int fbw, int fbh, bool corners);
 void drawQuadMesh(const BlockMesh &bm, float lineWidth, float blockLineWidth,
                   bool materialFill = false);
 void drawQuadMesh(const mesh::QuadMesh &sm, const BlockMesh &bm, float lineWidth,
+                  float blockLineWidth, bool materialFill = false);
+
+// UMBER's mesh, built on the shared decomposition (mesh/BlockQuadMesh.hxx),
+// and the same mesh after TMOP with the walls still taken off its blocks:
+// drawn by the one routine Stage 10, Stage 11, Stage 12 and ATLAS's two mesh
+// phases use, so that every method's mesh is pictured identically.
+void drawQuadMesh(const BlockQuadMesh &bm, float lineWidth, float blockLineWidth,
+                  bool materialFill = false);
+void drawQuadMesh(const mesh::QuadMesh &sm, const BlockQuadMesh &bm, float lineWidth,
                   float blockLineWidth, bool materialFill = false);
 
 } // namespace viewer

@@ -9,6 +9,7 @@
 #include <array>
 #include <queue>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace {
 
@@ -31,6 +32,20 @@ MotorcycleGraph::MotorcycleGraph(const Polysquare &ps) {
     cut = &ps.getCutMesh();
     uv = &ps.getUV();
     if (uv->empty()) throw std::runtime_error("MotorcycleGraph: the polysquare is not solved");
+
+    // The interfaces, as the polysquare was given them. They are walls for the
+    // flood -- a block that straddles one carries two materials, which is the
+    // one thing the multi-material path exists to prevent -- and they bound
+    // the sectors launchFeatureSectors() fires from.
+    edgeIsFeature.assign(mesh->edges.size(), 0);
+    vertexOnFeature.assign(mesh->vertices.size(), 0);
+    for (const int e : ps.getFeatureEdges()) {
+        if (e < 0 || e >= static_cast<int>(edgeIsFeature.size())) continue;
+        edgeIsFeature[e] = 1;
+        vertexOnFeature[mesh->edges[e][0]] = 1;
+        vertexOnFeature[mesh->edges[e][1]] = 1;
+        multiMaterial = true;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -130,6 +145,10 @@ void MotorcycleGraph::launch() {
 
     for (int v : mesh->boundaryVertices) {
         if (v >= static_cast<int>(corners.size())) continue;
+        // A boundary vertex an interface lands on has more than one sector, so
+        // the corner index -- one number for the whole star -- is not what
+        // says how many rays go where. launchFeatureSectors() takes it.
+        if (!vertexOnFeature.empty() && vertexOnFeature[v]) continue;
         const int k = corners[v];
         if (k >= 0 || boundaryDegree[v] != 2) continue;
 
@@ -255,7 +274,247 @@ void MotorcycleGraph::launch() {
             }
         }
     }
+    launchFeatureSectors();
     report_.motorcycles = static_cast<int>(bikes.size());
+}
+
+// ---------------------------------------------------------------------------
+// launchFeatureSectors()  --  the rays a multi-material domain needs
+//
+// See the header. The star of every vertex an interface touches is cut into
+// sectors by the feature edges at it -- dS and interfaces alike -- and each
+// sector is a reflex corner of its own material region exactly when its image
+// spans three quarter turns or more, whatever dS is doing there.
+//
+// Reading the sector from the image rather than from a corner index is what
+// makes this work at a junction. A corner index is one number per vertex and
+// says what the layout does across the whole star; at a vertex where three
+// materials meet there are three answers, and the only object that carries all
+// three is the image itself.
+// ---------------------------------------------------------------------------
+void MotorcycleGraph::launchFeatureSectors() {
+    if (!multiMaterial) return;
+
+    const int nV = static_cast<int>(mesh->vertices.size());
+    auto imageAt = [&](int f, int origVertex) -> Point {
+        const Triangle &t = mesh->triangles[f];
+        for (int i = 0; i < 3; ++i) if (t[i] == origVertex) return (*uv)[cut->triangles[f][i]];
+        return Point{0.0, 0.0};
+    };
+    auto isFeature = [&](int e) {
+        return e >= 0 && (mesh->isBoundaryEdge[e] || edgeIsFeature[e]);
+    };
+
+    // How many interface edges meet at each vertex, counting only the interior
+    // ones -- the same count BlockLayout::buildInterfaceChains cuts its chains
+    // at, so that the two agree about where the network has a node. Anything
+    // other than two is a node of the network: an end, a junction, a cross.
+    std::vector<int> interfaceValence(nV, 0);
+    for (int e = 0; e < static_cast<int>(mesh->edges.size()); ++e) {
+        if (!edgeIsFeature[e] || mesh->isBoundaryEdge[e]) continue;
+        ++interfaceValence[mesh->edges[e][0]];
+        ++interfaceValence[mesh->edges[e][1]];
+    }
+
+    for (int v = 0; v < nV; ++v) {
+        if (!vertexOnFeature[v]) continue;
+
+        // Whether the structure has a node at v at all, which is what decides
+        // how wide a sector here is allowed to be.
+        //
+        // A sector spanning q quarter turns is one face's corner region, and
+        // the face needs it cut into q right-angled corners, so it wants q - 1
+        // rays. At q = 2 -- a face running straight through -- that is one ray,
+        // and whether it is needed is exactly whether v is a node: if it is,
+        // the face's side is split there and leaving it alone leaves a
+        // T-junction; if it is not, the face runs through an ordinary point of
+        // its own side and there is nothing to resolve. A plain run-through
+        // vertex of a chain is the second case, and there are thousands of
+        // them on a refined mesh, so the test has to be this and not the angle.
+        //
+        // data/meshes/multimat/geom003 is the smallest case: a disk cut by a
+        // diameter and one radius, three materials, not one reflex corner
+        // anywhere. The half-disk runs straight through the junction at the
+        // centre, and without a ray from it the half is a four-cornered face
+        // whose side is two arcs -- which the decomposition cannot carry, so
+        // half the model goes missing.
+        const bool networkNode = mesh->isBoundaryVertex[v] || interfaceValence[v] != 2;
+
+        // --- The star as an ordered fan -------------------------------------
+        // edges[i] and edges[i+1] bound tris[i]. Open at a boundary vertex,
+        // where it runs from one boundary edge to the other; cyclic inside,
+        // where edges.back() == edges.front().
+        std::vector<int> edges, tris;
+        const int guard = mesh->vertexTriangles.vertexDegree(v) + 2;
+        {
+            int startEdge = -1;
+            const auto &vt = mesh->vertexTriangles;
+            for (int k = vt.rowPtr[v]; k < vt.rowPtr[v + 1]; ++k) {
+                const int t = vt.colIdx[k];
+                for (int i = 0; i < 3; ++i) {
+                    const int e = mesh->triangleEdges[t][i];
+                    if (e < 0) continue;
+                    if (mesh->edges[e][0] != v && mesh->edges[e][1] != v) continue;
+                    if (mesh->isBoundaryEdge[e]) startEdge = e;
+                }
+                if (startEdge >= 0) break;
+            }
+            if (startEdge < 0) {
+                // Interior: any edge at v will do as the seam of the cyclic walk.
+                const int t = mesh->vertexTriangles.colIdx[mesh->vertexTriangles.rowPtr[v]];
+                for (int i = 0; i < 3; ++i) {
+                    const int e = mesh->triangleEdges[t][i];
+                    if (e >= 0 && (mesh->edges[e][0] == v || mesh->edges[e][1] == v)) {
+                        startEdge = e;
+                        break;
+                    }
+                }
+            }
+            if (startEdge < 0) continue;
+
+            int entry = startEdge;
+            int cur = (mesh->edgeTriangles[entry][0] >= 0) ? mesh->edgeTriangles[entry][0]
+                                                           : mesh->edgeTriangles[entry][1];
+            edges.push_back(entry);
+            bool ok = true;
+            while (cur >= 0) {
+                tris.push_back(cur);
+                int next = -1;
+                for (int i = 0; i < 3; ++i) {
+                    const int e = mesh->triangleEdges[cur][i];
+                    if (e < 0 || e == entry) continue;
+                    if (mesh->edges[e][0] == v || mesh->edges[e][1] == v) { next = e; break; }
+                }
+                if (next < 0) { ok = false; break; }
+                edges.push_back(next);
+                if (mesh->isBoundaryEdge[next] || next == startEdge) break;
+                const int nb = (mesh->edgeTriangles[next][0] == cur) ? mesh->edgeTriangles[next][1]
+                                                                     : mesh->edgeTriangles[next][0];
+                if (nb < 0 || static_cast<int>(tris.size()) > guard) { ok = false; break; }
+                entry = next;
+                cur = nb;
+            }
+            if (!ok || tris.empty()) continue;
+        }
+
+        // Counter-clockwise, the sense the axis progression below steps in.
+        {
+            const Triangle &tri = mesh->triangles[tris.front()];
+            int i0 = -1;
+            for (int i = 0; i < 3; ++i) if (tri[i] == v) i0 = i;
+            if (i0 < 0) continue;
+            const int va = tri[(i0 + 1) % 3], vb = tri[(i0 + 2) % 3];
+            const double sgn = cross2(mesh->vertices[va] - mesh->vertices[v],
+                                      mesh->vertices[vb] - mesh->vertices[v]);
+            const int w = (mesh->edges[edges.front()][0] == v) ? mesh->edges[edges.front()][1]
+                                                               : mesh->edges[edges.front()][0];
+            const bool ccw = (w == va) ? (sgn > 0.0) : (sgn < 0.0);
+            if (!ccw) {
+                std::reverse(edges.begin(), edges.end());
+                std::reverse(tris.begin(), tris.end());
+            }
+        }
+
+        // --- The sectors ----------------------------------------------------
+        const bool cyclic = edges.size() == tris.size() + 1 &&
+                            edges.front() == edges.back() && !mesh->isBoundaryVertex[v];
+        std::vector<int> marks;   // indices into `edges` that are feature edges
+        const int nEdges = static_cast<int>(edges.size());
+        for (int i = 0; i < nEdges - (cyclic ? 1 : 0); ++i)
+            if (isFeature(edges[i])) marks.push_back(i);
+        if (marks.size() < 2) continue;
+
+        const int nSectors = cyclic ? static_cast<int>(marks.size())
+                                    : static_cast<int>(marks.size()) - 1;
+        const Point axes[4] = {{1.0, 0.0}, {0.0, 1.0}, {-1.0, 0.0}, {0.0, -1.0}};
+
+        for (int sIdx = 0; sIdx < nSectors; ++sIdx) {
+            const int a = marks[sIdx];
+            const int b = marks[(sIdx + 1) % marks.size()];
+            std::vector<int> fan;
+            for (int i = a; i != b; i = (i + 1) % (nEdges - (cyclic ? 1 : 0))) {
+                if (i >= static_cast<int>(tris.size())) break;
+                fan.push_back(tris[i]);
+                if (static_cast<int>(fan.size()) > guard) break;
+            }
+            if (fan.empty()) continue;
+
+            // How many quarter turns the sector spans in the image. The image
+            // angle of a triangle at v is exact -- phi is affine there -- so
+            // this is the sector's own angle and not an estimate of it.
+            double imageAngle = 0.0;
+            bool bad = false;
+            for (const int f : fan) {
+                const Triangle &tri = mesh->triangles[f];
+                int i0 = -1;
+                for (int i = 0; i < 3; ++i) if (tri[i] == v) i0 = i;
+                if (i0 < 0) { bad = true; break; }
+                const Point o = imageAt(f, v);
+                const Point p = imageAt(f, tri[(i0 + 1) % 3]) - o;
+                const Point q = imageAt(f, tri[(i0 + 2) % 3]) - o;
+                if (normP(p) < 1e-18 || normP(q) < 1e-18) { bad = true; break; }
+                imageAngle += std::fabs(std::atan2(cross2(p, q), dotP(p, q)));
+            }
+            if (bad || !(imageAngle > 0.0)) continue;
+
+            const int quarters = static_cast<int>(std::lround(imageAngle / M_PI_2));
+            if (quarters < 2) continue;                    // convex: no ray
+            if (quarters < 3 && !networkNode) continue;    // a straight run past nothing
+
+            // The axis the sector starts from: the feature edge bounding it on
+            // the clockwise side, which after snapBoundary sits on one.
+            const int w0 = (mesh->edges[edges[a]][0] == v) ? mesh->edges[edges[a]][1]
+                                                           : mesh->edges[edges[a]][0];
+            const Point startImage = imageAt(fan.front(), w0) - imageAt(fan.front(), v);
+            if (normP(startImage) < 1e-15) continue;
+            const int startAxis =
+                static_cast<int>(std::lround(computeAngle(startImage) / M_PI_2) + 8) % 4;
+
+            for (int j = 1; j <= quarters - 1; ++j) {
+                const Point e = axes[(startAxis + j) % 4];
+
+                int host = -1;
+                double bestMargin = -std::numeric_limits<double>::max();
+                for (const int f : fan) {
+                    const Triangle &tri = mesh->triangles[f];
+                    int i0 = -1;
+                    for (int i = 0; i < 3; ++i) if (tri[i] == v) i0 = i;
+                    if (i0 < 0) continue;
+                    double J[2][2];
+                    triangleJacobian(f, J);
+                    const Point d = solve2(J, e);
+                    const double dn = normP(d);
+                    if (dn < 1e-18) continue;
+                    const Point p = mesh->vertices[tri[(i0 + 1) % 3]] - mesh->vertices[v];
+                    const Point q = mesh->vertices[tri[(i0 + 2) % 3]] - mesh->vertices[v];
+                    const double np = normP(p), nq = normP(q);
+                    if (np < 1e-18 || nq < 1e-18) continue;
+                    const double sg = (cross2(p, q) > 0.0) ? 1.0 : -1.0;
+                    const double margin = std::min(sg * cross2(p, d) / (np * dn),
+                                                   sg * cross2(d, q) / (nq * dn));
+                    if (margin > bestMargin) { bestMargin = margin; host = f; }
+                }
+                if (host < 0 || bestMargin < -1e-9) { ++report_.skippedCorners; continue; }
+
+                Motorcycle m;
+                m.tri = host;
+                m.originVertex = v;
+                m.pos = mesh->vertices[v];
+                m.dir = e;
+                m.id = static_cast<int>(bikes.size());
+                bikes.push_back(m);
+
+                // Seal the corner the ray leaves from, as launch() does.
+                for (int i = 0; i < 3; ++i) {
+                    const int ed = mesh->triangleEdges[host][i];
+                    if (ed < 0) continue;
+                    if (mesh->edges[ed][0] == v || mesh->edges[ed][1] == v) {
+                        tracedEdges.insert(EdgeKey(mesh->edges[ed][0], mesh->edges[ed][1]));
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -316,24 +575,73 @@ void MotorcycleGraph::run() {
         return -1;
     };
 
-    // A boundary edge at that vertex, and which end of it the vertex is in the
-    // edge's own orientation -- the same pair a crossing records, so that the
-    // block structure can place the node on its loop either way.
+    // A feature edge at that vertex -- dS, or an interface -- and which end of
+    // it the vertex is in the edge's own orientation: the same pair a crossing
+    // records, so that the block structure can place the node on its chain
+    // either way. dS first, because a ray that lands on a vertex where an
+    // interface meets the boundary has left the model, and that is the stronger
+    // statement about where it ended.
     auto boundaryEdgeAt = [&](int v, double &alongOut) -> int {
         const auto &vt = mesh->vertexTriangles;
-        for (int k = vt.rowPtr[v]; k < vt.rowPtr[v + 1]; ++k) {
-            const int f = vt.colIdx[k];
-            for (int i = 0; i < 3; ++i) {
-                const int e = mesh->triangleEdges[f][i];
-                if (e < 0 || !mesh->isBoundaryEdge[e]) continue;
-                if (mesh->edges[e][0] == v) { alongOut = 0.0; return e; }
-                if (mesh->edges[e][1] == v) { alongOut = 1.0; return e; }
+        for (int pass = 0; pass < 2; ++pass) {
+            for (int k = vt.rowPtr[v]; k < vt.rowPtr[v + 1]; ++k) {
+                const int f = vt.colIdx[k];
+                for (int i = 0; i < 3; ++i) {
+                    const int e = mesh->triangleEdges[f][i];
+                    if (e < 0) continue;
+                    const bool want = (pass == 0) ? mesh->isBoundaryEdge[e]
+                                                  : (!edgeIsFeature.empty() && edgeIsFeature[e]);
+                    if (!want) continue;
+                    if (mesh->edges[e][0] == v) { alongOut = 0.0; return e; }
+                    if (mesh->edges[e][1] == v) { alongOut = 1.0; return e; }
+                }
             }
         }
         return -1;
     };
 
-    for (size_t id = 0; id < bikes.size(); ++id) {
+    // Carrying a parameter-domain direction from one triangle to its neighbour
+    // across their shared edge. The edge has an image in each of them; across a
+    // cut those differ by the transition, which is the rotation taking one to
+    // the other, so no bookkeeping of Pi_gamma is needed -- see the class
+    // comment.
+    auto carryDirection = [&](int e, int from, int to, const Point &dir) -> Point {
+        const int va = mesh->edges[e][0], vb = mesh->edges[e][1];
+        auto imageOf = [&](int f, int origVertex) -> Point {
+            const Triangle &t = mesh->triangles[f];
+            for (int i = 0; i < 3; ++i) if (t[i] == origVertex) return (*uv)[cut->triangles[f][i]];
+            return Point{0.0, 0.0};
+        };
+        const Point eHere = imageOf(from, vb) - imageOf(from, va);
+        const Point eThere = imageOf(to, vb) - imageOf(to, va);
+        if (normP(eHere) < 1e-15 || normP(eThere) < 1e-15) return dir;
+        const double turn = computeAngle(eThere) - computeAngle(eHere);
+        const double c = std::cos(turn), sn = std::sin(turn);
+        return Point{c * dir[0] - sn * dir[1], sn * dir[0] + c * dir[1]};
+    };
+
+    // The rays are traced a generation at a time, because a ray that stops on
+    // an interface starts another one on the far side of it -- see the note at
+    // the wall test below -- and appending to `bikes` in the middle of a pass
+    // over it would invalidate the reference the pass is holding. A generation
+    // is therefore traced to its end, and what it spawned is launched after it.
+    //
+    // The cap is a guard and not a limit anyone should reach: each continuation
+    // carries on along the same axis of the parameter domain, so it crosses
+    // each interface at most once before leaving through dS, and a model with
+    // more nested materials than this is one whose polysquare will have failed
+    // long before.
+    // The body of both loops below is left at this indentation rather than
+    // stepped in, the way the per-ray `while` in here already was: the tracing
+    // is three hundred lines and re-indenting it to add a generation around it
+    // would bury the change in whitespace.
+    const int maxGenerations = 64;
+    std::vector<Motorcycle> pending;
+    size_t generationStart = 0;
+    for (int generation = 0; generation < maxGenerations; ++generation) {
+    const size_t generationEnd = bikes.size();
+    pending.clear();
+    for (size_t id = generationStart; id < generationEnd; ++id) {
         Motorcycle &m = bikes[id];
         while (m.alive) {
         if (++m.steps > perRayCap) { m.alive = false; ++report_.ranOut; break; }
@@ -502,8 +810,21 @@ void MotorcycleGraph::run() {
         tracedEdges.insert(key);
 
         const int next = mesh->triangleAdjacency[m.tri][localEdge];
-        if (next < 0) {                 // out at the boundary of the model
-            // Where on the boundary, in the edge's own orientation: exitPoint()
+        // An interface is a wall in exactly the sense dS is, so a ray ends on
+        // one in exactly the sense it ends on dS.
+        //
+        // The "iso-lines are never stopped" rule above is about stopping on
+        // *another ray*: a ray halted on another ray's trail ends in the middle
+        // of the domain and that end is a T-junction. A wall is the opposite
+        // case -- it is a curve the layout follows all the way, so the end
+        // lands on a side of the structure and splits it, which is a node and
+        // not a T-junction. Carrying on across the interface instead would put
+        // the ray into a material whose own corners did not ask for it, and
+        // leave the region it came from cut by a line that does not end on its
+        // own boundary.
+        const bool intoWall = !edgeIsFeature.empty() && edgeIsFeature[e];
+        if (next < 0 || intoWall) {     // out at dS, or stopped on an interface
+            // Where on that curve, in the edge's own orientation: exitPoint()
             // measured `along` from the triangle's corner localEdge, which need
             // not be the edge's first vertex.
             exitEdge[id] = e;
@@ -511,30 +832,66 @@ void MotorcycleGraph::run() {
                                 ? along : 1.0 - along;
             m.alive = false;
             ++report_.reachedBoundary;
+
+            // ... and carries on out the other side.
+            //
+            // The ray has to end here: the region it was cutting up ends here,
+            // and a block never crosses an interface. But the region on the
+            // far side is cut up by this line too, and if nothing is drawn
+            // there the landing point sits in the middle of that region's
+            // side -- four corners, five arcs, a T-junction. Sec. 5 opens by
+            // claiming the meta-block structure has none, and on a
+            // single-material model it has none because every iso-line is
+            // carried through to dS. An interface is not dS, so the line is
+            // carried through it as well: one ray on each side, meeting at the
+            // landing, which makes that point an ordinary four-valent node of
+            // the structure instead of a T.
+            //
+            // Measured on data/meshes/multimat/rocket, where this is worth the
+            // most: without it the single face carrying the T-junction is 51%
+            // of the model and the decomposition has to throw it away.
+            if (intoWall && next >= 0) {
+                Motorcycle c;
+                c.tri = next;
+                c.pos = hit;
+                c.dir = carryDirection(e, m.tri, next, m.dir);
+                // It is nobody's corner: it starts where the parent stopped,
+                // and that point is already a node of the structure.
+                c.originVertex = -1;
+                pending.push_back(c);
+            }
             break;
         }
 
-        // Carry the direction into the next triangle. The shared edge has an
-        // image in each of them; across a cut those differ by the transition,
-        // which is the rotation taking one to the other.
-        const int va = mesh->edges[e][0], vb = mesh->edges[e][1];
-        auto imageOf = [&](int f, int origVertex) -> Point {
-            const Triangle &t = mesh->triangles[f];
-            for (int i = 0; i < 3; ++i) if (t[i] == origVertex) return (*uv)[cut->triangles[f][i]];
-            return Point{0.0, 0.0};
-        };
-        const Point eHere = imageOf(m.tri, vb) - imageOf(m.tri, va);
-        const Point eThere = imageOf(next, vb) - imageOf(next, va);
-        if (normP(eHere) > 1e-15 && normP(eThere) > 1e-15) {
-            const double turn = computeAngle(eThere) - computeAngle(eHere);
-            const double c = std::cos(turn), s = std::sin(turn);
-            m.dir = Point{c * m.dir[0] - s * m.dir[1], s * m.dir[0] + c * m.dir[1]};
-        }
-
+        m.dir = carryDirection(e, m.tri, next, m.dir);
         onWall[next] = 1;
         m.tri = next;
-        }
+        }   // while (m.alive)
+    }       // for each ray of this generation
+
+    // What this generation spawned becomes the next one. Appending here, with
+    // the pass over `bikes` finished, is the whole reason for the generations.
+    if (pending.empty()) break;
+    // At the cap, launching them would leave rays that are never traced --
+    // alive, one point long, a free end each in the arrangement. Refusing them
+    // instead leaves the structure short a cut, which is visible in the block
+    // counts rather than silently broken, and says so in the report.
+    if (generation + 1 >= maxGenerations) {
+        report_.continuationsDropped += static_cast<int>(pending.size());
+        break;
     }
+    generationStart = generationEnd;
+    for (Motorcycle &c : pending) {
+        c.id = static_cast<int>(bikes.size());
+        traces.push_back({c.pos});
+        exitEdge.push_back(-1);
+        exitAlong.push_back(0.0);
+        onWall[c.tri] = 1;
+        bikes.push_back(c);
+        ++report_.motorcycles;
+        ++report_.continuations;
+    }
+    }           // for each generation
 
     // An iso-line drawn from both of its ends is one iso-line.
     //
@@ -637,7 +994,10 @@ void MotorcycleGraph::floodBlocks() {
                 const int e = mesh->triangleEdges[f][i];
                 if (e < 0) continue;
                 // A cut is not a wall: it is interior to the model, and the
-                // parameterization is seamless across it.
+                // parameterization is seamless across it. An interface is:
+                // the two sides of it are different materials, so they are
+                // different blocks whatever the iso-lines did.
+                if (!edgeIsFeature.empty() && edgeIsFeature[e]) continue;
                 if (tracedEdges.count(EdgeKey(mesh->edges[e][0], mesh->edges[e][1]))) continue;
                 blockOfTriangle[nb] = block;
                 queue.push_back(nb);
@@ -778,6 +1138,29 @@ void MotorcycleGraph::findNodes() {
         n.kind = Node::Corner;
         n.vertex = v;
         nodes.push_back(n);
+    }
+
+    // Every vertex a ray was launched from, where that is not already one of
+    // the above. On a single-material model it never is: the corner index is
+    // non-zero at exactly the vertices launch() fires from. On a
+    // multi-material one the sectors launchFeatureSectors() fires from sit on
+    // interfaces, whose vertices are not boundary vertices at all, and a ray
+    // whose own origin is not a node of the structure is a ray whose first
+    // half cannot be cut into arcs.
+    {
+        std::unordered_set<int> seen;
+        for (const Node &n : nodes) if (n.vertex >= 0) seen.insert(n.vertex);
+        for (const Motorcycle &m : bikes) {
+            if (m.originVertex < 0 || !seen.insert(m.originVertex).second) continue;
+            const auto &vt = mesh->vertexTriangles;
+            if (vt.rowPtr[m.originVertex] >= vt.rowPtr[m.originVertex + 1]) continue;
+            Node n;
+            n.xy = mesh->vertices[m.originVertex];
+            n.uv = imageOfPoint(vt.colIdx[vt.rowPtr[m.originVertex]], n.xy);
+            n.kind = Node::Corner;
+            n.vertex = m.originVertex;
+            nodes.push_back(n);
+        }
     }
 
     // Where each line leaves the model. A ray that never got out has no node

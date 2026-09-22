@@ -13,6 +13,7 @@
 #include "viewer/Render.hxx"
 #include "viewer/Geometry.hxx"
 
+#include "mesh/BlockQuadMesh.hxx"
 #include "mesh/Mesh.hxx"
 #include "mesh/QuadMesh.hxx"
 #include "mesh/TMOP.hxx"
@@ -51,7 +52,6 @@
 #include "quantization/TMeshQuantizer.hxx"
 #include "OASIS/OASIS.hxx"
 #include "UMBER/BlockLayout.hxx"
-#include "UMBER/ChordCollapse.hxx"
 #include "UMBER/MotorcycleGraph.hxx"
 #include "UMBER/UMBER.hxx"
 #include "TORSION/ConeMetric.hxx"
@@ -108,15 +108,35 @@ enum class MBOPhase {
 // parameter domain on the right, the way PolyVector and DualMBO show their UV
 // meshes.
 //
-// Simplified is the odd one out in two ways. It is driven by a dialog rather
-// than by pressing on, the way OASIS mode is, because how thin a chord has to
-// be to be worth collapsing is a heuristic and the only way to settle it on a
-// given model is to try a number and look -- so 'c' at this phase re-opens the
-// dialog and runs the operation again from the structure the tracing left,
-// rather than advancing anywhere. And it takes the whole window instead of
-// splitting it: the collapse works in model space, and drawing the structure
-// before and after over the same mesh at the same scale is what shows which
-// blocks it took out.
+// The two block phases show the same structure twice, and the pair is the
+// point. Blocks splits the window and draws the traced iso-lines in both
+// domains at once, which is where a ray that went somewhere it should not have
+// is visible. Decomposition takes the whole window and draws what survived
+// being read as the shared BlockDecomposition
+// (BlockLayout::blockDecompositionOf) -- light-blue sides and green
+// macrovertices, the routine ATLAS's Blocks phase and the pipelines' Patches
+// phase draw theirs with, so that the three methods' block pictures read the
+// same way -- over the whole layout in grey underneath. Anywhere grey shows
+// through is a face the adapter refused, and that is exactly the part of the
+// model the mesh will be missing, so the two colours together are the coverage
+// report the console prints in numbers.
+//
+// The last two phases are the pipelines' Mesh and Smoothed in all but number,
+// on the same two classes:
+//
+//   Mesh       BlockQuadMesh (mesh/BlockQuadMesh.hxx): one count per chord,
+//              each macro edge meshed once, transfinite interpolation per
+//              block. Opened on a dialog as Stage 10 and ATLAS's Mesh are, and
+//              taking the same target edge length, so that meshing a UMBER
+//              layout and a MERIDIAN one at one number is a comparison of the
+//              layouts. 'e' re-opens it.
+//
+//   Smoothed   mesh::TMOP, the same dialog, the same solve and the same
+//              picture as the other two methods' last phase ('c' re-opens it).
+//              UMBER keeps its own settings for the reason ATLAS does: these
+//              are transfinite grids on a block decomposition, and mu has to
+//              be sampled at the element corners on one of those or the
+//              smoother hands back folds the mesh did not go in with.
 enum class UMBERPhase {
     MeshOnly   = 1,
     CrossField = 2,
@@ -124,7 +144,9 @@ enum class UMBERPhase {
     Frames     = 4,
     Polysquare = 5,
     Blocks     = 6,
-    Simplified = 7,
+    Decomposition = 7,
+    Mesh       = 8,
+    Smoothed   = 9,
 };
 
 // The phase sequence shared by the two quadrilateral-layout pipelines, MERIDIAN
@@ -403,20 +425,26 @@ private:
     // need the announce-a-frame-ahead treatment the two solves get.
     void runBlocks();
 
-    // The blocks as a graph rather than a colouring of the triangles, which is
-    // what a chord can be walked on. Idempotent, and a no-op until runBlocks()
-    // has produced something to build from.
+    // The blocks as a graph rather than a colouring of the triangles: the
+    // nodes, the arcs between them and the faces they bound. Idempotent, and a
+    // no-op until runBlocks() has produced something to build from.
     void buildBlockLayout();
 
-    // Modal dialog collecting the chord collapse settings, with a live count of
-    // how many chords they would let through -- the number that decides whether
-    // a threshold is the right one. Returns false if cancelled.
-    bool promptChordCollapseParameters();
+    // The traced layout read as the shared BlockDecomposition, with a note of
+    // what became of its faces. Called from the one place that can change the
+    // structure, so that nothing downstream ever holds a decomposition of a
+    // layout that has since been rebuilt.
+    void buildUMBERDecomposition();
 
-    // Collapse chords greedily at the current settings, always starting from
-    // the structure the tracing left rather than from the last result, so that
-    // trying a second threshold is a fresh attempt and not a further one.
-    void runChordCollapse();
+    // The UMBER mesh dialog: Stage 10's, taking the same target edge length
+    // and sharing meshSettings_ with it, so that the three methods' meshes are
+    // asked for in one number. 'e' at the Mesh phase re-opens it, and
+    // cancelling leaves whatever mesh is already there.
+    bool promptUMBERMesh();
+
+    // BlockQuadMesh on the current decomposition at those settings, reported
+    // line for line as ATLAS's and Stage 10's meshes are.
+    void runUMBERMesh();
 
     // The mesh with the optimized frame, its cuts and its boundary corners --
     // the left half of the split screen, and the whole of the Frames phase.
@@ -497,9 +525,9 @@ private:
     bool promptMERIDIANConnectivity(const Immersion &imm, const std::vector<Point> &uv);
 
     // Stages 5 to 7 again from the immersion already computed, at whatever the
-    // dialog was last left at. What 'c' does at the Separatrices phase, in the
-    // spirit of UMBER's Simplified phase: a tolerance is a judgement, and the
-    // only way to settle one is to try a number and look.
+    // dialog was last left at. What 'c' does at the Separatrices phase: a
+    // tolerance is a judgement, and the only way to settle one is to try a
+    // number and look.
     void rerunMERIDIANConnectivity();
 
     // Stage 7, Sec. 4: march the integral curves out of every cone over Psi,
@@ -546,9 +574,9 @@ private:
     // in smoothMesh_.
     //
     // Always from the Stage 10 mesh and never from the last smoothed one, so
-    // that trying a second metric is a fresh attempt and not a further one --
-    // the same discipline runChordCollapse follows. This is what makes the
-    // before/after numbers in the console mean what they say.
+    // that trying a second metric is a fresh attempt and not a further one.
+    // This is what makes the before/after numbers in the console mean what
+    // they say.
     void runTMOP();
 
     // Record why a stage produced nothing: to the console in full, to the
@@ -739,11 +767,16 @@ private:
     std::optional<UMBER>        umber_;
     std::optional<Polysquare>   polysquare_;
     std::optional<MotorcycleGraph> blocks_;
-    // Both point into the one before them -- blockLayout_ into blocks_, and
-    // chordCollapse_ into a copy of blockLayout_'s layout -- so blocks_ is
-    // never rebuilt without clearing these first.
+    // This points into the one before it, so blocks_ is never rebuilt without
+    // clearing it first.
     std::optional<BlockLayout>     blockLayout_;
-    std::optional<ChordCollapse>   chordCollapse_;
+    // The structure as the shared representation. Rebuilt whenever the layout
+    // is, and the one thing the Decomposition phase's picture and the Mesh
+    // phase are both read from, so that the picture and the mesh cannot be of
+    // two different structures.
+    std::optional<BlockDecomposition> umberDecomp_;
+    BlockLayout::DecompositionReport  umberDecompReport_;
+    std::optional<BlockQuadMesh>      umberMesh_;
     // Cached results of the solve: recomputing them per frame would walk every
     // vertex star for nothing.
     std::vector<std::pair<int, int>>    umberCorners_;   // (vertex, quarter turns)
@@ -911,6 +944,7 @@ private:
     bool polysquareAnnounced_  = false;
     bool polysquareAttempted_  = false;
     bool blocksAttempted_      = false;
+    bool umberMeshAttempted_   = false;
     // One-shot discipline for the three MERIDIAN stages. Each is attempted once
     // per run and not retried: a failure leaves its optional empty, and keying
     // off the optional alone would run the whole stage again on every frame --
@@ -1072,10 +1106,13 @@ private:
     // and none did sampled at the corners. Kept apart so the pipelines' Stage
     // 12 runs exactly as it always has.
     TMOPSettings atlasTmopSettings_ = [] { TMOPSettings t; t.corners = true; return t; }();
-
-    // Chord collapse settings, surviving a reset the way oasisLambda_ does so
-    // that the dialog opens on whatever was tried last.
-    ChordCollapse::Settings chordSettings_;
+    // UMBER's copy, which differs the same way and for the same reason: what
+    // it smooths is a transfinite grid on a block decomposition, exactly what
+    // ATLAS's is, and measured on data/meshes the corner sampling is the
+    // difference between the smoother improving the worst element and making
+    // it worse -- on singlemat/geom012 the worst scaled Jacobian goes 0.033 ->
+    // 0.162 at the corners and 0.033 -> 0.012 at the 2x2 Gauss points.
+    TMOPSettings umberTmopSettings_ = [] { TMOPSettings t; t.corners = true; return t; }();
 
     // The connectivity settings of Stages 5 to 7, likewise surviving a reset.
     // Defaults are the library's own, so the dialog opens on the recommended

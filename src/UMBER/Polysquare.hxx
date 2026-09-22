@@ -3,6 +3,7 @@
 
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -122,6 +123,17 @@ public:
         // its ends that it is for.
         int runsAligned = 0;
         double worstRunAlign = 0.0;
+        // The same alignment reading, taken on the material interfaces rather
+        // than on dS. An interface is a feature in the sense of Sec. 4.2's dS
+        // -- a curve the output has to keep -- so the polysquare has to put it
+        // on an axis too, or no block structure built on the image can follow
+        // it and every block across it straddles two materials. Zero edges on
+        // a single-material model, and then these mean nothing.
+        int interfaceEdges = 0;
+        double meanInterfaceAlignDeg = 0.0;
+        double maxInterfaceAlignDeg = 0.0;
+        int interfaceTurns = 0;         // places an interface turns in the image
+        int expectedInterfaceTurns = 0; // ... where the frame asked for a corner
         double transitionDeg = 0.0;     // worst residual of Eq. (7) across a cut
         double lengthRatio = 1.0;       // image boundary length / input length
         double arap = 0.0, l1 = 0.0, cor = 0.0;
@@ -189,6 +201,32 @@ public:
     // when asking how well the soft alignment did on its own.
     void setSnapBoundary(bool on) { snapBoundaryOn = on; }
 
+    // How hard the interfaces are pulled onto an axis, relative to dS.
+    //
+    // 1 asks of an interface exactly what Eq. (11) and Eq. (12) ask of dS, and
+    // that is too much on any domain whose interface network is more than a
+    // curve or two. dS is one closed curve per loop and the frame field's
+    // corners on it satisfy a Gauss-Bonnet count by construction; an interface
+    // network has junctions, landings and several branches meeting at a point,
+    // and the quarter turns the frame reads on each side of each of them are
+    // not guaranteed to be consistent with each other -- that consistency is
+    // what MERIDIAN::Interfaces::balance() exists to impose, and there is no
+    // counterpart here. Asking for the full weight where they are not
+    // consistent does not produce a rectilinear interface, it produces a torn
+    // map: on data/meshes/multimat/icf, six materials in eight branches, w = 1
+    // takes E_arap from 0.05 to 4.87 and flips 841 triangles.
+    //
+    // So the term is a pull rather than a demand. At the default the
+    // interfaces come out far closer to axis-aligned than they do without it,
+    // and where the network cannot be made rectilinear the distortion term
+    // wins and the map stays injective -- which is what the stages after this
+    // need of it, since they cut the model along the interfaces whether or not
+    // the image straightened them.
+    //
+    // 0 turns it off and leaves the interfaces to E_arap alone.
+    void setInterfaceWeight(double w) { interfaceWeight = w; }
+    double getInterfaceWeight() const { return interfaceWeight; }
+
     // How close two corners have to be, in mean image boundary edges, for them
     // to be treated as sharing an iso-line -- see snapCorners(). 0 disables it.
     //
@@ -205,13 +243,10 @@ public:
     // that is not four-sided; at 0.10 geom008 and geom009 both do; at 0.25
     // geom008 also gains a pair of sides that cross each other.
     //
-    // The trade is not free in the other direction either. On geom012 a wider
-    // tolerance leaves the chord collapse more to work with -- 110 blocks
-    // against 145 -- because at 0.05 the small shifts it makes are enough for
-    // six of that model's collapses to be rolled back for crossing rather than
-    // four. That is a heuristic yielding less, though, and the alternative is a
-    // structure with blocks in it that are not four-sided at all, so it is the
-    // narrower tolerance that is kept.
+    // (This used to be measured against what the chord collapse could then do
+    // with the result; that operation was deleted on 2026-09-21, and the
+    // numbers above -- which are about the structure the tracing leaves, not
+    // about anything downstream of it -- are what the tolerance is set by.)
     void setCornerSnapTolerance(double t) { cornerSnapTol = t; }
 
     // L-BFGS iterations per continuation stage, and the gradient tolerance.
@@ -236,6 +271,12 @@ public:
     // which is where the boundary of the polysquare turns: +1 convex, -1
     // reflex, 0 everywhere else.
     const std::vector<int>& getBoundaryCorners() const { return boundaryCorner; }
+
+    // The material interfaces the frame field was aligned to, as mesh edge
+    // indices -- taken from the frame field rather than passed again, since
+    // asking the two for different features is the one way to get a
+    // parameterization that follows a curve the field never saw.
+    const std::vector<int>& getFeatureEdges() const { return featureEdges; }
 
     // k of Pi_gamma = R(k*90 degrees) per cut, in the order HarmonicCut made
     // them. All zero means the field asked for a common polysquare; anything
@@ -279,6 +320,10 @@ private:
     };
 
     void buildTopology();
+    // The interfaces as chains of BoundaryEdge, in the order the frame field
+    // measured its corners along them. Called by buildTopology(); a no-op on a
+    // single-material model.
+    void buildFeatureChains();
     void extractTransitions();   // Eq. (7)
     void poissonInit();          // Eq. (6)
     void optimize();             // Eq. (9)
@@ -334,6 +379,30 @@ private:
     // the frame field reported it.
     std::vector<int> boundaryCorner;
 
+    // The interfaces, as UMBER::getFeatureEdges gave them and as a flag per
+    // original mesh edge.
+    std::vector<int> featureEdges;
+    std::vector<char> edgeIsFeature;
+    // The chains the frame field cut the network into, and its corner index
+    // per (edgeIn, edgeOut) walked in that direction -- theta_i of Eq. (12)
+    // where the curve is an interface rather than dS. Both are copied from the
+    // frame field at construction, so that the pair this stage looks up is the
+    // pair that stage measured.
+    std::vector<UMBER::FeatureChain> featureChains;
+    std::unordered_map<long long, int> interfaceCorner;
+
+    // The interfaces as boundary edges, chain by chain: chainStart indexes
+    // each chain's first entry (with the end appended, as loopStart does) and
+    // chainClosed says whether the pairs wrap.
+    std::vector<BoundaryEdge> fEdges;
+    std::vector<int> chainStart;
+    std::vector<char> chainClosed;
+    // dS plus the interfaces. Eq. (11) and Eq. (12) weight each edge by its
+    // share of this, so that a length means the same thing on either kind of
+    // curve; it equals totalBoundaryLength on a single-material model, where
+    // every number below is then bit for bit what it was.
+    double totalFeatureLength = 0.0;
+
     std::vector<int> transitionK;      // per cut
     std::vector<BoundaryEdge> bEdges;  // in loop order, loops back to back
     std::vector<int> loopStart;        // index into bEdges of each loop's first edge
@@ -356,6 +425,7 @@ private:
     double l1Weight = 0.125;  // the stage of that schedule currently running
     double l1Eps = 1e-2;
     double corWeight = 10.0;
+    double interfaceWeight = 0.15;
     bool snapBoundaryOn = true;
     double cornerSnapTol = 0.05;
     double barrierWeight = 1.0;

@@ -76,13 +76,51 @@ public:
     std::vector<MacroEdge> edges;
     std::vector<Block> blocks;
 
-    // Which pipeline built this -- "ATLAS", "MERIDIAN" or "TORSION" -- kept
-    // for messages only; nothing here branches on it.
+    // Which pipeline built this -- "ATLAS", "MERIDIAN", "TORSION" or "UMBER"
+    // -- kept for messages only; nothing here branches on it.
     std::string source;
 
     // Side `side` of `block`, corner to corner, in that direction. Empty for
     // an out-of-range block or side.
     std::vector<Point> sidePolyline(int block, int side) const;
+
+    // ── Sampling a block ────────────────────────────────────────────────────
+    //
+    // The three below are the only things here that compute rather than store,
+    // and they are here rather than in a caller because every caller wants the
+    // same three and wants them to agree. A block drawn, a block meshed and a
+    // block asked which material it sits in have to be sampled identically or
+    // the picture is of something other than the mesh; and "the u parameter of
+    // side 0" has to mean the same thing to the two blocks that share side 0,
+    // or their grids do not meet. Nothing here searches, fits or optimizes:
+    // it is the decomposition read at a parameter, no more.
+
+    // `n + 1` points along side `side` of `block`, corner to corner, at equal
+    // arc length of the side's own polyline (not at equal parameter, which on
+    // a polyline of uneven steps is a different and worse set of points).
+    // Empty when the side has no polyline; `n < 1` is taken as 1.
+    std::vector<Point> sampleSide(int block, int side, int n) const;
+
+    // One point of side `side` at arc-length fraction `t` in [0, 1], corner to
+    // corner. The two blocks sharing a macro edge get the same point for the
+    // same place on it, since both read the one polyline and one of them
+    // simply reads it backwards -- which is what makes a mesh built on this
+    // conforming by construction rather than by tolerance.
+    Point pointOnSide(int block, int side, double t) const;
+
+    // The transfinite (Coons) blend of the block's four sides at (u, v) in
+    // [0, 1]^2, with u along side 0 (corners 0 -> 1) and v along side 3
+    // reversed (corners 0 -> 3). On the four edges of the square it reproduces
+    // the sides exactly, so a grid built from it meets its neighbours' grids
+    // on the shared sides whatever it does inside.
+    Point coonsPoint(int block, double u, double v) const;
+
+    // A point that really is inside block `b`'s outline, for asking a question
+    // of the model underneath it -- which material, which triangle. The Coons
+    // centre is tried first and is the answer for all but a badly non-convex
+    // block; where it falls outside, a vertex of the outline is walked inward
+    // instead. Returns false only for a block whose outline is degenerate.
+    bool interiorPoint(int block, Point &out) const;
 
     // The macro edges as OBJ polylines, and the blocks as closed OBJ loops --
     // one pair of writers standing in for what used to be BlockCover::
