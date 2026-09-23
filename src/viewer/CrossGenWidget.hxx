@@ -34,9 +34,6 @@
 #include "MERIDIAN/SubdomainLabels.hxx"
 #include "Parameterization/CutMesh.hxx"
 #include "Parameterization/HarmonicCut.hxx"
-#ifdef CROSSGEN_WITH_COMISO
-#include "Parameterization/MIQ.hxx"
-#endif
 #include "Parameterization/UVGParam.hxx"
 #include "polyvector/PolyVectors.hxx"
 #include "crossfield/CrossField.hxx"
@@ -79,7 +76,6 @@ enum class Phase {
     CrossField   = 2,
     Singularities = 3,
     CutSeams     = 4,
-    UVMesh       = 5,
 };
 
 // The last two stages quantize the block decomposition tracing left (Sec. 4
@@ -105,8 +101,8 @@ enum class MBOPhase {
 // the frame field of Sec. 4.2 and the polysquare of Sec. 4.3. Neither is
 // animated; both are one blocking L-BFGS run with nothing worth drawing in
 // between. The two middle phases split the window, model on the left and
-// parameter domain on the right, the way PolyVector and DualMBO show their UV
-// meshes.
+// parameter domain on the right, the way the pipelines' Layout phase shows
+// psi_R and Psi.
 //
 // The two block phases show the same structure twice, and the pair is the
 // point. Blocks splits the window and draws the traced iso-lines in both
@@ -729,9 +725,6 @@ private:
 
     std::optional<PolyField>   field_;
     std::optional<CutMesh>     cutMesh_;
-#ifdef CROSSGEN_WITH_COMISO
-    std::optional<MIQSolver>   miqSolver_;
-#endif
     std::optional<CrossField>  crossField_;
     std::optional<DualMBO>        dualMBOField_;
     std::shared_ptr<SeparatrixTrace> separatrixTrace_;

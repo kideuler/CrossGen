@@ -64,21 +64,9 @@ Phase nextPhase(Phase p) {
         case Phase::MeshOnly:      return Phase::CrossField;
         case Phase::CrossField:    return Phase::Singularities;
         case Phase::Singularities: return Phase::CutSeams;
-#ifdef CROSSGEN_WITH_COMISO
-        case Phase::CutSeams:      return Phase::UVMesh;
-        case Phase::UVMesh:        return Phase::UVMesh;
-#else
-        // No CoMiSo, no MIQSolver: the UV mesh phase would have nothing to
-        // show, so cut seams is the last stop.
         case Phase::CutSeams:      return Phase::CutSeams;
-        case Phase::UVMesh:        return Phase::CutSeams;
-#endif
     }
-#ifdef CROSSGEN_WITH_COMISO
-    return Phase::UVMesh;
-#else
     return Phase::CutSeams;
-#endif
 }
 
 MBOPhase nextMBOPhase(MBOPhase p) {
@@ -162,12 +150,6 @@ const char *phaseName(Phase p) {
         case Phase::CrossField:    return "2) crossfield";
         case Phase::Singularities: return "3) singularities";
         case Phase::CutSeams:      return "4) cut seams";
-        case Phase::UVMesh:
-#ifdef CROSSGEN_WITH_COMISO
-            return "5) UV mesh (MIQ)";
-#else
-            return "5) UV mesh (disabled, built without CoMiSo)";
-#endif
     }
     return "?";
 }
@@ -784,9 +766,6 @@ void CrossGenWidget::wheelEvent(QWheelEvent *event) {
 void CrossGenWidget::doReset() {
     field_.reset();
     cutMesh_.reset();
-#ifdef CROSSGEN_WITH_COMISO
-    miqSolver_.reset();
-#endif
     crossField_.reset();
     dualMBOField_.reset();
     separatrixTrace_.reset();
@@ -6379,32 +6358,6 @@ void CrossGenWidget::runComputations() {
                   << " | singularityPathCutEdges="
                   << cutMesh_->getSingularityPathCutEdges().size() << "\n";
     }
-
-#ifdef CROSSGEN_WITH_COMISO
-    // ── PolyVector: MIQ parametrization ──────────────────────────────────────
-    if (mode_ == Mode::PolyVector && phase_ >= Phase::UVMesh &&
-        cutMesh_.has_value() && !miqSolver_.has_value()) {
-        auto t0 = Clock::now();
-        miqSolver_.emplace(*cutMesh_);
-        miqSolver_->solve(100.0, 5.0, false, 10, 5000, true, true, true);
-        auto t1 = Clock::now();
-
-        int flips = miqSolver_->numFlips();
-        const auto &UV = miqSolver_->getUV();
-        std::ostringstream oss;
-        oss << "[MIQ] Computed UV mesh: " << UV.rows() << " vertices, "
-            << flips << " flips: "
-            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
-        console_.log(oss.str());
-        std::cerr << "[Viewer] MIQ parametrization: " << UV.rows()
-                  << " UV vertices, " << flips << " flipped triangles\n";
-
-        viewer::computeUVMeshBounds(*miqSolver_, uvView_.cx, uvView_.cy, uvView_.baseW, uvView_.baseH);
-        uvView_.zoom = 1.0;
-        uvView_.fbw  = view_.fbw;
-        uvView_.fbh  = view_.fbh;
-    }
-#endif
 }
 
 // ── animation render paths ───────────────────────────────────────────────────
@@ -6479,9 +6432,6 @@ void CrossGenWidget::renderTraceAnimation() {
 // what decides where a drag or a scroll lands.
 bool CrossGenWidget::inUVSplitScreen() const {
     return
-#ifdef CROSSGEN_WITH_COMISO
-           (mode_ == Mode::PolyVector && phase_ == Phase::UVMesh && miqSolver_.has_value()) ||
-#endif
            // The chord collapse phase takes the whole window back: what it has
            // to show is the structure before against the structure after, and
            // both of those live in the model.
@@ -6657,52 +6607,6 @@ void CrossGenWidget::renderMERIDIANModel() {
 // ── normal render ─────────────────────────────────────────────────────────────
 
 void CrossGenWidget::renderNormal() {
-#ifdef CROSSGEN_WITH_COMISO
-    if (mode_ == Mode::PolyVector && phase_ == Phase::UVMesh && miqSolver_.has_value()) {
-        // ── Split-screen: left = original mesh, right = UV mesh ───────────────
-        int w = fbw(), h = fbh();
-        int halfW = w / 2;
-
-        // ── Left panel: mesh with cut seams & singularities ───────────────────
-        applyHalfOrtho(0, halfW, view_);
-        {
-            viewer::ViewState leftVs = view_;
-            leftVs.fbw = halfW;
-            leftVs.fbh = h;
-            viewer::drawAxis(leftVs);
-        }
-        viewer::drawMesh(*mesh_);
-        if (field_.has_value() && cutMesh_.has_value()) {
-            viewer::drawUField(*mesh_, cutMesh_->getUField(), scale_);
-            viewer::drawVField(*mesh_, cutMesh_->getVField(), scale_);
-            if (!cutMesh_->getSingularityPathCutEdges().empty())
-                viewer::drawEdgeSetOnMesh(*mesh_, cutMesh_->getCutEdges(), 1.0f, 0.75f, 0.1f, 4.0f);
-            else
-                viewer::drawEdgeSetOnMesh(*mesh_, cutMesh_->getCutEdges(), 1.0f, 0.2f, 0.9f, 3.5f);
-            double ballRadius = 0.5 * avgEdge_;
-            for (const auto &sig : field_->uSingularities) {
-                int vid    = sig.first;
-                int index4 = sig.second;
-                if (vid < 0 || vid >= static_cast<int>(mesh_->vertices.size())) continue;
-                const Point &c = mesh_->vertices[vid];
-                if (index4 == 1)
-                    viewer::drawDisk3D(c, ballRadius, 0.2f, 0.2f, 0.95f);
-                else if (index4 == -1)
-                    viewer::drawDisk3D(c, ballRadius, 0.95f, 0.2f, 0.2f);
-            }
-        }
-
-        // ── Right panel: UV mesh ──────────────────────────────────────────────
-        applyHalfOrtho(halfW, w - halfW, uvView_);
-        viewer::drawUVMesh(*miqSolver_);
-        if (field_.has_value() && cutMesh_.has_value()) {
-            double uvRadius = 0.8;
-            viewer::drawSingularitiesOnUV(*miqSolver_, *cutMesh_, *field_, uvRadius);
-        }
-
-        drawSplitDivider(halfW);
-    } else
-#endif
     if (mode_ == Mode::MBO) {
         viewer::drawAxis(view_);
         // The quantized grid is the payoff of this whole mode, and the
@@ -7227,7 +7131,7 @@ void CrossGenWidget::renderNormal() {
             }
         }
     } else {
-        // PolyVector phases 1-4 (not UV)
+        // PolyVector phases 1-4
         viewer::drawAxis(view_);
         if (phase_ >= Phase::MeshOnly)
             viewer::drawMesh(*mesh_);

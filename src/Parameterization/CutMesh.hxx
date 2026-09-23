@@ -17,7 +17,7 @@ class DualMBO;
 
 // Cut a triangle mesh (represented by PolyField::getMesh()) into a topological disk.
 //
-// Implements the MIQ-style cutting strategy:
+// Implements the cutting strategy of Bommes et al. 2009:
 //  1) Build a spanning tree of the dual graph and cut the complement primal edges.
 //  2) Ensure all singularities lie on the boundary by cutting shortest paths from
 //     each singular vertex to the current cut graph / boundary.
@@ -63,7 +63,7 @@ public:
     const std::unordered_map<EdgeKey, int, EdgeKeyHash>& getNaturalBoundaryEdgeTriangle() const { return naturalBoundaryEdgeTriangle; }
 
     // Subset of cut edges that were added specifically to connect singularities
-    // to the boundary / existing cut graph (step 2 in the MIQ-style strategy).
+    // to the boundary / existing cut graph (step 2 of the strategy above).
     // These are expressed in original-mesh vertex indices, same as getCutEdges().
     const std::unordered_set<EdgeKey, EdgeKeyHash>& getSingularityPathCutEdges() const { return singularityPathCutEdges; }
 

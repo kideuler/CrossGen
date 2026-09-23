@@ -1,4 +1,4 @@
-// Utility to cut a mesh into a topological disk (MIQ-style) and run sanity checks.
+// Utility to cut a mesh into a topological disk (Bommes et al. 2009) and run sanity checks.
 
 #include <iostream>
 #include <memory>

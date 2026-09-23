@@ -28,9 +28,6 @@
 #include "mesh/BlockQuadMesh.hxx"
 #include "mesh/QuadMesh.hxx"
 #include "Parameterization/CutMesh.hxx"
-#ifdef CROSSGEN_WITH_COMISO
-#include "Parameterization/MIQ.hxx"
-#endif
 #include "Parameterization/UVGParam.hxx"
 #include "polyvector/PolyVectors.hxx"
 #include "crossfield/CrossField.hxx"
@@ -104,20 +101,6 @@ void drawDisk3D(const Point &center, double radius, float baseR, float baseG, fl
 // Draw simple text overlay in screen coordinates (top-left origin).
 // fbw/fbh are the physical framebuffer dimensions.
 void drawTextOverlay(int fbw, int fbh, const char *text, float x, float y, float r, float g, float b);
-
-#ifdef CROSSGEN_WITH_COMISO
-// Compute view bounds for a UV mesh (for initializing the view state once).
-void computeUVMeshBounds(const MIQSolver &miq, double &cx, double &cy, double &baseW, double &baseH);
-
-// Draw UV mesh from MIQ parametrization (2D view of UV coordinates).
-// Does not modify the view state - call computeUVMeshBounds first to set up the view.
-void drawUVMesh(const MIQSolver &miq);
-
-// Draw singularities on the UV mesh using the same coloring as the 3D view.
-// Uses the origToCutVerts mapping from CutMesh to find UV coordinates.
-void drawSingularitiesOnUV(const MIQSolver &miq, const CutMesh &cutMesh,
-                           const PolyField &field, double radius);
-#endif // CROSSGEN_WITH_COMISO
 
 // Draw the medial axis (Voronoi edges + vertices) on top of a mesh.
 void drawMedialAxis(const MedialAxis &ma, double vertexRadius);

@@ -22,14 +22,14 @@ optional Qt6 viewer. It backs an IMR 2027 paper: a p=0 dual-mesh MBO cross field
 ## Build
 
 ```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release          # existing build/ is Release, viewer ON, CoMiSo OFF
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release          # existing build/ is Release, viewer ON
 cmake --build build -j8                                 # or: --target TestMERIDIAN TestTORSION -j8
 ```
 
 - `build.sh` runs `rm -rf build` and does a full rebuild. `make_meshes.sh` also calls
   `clean.sh`, which deletes the `.msh`/`.obj` meshes. Don't run either unless asked.
-- Options: `BUILD_OPENGL_VIEWER` (Qt6 `Viewer`), `CROSSGEN_ENABLE_COMISO` (MIQ only,
-  default OFF), `CROSSGEN_ENABLE_OPENMP` (TMOP; finds Homebrew libomp), `BUILD_MESH2GMSH`.
+- Options: `BUILD_OPENGL_VIEWER` (Qt6 `Viewer`), `CROSSGEN_ENABLE_OPENMP` (TMOP; finds Homebrew
+  libomp), `BUILD_MESH2GMSH`.
 - Libraries: `CrossGenGeom` (src/geom, OCC) and `PolyVector` (all the rest, links
   CrossGenGeom PUBLIC). Every executable is a thin driver in `src/utils/`.
 - `data/meshes/**` is copied into `build/data/meshes` **at configure time**. Re-run
@@ -62,7 +62,7 @@ cmake --build build -j8                                 # or: --target TestMERID
 | `src/MERIDIAN` | **Pipeline A**, Shepherd 2022 Stages 0b–11: Interfaces → ConeSingularities → ConeCut → RicciFlow → Immersion → SubdomainLabels → LayoutEnergy → Separatrices → Arrangement → SplineFit → QuadMesh, plus DiskTemplate (0c/11). The stage map is in the header comment of `MERIDIAN.hxx` |
 | `src/TORSION` | **Pipeline B**: the same stages, but Stages 3–4 are swapped for integrating the DualMBO field (ConeMetric, FieldFrames, FieldIntegration, TutteEmbedding). Both pipelines meet at `Immersion`, and every stage after that is shared |
 | `src/geom` | Splines, polylines, Coons, B-rep (`Vertex/Edge/Face/Shape`), STEP/BREP output, all on top of OCC |
-| `src/tracing`, `src/quantization`, `src/medialaxis`, `src/UMBER`, `src/OASIS`, `src/Parameterization` | Older approaches (Viertel IMR19 tracing, QGP, medial axis, polysquare, spectral, MIQ). Rarely touched now |
+| `src/tracing`, `src/quantization`, `src/medialaxis`, `src/UMBER`, `src/OASIS`, `src/Parameterization` | Older approaches (Viertel IMR19 tracing, QGP, medial axis, polysquare, spectral, seam cuts). Rarely touched now |
 | `src/viewer` | Qt6 `Viewer`. `run_meshes.sh` opens every mesh in turn; it has figure/SVG export |
 | `paper_tests/` | E1–E5 paper experiments (`make paper`; E1/E2 are also ctests). **Read `paper_tests/README.md` first.** It is the running log of findings, methods and protocol. Results go in `paper_tests/results/` |
 | `data/geometry/{singlemat,multimat}` | `.geo` sources. `Mesh2Dgmsh` turns them into `data/meshes/<kind>/*.obj` (gitignored) |

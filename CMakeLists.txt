@@ -14,22 +14,6 @@ set_target_properties(Eigen3::Eigen PROPERTIES
 )
 message(STATUS "Using local Eigen3 from: ${EIGEN3_INCLUDE_DIR}")
 
-# CoMiSo library - use local submodule
-#
-# CoMiSo is only needed for MIQ (mixed-integer quadrangulation); it is a large
-# dependency to build and most work in this repo never touches it. Turn this
-# off to skip building it entirely; code that depends on it is compiled out
-# via the CROSSGEN_WITH_COMISO define (see MIQ.hxx / MIQ.cxx).
-option(CROSSGEN_ENABLE_COMISO "Build the bundled CoMiSo solver and enable MIQ" OFF)
-
-if (CROSSGEN_ENABLE_COMISO)
-    set(COMISO_ENABLE_DEFAULT OFF CACHE BOOL "" FORCE)
-    add_subdirectory(extern/CoMiSo)
-    message(STATUS "Using local CoMiSo from: ${CMAKE_CURRENT_SOURCE_DIR}/extern/CoMiSo")
-else()
-    message(STATUS "CROSSGEN_ENABLE_COMISO is OFF: skipping CoMiSo build (MIQ disabled)")
-endif()
-
 # OpenMP
 #
 # Used by the TMOP smoother (src/mesh/TMOP.cxx) and by nothing else so far. The
@@ -143,8 +127,6 @@ add_library(PolyVector SHARED
     src/Parameterization/CutMesh.cxx
     src/Parameterization/HarmonicCut.hxx
     src/Parameterization/HarmonicCut.cxx
-    src/Parameterization/MIQ.hxx
-    src/Parameterization/MIQ.cxx
     src/Parameterization/UVGParam.hxx
     src/Parameterization/UVGParam.cxx
     src/crossfield/CrossField.hxx
@@ -253,10 +235,6 @@ target_link_libraries(PolyVector PUBLIC Eigen3::Eigen CrossGenGeom)
 if (CROSSGEN_OPENMP_TARGET)
     target_link_libraries(PolyVector PUBLIC ${CROSSGEN_OPENMP_TARGET})
 endif()
-if (CROSSGEN_ENABLE_COMISO)
-    target_link_libraries(PolyVector PUBLIC CoMISo::CoMISo)
-    target_compile_definitions(PolyVector PUBLIC CROSSGEN_WITH_COMISO)
-endif()
 
 # Small utility to load and print mesh data
 add_executable(LoadMesh src/utils/LoadMesh.cxx)
@@ -269,12 +247,6 @@ target_link_libraries(TraceMesh PRIVATE PolyVector)
 # Utility to cut a mesh into a disk and run sanity checks
 add_executable(TestCutMesh src/utils/TestCutMesh.cxx)
 target_link_libraries(TestCutMesh PRIVATE PolyVector)
-
-# Test MIQ parametrization quality (needs CoMiSo)
-if (CROSSGEN_ENABLE_COMISO)
-    add_executable(TestMIQ src/utils/TestMIQ.cxx)
-    target_link_libraries(TestMIQ PRIVATE PolyVector)
-endif()
 
 # Test medial axis construction and phi-inverse mapping
 add_executable(TestMedialAxis src/utils/TestMedialAxis.cxx)
@@ -366,25 +338,6 @@ add_custom_target(cut
     COMMENT "Running TestCutMesh on all meshes in data/meshes"
     VERBATIM
 )
-
-# Custom target to run TestMIQ on all meshes (needs CoMiSo)
-if (CROSSGEN_ENABLE_COMISO)
-    set(MIQ_COMMANDS "")
-    foreach(MESH_FILE ${MESH_OBJ_FILES})
-        get_filename_component(MESH_NAME ${MESH_FILE} NAME)
-        list(APPEND MIQ_COMMANDS
-            COMMAND ${CMAKE_COMMAND} -E echo "Processing ${MESH_NAME}..."
-            COMMAND $<TARGET_FILE:TestMIQ> ${MESH_FILE} || ${CMAKE_COMMAND} -E true
-        )
-    endforeach()
-
-    add_custom_target(miq
-        ${MIQ_COMMANDS}
-        DEPENDS TestMIQ
-        COMMENT "Running TestMIQ on all meshes in data/meshes"
-        VERBATIM
-    )
-endif()
 
 # Custom target to run TestDualMBO on all meshes
 set(DualMBO_COMMANDS "")
@@ -698,9 +651,6 @@ add_test(NAME MERIDIAN_TMOP_singlemat_geom012
 set_tests_properties(MERIDIAN_TMOP_singlemat_geom012 PROPERTIES TIMEOUT 2400)
 
 # Optional Qt6 OpenGL viewer (replaces the old GLFW-based viewer)
-#
-# Builds without CoMiSo too: the UV-mesh split-screen view (phase 5, MIQ) is
-# compiled out via CROSSGEN_WITH_COMISO and that phase is simply unreachable.
 option(BUILD_OPENGL_VIEWER "Build the Qt6 OpenGL mesh/field viewer" OFF)
 if (BUILD_OPENGL_VIEWER)
     find_package(OpenGL REQUIRED)

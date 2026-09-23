@@ -5,10 +5,9 @@
 //   TestTORSION <mesh.obj> [options]
 //   TestTORSION --selftest
 //   TestTORSION --ref-test <mesh.obj>
-//   TestTORSION --census <mesh.obj> [<mesh.obj> ...]
 //
 // Reports each stage and exits non-zero if the pipeline did not reach a valid
-// layout. The three other modes are the plan's own validation steps, in the
+// layout. The two other modes are the plan's own validation steps, in the
 // order it puts them:
 //
 //   --selftest   the four new pieces on inputs whose answers are known in
@@ -23,11 +22,6 @@
 //                answered if maxConeAngleResidual does not regress. This
 //                isolates the reference metric from every other source of
 //                error before the integration exists to be blamed for it.
-//
-//   --census     Sec. 7.1's flip census, which sizes the untangling before a
-//                line of it is written: MIQ from the same DualMBO field with
-//                doRound = false, which is precisely the seamless,
-//                non-integer-grid map Sec. 6 asks for, and its flip count.
 
 #include <algorithm>
 #include <cmath>
@@ -42,10 +36,6 @@
 #include "MERIDIAN/MERIDIAN.hxx"
 #include "MERIDIAN/QuadMesh.hxx"
 #include "MERIDIAN/SplineFit.hxx"
-#include "Parameterization/CutMesh.hxx"
-#ifdef CROSSGEN_WITH_COMISO
-#include "Parameterization/MIQ.hxx"
-#endif
 #include "dualmbo/DualMBO.hxx"
 #include "TORSION/ConeMetric.hxx"
 #include "TORSION/TORSION.hxx"
@@ -648,79 +638,10 @@ int referenceTest(const std::string &path) {
     return failures == 0 ? 0 : 1;
 }
 
-// ---------------------------------------------------------------------------
-// census()  --  Sec. 7.1, step 2 of Sec. 9's order of work
-//
-// "The census is available for free, today." MIQSolver already implements the
-// whole of this stage -- from a DualMBO field, via CutMesh(const DualMBO&), with a
-// per-seam mismatch in {0,1,2,3} -- and it already counts flips. Run with
-// doRound = false, which is precisely the seamless, non-integer-grid map Sec. 6
-// wants, and record flips per model. That number sizes the untangling before a
-// line of it is written.
-//
-// It is a *different* cut from MERIDIAN's -- CutMesh cuts with its own dual
-// spanning tree -- so it is a census and not a prediction of TORSION's own flip
-// count. What it sizes is the phenomenon: whether least-squares integration of
-// this field on this corpus inverts a handful of triangles or a tenth of the
-// model.
-// ---------------------------------------------------------------------------
-#ifdef CROSSGEN_WITH_COMISO
-int census(const std::vector<std::string> &paths) {
-    std::cout << "Sec. 7.1 flip census: MIQ from the DualMBO field, doRound = false\n\n";
-    std::cout << std::left << std::setw(34) << "model" << std::right
-              << std::setw(9) << "tris" << std::setw(9) << "cones"
-              << std::setw(9) << "flips" << std::setw(11) << "flips %" << "\n";
-    std::cout << std::string(72, '-') << "\n";
-
-    int worst = 0;
-    int modelsWithFlips = 0;
-    for (const std::string &path : paths) {
-        std::shared_ptr<Mesh> mesh;
-        try {
-            mesh = std::make_shared<Mesh>(path);
-        } catch (const std::exception &e) {
-            std::cout << std::left << std::setw(34) << path << "  load failed: " << e.what() << "\n";
-            continue;
-        }
-        try {
-            DualMBO field(mesh, 500, 10.0);
-            field.initialize();
-            const double nTris = static_cast<double>(mesh->triangles.size());
-            for (int i = 0; i < 500; ++i) {
-                field.step();
-                if (field.error < 2.0 * nTris * 1e-5) break;
-            }
-            field.computeSingularities();
-
-            CutMesh cm(field);
-            MIQSolver miq(cm);
-            miq.solve(30.0, 5.0, false, 5, 5000, /*doRound=*/false,
-                      /*singularityRound=*/false, /*boundaryFeatures=*/true);
-            const int flips = miq.numFlips();
-            if (flips > 0) ++modelsWithFlips;
-            worst = std::max(worst, flips);
-            std::cout << std::left << std::setw(34) << path << std::right
-                      << std::setw(9) << mesh->triangles.size()
-                      << std::setw(9) << field.singularVertices.size()
-                      << std::setw(9) << flips
-                      << std::setw(11) << std::fixed << std::setprecision(3)
-                      << (100.0 * flips / std::max(1.0, nTris)) << std::defaultfloat << "\n";
-        } catch (const std::exception &e) {
-            std::cout << std::left << std::setw(34) << path << "  threw: " << e.what() << "\n";
-        }
-    }
-    std::cout << std::string(72, '-') << "\n";
-    std::cout << modelsWithFlips << " of " << paths.size()
-              << " model(s) inverted something; worst " << worst << " triangle(s).\n";
-    return 0;
-}
-#endif // CROSSGEN_WITH_COMISO
-
 void usage(const char *prog) {
     std::cout << "Usage: " << prog << " <mesh.obj> [options]\n"
               << "       " << prog << " --selftest\n"
-              << "       " << prog << " --ref-test <mesh.obj>\n"
-              << "       " << prog << " --census <mesh.obj> [...]\n\n"
+              << "       " << prog << " --ref-test <mesh.obj>\n\n"
               << "Stage 3F / 4F / 4R (the field route)\n"
               << "  --h <len>          target edge length h of the frame     (default 1)\n"
               << "  --no-untangle      leave psi_0 as the integration left it, flips and all\n"
@@ -811,17 +732,6 @@ int main(int argc, char **argv) {
     if (first == "--ref-test") {
         if (argc < 3) { usage(argv[0]); return 1; }
         return referenceTest(argv[2]);
-    }
-    if (first == "--census") {
-#ifdef CROSSGEN_WITH_COMISO
-        std::vector<std::string> paths(argv + 2, argv + argc);
-        if (paths.empty()) { usage(argv[0]); return 1; }
-        return census(paths);
-#else
-        std::cerr << "--census requires MIQ, which needs CrossGen built with "
-                     "CROSSGEN_ENABLE_COMISO=ON.\n";
-        return 1;
-#endif
     }
 
     const std::string path = first;
