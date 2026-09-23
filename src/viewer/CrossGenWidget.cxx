@@ -1229,7 +1229,11 @@ void CrossGenWidget::runUMBER() {
     // --- Cuts, Sec. 4.1 -----------------------------------------------------
     auto tc0 = Clock::now();
     try {
-        umberCut_.emplace(mesh_);
+        // No cuts: the holes stay holes and the parameterization is a common
+        // polysquare. See the HarmonicCut constructor for why a block
+        // decomposition wants that and the closed form of Sec. 4.1 costs it
+        // the ring it cannot represent.
+        umberCut_.emplace(mesh_, /*openVoids=*/false);
     } catch (const std::exception &e) {
         umberCut_.reset();
         console_.log(std::string("[UMBER] cutting FAILED: ") + e.what());
@@ -1240,10 +1244,9 @@ void CrossGenWidget::runUMBER() {
     {
         const auto &rep = umberCut_->getReport();
         std::ostringstream oss;
-        oss << "[UMBER] cuts: " << rep.voids << " void(s), " << rep.cutsMade
-            << " cut(s), " << umberCut_->getCutEdges().size() << " edges, "
-            << (rep.isDisk ? "disk \033[32m[PASS]\033[0m" : "not a disk \033[31m[FAIL]\033[0m")
-            << ", " << formatMs(std::chrono::duration<double, std::milli>(tc1 - tc0).count());
+        oss << "[UMBER] " << rep.voids << " hole(s), left uncut, chi "
+            << rep.eulerCharacteristic << ", "
+            << formatMs(std::chrono::duration<double, std::milli>(tc1 - tc0).count());
         console_.log(oss.str());
     }
 

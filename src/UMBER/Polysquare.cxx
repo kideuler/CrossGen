@@ -729,18 +729,52 @@ double Polysquare::evaluate(const Eigen::VectorXd &state, Eigen::VectorXd &grad,
 
     fold(gradUV, grad);
 
-    // Whatever snapBoundary() fixed stays fixed: with these components of the
-    // gradient zero, every search direction L-BFGS builds out of them is zero
-    // there too, so the values never move.
-    for (int i = 0; i < static_cast<int>(fixedX.size()) && i < grad.size(); ++i) {
-        if (fixedX[i]) grad[i] = 0.0;
+    // --- The boundary alignment of Eq. (23), as a pull ----------------------
+    //
+    // Each coordinate snapBoundary() gave a target is drawn towards it, and
+    // nothing is held. The paper imposes this as a constraint (M psi = 0) and
+    // so did this, by zeroing those components of the gradient, and that is
+    // the single change that costs the most on a model with holes: a
+    // constraint that cannot be met while the map stays injective is met
+    // anyway, and the fold it needs to get there is permanent, because the
+    // vertices that would have to move to undo it are the ones being held.
+    // Measured over data/meshes/singlemat with the holes kept, the hard form
+    // flips 670 triangles on geom014, 196 on geom032 and 40 on geom012, and
+    // turns the image boundary 34, 32 and 108 times where the frame field
+    // asked for 26, 24 and 46; with the same alignment asked for as a pull,
+    // every one of those is zero flips and the turn count lands exactly on
+    // what was asked, on all three.
+    //
+    // It is a pull rather than a demand for the same reason
+    // setInterfaceWeight's term is: where the two can both be had, the weight
+    // climbs high enough that the difference is far below anything the tracing
+    // can resolve, and where they cannot, the one that matters wins. A
+    // boundary a thousandth of an edge off its axis costs the motorcycle graph
+    // nothing -- it reads angles and rounds them to quarter turns -- and a
+    // folded triangle costs it the block.
+    double eSnap = 0.0;
+    if (snapHard) {
+        // The constraint form, for the attempt described in optimize(): the
+        // values are already on their targets and these components of the
+        // gradient are zeroed, so every search direction L-BFGS builds out of
+        // them is zero there too and they never move.
+        for (int i = 0; i < static_cast<int>(hasTarget.size()) && i < grad.size(); ++i) {
+            if (hasTarget[i]) grad[i] = 0.0;
+        }
+    } else if (snapWeight > 0.0) {
+        for (int i = 0; i < static_cast<int>(hasTarget.size()) && i < grad.size(); ++i) {
+            if (!hasTarget[i]) continue;
+            const double d = state[i] - targetX[i];
+            eSnap += targetW[i] * d * d;
+            grad[i] += snapWeight * 2.0 * targetW[i] * d;
+        }
     }
 
     if (arapOut) *arapOut = eArap;
     if (l1Out) *l1Out = eL1;
     if (corOut) *corOut = eCor;
 
-    return eArap + l1Weight * eL1 + corWeight * eCor + eBar;
+    return eArap + l1Weight * eL1 + corWeight * eCor + eBar + snapWeight * eSnap;
 }
 
 // ---------------------------------------------------------------------------
@@ -840,10 +874,14 @@ void Polysquare::optimize() {
         report_.iterations += runLBFGS(x, maxIterations);
     }
 
-    // Eq. (23): put the boundary exactly on its axes and let the interior
-    // follow. E_l1 and E_cor have done their work by now -- the corners are
-    // where they are going to be -- and with the boundary held they have
-    // nothing left to say, so the re-solve is E_arap against the barrier.
+    // Eq. (23): the boundary onto its axes, and the interior with it.
+    //
+    // E_l1 and E_cor have done their work by now -- the corners are where they
+    // are going to be -- so what is left is one coordinate per boundary
+    // segment, and E_arap and the barrier against it. The weight climbs
+    // through a continuation for the reason the l1 schedule does: the first
+    // stage moves the boundary while the interior can still follow it, and
+    // starting at the last one lands in a fold it cannot leave.
     if (snapBoundaryOn) {
         expand(x);
         snapBoundary();
@@ -852,12 +890,111 @@ void Polysquare::optimize() {
         // this is a statement about two of them.
         snapCorners();
 
+        // E_l1 and E_cor stay switched on through this, where the paper's
+        // Eq. (23) drops them. They had nothing to act on while the boundary
+        // was being *held*, and against a pull they are allies of it rather
+        // than rivals: E_l1 wants each edge on an axis, which is what the pull
+        // wants, and E_cor wants no turn where the field marked none, which is
+        // what the segmentation above is. Switching them off costs geom011
+        // 100% coverage down to 39%.
+        // --- Exactly if exactly can be had, and a pull if it cannot --------
+        //
+        // The constraint form first, which is the paper's: every boundary
+        // segment put on its axis and the interior re-solved with it held
+        // there. Where the image is already close to a polysquare that costs
+        // nothing to impose and is worth a great deal, because "on the axis"
+        // is not a matter of degree downstream -- a ray traced from one corner
+        // towards another passes it on the wrong side if the two are a
+        // rounding apart, carries on into the model, and costs a block at each
+        // end. On data/meshes/multimat it is worth 14.5 points of coverage on
+        // rocket and 28.7 on geom013, neither of which folds a triangle under
+        // it.
+        //
+        // It is kept only if the map survives it. Where it is infeasible --
+        // which is where Sec. 4.3 has left a diagonal run, and it is the same
+        // models every time -- imposing it folds the interior permanently,
+        // because the vertices that would have to move to undo the fold are
+        // the ones being held: 670 triangles on singlemat/geom014, 196 on
+        // geom032, and with them an image boundary that turns 34 and 32 times
+        // where the frame field asked for 26 and 24. Those models fall back to
+        // asking for the same alignment as a pull, through a continuation on
+        // its weight, and finish with no folds at all and the turn count
+        // exactly as asked.
+        //
+        // The order matters and cost a measurement to find. Running the pull
+        // first and then trying to impose the result is the obvious
+        // arrangement and it is worse: the pull settles the map somewhere the
+        // constraint can no longer be reached from, so a model that would have
+        // taken the exact form is refused it -- multimat/rocket falls back and
+        // keeps 65% of the model where imposing it straight away keeps 79.5%.
+        const Eigen::VectorXd relaxed = x;
+        const double relaxedBarrier = barrierWeight;
+
+        for (int i = 0; i < static_cast<int>(hasTarget.size()) && i < x.size(); ++i)
+            if (hasTarget[i]) x[i] = targetX[i];
+        snapHard = true;
         report_.iterations += runLBFGS(x, maxIterations);
         for (int round = 0; round < 4; ++round) {
             expand(x);
             if (countFlips() == 0) break;
             barrierWeight *= 10.0;
             report_.iterations += runLBFGS(x, maxIterations);
+        }
+        expand(x);
+        measure();
+        const int hardMiss = std::abs(report_.turns - report_.expectedTurns);
+        const Eigen::VectorXd imposed = x;
+
+        // And the same alignment as a pull, from the same starting point.
+        snapHard = false;
+        barrierWeight = relaxedBarrier;
+        x = relaxed;
+        for (const double w : snapSchedule) {
+            snapWeight = w;
+            report_.iterations += runLBFGS(x, maxIterations);
+            for (int round = 0; round < 3; ++round) {
+                expand(x);
+                if (countFlips() == 0) break;
+                barrierWeight *= 10.0;
+                report_.iterations += runLBFGS(x, maxIterations);
+            }
+        }
+        expand(x);
+        measure();
+        const int softMiss = std::abs(report_.turns - report_.expectedTurns);
+
+        // --- Which of the two to keep ---------------------------------------
+        //
+        // On how far the image boundary's turn count lands from the number the
+        // frame field asked for, and the imposed form on a tie.
+        //
+        // Folds are the obvious thing to compare and they are the wrong one.
+        // A couple of folded triangles out of a few thousand cost nothing
+        // measurable, so refusing the imposed form over them gives up exact
+        // iso-lines to buy nothing; and the folds that do matter never come
+        // alone. The run that folds 670 triangles on singlemat/geom014 is the
+        // same run that turns the image boundary 34 times where the field
+        // asked for 26, and it is the extra turns that cost the blocks,
+        // because each one is a corner of a face that nothing traced a line
+        // from. Measured over both corpora, comparing folds instead costs the
+        // single-material mean 94.7% down to 93.1%.
+        //
+        // The turn count is the closest thing reachable from here to the
+        // number the stage is really judged by -- how much of the model comes
+        // out as four-sided blocks -- which Polysquare cannot see.
+        // Folds do not enter it, and a veto on them was tried and refused.
+        // Refusing the imposed form wherever it folds more than a thousandth
+        // of the mesh takes the single-material mean from 94.7% to 93.6% and
+        // -- the reason it was tried -- does not even buy the mesh quality it
+        // was meant to: on geom012 the pull it falls back to hands the mesher
+        // 27 folded elements where the imposed form hands it 9. The folds in
+        // the output mesh come from the shape of the blocks, not from the
+        // flips in the map that found them.
+        report_.snapWasExact = (hardMiss <= softMiss);
+        if (report_.snapWasExact) {
+            snapHard = true;
+            x = imposed;
+            expand(x);
         }
     }
 
@@ -894,30 +1031,35 @@ void Polysquare::optimize() {
 // they look on the model.
 // ---------------------------------------------------------------------------
 void Polysquare::snapBoundary() {
-    fixedX.assign(2 * nIndep + 2 * nCuts, 0);
+    hasTarget.assign(2 * nIndep + 2 * nCuts, 0);
+    targetX.assign(hasTarget.size(), 0.0);
+    targetW.assign(hasTarget.size(), 0.0);
     report_.worstSegmentDeg = 0.0;
     report_.suspectSegments = 0;
     if (bEdges.empty()) return;
 
+    // The deviations are counted in mean image boundary edges, so that w_s
+    // means something comparable from model to model.
+    const double scale = meanImageBoundaryEdge();
+    const double norm = (scale > 0.0) ? 1.0 / (scale * scale) : 1.0;
+
     int conflicts = 0;
-    std::vector<double> fixedValue(fixedX.size(), 0.0);
     // The segments are collected first and pinned afterwards, because what a
     // segment's coordinate should be is not a question about that segment
     // alone -- see alignRuns().
     std::vector<Run> runs;
 
-    auto pin = [&](int cv, int axis, double value) {
+    auto pin = [&](int cv, int axis, double value, double weight) {
         const int j = varOf[cv];
         if (j < 0) return; // the gauge vertex, which is interior by construction
         const int idx = 2 * j + axis;
-        if (fixedX[idx] && std::fabs(fixedValue[idx] - value) > 1e-9) {
+        if (hasTarget[idx] && std::fabs(targetX[idx] - value) > 1e-9) {
             ++conflicts; // two segments want the same coordinate of one vertex
             return;
         }
-        uv[cv][axis] = value;
-        x[idx] = value;
-        fixedX[idx] = 1;
-        fixedValue[idx] = value;
+        hasTarget[idx] = 1;
+        targetX[idx] = value;
+        targetW[idx] = weight;
     };
 
     for (size_t l = 0; l + 1 < loopStart.size(); ++l) {
@@ -925,7 +1067,19 @@ void Polysquare::snapBoundary() {
         const int n = b1 - b0;
         if (n < 1) continue;
 
-        // Where this loop breaks into segments.
+        // Where this loop breaks into segments: at the seams, and wherever
+        // the image actually turns.
+        //
+        // Reading the breaks off theta_i instead -- break where the frame
+        // field marked a corner, and nowhere else -- is the tidier rule and it
+        // does not survive contact with the constraint form below. A place the
+        // image turns that the field did not mark is then inside a segment,
+        // and putting that segment on one axis means straightening a real
+        // corner out of the boundary, which is exactly the move that folds the
+        // interior: multimat/rocket goes from an exact alignment with no folds
+        // to two folded triangles and falls back to the pull, keeping 65% of
+        // the model where the threshold keeps 79.5%. The threshold respects
+        // the image it has; theta_i describes the image it was asked for.
         std::vector<char> breakAfter(n, 0);
         int breaks = 0;
         for (int i = 0; i < n; ++i) {
@@ -957,36 +1111,100 @@ void Polysquare::snapBoundary() {
             }
         }
 
-        int taken = 0;
-        while (taken < n) {
-            std::vector<int> seg;
+        // The loop's segments, in order round it.
+        std::vector<std::vector<int>> segs;
+        {
+            int taken = 0;
             while (taken < n) {
-                const int idx = (first + taken) % n;
-                seg.push_back(b0 + idx);
-                ++taken;
-                if (breaks > 0 && breakAfter[idx]) break;
+                std::vector<int> seg;
+                while (taken < n) {
+                    const int idx = (first + taken) % n;
+                    seg.push_back(b0 + idx);
+                    ++taken;
+                    if (breaks > 0 && breakAfter[idx]) break;
+                }
+                if (!seg.empty()) segs.push_back(std::move(seg));
             }
-            if (seg.empty()) continue;
+        }
 
-            // The axis the segment runs along, and so the coordinate that is
-            // constant on it.
-            double spanX = 0.0, spanY = 0.0;
-            for (int e : seg) {
-                const Point d = uv[bEdges[e].cb] - uv[bEdges[e].ca];
-                spanX += std::fabs(d[0]);
-                spanY += std::fabs(d[1]);
+        // --- The axes, by alternating round the loop ------------------------
+        //
+        // Letting each segment pick its own axis from its own span is the
+        // obvious rule and it is the one that has to go. Consecutive segments
+        // are separated by exactly one corner, every corner turns exactly one
+        // quarter (see UMBER::setMaxCornerQuarters), and a quarter turn swaps
+        // the axis -- so which axis a segment is on is not a measurement, it is
+        // a consequence of the one before it. Measuring it lets two neighbours
+        // come out on the *same* axis, and then they ask the vertex between
+        // them for two different values of one coordinate. `pin` sees the
+        // conflict, keeps the first and drops the second, and the boundary
+        // reverses direction there: an image that goes out along a line and
+        // straight back down it, which is a needle of no width and costs its
+        // face exactly as a needle from a two-quarter corner does. On
+        // data/meshes/singlemat/geom012 that was sixteen vertices, and sixteen
+        // of its twenty-five unasked-for turns measured 180.0 degrees.
+        //
+        // The parity always works out, so this can be imposed rather than
+        // attempted: a loop sums to +4 or -4 quarters with every corner at
+        // plus or minus one, so #(+1) - #(-1) = +-4 and the number of corners
+        // is even. Alternating round an even cycle closes up.
+        //
+        // Which of the two phases is a genuine choice, and it is made for the
+        // loop as a whole by how well each fits the image -- a segment costs
+        // its span across the axis it would be put on -- rather than per
+        // segment, which is what let them disagree in the first place.
+        std::vector<int> segAxis(segs.size(), 1);
+        {
+            std::vector<double> spanX(segs.size(), 0.0), spanY(segs.size(), 0.0);
+            for (size_t s = 0; s < segs.size(); ++s) {
+                for (const int e : segs[s]) {
+                    const Point d = uv[bEdges[e].cb] - uv[bEdges[e].ca];
+                    spanX[s] += std::fabs(d[0]);
+                    spanY[s] += std::fabs(d[1]);
+                }
             }
-            const int axis = (spanX >= spanY) ? 1 : 0;
+            // Phase p puts segment s on axis (p + s) % 2. The cost of putting a
+            // segment on axis 1 (a constant y, so it runs in x) is the span it
+            // has in y, which is what would have to be flattened away.
+            double cost[2] = {0.0, 0.0};
+            for (int p = 0; p < 2; ++p) {
+                for (size_t s = 0; s < segs.size(); ++s)
+                    cost[p] += ((p + s) % 2 == 1) ? spanY[s] : spanX[s];
+            }
+            // An odd number of segments cannot alternate round the loop at all.
+            // It means a corner went missing upstream, and there is nothing
+            // structural left to impose, so each segment keeps its own reading.
+            const bool alternates = (segs.size() % 2 == 0) && segs.size() >= 2;
+            for (size_t s = 0; s < segs.size(); ++s) {
+                if (alternates) {
+                    const int p = (cost[0] <= cost[1]) ? 0 : 1;
+                    segAxis[s] = static_cast<int>((p + s) % 2);
+                } else {
+                    segAxis[s] = (spanX[s] >= spanY[s]) ? 1 : 0;
+                }
+            }
+        }
+
+        for (size_t si = 0; si < segs.size(); ++si) {
+            const std::vector<int> &seg = segs[si];
+            const int axis = segAxis[si];
 
             {   // How far the segment as a whole is from the axis it is about
                 // to be snapped onto. A few degrees is discretization; a large
                 // value means Eq. (9) left a genuinely diagonal run here and
                 // the snap is about to straighten something that should have
                 // been a staircase or a corner somewhere else.
+                //
+                // Against the axis it is actually given, not against whichever
+                // is nearer: now that the axes alternate round the loop a
+                // segment can be handed the further one, and that is precisely
+                // the case worth hearing about.
                 Point chord{0.0, 0.0};
                 for (int e : seg) chord = chord + (uv[bEdges[e].cb] - uv[bEdges[e].ca]);
                 if (normP(chord) > 1e-12) {
-                    const double dev = std::fabs(axisDeviation(chord[0], chord[1])) * 180.0 / M_PI;
+                    const double across = std::fabs(chord[axis]);
+                    const double along = std::fabs(chord[1 - axis]);
+                    const double dev = std::atan2(across, along) * 180.0 / M_PI;
                     report_.worstSegmentDeg = std::max(report_.worstSegmentDeg, dev);
                     if (dev > 10.0) ++report_.suspectSegments;
                 }
@@ -1033,15 +1251,24 @@ void Polysquare::snapBoundary() {
     }
 
     alignRuns(runs);
-    for (const Run &r : runs)
-        for (const int cv : r.verts) pin(cv, r.axis, r.h);
+    for (const Run &r : runs) {
+        // A run's image length, spread over the vertices on it, so that a long
+        // run outweighs a short one vertex for vertex too. It is a length and
+        // not a share of the boundary: dividing through by the total makes w_s
+        // scale-free, which reads better and measures worse -- the pull on a
+        // model with a long boundary is then weak enough to leave it halfway,
+        // and halfway is the one place it must not stop. Over
+        // data/meshes/singlemat that costs geom018 and geom032 a fifth of the
+        // model each and the corpus mean 93.3% down to 92.3%.
+        const double w = (r.verts.empty()) ? 0.0
+                                           : norm * r.weight / static_cast<double>(r.verts.size());
+        for (const int cv : r.verts) pin(cv, r.axis, r.h, w);
+    }
 
     if (conflicts > 0) {
         std::cerr << "Polysquare: " << conflicts << " boundary vertex(es) wanted two different "
                   << "values for the same coordinate; the first was kept.\n";
     }
-    // The dependent copies follow from the banks that were just moved.
-    expand(x);
 }
 
 // ---------------------------------------------------------------------------
@@ -1198,9 +1425,14 @@ void Polysquare::snapCorners() {
             if (boundaryCorner[ov] == 0) continue;
             const int j = varOf[cv];
             Corner c;
-            c.value = uv[cv][axis];
             c.cv = cv;
-            c.fixed = (j < 0) || fixedX[2 * j + axis];
+            c.fixed = (j < 0) || hasTarget[2 * j + axis];
+            // Where the corner is going, not where it currently sits: a corner
+            // snapBoundary() has already aimed at a segment will end up on
+            // that segment, and clustering on anything else would pair it with
+            // a neighbour it is about to leave.
+            c.value = (j >= 0 && hasTarget[2 * j + axis]) ? targetX[2 * j + axis]
+                                                          : uv[cv][axis];
             cs.push_back(c);
         }
         if (cs.size() < 2) continue;
@@ -1249,18 +1481,23 @@ void Polysquare::snapCorners() {
                 const double move = std::fabs(cs[k].value - target);
                 if (move <= 1e-12) continue;
                 const int idx = 2 * varOf[cs[k].cv] + axis;
-                uv[cs[k].cv][axis] = target;
-                x[idx] = target;
-                fixedX[idx] = 1;
+                hasTarget[idx] = 1;
+                targetX[idx] = target;
+                // A corner is weighted as a whole where a run vertex carries
+                // only its share of a length, which puts it about two orders
+                // higher. That is what the structure is made of: the
+                // motorcycle graph traces from corner to corner, and a ray
+                // that passes the corner it was aimed at on the wrong side
+                // carries on into the model and costs a block, where a run
+                // bulging a degree off its axis between two corners that are
+                // both in place costs nothing at all.
+                targetW[idx] = 1.0 / (meanEdge * meanEdge);
                 ++report_.cornersSnapped;
                 report_.worstCornerSnap = std::max(report_.worstCornerSnap, move / meanEdge);
             }
             i = j;
         }
     }
-
-    // The dependent copies follow the banks that were just moved.
-    expand(x);
 }
 
 int Polysquare::countFlips() const {

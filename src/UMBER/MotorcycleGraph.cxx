@@ -208,6 +208,17 @@ void MotorcycleGraph::launch() {
         // angles, which puts a ray in the neighbouring triangle whenever the
         // wedges do not sum quite as expected and leaves it pointing out of
         // the triangle it was given, with nowhere to go on its first step.
+        //
+        // The axis the ray leaves along is read off the starting edge and not
+        // off the wedge's opening angle. Both are roundings and the first is
+        // the safer one: where Sec. 4.3 has left the image off its axes the
+        // wedge is the more distorted of the two, and taking the count from it
+        // fires rays a corner never asked for -- measured over
+        // data/meshes/singlemat that costs geom032 88.5% of the model down to
+        // 37.1% and geom014 78.7% down to 50.1%. A ray the corner index asks
+        // for that the wedge cannot hold is dropped just below instead, which
+        // leaves the structure short of a cut rather than cut in the wrong
+        // place.
         const Point axes[4] = {{1.0, 0.0}, {0.0, 1.0}, {-1.0, 0.0}, {0.0, -1.0}};
         for (int j = 1; j <= 1 - k; ++j) {
             const Point e = axes[(startAxis + j) % 4];

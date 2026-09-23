@@ -2,10 +2,12 @@
 // Sec. 4.1 cuts, and run the UMBER frame field optimization (Sec. 4.2 of
 // Wang et al. 2022) on top, reporting the cut report, the energy split and the
 // internal singularities before and after.
+#include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "MERIDIAN/Interfaces.hxx"
 #include "Parameterization/HarmonicCut.hxx"
@@ -105,22 +107,37 @@ int main(int argc, char **argv) {
               << dualMBO.singularVertices.size() << " DualMBO singularities\n";
 
     // --- Cuts, Sec. 4.1 ------------------------------------------------------
-    HarmonicCut hc(mesh);
+    //
+    // Off by default: a block decomposition wants a *common* polysquare, not
+    // the closed form the cuts buy. See the HarmonicCut constructor. The
+    // environment variable is here so the two can be measured against each
+    // other on the corpus without editing anything.
+    const bool openVoids = (std::getenv("UMBER_CUT_VOIDS") != nullptr);
+    HarmonicCut hc(mesh, openVoids);
     const auto &cutReport = hc.getReport();
     std::cout << "  boundary loops " << cutReport.boundaryLoops
               << " (" << cutReport.voids << " void(s)), cuts made " << cutReport.cutsMade
               << ", cut edges " << hc.getCutEdges().size() << "\n";
     for (const auto &m : cutReport.messages) std::cout << "    " << m << "\n";
-    if (cutReport.isDisk)
+    if (!openVoids) {
+        std::cout << "  holes left as holes (no cuts): a common polysquare, "
+                  << cutReport.eulerCharacteristic << " = chi\n";
+    } else if (cutReport.isDisk) {
         std::cout << "\033[32m[PASS]\033[0m Cut mesh is a disk.\n";
-    else
+    } else {
         std::cout << "\033[31m[FAIL]\033[0m Cut mesh is not a disk.\n";
+    }
 
     // --- Frame field optimization, Eq. (1) -----------------------------------
     try {
         UMBER umber(dualMBO, hc);
         if (multiMaterial) umber.setFeatureEdges(interfaces->interfaceEdges());
         if (lbfgsIters > 0) umber.setMaxIterations(lbfgsIters);
+        // UMBER::setMaxCornerQuarters. Here so that the needle a corner of two
+        // quarter turns puts in the image can be measured against the blunt end
+        // the cap gives instead, without editing anything.
+        if (const char *q = std::getenv("UMBER_MAX_CORNER_QUARTERS"))
+            umber.setMaxCornerQuarters(std::atoi(q));
         umber.initialize();
 
         const UMBER::EnergyTerms before = umber.energy();
@@ -140,6 +157,14 @@ int main(int argc, char **argv) {
         const auto sharp = umber.sharpTurns();
         std::cout << "  final internal singularities: " << singAfter.size()
                   << ", shortest frame vector " << umber.minFrameNorm() << "\n";
+        if (umber.unwoundHoles() > 0) {
+            std::cout << "  " << umber.unwoundHoles()
+                      << " hole(s) whose field wound round them, unwound at initialization\n";
+        }
+        if (umber.combPieces() > 1) {
+            std::cout << "  the branch cuts left the comb in " << umber.combPieces()
+                      << " pieces\n";
+        }
         std::cout << "  interior edges turning > 45 deg: " << sharp.size();
         if (!sharp.empty()) std::cout << " (worst " << sharp.front().second << " deg)";
         std::cout << "\n";
@@ -170,6 +195,50 @@ int main(int argc, char **argv) {
                       << " convex, " << refl << " reflex";
             if (high > 0) std::cout << ", " << high << " higher order";
             std::cout << "), counted on both sides of every branch\n";
+        }
+
+        // --- The same count, loop by loop ------------------------------------
+        //
+        // The total is not the thing to read once the holes are kept. Every
+        // rectilinear closed curve turns a whole number of times, so each loop
+        // has its own budget -- +4 quarters for the outer one, -4 for every
+        // hole -- and a total that lands on 4 chi can still be a field that
+        // took two quarters off one hole and gave them to another. The
+        // deformation cannot recover from that: the hole with too few corners
+        // has no rectilinear image at all.
+        {
+            const auto &loops = hc.getBoundaryLoops();
+            std::vector<int> loopOf(mesh->vertices.size(), -1);
+            for (size_t li = 0; li < loops.size(); ++li)
+                for (const int v : loops[li]) loopOf[v] = static_cast<int>(li);
+
+            std::vector<int> sum(loops.size(), 0);
+            for (const auto &[vid, k] : corners)
+                if (loopOf[vid] >= 0) sum[loopOf[vid]] += k;
+
+            // A hole turns through exactly one full turn the other way from
+            // the outer loop, whatever its shape: -4 quarters. The outer loop
+            // turns through +4, plus whatever the field failed to push out of
+            // the interior -- an interior defect of index w holds 4w quarter
+            // turns that never reached a boundary, and they are missing from
+            // the outer loop's count and from nowhere else.
+            int trapped = 0;
+            for (const auto &[vid, w] : singAfter) trapped += 4 * static_cast<int>(w);
+
+            int wrongLoops = 0;
+            std::cout << "  per loop:";
+            for (size_t li = 0; li < loops.size(); ++li) {
+                const int want =
+                    (static_cast<int>(li) == hc.getOuterLoop()) ? 4 - trapped : -4;
+                std::cout << " " << sum[li] << "/" << want;
+                if (sum[li] != want) ++wrongLoops;
+            }
+            std::cout << " quarter turns\n";
+            if (wrongLoops == 0)
+                std::cout << "\033[32m[PASS]\033[0m Every boundary loop turns through a whole turn.\n";
+            else
+                std::cout << "\033[31m[FAIL]\033[0m " << wrongLoops
+                          << " boundary loop(s) do not turn through a whole turn.\n";
         }
 
         const int chi = 1 - cutReport.voids;
@@ -224,7 +293,8 @@ int main(int argc, char **argv) {
         std::cout << "\n";
         std::cout << std::fixed << std::setprecision(3)
                   << "    boundary alignment: mean " << pr.meanAlignDeg << " deg, worst "
-                  << pr.maxAlignDeg << " deg; length ratio " << pr.lengthRatio << "\n";
+                  << pr.maxAlignDeg << " deg; length ratio " << pr.lengthRatio
+                  << (pr.snapWasExact ? " (exact)" : " (pulled, not imposed)") << "\n";
         if (pr.interfaceEdges > 0) {
             std::cout << "    interface alignment: mean " << pr.meanInterfaceAlignDeg
                       << " deg, worst " << pr.maxInterfaceAlignDeg << " deg over "

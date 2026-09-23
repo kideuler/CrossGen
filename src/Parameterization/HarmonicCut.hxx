@@ -68,7 +68,33 @@ public:
         std::vector<std::string> messages;
     };
 
-    explicit HarmonicCut(std::shared_ptr<Mesh> mesh);
+    // `openVoids` false makes every void stay shut: no cuts, and a "cut mesh"
+    // that is the input mesh vertex for vertex. Everything downstream still
+    // works -- there are simply no seams, no transitions and no harmonic
+    // degrees of freedom -- so it is the switch between a *closed-form*
+    // polysquare and a *common* one, and it is a real choice rather than a
+    // degradation.
+    //
+    // Sec. 4.1 wants the cuts because its goal is the closed form: an annulus
+    // then maps to a ring with no corners on it at all, which is one spline
+    // patch instead of four and is what an IGA solver wants to be handed.
+    // A *block decomposition* wants the opposite. Its blocks are
+    // four-cornered, so a cornerless ring is not a block it can represent, and
+    // the ring's image is refused whole (`BlockLayout::DecompositionReport`
+    // counts it under notFourSided); the four reflex corners a common
+    // polysquare is forced to put on the hole are exactly the four the
+    // motorcycle graph needs to send rays from. Measured over
+    // data/meshes/singlemat, every model that lost coverage but one was a
+    // holed one, and the worst of them -- geom026, geom032 -- were the ones
+    // whose cuts carried a 180-degree transition, which folds the image over
+    // itself. See [[umber-no-cut-parameterization]].
+    //
+    // The default stays true because MERIDIAN::ConeCut uses this class for
+    // Stage 2, where a disk is exactly what is wanted.
+    explicit HarmonicCut(std::shared_ptr<Mesh> mesh, bool openVoids = true);
+
+    // Whether the voids were opened at all -- see the constructor.
+    bool getOpenVoids() const { return openVoids; }
 
     const Mesh& getOriginalMesh() const { return *orig; }
     std::shared_ptr<Mesh> getOriginalMeshPtr() const { return orig; }
@@ -121,6 +147,7 @@ private:
     Report checkCutMesh() const;
 
     std::shared_ptr<Mesh> orig;
+    bool openVoids = true;
     Mesh cut;
     Report report;
 

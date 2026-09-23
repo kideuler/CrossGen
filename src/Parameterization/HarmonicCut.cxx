@@ -56,7 +56,8 @@ struct DSU {
 
 } // namespace
 
-HarmonicCut::HarmonicCut(std::shared_ptr<Mesh> mesh) : orig(std::move(mesh)) {
+HarmonicCut::HarmonicCut(std::shared_ptr<Mesh> mesh, bool openVoidsIn)
+    : orig(std::move(mesh)), openVoids(openVoidsIn) {
     if (!orig) throw std::runtime_error("HarmonicCut: null mesh");
     if (orig->triangles.empty()) throw std::runtime_error("HarmonicCut: empty mesh");
 
@@ -227,6 +228,8 @@ std::vector<int> HarmonicCut::shortestInteriorPath(const std::vector<int> &sourc
 void HarmonicCut::generateCuts() {
     cuts.clear();
     cutEdges.clear();
+
+    if (!openVoids) return;  // the caller wants the voids kept -- see the ctor
 
     const int nLoops = static_cast<int>(boundaryLoops.size());
     if (nLoops <= 1) return; // already a disk: no voids to open
@@ -482,6 +485,19 @@ HarmonicCut::Report HarmonicCut::checkCutMesh() const {
 
     rep.isDisk = rep.trianglesConnected && rep.boundaryComponents == 1 &&
                  rep.eulerCharacteristic == 1;
+
+    // With the voids deliberately kept, none of the disk checks below is a
+    // finding: chi is 1 - beta and there are beta + 1 boundary components
+    // because that is what was asked for. Only the connectivity still means
+    // anything, and it is checked above.
+    if (!openVoids) {
+        if (!rep.trianglesConnected) {
+            std::ostringstream oss;
+            oss << "Mesh triangles fall into " << comps << " components.";
+            rep.messages.push_back(oss.str());
+        }
+        return rep;
+    }
 
     if (rep.cutsMade != rep.voids) {
         std::ostringstream oss;

@@ -11,6 +11,40 @@
 
 #include "dualmbo/DualMBO.hxx"
 
+namespace {
+
+// A vertex certain to lie on the outer boundary loop: the rightmost boundary
+// vertex, since no hole can reach past the outside of the model. Cheaper and
+// more robust than measuring the enclosed area of every loop, and it does not
+// need the loops to have been walked in order.
+int outerBoundaryVertex(const Mesh &mesh) {
+    int best = -1;
+    for (const int v : mesh.boundaryVertices) {
+        if (best < 0 || mesh.vertices[v][0] > mesh.vertices[best][0] ||
+            (mesh.vertices[v][0] == mesh.vertices[best][0] &&
+             mesh.vertices[v][1] > mesh.vertices[best][1])) {
+            best = v;
+        }
+    }
+    return best;
+}
+
+// Ray casting. Used only to find a point inside a hole, where a wrong answer
+// on the ring itself costs nothing: the search that calls it wants clearance.
+bool pointInPolygon(const std::vector<Point> &poly, double px, double py) {
+    bool inside = false;
+    const size_t n = poly.size();
+    for (size_t i = 0, j = n - 1; i < n; j = i++) {
+        const double yi = poly[i][1], yj = poly[j][1];
+        if ((yi > py) == (yj > py)) continue;
+        const double x = (poly[j][0] - poly[i][0]) * (py - yi) / (yj - yi) + poly[i][0];
+        if (px < x) inside = !inside;
+    }
+    return inside;
+}
+
+} // namespace
+
 // ---------------------------------------------------------------------------
 // Construction
 // ---------------------------------------------------------------------------
@@ -237,6 +271,11 @@ void UMBER::initialize() {
     // annihilate from one that may not.
     buildRegions();
     combInitialField();
+    // Only with the holes kept: a cut mesh has none to wind around. The comb
+    // is what the winding is measured off, and re-running it over the
+    // corrected input is what makes the correction stick -- see
+    // unwindHoleHolonomy().
+    if (cutEdges.empty() && unwindHoleHolonomy()) combInitialField();
 
     x.resize(2 * nT);
     for (int t = 0; t < nT; ++t) {
@@ -376,29 +415,81 @@ std::unordered_set<UMBER::EdgeKey, UMBER::EdgeKeyHash> UMBER::singularitySeams()
         isExit[mesh->edges[e][1]] = 1;
     }
 
-    // Multi-source Dijkstra out of those: dist[v] is the distance to the
-    // nearest one and prev[v] the next step towards it.
-    std::vector<double> dist(nV, std::numeric_limits<double>::max());
-    std::vector<int> prev(nV, -1);
-    std::priority_queue<std::pair<double, int>, std::vector<std::pair<double, int>>,
-                        std::greater<std::pair<double, int>>> queue;
-    for (int v = 0; v < nV; ++v) {
-        if (!isExit[v]) continue;
-        dist[v] = 0.0;
-        queue.emplace(0.0, v);
+    // --- Which boundary component each exit belongs to ----------------------
+    //
+    // The outer loop first, by the rightmost boundary vertex: no hole reaches
+    // past the outside of the model. Everything else on the boundary is a
+    // hole, numbered so that the count below can be kept per hole.
+    std::vector<std::vector<int>> bAdj(nV);
+    for (const int e : mesh->boundaryEdges) {
+        bAdj[mesh->edges[e][0]].push_back(mesh->edges[e][1]);
+        bAdj[mesh->edges[e][1]].push_back(mesh->edges[e][0]);
     }
-    while (!queue.empty()) {
-        const auto [d, v] = queue.top();
-        queue.pop();
-        if (d > dist[v]) continue;
-        for (const auto &[nb, w] : adj[v]) {
-            if (dist[v] + w < dist[nb]) {
-                dist[nb] = dist[v] + w;
-                prev[nb] = v;
-                queue.emplace(dist[nb], nb);
+    std::vector<int> holeOf(nV, -1);          // -1: interior or on the outer loop
+    int holes = 0;
+    {
+        const int outer = outerBoundaryVertex(*mesh);
+        std::vector<char> seen(nV, 0);
+        if (outer >= 0) {
+            std::vector<int> stack{outer};
+            seen[outer] = 1;
+            while (!stack.empty()) {
+                const int v = stack.back();
+                stack.pop_back();
+                for (const int w : bAdj[v]) if (!seen[w]) { seen[w] = 1; stack.push_back(w); }
+            }
+        }
+        for (const int v : mesh->boundaryVertices) {
+            if (seen[v] || holeOf[v] >= 0) continue;
+            const int h = holes++;
+            std::vector<int> stack{v};
+            holeOf[v] = h;
+            seen[v] = 1;
+            while (!stack.empty()) {
+                const int x = stack.back();
+                stack.pop_back();
+                for (const int w : bAdj[x]) {
+                    if (holeOf[w] >= 0) continue;
+                    holeOf[w] = h;
+                    seen[w] = 1;
+                    stack.push_back(w);
+                }
             }
         }
     }
+
+    // Multi-source Dijkstra out of a set of exits: dist[v] is the distance to
+    // the nearest one and prev[v] the next step towards it. `blocked` is for
+    // the second of the two runs below.
+    auto runDijkstra = [&](const std::vector<char> &sources, const std::vector<char> &blocked,
+                           std::vector<double> &dist, std::vector<int> &prev) {
+        dist.assign(nV, std::numeric_limits<double>::max());
+        prev.assign(nV, -1);
+        std::priority_queue<std::pair<double, int>, std::vector<std::pair<double, int>>,
+                            std::greater<std::pair<double, int>>> queue;
+        for (int v = 0; v < nV; ++v) {
+            if (!sources[v]) continue;
+            dist[v] = 0.0;
+            queue.emplace(0.0, v);
+        }
+        while (!queue.empty()) {
+            const auto [d, v] = queue.top();
+            queue.pop();
+            if (d > dist[v]) continue;
+            for (const auto &[nb, w] : adj[v]) {
+                if (!blocked.empty() && blocked[nb]) continue;
+                if (dist[v] + w < dist[nb]) {
+                    dist[nb] = dist[v] + w;
+                    prev[nb] = v;
+                    queue.emplace(dist[nb], nb);
+                }
+            }
+        }
+    };
+
+    std::vector<double> dist;
+    std::vector<int> prev;
+    runDijkstra(isExit, std::vector<char>(), dist, prev);
 
     // --- The pairs that annihilate rather than leave ------------------------
     //
@@ -489,17 +580,137 @@ std::unordered_set<UMBER::EdgeKey, UMBER::EdgeKeyHash> UMBER::singularitySeams()
     }
 
     // --- Everything else keeps its route to dS ------------------------------
-    for (size_t i = 0; i < sing.size(); ++i) {
-        if (paired[i]) continue;
-        int cur = sing[i].first;
-        int guard = 0;
-        while (cur >= 0 && !isExit[cur] && guard++ < nV) {
-            const int nxt = prev[cur];
-            if (nxt < 0) break; // unreachable: leave this one to the traversal
-            seams.insert(EdgeKey(cur, nxt));
+    //
+    // Nearest exit, which is what the cut wants to be: short, so that the jump
+    // E_smooth has to remove is small, and -- because one Dijkstra's paths
+    // form a forest -- never crossing another cut, only merging with it.
+    //
+    // Where each one *lands*, though, is not free, and that is the whole of
+    // what the rest of this function is about. Follow each route to its exit
+    // first, and charge it to the hole it ends on.
+    auto walk = [&](int from, const std::vector<int> &parent,
+                    const std::vector<char> &stop, std::vector<EdgeKey> *out) {
+        int cur = from, guard = 0;
+        while (cur >= 0 && !stop[cur] && guard++ < nV) {
+            const int nxt = parent[cur];
+            if (nxt < 0) return -1;  // unreachable: leave this one to the traversal
+            if (out) out->emplace_back(cur, nxt);
             cur = nxt;
         }
+        return cur;
+    };
+
+    std::vector<int> landing(sing.size(), -1);
+    std::vector<int> charged(std::max(1, holes), 0);   // quarter turns, per hole
+    for (size_t i = 0; i < sing.size(); ++i) {
+        if (paired[i]) continue;
+        landing[i] = walk(sing[i].first, prev, isExit, nullptr);
+        if (landing[i] >= 0 && holeOf[landing[i]] >= 0)
+            charged[holeOf[landing[i]]] += sing[i].second;
     }
+
+    // --- What a hole may be charged -----------------------------------------
+    //
+    // A whole number of turns, and nothing else.
+    //
+    // Every rectilinear closed curve turns through a whole number of full
+    // turns, and an inner loop turns through exactly one, the other way from
+    // the outer loop: -4 quarters, however re-entrant the hole is. The
+    // geometry has already paid that. A defect leaving through the hole spends
+    // some of it -- four quarters take a circular hole from four reflex
+    // corners to none -- so any charge that is not a multiple of four leaves
+    // the hole's image turning through a fraction of a turn, which no
+    // rectilinear curve does, and the deformation has nothing to converge to.
+    //
+    // It is the same condition the comb needs. The combed representative jumps
+    // a quarter turn across each cut, so a loop drawn tight around the hole
+    // comes back rotated by the charge; unless that is a whole number of turns
+    // there is no single-valued vector field there at all, and Eq. (1) cannot
+    // descend to one -- it would have to pass through a field with an interior
+    // zero, which is a barrier and not a hill. On
+    // data/meshes/singlemat/geom026, two holes charged two quarters each, the
+    // optimization ends with four interior singularities it cannot shed and
+    // the deformation folds 2220 triangles.
+    //
+    // A whole number of turns that is not zero is left alone here and taken
+    // out later by unwindHoleHolonomy(), which can move a whole turn at no
+    // cost by parking it in the hole.
+    //
+    // The ones that have to move are sent to the outer loop instead, cheapest
+    // first, and only as many as the count needs. Sending *every* defect there
+    // is the obvious alternative and it is worse: the routes then all share
+    // one tree and merge into long common tails, and four quarter jumps merged
+    // into one tail is a full turn, which the comb reads as a defect of its
+    // own at the vertex where its two wavefronts meet. Measured on
+    // data/meshes/singlemat/geom012 that is one whole-turn defect the
+    // optimization never sheds and an outer loop reading 12 quarter turns
+    // instead of 4.
+    //
+    // The reroute also may not touch a hole on the way past. One Dijkstra's
+    // cuts are slits running in from the boundary, and a slit separates
+    // nothing; let one pass through a vertex of a hole's ring and the slit
+    // and the ring together cut the model in two, which is the same
+    // disjointness Sec. 4.1 imposes on its own cuts.
+    std::vector<int> rerouted;
+    bool needReroute = false;
+    for (int h = 0; h < holes; ++h) if (charged[h] % 4 != 0) needReroute = true;
+
+    std::vector<double> distOut;
+    std::vector<int> prevOut;
+    std::vector<char> outerExit;
+    if (needReroute) {
+        outerExit.assign(nV, 0);
+        for (const int v : mesh->boundaryVertices) if (holeOf[v] < 0) outerExit[v] = 1;
+        for (const int e : featureEdges) {
+            if (e < 0 || e >= static_cast<int>(mesh->edges.size())) continue;
+            outerExit[mesh->edges[e][0]] = 1;
+            outerExit[mesh->edges[e][1]] = 1;
+        }
+        std::vector<char> blocked(nV, 0);
+        for (const int v : mesh->boundaryVertices)
+            if (holeOf[v] >= 0 && !outerExit[v]) blocked[v] = 1;
+        runDijkstra(outerExit, blocked, distOut, prevOut);
+
+        std::vector<char> moved(sing.size(), 0);
+        for (int h = 0; h < holes; ++h) {
+            if (charged[h] % 4 == 0) continue;
+
+            std::vector<int> onThisHole;
+            for (size_t i = 0; i < sing.size(); ++i) {
+                if (paired[i] || landing[i] < 0) continue;
+                if (holeOf[landing[i]] == h) onThisHole.push_back(static_cast<int>(i));
+            }
+            std::sort(onThisHole.begin(), onThisHole.end(), [&](int a, int b) {
+                const double ca = distOut[sing[a].first] - dist[sing[a].first];
+                const double cb = distOut[sing[b].first] - dist[sing[b].first];
+                return ca < cb;
+            });
+            for (const int i : onThisHole) {
+                if (charged[h] % 4 == 0) break;
+                if (!(distOut[sing[i].first] < std::numeric_limits<double>::max())) continue;
+                charged[h] -= sing[i].second;
+                moved[i] = 1;
+                rerouted.push_back(i);
+            }
+            if (charged[h] % 4 != 0) {
+                std::cerr << "UMBER: a hole is charged " << charged[h]
+                          << " quarter turn(s), which is not a whole turn; its image "
+                          << "cannot be rectilinear.\n";
+            }
+        }
+        for (size_t i = 0; i < sing.size(); ++i) if (moved[i]) landing[i] = -2;
+    }
+
+    for (size_t i = 0; i < sing.size(); ++i) {
+        if (paired[i]) continue;
+        std::vector<EdgeKey> path;
+        const bool viaOuter = (landing[i] == -2);
+        const int end = viaOuter ? walk(sing[i].first, prevOut, outerExit, &path)
+                                 : walk(sing[i].first, prev, isExit, &path);
+        if (end < 0) continue;   // unreachable: leave this one to the traversal
+        for (const EdgeKey &k : path) seams.insert(k);
+    }
+    seamsRerouted = static_cast<int>(rerouted.size());
 
     return seams;
 }
@@ -542,8 +753,10 @@ void UMBER::combInitialField() {
 
     std::vector<char> visited(nT, 0);
     std::deque<int> queue;
+    combComponents = 0;
     for (int seed = 0; seed < nT; ++seed) {
         if (visited[seed]) continue;
+        ++combComponents;
 
         // A new seed means the non-cut dual graph is disconnected (the cuts
         // separate a piece of the domain). Each component is combed on its own
@@ -576,6 +789,218 @@ void UMBER::combInitialField() {
         vField[t] = rotateVector(uField[t], 1);
         angles[t] = computeAngle(uField[t]);
     }
+}
+
+// ---------------------------------------------------------------------------
+// unwindHoleHolonomy()
+//
+// The combed field is single-valued -- singularitySeams() saw to that by
+// keeping every defect's exit off the holes -- but single-valued is not
+// enough. Around a hole the field may still rotate through a whole number of
+// turns, and only one of those numbers has a polysquare.
+//
+// Take the flat annulus. Two boundary-aligned fields on it with no interior
+// zero: the *rotational* one, which follows the two circles round and rotates
+// once per loop, and the *constant* one, which points along a fixed axis and
+// is aligned only at four points of each circle. The constant field is the
+// square annulus -- four convex corners outside, four reflex inside, four
+// blocks. The rotational field is the cornerless ring: the image of each
+// circle turns through a full turn with no corner anywhere on it, so the ring
+// is one face with no four corners to find, and `BlockLayout` refuses it
+// whole. That is the closed-form polysquare Sec. 4.1 is built to reach, and it
+// is exactly what a block decomposition cannot use.
+//
+// Eq. (1) will not choose between them, and not because the weights are
+// wrong. The two fields are in different homotopy classes of maps from the
+// annulus to the circle of directions, and every path between them passes
+// through a field with an interior zero. Descent does not cross that: it is a
+// barrier, not a hill, and no schedule on w_a or w_r changes it. Measured on
+// data/meshes/singlemat, geom006 and geom021 -- both annuli -- came out of the
+// optimization with 0 of the 4 quarter turns their outer loop needs and 0 of
+// the -4 their hole needs, every corner cancelled against its neighbour, and
+// the deformation that followed flipped 308 triangles trying to flatten a ring
+// that has no flattening.
+//
+// So the class is chosen here, once, before the optimization starts. The
+// rotation number m_h around hole h is measured off the combed field and the
+// field is multiplied by the unit direction of (z - c_h)^(-m_h), c_h any point
+// strictly inside the hole. That factor is smooth and non-vanishing
+// everywhere on the model precisely because c_h is *not* on the model -- the
+// hole is not part of the domain, so a defect may be parked in it for free --
+// and it subtracts 2 pi m_h from the rotation around that hole while leaving
+// every other loop alone. What comes out is the same field in the one class
+// the rest of the pipeline can use, and Eq. (1) then does what it always did.
+//
+// A no-op on a simply connected model, and a no-op when Sec. 4.1's cuts are in
+// use: a cut mesh has no hole left to wind around, and the winding it would
+// have had is the free transition Pi_gamma instead.
+// ---------------------------------------------------------------------------
+bool UMBER::unwindHoleHolonomy() {
+    const int nV = static_cast<int>(mesh->vertices.size());
+    const int nT = static_cast<int>(mesh->triangles.size());
+    if (mesh->boundaryEdges.empty()) return false;
+
+    const int outerSeed = outerBoundaryVertex(*mesh);
+    if (outerSeed < 0) return false;
+
+    // --- The boundary loops, as ordered rings -------------------------------
+    std::vector<std::vector<int>> vbe(nV);
+    for (const int e : mesh->boundaryEdges) {
+        vbe[mesh->edges[e][0]].push_back(e);
+        vbe[mesh->edges[e][1]].push_back(e);
+    }
+
+    std::vector<char> usedEdge(mesh->edges.size(), 0);
+    std::vector<double> delta(nT, 0.0);
+    int corrected = 0;
+
+    for (const int e0 : mesh->boundaryEdges) {
+        if (usedEdge[e0]) continue;
+
+        std::vector<int> ringV, ringE;
+        int prevEdge = e0, v = mesh->edges[e0][1];
+        ringV.push_back(mesh->edges[e0][0]);
+        ringE.push_back(e0);
+        usedEdge[e0] = 1;
+        bool closed = false;
+        for (int guard = 0; guard <= nV; ++guard) {
+            ringV.push_back(v);
+            if (v == ringV.front()) { ringV.pop_back(); closed = true; break; }
+            if (vbe[v].size() != 2) break;   // a pinch: not a loop this can walk
+            const int e = (vbe[v][0] != prevEdge) ? vbe[v][0] : vbe[v][1];
+            if (usedEdge[e]) break;
+            usedEdge[e] = 1;
+            ringE.push_back(e);
+            prevEdge = e;
+            v = (mesh->edges[e][0] == v) ? mesh->edges[e][1] : mesh->edges[e][0];
+        }
+        if (!closed || ringV.size() < 3) continue;
+
+        // The outer loop keeps whatever rotation the interior defects give it;
+        // it is the holes that have to be put in class zero.
+        bool isOuter = false;
+        for (const int w : ringV) if (w == outerSeed) { isOuter = true; break; }
+        if (isOuter) continue;
+
+        // Walk it counter-clockwise as a plain polygon, so that the sign of
+        // the holonomy and the sign of the correction agree.
+        double area2 = 0.0;
+        for (size_t i = 0; i < ringV.size(); ++i) {
+            const Point &a = mesh->vertices[ringV[i]];
+            const Point &b = mesh->vertices[ringV[(i + 1) % ringV.size()]];
+            area2 += a[0] * b[1] - b[0] * a[1];
+        }
+        if (area2 < 0.0) {
+            std::reverse(ringV.begin(), ringV.end());
+            std::reverse(ringE.begin(), ringE.end());
+        }
+
+        // --- The rotation of the field around the ring ----------------------
+        // One triangle per boundary edge -- the only one it has -- taken in
+        // ring order, and the wrapped differences summed around the cycle.
+        std::vector<int> strip;
+        strip.reserve(ringE.size());
+        for (const int e : ringE) {
+            const int t = (mesh->edgeTriangles[e][0] >= 0) ? mesh->edgeTriangles[e][0]
+                                                           : mesh->edgeTriangles[e][1];
+            if (t >= 0) strip.push_back(t);
+        }
+        if (strip.size() < 3) continue;
+
+        double holonomy = 0.0;
+        for (size_t i = 0; i < strip.size(); ++i) {
+            const double a = computeAngle(uField[strip[i]]);
+            const double b = computeAngle(uField[strip[(i + 1) % strip.size()]]);
+            holonomy += wrap_pi(b - a);
+        }
+        const int m = static_cast<int>(std::lround(holonomy / (2.0 * M_PI)));
+        const double residual = std::fabs(holonomy - 2.0 * M_PI * m);
+        if (residual > 0.5 * M_PI) {
+            // Not near a whole turn: the walk aliased, or a defect is sitting
+            // on the ring. Correcting by a rounded m would be guesswork, and
+            // the count that follows will show what it cost.
+            std::cerr << "UMBER: a hole's field rotates " << (holonomy * 180.0 / M_PI)
+                      << " deg, not a whole number of turns; left uncorrected.\n";
+            continue;
+        }
+        if (m == 0) continue;
+
+        // --- Where to park the defect ---------------------------------------
+        // Any point strictly inside the hole does; the centroid unless the
+        // hole is re-entrant enough to put it back on the model, and then the
+        // clearest point of a coarse grid over the ring's box.
+        std::vector<Point> poly;
+        poly.reserve(ringV.size());
+        for (const int w : ringV) poly.push_back(mesh->vertices[w]);
+
+        Point c{0.0, 0.0};
+        for (const Point &p : poly) { c[0] += p[0]; c[1] += p[1]; }
+        c[0] /= static_cast<double>(poly.size());
+        c[1] /= static_cast<double>(poly.size());
+
+        if (!pointInPolygon(poly, c[0], c[1])) {
+            double lo[2] = {poly[0][0], poly[0][1]}, hi[2] = {poly[0][0], poly[0][1]};
+            for (const Point &p : poly) {
+                lo[0] = std::min(lo[0], p[0]); hi[0] = std::max(hi[0], p[0]);
+                lo[1] = std::min(lo[1], p[1]); hi[1] = std::max(hi[1], p[1]);
+            }
+            double bestClear = -1.0;
+            const int N = 32;
+            for (int i = 1; i < N; ++i) {
+                for (int j = 1; j < N; ++j) {
+                    const double px = lo[0] + (hi[0] - lo[0]) * i / N;
+                    const double py = lo[1] + (hi[1] - lo[1]) * j / N;
+                    if (!pointInPolygon(poly, px, py)) continue;
+                    double clear = std::numeric_limits<double>::max();
+                    for (const Point &p : poly) {
+                        const double dx = p[0] - px, dy = p[1] - py;
+                        clear = std::min(clear, dx * dx + dy * dy);
+                    }
+                    if (clear > bestClear) { bestClear = clear; c = Point{px, py}; }
+                }
+            }
+            if (bestClear < 0.0) {
+                std::cerr << "UMBER: could not find a point inside a hole; "
+                          << "its rotation is left uncorrected.\n";
+                continue;
+            }
+        }
+
+        for (int t = 0; t < nT; ++t) {
+            const Triangle &tri = mesh->triangles[t];
+            const double cx = (mesh->vertices[tri[0]][0] + mesh->vertices[tri[1]][0] +
+                               mesh->vertices[tri[2]][0]) / 3.0;
+            const double cy = (mesh->vertices[tri[0]][1] + mesh->vertices[tri[1]][1] +
+                               mesh->vertices[tri[2]][1]) / 3.0;
+            delta[t] -= m * std::atan2(cy - c[1], cx - c[0]);
+        }
+        ++corrected;
+    }
+
+    if (corrected == 0) return false;
+
+    // The correction goes on the *input* directions and the comb is run again
+    // over them, rather than on the combed field. The two are not the same
+    // thing. A comb that has closed a loop around a hole has already committed
+    // to a branch on the far side of it, and the quarter turns it spent
+    // getting there are in the field as a defect sitting wherever its two
+    // wavefronts met -- measured on data/meshes/singlemat/geom012, one vertex
+    // carrying a whole turn. Multiplying that field by a smooth factor moves
+    // the defect, it does not remove it. Correcting the input first and
+    // combing the result leaves the comb nothing to close around: the
+    // holonomy it would have had to absorb is gone before it starts.
+    //
+    // The correction does not disturb what the comb is combing. It is a
+    // rotation by a continuously varying angle, so it changes the cross field
+    // it acts on, but not the winding of that cross field at any vertex -- it
+    // never vanishes -- and so not one of the seams either.
+    for (int t = 0; t < nT; ++t) {
+        const double s = std::sin(delta[t]), co = std::cos(delta[t]);
+        const Point u = initialDirections[t];
+        initialDirections[t] = Point{co * u[0] - s * u[1], s * u[0] + co * u[1]};
+    }
+    holesUnwound = corrected;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1053,35 +1478,86 @@ std::vector<std::pair<int, int>> UMBER::boundarySingularities() const {
     // A running total, and the vertex that carries it past the next halfway
     // mark gets the corner. Equivalent to rounding vertex by vertex wherever a
     // corner is sharp, and correct where it is not.
+    //
+    // With one limit on top of that, and it is not a refinement: no vertex may
+    // be handed more than `maxCornerQuarters` at once (see the setter). A
+    // corner of a polysquare turns one quarter. Two quarters at one vertex is
+    // an interior angle of zero in the image -- a needle, of no width at all --
+    // and a needle is not a shape a quad can be laid on: the face at its tip
+    // closes with three sides, 180 + 90 + 90, and no amount of tracing makes it
+    // four. So the surplus is not rounded away, which would break the loop's
+    // Gauss-Bonnet count, but *carried* to the next vertex along, which spends
+    // it as a second ordinary corner one edge further on. The needle becomes a
+    // blunt end one edge wide, and every face around it is a rectangle.
+    //
+    // This is the same discipline singularitySeams() applies to a hole's
+    // charge, one level down: the budget is fixed by the geometry and only its
+    // distribution is ours to choose, so where a distribution has no
+    // rectilinear realization it is the distribution that has to move.
     std::vector<char> visited(nV, 0);
 
     for (int seed : mesh->boundaryVertices) {
         if (visited[seed] || boundaryDegree[seed] != 2) continue;
 
+        // The loop in order first, so that a quarter turn the cap could not
+        // place on the vertex that earned it has somewhere to go. Walking and
+        // handing out at the same time cannot do that: the carry from the last
+        // vertex of the walk has no next vertex to be given to.
+        std::vector<int> loop;
+        {
+            int v = seed;
+            int prevEdge = -1;
+            while (v >= 0 && !visited[v]) {
+                visited[v] = 1;
+                loop.push_back(v);
+                // A pinch (more than two boundary edges) has no unambiguous
+                // next, so the walk stops and whatever is left of the running
+                // total is dropped with it.
+                if (boundaryDegree[v] != 2) break;
+                const int e = (incidentBoundary[v][0] != prevEdge) ? incidentBoundary[v][0]
+                                                                   : incidentBoundary[v][1];
+                prevEdge = e;
+                v = otherEnd(e, v);
+            }
+        }
+        if (loop.empty()) continue;
+
+        const long cap = std::max(1, maxCornerQuarters);
+        std::vector<int> give(loop.size(), 0);
         double running = 0.0;
         long handedOut = 0;
-        int v = seed;
-        int prevEdge = -1;
 
-        while (v >= 0 && !visited[v]) {
-            visited[v] = 1;
-            if (measured[v]) running += raw[v];
-
-            const long want = std::lround(running);
-            if (want != handedOut) {
-                result.emplace_back(v, static_cast<int>(want - handedOut));
-                handedOut = want;
+        for (size_t i = 0; i < loop.size(); ++i) {
+            if (measured[loop[i]]) running += raw[loop[i]];
+            long step = std::lround(running) - handedOut;
+            if (step > cap) step = cap;
+            else if (step < -cap) step = -cap;
+            if (step != 0) {
+                give[i] = static_cast<int>(step);
+                handedOut += step;
             }
-
-            // Step to the next vertex of the loop. A pinch (more than two
-            // boundary edges) has no unambiguous next, so the walk stops and
-            // whatever is left of `running` is dropped with it.
-            if (boundaryDegree[v] != 2) break;
-            const int e = (incidentBoundary[v][0] != prevEdge) ? incidentBoundary[v][0]
-                                                              : incidentBoundary[v][1];
-            prevEdge = e;
-            v = otherEnd(e, v);
         }
+
+        // What the cap held back at the tail of the walk, placed on the next
+        // free vertices round the loop. Rare -- it needs a corner in the last
+        // few vertices of an arbitrary starting point -- and it has to be done,
+        // or the loop no longer turns through a whole turn.
+        long left = std::lround(running) - handedOut;
+        for (size_t pass = 0; left != 0 && pass < loop.size(); ++pass) {
+            const int step = (left > 0) ? 1 : -1;
+            bool placed = false;
+            for (size_t i = 0; i < loop.size(); ++i) {
+                if (give[i] != 0) continue;
+                give[i] = step;
+                left -= step;
+                placed = true;
+                break;
+            }
+            if (!placed) break;   // every vertex already carries one
+        }
+
+        for (size_t i = 0; i < loop.size(); ++i)
+            if (give[i] != 0) result.emplace_back(loop[i], give[i]);
     }
 
     return result;

@@ -326,6 +326,28 @@ public:
     // the free transitions carry part of the total and the sum need not match.
     std::vector<std::pair<int, int>> boundarySingularities() const;
 
+    // The most quarter turns boundarySingularities() will put on one vertex.
+    //
+    // 1, and it is a structural limit rather than a tuning knob. A corner of a
+    // polysquare turns through one quarter; a vertex carrying two turns the
+    // image boundary through 180 degrees, which is an interior angle of zero --
+    // a needle of no width. Nothing downstream survives one. The face at a
+    // needle's tip has three sides, not four, because 180 + 90 + 90 already
+    // closes it, so the tip costs the block decomposition that face whatever
+    // the tracing does; on data/meshes/singlemat/geom028, a six-pointed star
+    // whose 40.5-degree tips each read 1.55 quarters and round to 2, it cost
+    // five faces and 20.9% of the model.
+    //
+    // The cap does not round the surplus away -- that would break the
+    // Gauss-Bonnet count the whole stage rests on -- it carries it to the next
+    // vertex along, which spends it as a second ordinary corner. A sharp tip
+    // comes out as a blunt end one edge wide, which is what a polysquare's
+    // version of a sharp tip is.
+    //
+    // Raising it restores the old behaviour, and is here to measure against.
+    void setMaxCornerQuarters(int q) { maxCornerQuarters = q; }
+    int getMaxCornerQuarters() const { return maxCornerQuarters; }
+
     // ── The same reading, taken along the material interfaces ───────────────
     //
     // boundarySingularities() answers "where does the frame put a corner of
@@ -391,6 +413,19 @@ public:
     // number of L-BFGS iterations over all continuation stages.
     double gradientNorm() const { return currentGradNorm; }
     int iterations() const { return totalIterations; }
+
+    // Holes whose rotation number the initialization had to unwind -- see
+    // unwindHoleHolonomy(). Nonzero means the smoothest field on this model
+    // was a cornerless ring and the one with a polysquare had to be asked for.
+    int unwoundHoles() const { return holesUnwound; }
+
+    // How many pieces the branch cuts left the comb's dual graph in; 1 is the
+    // healthy case. See combInitialField().
+    int combPieces() const { return combComponents; }
+
+    // Branch cuts that had to be sent past the hole they were nearest; see
+    // singularitySeams().
+    int reroutedSeams() const { return seamsRerouted; }
 
     // Interior edges, cuts excluded, where the frame turns by more than
     // `thresholdDegrees` between the two triangles, as (edge index, degrees),
@@ -474,6 +509,26 @@ private:
     // Breadth-first comb of the initial directions over the dual graph,
     // stopping at the cut edges and at the branch cuts. See initialize().
     void combInitialField();
+
+    // Put the combed field in the one homotopy class that has a polysquare:
+    // zero total rotation around every hole. A no-op on a simply connected
+    // model and whenever the cuts of Sec. 4.1 are being used, since a cut mesh
+    // has no hole to wind around. See the implementation -- this is a choice
+    // Eq. (1) cannot make for itself, because the classes are separated by
+    // fields with an interior zero and descent does not cross those.
+    bool unwindHoleHolonomy();   // true if it changed anything
+    int holesUnwound = 0;
+    // Components the comb's dual graph fell into. One is the healthy case:
+    // more means the branch cuts separated a piece of the model and the comb
+    // had to guess a branch there, which shows up as an interior defect the
+    // optimization cannot shed. See combInitialField().
+    int combComponents = 0;
+    // Branch cuts sent to the outer loop rather than to the hole they were
+    // nearest, so that the hole's charge came out a whole number of turns.
+    // See singularitySeams().
+    mutable int seamsRerouted = 0;
+    // The cap of setMaxCornerQuarters(), which see.
+    int maxCornerQuarters = 1;
 
     // The edge two triangles of a vertex star share, -1 if they share none.
     int sharedEdge(int ta, int tb) const;

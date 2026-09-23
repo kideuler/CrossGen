@@ -111,6 +111,11 @@ public:
         // is the number that catches it.
         double worstSegmentDeg = 0.0;
         int suspectSegments = 0;        // segments past 10 degrees
+        // Whether the boundary could be put exactly on its axes without
+        // folding the map, or whether it had to keep the pull instead. See the
+        // end of optimize(); false is not a failure, it is a shape whose image
+        // Sec. 4.3 could not make rectilinear.
+        bool snapWasExact = false;
         // Corner coordinates moved onto a shared iso-line by snapCorners(),
         // the largest such move in mean image boundary edges, and the clusters
         // it had to leave alone because two corners it could not move disagreed.
@@ -336,7 +341,7 @@ private:
         std::vector<int> verts;   // cut-mesh vertices
     };
 
-    void snapBoundary();         // Eq. (23), the boundary constraint
+    void snapBoundary();         // Eq. (23), as the targets of the pull above
     // Give runs that lie on one iso-line one coordinate between them.
     void alignRuns(std::vector<Run> &runs);
     void snapCorners();          // corners that share an iso-line put on one
@@ -418,7 +423,22 @@ private:
     int pinnedVertex = -1;
 
     Eigen::VectorXd x;        // 2*nIndep free coordinates, then 2*nCuts translations
-    std::vector<char> fixedX; // components snapBoundary() nailed down
+    // The boundary alignment of Eq. (23), as a pull rather than a constraint.
+    // hasTarget[i] says component i of x was given one, targetX[i] is the
+    // coordinate its segment wants and targetW[i] its share of the image
+    // boundary, so that a long run outweighs a short one. snapWeight is w_s of
+    // the continuation in optimize(); 0 leaves the term out entirely.
+    std::vector<char> hasTarget;
+    std::vector<double> targetX;
+    std::vector<double> targetW;
+    double snapWeight = 0.0;
+    // Whether the pull is being imposed as a constraint instead; see the end
+    // of optimize().
+    bool snapHard = false;
+    // w_s per stage. Four decades: the last one holds a boundary vertex to
+    // about a thousandth of an image edge of its axis where that is possible
+    // at all, which is two orders under anything the tracing can resolve.
+    std::vector<double> snapSchedule{1.0, 10.0, 100.0, 1000.0};
     std::vector<Point> uv;    // per cut-mesh vertex
 
     std::vector<double> l1Schedule{0.125, 0.25, 0.5, 1.0, 2.0};
