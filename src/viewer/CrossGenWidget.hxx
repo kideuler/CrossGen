@@ -38,6 +38,7 @@
 #include "polyvector/PolyVectors.hxx"
 #include "crossfield/CrossField.hxx"
 #include "dualMBO/DualMBO.hxx"
+#include "tracing/LayoutBlocks.hxx"
 #include "tracing/PartitionSimplify.hxx"
 #include "tracing/QuadLayout.hxx"
 #include "tracing/SeparatrixTrace.hxx"
@@ -78,12 +79,35 @@ enum class Phase {
     CutSeams     = 4,
 };
 
-// The last two stages quantize the block decomposition tracing left (Sec. 4
-// of Viertel et al. is a block decomposition already -- a QuadLayout's faces
-// are its blocks -- so this runs the same Campen et al. 2015 quantizer the
-// MedialAxisPhase stages below do, on the T-mesh a QuadLayout converts to
-// directly). Split the same way, so the console reports the solve before the
-// picture that depends on it.
+// Mode 2 is Viertel, Osting and Staten (IMR 2019): the P1 MBO cross field,
+// its separatrices (Sec. 3), the quad layout with T-junctions they cut out, and
+// the partition simplification of Sec. 4.
+//
+// Quantize and Quantized run the Campen et al. 2015 quantizer on that T-layout
+// (a QuadLayout's faces are its blocks, T-junctions and all, so this is the
+// same solve the MedialAxisPhase stages below run, on the T-mesh a QuadLayout
+// converts to directly). Split the same way, so the console reports the solve
+// before the picture that depends on it. They are a detour: the three phases
+// after them do not read them.
+//
+// The last three finish the method the way every other mode is finished:
+//
+//   Blocks     the simplified layout as the shared BlockDecomposition, on
+//              spline geometry (tracing/LayoutBlocks.hxx): each shared side
+//              fitted once as a cubic B-spline, each block its Coons patch.
+//              Drawn as every mode draws its blocks -- light-blue sides, green
+//              macrovertices -- over the whole layout in grey. A component
+//              with a T-junction on a side is not a block, since T-junctions
+//              are not meshed yet: the junction is a red disk and the
+//              component is shaded, and the shading is the part of the model
+//              with no block on it, which the console prints as a coverage.
+//   Mesh       mesh/BlockQuadMesh on those blocks, on the dialog and the
+//              target edge length every mode shares ('e' re-opens it). The
+//              refused components stay shaded and the T-junctions red.
+//   Smoothed   mesh::TMOP, the same dialog and solve as the other modes' last
+//              phase ('c' re-opens it), with mu at the element corners for the
+//              reason ATLAS and UMBER have: a transfinite grid on a block
+//              decomposition.
 enum class MBOPhase {
     MeshOnly    = 1,
     CrossField  = 2,
@@ -94,6 +118,9 @@ enum class MBOPhase {
     Simplified  = 7,
     Quantize    = 8,
     Quantized   = 9,
+    Blocks      = 10,
+    Mesh        = 11,
+    Smoothed    = 12,
 };
 
 // UMBER borrows the first three DualMBO stages verbatim -- its input *is* a
@@ -441,6 +468,10 @@ private:
     // BlockQuadMesh on the current decomposition at those settings, reported
     // line for line as ATLAS's and Stage 10's meshes are.
     void runUMBERMesh();
+    // The mesh dialog and the mesh report both block-decomposition modes
+    // (UMBER, and the tracing of mode 2) share.
+    bool promptBlockQuadMesh(const BlockDecomposition &decomp, const char *title);
+    void reportBlockQuadMesh(const BlockQuadMesh &bqm, double ms);
 
     // The mesh with the optimized frame, its cuts and its boundary corners --
     // the left half of the split screen, and the whole of the Frames phase.
@@ -673,6 +704,11 @@ private:
     // skip. Empty until traceQuant_ exists.
     std::vector<int> hangingTJunctions() const;
 
+    // Mode 2's last three phases: the blocks, the mesh on them, and its dialog.
+    void buildTraceBlocks();
+    bool promptTraceMesh();
+    void runTraceMesh();
+
     // rendering sub-routines called from paintGL
     void renderMBOAnimation();
     void renderDualMBOAnimation();
@@ -741,6 +777,14 @@ private:
     // for the same reason. Built from simplified_ and cleared with it.
     std::optional<QuadLayoutQuant> traceQuant_;
     TMeshQuantizer::Report traceQuantReport_;
+    // simplified_'s layout as blocks on spline geometry, and the mesh on them
+    // (MBOPhase::Blocks and Mesh). Both copy what they need, so neither holds
+    // on to the layout.
+    std::optional<LayoutBlocks> traceBlocks_;
+    std::optional<BlockQuadMesh> traceMesh_;
+    // Triangles of the model inside a component that is not a block, found
+    // once when the blocks are built: the uncovered area, filled.
+    std::vector<int> traceUncoveredTris_;
     std::shared_ptr<Mesh>      delaunayMesh_;
     std::shared_ptr<MedialAxis> medialAxis_;
     // The Sec. 3 map phi from the boundary to the axis above; holds a
@@ -938,6 +982,7 @@ private:
     bool polysquareAttempted_  = false;
     bool blocksAttempted_      = false;
     bool umberMeshAttempted_   = false;
+    bool traceMeshAttempted_   = false;
     // One-shot discipline for the three MERIDIAN stages. Each is attempted once
     // per run and not retried: a failure leaves its optional empty, and keying
     // off the optional alone would run the whole stage again on every frame --
@@ -1106,6 +1151,11 @@ private:
     // it worse -- on singlemat/geom012 the worst scaled Jacobian goes 0.033 ->
     // 0.162 at the corners and 0.033 -> 0.012 at the 2x2 Gauss points.
     TMOPSettings umberTmopSettings_ = [] { TMOPSettings t; t.corners = true; return t; }();
+    // Mode 2's, for the same reason again: its mesh is BlockQuadMesh's
+    // transfinite grid, exactly UMBER's kind of mesh.
+    TMOPSettings traceTmopSettings_ = [] { TMOPSettings t; t.corners = true; return t; }();
+    // The copy above that the current mode's TMOP dialog and solve both use.
+    TMOPSettings &tmopSettingsForMode();
 
     // The connectivity settings of Stages 5 to 7, likewise surviving a reset.
     // Defaults are the library's own, so the dialog opens on the recommended

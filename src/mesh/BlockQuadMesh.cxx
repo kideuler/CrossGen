@@ -159,6 +159,13 @@ BlockQuadMesh::BlockQuadMesh(const BlockDecomposition &D, const Options &opts) :
 
     assignIntervals(D);
     meshEdges(D);
+    for (size_t e = 0; e < D.edges.size(); ++e) {
+        const BlockDecomposition::MacroEdge &me = D.edges[e];
+        if (me.boundary || me.blockB >= 0 || me.blockA < 0) continue;
+        for (const int v : edgeNodes_[e]) openVerts_.push_back(v);
+    }
+    std::sort(openVerts_.begin(), openVerts_.end());
+    openVerts_.erase(std::unique(openVerts_.begin(), openVerts_.end()), openVerts_.end());
     meshBlocks(D);
     smooth();
     check(D);

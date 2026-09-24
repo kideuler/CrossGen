@@ -121,7 +121,20 @@ public:
     // the interpolated representation vector vanishes, instead of taking the
     // barycentre. It is the better centre when the solve lands inside the
     // triangle and nonsense when it does not, so it falls back on its own.
-    explicit FieldTracer(std::shared_ptr<CrossField> cf, bool useExactCenters = true);
+    //
+    // `boundaryTriangles` false skips every triangle with a vertex on the
+    // boundary when looking for singularities, which is what
+    // CrossField::computeSingularities does; see buildSingularities() for why
+    // the default is not to.
+    //
+    // `absorbAt`, one flag per vertex, names vertices whose incident singular
+    // triangles are not singularities of the layout: the nodes of a material
+    // interface network, which the layout turns at by their sectors
+    // (SeparatrixTrace) and where a field that could not be aligned to every
+    // incident interface turns instead. Their index is kept in
+    // absorbedIndexSum4() and they emit nothing.
+    explicit FieldTracer(std::shared_ptr<CrossField> cf, bool useExactCenters = true,
+                         bool boundaryTriangles = true, std::vector<char> absorbAt = {});
 
     const Mesh &getMesh() const { return *mesh; }
     std::shared_ptr<CrossField> getCrossField() const { return crossField; }
@@ -131,6 +144,26 @@ public:
 
     // -1 when the triangle carries no singularity.
     int singularityOfTriangle(int f) const { return singularityOf[f]; }
+
+    // Four times the sum of the indices of every singular triangle found,
+    // i.e. sum d, dropped ones included -- the interior half of the
+    // Poincare-Hopf check SeparatrixTrace makes (docs/viertel_2019.md Sec. 3.2).
+    int interiorIndexSum4() const { return indexSum4; }
+    // Triangles of index |d| >= 2, which the paper does not treat.
+    int multipleSingularityCount() const { return multipleSingularities; }
+    // Triangles whose index leaves the local model fewer than two sectors or
+    // more than eight (d >= 3, d <= -5): no ports, so they emit nothing.
+    int droppedSingularityCount() const { return droppedSingularities; }
+    // Singular triangles at an `absorbAt` vertex, and four times their index.
+    int absorbedSingularityCount() const { return absorbedSingularities; }
+    int absorbedIndexSum4() const { return absorbedIndex4; }
+    // Per vertex: four times the index absorbed there -- the field's own
+    // winding round an `absorbAt` vertex, where it is not a singularity to
+    // trace from but a count the node's sectors have to agree with. A
+    // triangle touching two such vertices is charged to the first.
+    int absorbedIndexAt(int v) const {
+        return (v >= 0 && v < static_cast<int>(absorbedAt.size())) ? absorbedAt[v] : 0;
+    }
 
     double averageEdgeLength() const { return avgEdge; }
 
@@ -188,7 +221,8 @@ private:
     Status crossEdge(Walker &w, int f, int edge, double along, const Point &hit,
                      double outTheta, double chordDir) const;
 
-    void buildSingularities(bool useExactCenters);
+    void buildSingularities(bool useExactCenters, bool boundaryTriangles,
+                            const std::vector<char> &absorbAt);
 
     std::shared_ptr<CrossField> crossField;
     const Mesh *mesh = nullptr;
@@ -196,6 +230,12 @@ private:
     std::vector<double> vertexTheta;   // arg(u_v)/4, the principal representative
     std::vector<Singularity> singularities;
     std::vector<int> singularityOf;    // triangle -> index into singularities, or -1
+    int indexSum4 = 0;
+    int multipleSingularities = 0;
+    int droppedSingularities = 0;
+    int absorbedSingularities = 0;
+    int absorbedIndex4 = 0;
+    std::vector<int> absorbedAt;
 
     double avgEdge = 1.0;
     double vertexSnap = 1e-9;          // distance below which a point is taken to be a vertex

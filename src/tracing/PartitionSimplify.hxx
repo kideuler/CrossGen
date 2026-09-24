@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "tracing/QuadLayout.hxx"
+#include "tracing/StemExtension.hxx"
 
 // ---------------------------------------------------------------------------
 // Partition simplification: Sec. 4 of Viertel, Osting and Staten, IMR 2019,
@@ -63,7 +64,8 @@ public:
         TJunctionHasNowhereToGo,   // condition 3
         NoPatches,
         Energy,                // Sec. 4.1
-        Drag                   // Settings::maxDrag
+        Drag,                  // Settings::maxDrag
+        RungAcrossInterface    // a rung from an interface to another curve of the model
     };
     static const char *blockName(Block b);
 
@@ -138,6 +140,14 @@ public:
         double sliverSide = 0.5;
         bool removeSlivers = true;
 
+        // docs/viertel_2019.md Sec. 12: once no chord is left to collapse,
+        // trace the stem of every T-junction that remains on through the side
+        // it stopped on to the boundary (StemExtension), and then collapse
+        // again. Needs the field, so it runs only when the layout handed in
+        // was built from a trace (QuadLayout::getTrace()).
+        bool extendStems = true;
+        StemExtension::Settings stems;
+
         int maxCollapses = 100000;
     };
 
@@ -159,7 +169,12 @@ public:
         int blockCount[12] = {0};
         // Which part of Proposition 2 the rolled-back ones broke.
         int rbCrossings = 0, rbDangling = 0, rbNotFewer = 0, rbMoreT = 0, rbSing = 0, rbArea = 0,
-            rbWorse = 0, rbFailed = 0, rbSpur = 0, rbLens = 0;
+            rbWorse = 0, rbFailed = 0, rbSpur = 0, rbLens = 0, rbInterface = 0;
+        // Settings::extendStems: what the continuation pass did, and the
+        // T-junctions there were before it and after the collapses that
+        // followed it.
+        StemExtension::Report stems;
+        int tJunctionsBeforeStems = 0;
     };
 
     PartitionSimplify(const QuadLayout &layout, const Settings &settings);
@@ -190,7 +205,8 @@ private:
         std::vector<int> darts;   // in the traversal order of the component that owns them
         int endL = -1, endR = -1;
         double length = 0.0;
-        bool onBoundary = false;
+        bool onBoundary = false;   // a piece of dS or of an interface (a curve of the model)
+        bool onInterface = false;  // ... of an interface
         bool contractible = true; // no node other than a plain join sits along it
     };
 
@@ -233,7 +249,10 @@ private:
     bool collapse(const Chord &c);
 
     bool isSingularity(int node) const;
+    // On dS or on an interface: a curve of the model, which nothing may leave.
     bool isOnBoundary(int node) const;
+    bool isOnInterface(int node) const;
+    bool isNetworkNode(int node) const;
     // The arc a T-junction's own separatrix ends along, as opposed to the two
     // that carry the side it ended on.
     int stemArcOf(int node) const;
@@ -244,6 +263,7 @@ private:
     std::vector<Chord> chords_;
     std::vector<ChordSummary> chordSummaries_;
     std::vector<int> faceOfDart_;
+    const FieldTracer *tracer_ = nullptr;   // from the layout's trace, for extendStems
     double tol_ = 1e-9;
     double meshEdge_ = 0.0;   // mean edge of the model, the scale maxDrag is in
 

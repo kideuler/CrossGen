@@ -46,7 +46,9 @@ public:
         Crossing,        // where two separatrices cross
         Heteroclinic,    // where two separatrices were joined head-on into one curve
         TJunction,       // where a separatrix stopped on another one
-        Dangling         // a free end: a separatrix that stopped on nothing at all
+        Dangling,        // a free end: a separatrix that stopped on nothing at all
+        InterfaceNode,   // a node of the material interface network: a corner of its regions
+        InterfaceHit     // where a separatrix crosses a material interface
     };
 
     struct Node {
@@ -62,8 +64,12 @@ public:
     struct Arc {
         std::vector<Point> pts;  // pts.front() sits on node a, pts.back() on node b
         int a = -1, b = -1;
-        int separatrix = -1;     // -1 for a piece of the boundary
+        int separatrix = -1;     // -1 for a piece of the boundary or of an interface
         bool onBoundary = false;
+        // A piece of a material interface: a curve of the model, like dS, and
+        // so never moved or deleted by partition simplification -- but with a
+        // component of the layout on both sides, which dS does not have.
+        bool onInterface = false;
         double length = 0.0;
     };
 
@@ -124,6 +130,8 @@ public:
     // The mesh the layout was traced on; null for one handed over directly to
     // rebuild(), which keeps no reference to a model.
     const Mesh *getMesh() const { return mesh; }
+    // The trace it was built from, likewise; null for one handed over directly.
+    const SeparatrixTrace *getTrace() const { return trace; }
 
     static int arcOfDart(int dart) { return dart >> 1; }
 
@@ -149,6 +157,7 @@ private:
     void collectNodes();
     void buildSeparatrixArcs();
     void buildBoundaryArcs();
+    void buildInterfaceArcs();
     void sortAroundNodes();
     void traceFaces();
     void checkEmbedding();
@@ -167,6 +176,8 @@ private:
     // Node ids on each boundary loop, as (edge index in the loop + parameter
     // along it, node).
     std::vector<std::vector<Split>> splitsOfLoop;
+    // And on each interface branch (Interfaces::Branch::verts), the same way.
+    std::vector<std::vector<Split>> splitsOfBranch;
 
     // Position lookup for merging coincident nodes.
     std::vector<std::pair<long long, int>> nodeHash;

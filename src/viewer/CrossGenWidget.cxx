@@ -79,9 +79,12 @@ MBOPhase nextMBOPhase(MBOPhase p) {
         case MBOPhase::Layout:       return MBOPhase::Simplified;
         case MBOPhase::Simplified:   return MBOPhase::Quantize;
         case MBOPhase::Quantize:     return MBOPhase::Quantized;
-        case MBOPhase::Quantized:    return MBOPhase::Quantized;
+        case MBOPhase::Quantized:    return MBOPhase::Blocks;
+        case MBOPhase::Blocks:       return MBOPhase::Mesh;
+        case MBOPhase::Mesh:         return MBOPhase::Smoothed;
+        case MBOPhase::Smoothed:     return MBOPhase::Smoothed;
     }
-    return MBOPhase::Quantized;
+    return MBOPhase::Smoothed;
 }
 
 UMBERPhase nextUMBERPhase(UMBERPhase p) {
@@ -165,6 +168,9 @@ const char *mboPhaseName(MBOPhase p) {
         case MBOPhase::Simplified:   return "7) simplified partition";
         case MBOPhase::Quantize:     return "8) Quantization";
         case MBOPhase::Quantized:    return "9) Quantized block decomposition";
+        case MBOPhase::Blocks:       return "10) block decomposition";
+        case MBOPhase::Mesh:         return "11) quad mesh";
+        case MBOPhase::Smoothed:     return "12) TMOP smoothing";
     }
     return "?";
 }
@@ -476,6 +482,15 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
                 umberPhase_ = UMBERPhase::Mesh;
             }
         }
+        // And the tracing mode's.
+        if (mode_ == Mode::MBO && mboPhase_ >= MBOPhase::Mesh && traceBlocks_.has_value() &&
+            !traceBlocks_->blocks().empty()) {
+            traceMeshAttempted_ = true;
+            if (promptTraceMesh()) {
+                runTraceMesh();
+                mboPhase_ = MBOPhase::Mesh;
+            }
+        }
         break;
 
     case Qt::Key_I:
@@ -483,7 +498,7 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
         // either pipeline, which is what makes it useful and also what makes a
         // key to hide it necessary: at the mesh phase it lies on top of the
         // elements it is there to be compared against.
-        if ((inPipeline() || mode_ == Mode::UMBER) && interfaces_.has_value() &&
+        if ((inPipeline() || mode_ == Mode::UMBER || mode_ == Mode::MBO) && interfaces_.has_value() &&
             interfaces_->multiMaterial()) {
             showInterfaces_ = !showInterfaces_;
             console_.log(showInterfaces_ ? "[Interfaces] network shown"
@@ -498,7 +513,9 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
         // and the flat metric for the same triangles.
         if ((inPipeline() && interfaces_.has_value() && interfaces_->multiMaterial()) ||
             (mode_ == Mode::ATLAS && atlasMultiMaterial_) ||
-            (mode_ == Mode::UMBER && umberDecompReport_.materials > 1)) {
+            (mode_ == Mode::UMBER && umberDecompReport_.materials > 1) ||
+            (mode_ == Mode::MBO && traceBlocks_.has_value() &&
+             traceBlocks_->getReport().materials > 1)) {
             showMaterialFill_ = !showMaterialFill_;
             if (mode_ == Mode::ATLAS)
                 console_.log(showMaterialFill_ ? "[ATLAS] cells and elements filled by material"
@@ -506,6 +523,9 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
             else if (mode_ == Mode::UMBER)
                 console_.log(showMaterialFill_ ? "[UMBER] elements filled by material"
                                                : "[UMBER] material fill off");
+            else if (mode_ == Mode::MBO)
+                console_.log(showMaterialFill_ ? "[Blocks] elements filled by material"
+                                               : "[Blocks] material fill off");
             else
                 console_.log(showMaterialFill_ ? "[Interfaces] triangles filled by material"
                                                : "[Interfaces] material fill off");
@@ -773,6 +793,8 @@ void CrossGenWidget::doReset() {
     simplified_.reset();
     traceQuant_.reset();
     traceQuantReport_ = TMeshQuantizer::Report{};
+    traceMesh_.reset();
+    traceBlocks_.reset();
     delaunayMesh_.reset();
     blockQuant_.reset();
     quantReport_ = TMeshQuantizer::Report{};
@@ -864,6 +886,7 @@ void CrossGenWidget::doReset() {
     umberAnnounced_       = false;
     umberAttempted_       = false;
     umberMeshAttempted_   = false;
+    traceMeshAttempted_   = false;
     polysquareAnnounced_  = false;
     polysquareAttempted_  = false;
     blocksAttempted_      = false;
@@ -1476,7 +1499,15 @@ void CrossGenWidget::buildUMBERDecomposition() {
 // model. Sharing it is what makes "mesh this model with UMBER and with
 // MERIDIAN at 0.05" a comparison of two layouts rather than of two targets.
 bool CrossGenWidget::promptUMBERMesh() {
-    if (!umberDecomp_.has_value() || umberDecomp_->blocks.empty() || !mesh_) return false;
+    if (!umberDecomp_.has_value() || umberDecomp_->blocks.empty()) return false;
+    return promptBlockQuadMesh(*umberDecomp_, "UMBER — quadrilateral mesh on the blocks");
+}
+
+// The dialog both UMBER and the tracing mode open on their Mesh phase: the
+// target edge length and the chord bounds of mesh/BlockQuadMesh, on the one
+// settings object the pipelines' Stage 10 and ATLAS's mesh use too.
+bool CrossGenWidget::promptBlockQuadMesh(const BlockDecomposition &decomp, const char *title) {
+    if (decomp.blocks.empty() || !mesh_) return false;
 
     Point lo{std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity()};
     Point hi{-lo[0], -lo[1]};
@@ -1488,7 +1519,7 @@ bool CrossGenWidget::promptUMBERMesh() {
     const double extent = (diag > 0.0) ? diag : 1.0;
 
     QDialog dlg(this);
-    dlg.setWindowTitle("UMBER — quadrilateral mesh on the blocks");
+    dlg.setWindowTitle(QString::fromUtf8(title));
 
     auto *targetBox = new QDoubleSpinBox(&dlg);
     targetBox->setRange(1e-4, 10.0);
@@ -1502,8 +1533,8 @@ bool CrossGenWidget::promptUMBERMesh() {
 
     auto *derived = new QLabel(&dlg);
     derived->setTextFormat(Qt::PlainText);
-    const int blocks = static_cast<int>(umberDecomp_->blocks.size());
-    const int edges = static_cast<int>(umberDecomp_->edges.size());
+    const int blocks = static_cast<int>(decomp.blocks.size());
+    const int edges = static_cast<int>(decomp.edges.size());
     auto updateDerived = [targetBox, derived, extent, blocks, edges]() {
         const double h = targetBox->value();
         std::ostringstream oss;
@@ -1585,12 +1616,18 @@ void CrossGenWidget::runUMBERMesh() {
     }
     auto t1 = Clock::now();
 
-    const BlockQuadMesh::Report &r = umberMesh_->getReport();
+    reportBlockQuadMesh(*umberMesh_,
+                        std::chrono::duration<double, std::milli>(t1 - t0).count());
+}
+
+// The console report of a BlockQuadMesh, line for line as ATLAS's mesh and
+// Stage 10's are, for whichever mode built it.
+void CrossGenWidget::reportBlockQuadMesh(const BlockQuadMesh &bqm, double ms) {
+    const BlockQuadMesh::Report &r = bqm.getReport();
     {
         std::ostringstream oss;
         oss << "[Mesh] " << r.quads << " quad(s) on " << r.vertices << " vertices over "
-            << r.blocks << " block(s), "
-            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+            << r.blocks << " block(s), " << formatMs(ms);
         console_.log(oss.str());
     }
     {
@@ -4129,14 +4166,30 @@ void CrossGenWidget::runMERIDIANMesh() {
 // what a given metric can even be started on is a fact about *this* mesh. The
 // counts are read off the mesh that is about to be smoothed and not off the
 // last one.
+// The TMOP settings the current mode smooths with. ATLAS, UMBER and the
+// tracing mode keep their own (atlasTmopSettings_ and the two after it), which
+// differ from the pipelines' in one default for one reason: each smooths a
+// transfinite grid on a block decomposition. The dialog and the solve both read
+// them through here, so what the dialog sets is what the solve runs -- in UMBER
+// mode the dialog used to edit the pipelines' copy while the solve read UMBER's.
+CrossGenWidget::TMOPSettings &CrossGenWidget::tmopSettingsForMode() {
+    if (mode_ == Mode::ATLAS) return atlasTmopSettings_;
+    if (mode_ == Mode::UMBER) return umberTmopSettings_;
+    if (mode_ == Mode::MBO) return traceTmopSettings_;
+    return tmopSettings_;
+}
+
 bool CrossGenWidget::promptTMOP() {
-    // ATLAS keeps its own settings; see atlasTmopSettings_.
-    TMOPSettings &ts = (mode_ == Mode::ATLAS) ? atlasTmopSettings_ : tmopSettings_;
+    TMOPSettings &ts = tmopSettingsForMode();
     if (!haveFinishedMesh()) return false;
     const bool atlas = (mode_ == Mode::ATLAS);
+    const bool blockMode = atlas || mode_ == Mode::UMBER || mode_ == Mode::MBO;
 
     QDialog dlg(this);
-    dlg.setWindowTitle(atlas ? "ATLAS — TMOP smoothing" : "Stage 12 — TMOP smoothing");
+    dlg.setWindowTitle(atlas ? "ATLAS — TMOP smoothing"
+                             : (mode_ == Mode::UMBER ? "UMBER — TMOP smoothing"
+                                                     : (mode_ == Mode::MBO ? "Viertel — TMOP smoothing"
+                                                                           : "Stage 12 — TMOP smoothing")));
 
     auto *metricBox = new QComboBox(&dlg);
     // Ordered as the header lists them, and paired with the enum value rather
@@ -4337,7 +4390,7 @@ bool CrossGenWidget::promptTMOP() {
     form->addRow(untangleBox);
     form->addRow("threads", threadBox);
     form->addRow("this mesh", derived);
-    form->addRow(new QLabel(atlas ? "Always run on the TFI mesh, never on the last\n"
+    form->addRow(new QLabel(blockMode ? "Always run on the TFI mesh, never on the last\n"
                                     "smoothed one, so a second setting is a fresh attempt."
                                   : "Always run on the Stage 10 mesh, never on the last\n"
                                     "smoothed one, so a second setting is a fresh attempt.", &dlg));
@@ -4364,20 +4417,19 @@ bool CrossGenWidget::promptTMOP() {
 // different scale: a thousand sweeps over a mesh of this size is a fraction of
 // a second, so it is not announced a frame ahead the way the Ricci solve is.
 void CrossGenWidget::runTMOP() {
-    // ATLAS and UMBER keep their own settings; see atlasTmopSettings_ and
-    // umberTmopSettings_, which differ from the pipelines' in one default for
-    // one reason -- both smooth transfinite grids on a block decomposition.
+    // ATLAS, UMBER and the tracing mode keep their own settings; see
+    // tmopSettingsForMode().
     const bool atlas = (mode_ == Mode::ATLAS);
-    const bool umber = (mode_ == Mode::UMBER);
-    TMOPSettings &ts = atlas ? atlasTmopSettings_
-                             : (umber ? umberTmopSettings_ : tmopSettings_);
+    // UMBER and the tracing mode: the two that smooth a BlockQuadMesh.
+    const bool blockMesh = (mode_ == Mode::UMBER) || (mode_ == Mode::MBO);
+    TMOPSettings &ts = tmopSettingsForMode();
     // The pipelines number this Stage 12 after their Stage 10; ATLAS's stages
-    // stop at 6 and UMBER's at the chord collapse, so there it is named for
-    // what it smooths.
-    const std::string stage = (atlas || umber) ? "TMOP" : "Stage 12";
+    // stop at 6, UMBER's at its decomposition and the tracing's at Sec. 4, so
+    // there it is named for what it smooths.
+    const std::string stage = (atlas || blockMesh) ? "TMOP" : "Stage 12";
     if (!haveFinishedMesh()) {
         blockPipeline(stage + " not run",
-                      (atlas || umber) ? "there is no TFI mesh to smooth"
+                      (atlas || blockMesh) ? "there is no TFI mesh to smooth"
                                        : "Stage 10 produced no mesh to smooth");
         return;
     }
@@ -4432,7 +4484,7 @@ void CrossGenWidget::runTMOP() {
 
     {
         std::ostringstream oss;
-        oss << "[TMOP] " << ((atlas || umber) ? "" : "Stage 12: ") << tr.sweeps << " sweep(s)";
+        oss << "[TMOP] " << ((atlas || blockMesh) ? "" : "Stage 12: ") << tr.sweeps << " sweep(s)";
         if (tr.untangleSweeps > 0) oss << " after " << tr.untangleSweeps << " untangling";
         oss << " over " << tr.colors << " colour(s) on " << tr.threads << " thread(s)"
             << (tr.openMP ? "" : " (no OpenMP)") << ", "
@@ -4493,12 +4545,12 @@ void CrossGenWidget::runTMOP() {
     for (const std::string &m : tr.messages) console_.log("[TMOP] " + m);
     {
         std::ostringstream oss;
-        oss << "[TMOP] " << ((atlas || umber) ? "the smoother " : "Stage 12 ")
+        oss << "[TMOP] " << ((atlas || blockMesh) ? "the smoother " : "Stage 12 ")
             << (ok ? "left the mesh better than it found it [PASS]" : "did not improve the mesh [FAIL]");
         console_.log(oss.str());
         std::cerr << "[Viewer] " << oss.str() << "\n";
     }
-    console_.log((atlas || umber)
+    console_.log((atlas || blockMesh)
                      ? "[TMOP] the same picture as the TFI mesh, with the nodes where the solve "
                        "left them. Press 'c' to smooth the TFI mesh again at other settings"
                      : "[TMOP] the same picture as Stage 10, with the nodes where the solve "
@@ -4511,12 +4563,14 @@ void CrossGenWidget::runTMOP() {
 bool CrossGenWidget::haveFinishedMesh() const {
     if (mode_ == Mode::ATLAS) return atlasMesh_.has_value();
     if (mode_ == Mode::UMBER) return umberMesh_.has_value();
+    if (mode_ == Mode::MBO) return traceMesh_.has_value();
     return quadMesh_.has_value();
 }
 
 mesh::QuadMesh CrossGenWidget::finishedMesh(const mesh::QuadMesh::Options &o) const {
     if (mode_ == Mode::ATLAS) return mesh::QuadMesh::from(*atlasMesh_, o);
     if (mode_ == Mode::UMBER) return mesh::QuadMesh::from(*umberMesh_, o);
+    if (mode_ == Mode::MBO) return mesh::QuadMesh::from(*traceMesh_, o);
     return diskFill_.has_value() ? mesh::QuadMesh::from(*diskFill_, o)
                                  : mesh::QuadMesh::from(*quadMesh_, o);
 }
@@ -5385,6 +5439,23 @@ void CrossGenWidget::advancePhase() {
         mboPhase_ = nextMBOPhase(mboPhase_);
         if (mboPhase_ != old)
             std::cerr << "[Viewer] MBO Phase " << mboPhaseName(mboPhase_) << "\n";
+
+        // The last two phases as every other mode has them: the mesh dialog on
+        // the way into Mesh, the TMOP one on the way into Smoothed and on
+        // every 'c' there, each marked as asked before it opens so that the
+        // catch-up in runComputations() does not open a second one on top.
+        if (old == MBOPhase::Blocks && mboPhase_ == MBOPhase::Mesh) {
+            // 'c' pressed again before the frame that builds the blocks.
+            if (!traceBlocks_.has_value()) buildTraceBlocks();
+            if (traceBlocks_.has_value() && !traceBlocks_->blocks().empty()) {
+                traceMeshAttempted_ = true;
+                if (promptTraceMesh()) runTraceMesh();
+            }
+        }
+        if (mboPhase_ == MBOPhase::Smoothed && traceMesh_.has_value()) {
+            tmopAttempted_ = true;
+            if (promptTMOP()) runTMOP();
+        }
     } else if (mode_ == Mode::MedialAxis) {
         MedialAxisPhase old = maPhase_;
         maPhase_ = nextMedialAxisPhase(maPhase_);
@@ -5527,13 +5598,210 @@ std::vector<int> CrossGenWidget::hangingTJunctions() const {
     return out;
 }
 
+// ── the tracing mode's blocks, mesh and dialog ──────────────────────────────
+//
+// Sec. 4's partition read as the shared BlockDecomposition on spline geometry
+// (tracing/LayoutBlocks.hxx), then meshed and smoothed by the classes UMBER
+// uses. A component with a T-junction on a side is not a block: T-junctions
+// are not meshed yet, so it stays grey with a red disk on the junction, and the
+// coverage the console prints is how much of the model is left once those are
+// taken out.
+void CrossGenWidget::buildTraceBlocks() {
+    traceBlocks_.reset();
+    traceUncoveredTris_.clear();
+    traceMesh_.reset();
+    smoothMesh_.reset();
+    traceMeshAttempted_ = false;
+    tmopAttempted_ = false;
+    if (!simplified_.has_value() || !mesh_) return;
+
+    auto t0 = Clock::now();
+    try {
+        traceBlocks_.emplace(simplified_->getLayout(), *mesh_);
+    } catch (const std::exception &e) {
+        traceBlocks_.reset();
+        console_.log(std::string("[Blocks] FAILED: ") + e.what());
+        std::cerr << "[Viewer] LayoutBlocks failed: " << e.what() << "\n";
+        return;
+    }
+    auto t1 = Clock::now();
+
+    // The uncovered area as triangles of the model, by centroid: what the
+    // picture fills so that it reads as a region rather than as an outline.
+    {
+        const QuadLayout &sl = simplified_->getLayout();
+        const std::vector<char> &isBlock = traceBlocks_->faceIsBlock();
+        for (size_t f = 0; f < sl.getFaces().size(); ++f) {
+            if (f < isBlock.size() && isBlock[f]) continue;
+            std::vector<Point> poly;
+            for (const int d : sl.getFaces()[f].darts) {
+                std::vector<Point> pts = sl.getArcs()[QuadLayout::arcOfDart(d)].pts;
+                if (d & 1) std::reverse(pts.begin(), pts.end());
+                poly.insert(poly.end(), pts.begin(), pts.end() - 1);
+            }
+            if (poly.size() < 3) continue;
+            Point lo = poly[0], hi = poly[0];
+            for (const Point &p : poly) {
+                lo[0] = std::min(lo[0], p[0]); lo[1] = std::min(lo[1], p[1]);
+                hi[0] = std::max(hi[0], p[0]); hi[1] = std::max(hi[1], p[1]);
+            }
+            for (size_t t = 0; t < mesh_->triangles.size(); ++t) {
+                const Triangle &tri = mesh_->triangles[t];
+                const Point c = (mesh_->vertices[tri[0]] + mesh_->vertices[tri[1]] +
+                                 mesh_->vertices[tri[2]]) / 3.0;
+                if (c[0] < lo[0] || c[0] > hi[0] || c[1] < lo[1] || c[1] > hi[1]) continue;
+                int wind = 0;
+                for (size_t i = 0; i < poly.size(); ++i) {
+                    const Point &a = poly[i], &b = poly[(i + 1) % poly.size()];
+                    if (a[1] <= c[1]) {
+                        if (b[1] > c[1] && cross2(b - a, c - a) > 0.0) ++wind;
+                    } else if (b[1] <= c[1] && cross2(b - a, c - a) < 0.0) {
+                        --wind;
+                    }
+                }
+                if (wind != 0) traceUncoveredTris_.push_back(static_cast<int>(t));
+            }
+        }
+    }
+
+    const LayoutBlocks::Report &r = traceBlocks_->getReport();
+    {
+        std::ostringstream oss;
+        oss << "[Blocks] " << r.blocks << " block(s) of " << r.faces << " component(s), "
+            << traceBlocks_->decomposition().edges.size() << " macro edge(s), "
+            << traceBlocks_->decomposition().vertices.size() << " macrovertex/-ices: "
+            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+    }
+    if (r.blocks < r.faces) {
+        std::ostringstream oss;
+        oss << "[Blocks] not blocks: " << r.tJunctionFaces << " with a T-junction on a side ("
+            << r.tJunctions << " T-junction(s), in red)";
+        if (r.notFourSided > 0) oss << ", " << r.notFourSided << " not four-sided";
+        if (r.notDisks > 0) oss << ", " << r.notDisks << " not a disk";
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(3) << "[Blocks] splines: " << r.fittedArcs
+            << " side(s) fitted as cubic B-splines (up to " << r.maxSegmentsUsed
+            << " segments; " << r.meanDeviation << " mean, " << r.maxDeviation
+            << " worst deviation, in mean mesh edges), " << r.exactArcs
+            << " on the boundary carried exactly";
+        if (r.foldedPatches > 0) oss << "; " << r.foldedPatches << " Coons patch(es) fold";
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Blocks] B-rep: " << r.brepFaces << " face(s), " << r.brepEdges << " edge(s) ("
+            << r.brepSharedEdges << " shared, " << r.brepFreeEdges << " free), "
+            << (r.brepValid ? "valid" : "NOT valid");
+        if (r.brepFailures > 0) oss << ", " << r.brepFailures << " refused by the kernel";
+        console_.log(oss.str());
+    }
+    for (const std::string &m : r.messages) console_.log("[Blocks] " + m);
+
+    // The number to read the method by, said every time and loudly when it is
+    // short: what is not covered is not meshed.
+    const double coverage = traceBlocks_->coverage();
+    std::ostringstream cov;
+    cov << std::fixed << std::setprecision(1) << "[Blocks] covering " << 100.0 * coverage
+        << "% of the model";
+    if (coverage < 0.999)
+        cov << " -- the shaded components outlined in grey are the rest, and they get no elements";
+    console_.log(cov.str());
+    std::cerr << "[Viewer] " << cov.str() << "\n";
+    if (r.straddlingBlocks > 0) {
+        std::ostringstream bad;
+        bad << "[Blocks] " << r.straddlingBlocks << " block(s) sit in more than one of the "
+            << r.materials << " material(s): the separatrices follow a cross field that is "
+               "not aligned to the interfaces, and the elements in those blocks will straddle one";
+        console_.log(bad.str());
+    }
+}
+
+bool CrossGenWidget::promptTraceMesh() {
+    if (!traceBlocks_.has_value()) return false;
+    return promptBlockQuadMesh(traceBlocks_->decomposition(),
+                               "Viertel — quadrilateral mesh on the blocks");
+}
+
+// BlockQuadMesh at the dialog's settings, as UMBER's Mesh phase runs it.
+void CrossGenWidget::runTraceMesh() {
+    if (!traceBlocks_.has_value() || traceBlocks_->blocks().empty()) {
+        blockPipeline("the mesh not built", "the tracing left no conforming block to mesh");
+        return;
+    }
+    traceMeshAttempted_ = true;
+    traceMesh_.reset();
+    smoothMesh_.reset();
+    tmopAttempted_ = false;
+    pipelineBlocked_.clear();
+
+    BlockQuadMesh::Options mo;
+    mo.targetEdgeLength   = meshSettings_.target;
+    mo.minIntervals       = meshSettings_.minEdges;
+    mo.maxIntervals       = meshSettings_.maxEdges;
+    mo.smoothingPasses    = TORSION::Options().quadSmoothingPasses;
+    mo.smoothingThreshold = TORSION::Options().quadSmoothingThreshold;
+
+    auto t0 = Clock::now();
+    try {
+        traceMesh_.emplace(traceBlocks_->decomposition(), mo);
+    } catch (const std::exception &e) {
+        traceMesh_.reset();
+        blockPipeline("the mesh failed", e.what());
+        return;
+    }
+    auto t1 = Clock::now();
+    reportBlockQuadMesh(*traceMesh_, std::chrono::duration<double, std::milli>(t1 - t0).count());
+    if (traceBlocks_->coverage() < 0.999) {
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(1) << "[Mesh] " << 100.0 * traceBlocks_->coverage()
+            << "% of the model meshed: the shaded components carry a T-junction or are not "
+               "four-sided";
+        console_.log(oss.str());
+    }
+}
+
 // ── lazy computations ────────────────────────────────────────────────────────
 
 void CrossGenWidget::runComputations() {
     // ── MBO: Initialize CrossField ────────────────────────────────────────────
     if (mode_ == Mode::MBO && mboPhase_ >= MBOPhase::CrossField && !crossField_.has_value()) {
+        // Stage 0b first, as the pipelines run it: the field is aligned to the
+        // material interfaces and each disk inclusion's centre is pinned
+        // (CrossField::setAlignedInteriorEdges, setPinDiskCenters), and the
+        // tracing emits from the network's nodes and cuts its branches where
+        // separatrices cross them. Closed loops are left unsplit; a separatrix
+        // crossing an inclusion's rim cuts it where the layout turns.
+        if (!interfacesAttempted_) {
+            interfacesAttempted_ = true;
+            try {
+                Interfaces::Options io;
+                io.splitLoops = false;
+                interfaces_.emplace(mesh_, io);
+            } catch (const std::exception &e) {
+                interfaces_.reset();
+                console_.log(std::string("[Interfaces] FAILED: ") + e.what());
+            }
+            if (interfaces_.has_value() && interfaces_->multiMaterial()) {
+                const Interfaces::Report &ir = interfaces_->getReport();
+                std::ostringstream oss;
+                oss << "[Interfaces] " << ir.materials << " material(s), " << ir.interfaceEdges
+                    << " interface edge(s) in " << ir.branches << " branch(es) (" << ir.closedLoops
+                    << " closed), " << ir.nodes << " node(s): " << ir.junctions << " junction(s), "
+                    << ir.landings << " landing(s), " << ir.kinks << " kink(s)";
+                if (ir.illPosedNodes > 0) oss << ", " << ir.illPosedNodes << " ill-posed";
+                console_.log(oss.str());
+            }
+        }
         auto t0 = Clock::now();
         crossField_.emplace(mesh_);
+        if (interfaces_.has_value() && interfaces_->multiMaterial()) {
+            crossField_->setAlignedInteriorEdges(interfaces_->interfaceEdges());
+            crossField_->setPinDiskCenters(true);
+        }
         crossField_->initialize(1);
         auto t1 = Clock::now();
         console_.log("[MBO] Initialized CrossField: " +
@@ -5581,7 +5849,9 @@ void CrossGenWidget::runComputations() {
         // costs 40 components and 12 T-junctions, and on geom006 -- a box with
         // a round hole -- the difference is 12 components and none against 14
         // and four.
-        separatrixTrace_ = std::make_shared<SeparatrixTrace>(cfPtr, true);
+        separatrixTrace_ = std::make_shared<SeparatrixTrace>(
+            cfPtr, true, SeparatrixTrace::Settings(),
+            (interfaces_.has_value() && interfaces_->multiMaterial()) ? &*interfaces_ : nullptr);
         auto t1 = Clock::now();
         std::ostringstream oss;
         oss << "[Separatrices] Initialized " << separatrixTrace_->separatrices.size()
@@ -5589,6 +5859,19 @@ void CrossGenWidget::runComputations() {
             << " singularities: "
             << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
         console_.log(oss.str());
+        const SeparatrixTrace::Report &tr = separatrixTrace_->getReport();
+        if (tr.interfaceNodes > 0 || separatrixTrace_->getInterfaces()) {
+            std::ostringstream it;
+            it << "[Separatrices] " << tr.interfaceEmitted << " of them from " << tr.interfaceNodes
+               << " interface node(s), which absorbed " << tr.absorbedSingularities
+               << " singular triangle(s) of the field";
+            console_.log(it.str());
+        }
+        std::ostringstream ph;
+        ph << "[Separatrices] Poincare-Hopf: sum of indices "
+           << (tr.interiorIndexSum4 + tr.boundaryIndexSum4 + tr.interfaceIndexSum4) << "/4 against "
+           << tr.eulerCharacteristic << (tr.poincareHopf ? " [ok]" : " [FAILS]");
+        console_.log(ph.str());
     }
 
     // ── MBO: Step tracing one iteration per frame ─────────────────────────────
@@ -5655,6 +5938,42 @@ void CrossGenWidget::runComputations() {
             << r.blockedByEnergy << " by the energy, " << r.rolledBack
             << " collapse(s) undone for breaking Proposition 2";
         console_.log(why.str());
+        if (r.stems.attempted > 0) {
+            std::ostringstream st;
+            st << "[Simplify] Sec. 12: " << r.stems.extended << " of " << r.stems.attempted
+               << " T-junction stem(s) traced on to the boundary, " << r.tJunctionsBeforeStems
+               << " -> " << sl.tJunctions << " T-junction(s)";
+            const int refused = r.stems.attempted - r.stems.extended;
+            if (refused > 0)
+                st << "; the rest " << r.stems.noBoundary << " never reached it, "
+                   << r.stems.tangential << " ran alongside a separatrix, " << r.stems.throughNode
+                   << " ran into a node, " << r.stems.tooManyCrossings << " crossed too many, "
+                   << r.stems.invalid << " left a worse layout";
+            console_.log(st.str());
+        }
+    }
+
+    // ── MBO: the simplified layout as blocks, then the mesh on them ─────────
+    //
+    // Not after the quantization but beside it: the blocks read the simplified
+    // layout, not the quantized grid, so a model the quantizer refuses still
+    // has its blocks. The mesh and TMOP dialogs are opened by advancePhase();
+    // these two are the catch-ups for a phase reached without passing through
+    // it, marked as asked before the dialog opens for the pipelines' reason
+    // (the dialog paints, and painting comes back here).
+    if (mode_ == Mode::MBO && mboPhase_ >= MBOPhase::Blocks && simplified_.has_value() &&
+        !traceBlocks_.has_value()) {
+        buildTraceBlocks();
+    }
+    if (mode_ == Mode::MBO && mboPhase_ == MBOPhase::Mesh && traceBlocks_.has_value() &&
+        !traceBlocks_->blocks().empty() && !traceMeshAttempted_) {
+        traceMeshAttempted_ = true;
+        if (promptTraceMesh()) runTraceMesh();
+    }
+    if (mode_ == Mode::MBO && mboPhase_ == MBOPhase::Smoothed && traceMesh_.has_value() &&
+        !tmopAttempted_) {
+        tmopAttempted_ = true;
+        if (promptTMOP()) runTMOP();
     }
 
     // ── MBO: quantize the block decomposition the layout already is (QGP) ────
@@ -5666,7 +5985,8 @@ void CrossGenWidget::runComputations() {
     // medial axis blocks need. xIdeal is 1 on every edge, same as there:
     // Stage II drives each edge to its minimum and acts as an automatic
     // block-merging operator on top of what chord collapse already did.
-    if (mode_ == Mode::MBO && mboPhase_ >= MBOPhase::Quantize &&
+    if (mode_ == Mode::MBO &&
+        (mboPhase_ == MBOPhase::Quantize || mboPhase_ == MBOPhase::Quantized) &&
         simplified_.has_value() && !traceQuant_.has_value()) {
         auto t0 = Clock::now();
         traceQuant_.emplace(makeQuantTMesh(simplified_->getLayout()));
@@ -6607,12 +6927,93 @@ void CrossGenWidget::renderMERIDIANModel() {
 // ── normal render ─────────────────────────────────────────────────────────────
 
 void CrossGenWidget::renderNormal() {
-    if (mode_ == Mode::MBO) {
+    if (mode_ == Mode::MBO && mboPhase_ >= MBOPhase::Blocks && traceBlocks_.has_value() &&
+        simplified_.has_value()) {
+        // ── The blocks, and the mesh on them ────────────────────────────────
+        //
+        // What is not a block is shaded and outlined in grey, so that in
+        // every one of the three phases the shading is exactly the part of the
+        // model with no block on it -- the coverage the console prints, as a
+        // picture -- and a red disk sits on every T-junction that put a
+        // component there.
         viewer::drawAxis(view_);
+        const QuadLayout &sl = simplified_->getLayout();
+        const auto &faces = sl.getFaces();
+        const auto &arcs = sl.getArcs();
+        const std::vector<char> &isBlock = traceBlocks_->faceIsBlock();
+        auto drawRefused = [&](float width) {
+            viewer::color3f(0.55f, 0.55f, 0.6f);
+            viewer::lineWidth(width);
+            for (size_t f = 0; f < faces.size(); ++f) {
+                if (f < isBlock.size() && isBlock[f]) continue;
+                for (const int d : faces[f].darts) {
+                    const auto &pts = arcs[QuadLayout::arcOfDart(d)].pts;
+                    glBegin(GL_LINE_STRIP);
+                    for (const Point &p : pts) glVertex2d(p[0], p[1]);
+                    glEnd();
+                }
+            }
+            viewer::lineWidth(1.0f);
+        };
+        const double sceneDiag = std::hypot(bounds_.maxx - bounds_.minx, bounds_.maxy - bounds_.miny);
+        auto fillUncovered = [&]() {
+            if (traceUncoveredTris_.empty()) return;
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            viewer::color4f(1.0f, 0.55f, 0.5f, 0.35f);
+            glBegin(GL_TRIANGLES);
+            for (const int t : traceUncoveredTris_) {
+                const Triangle &tri = mesh_->triangles[t];
+                for (int k = 0; k < 3; ++k)
+                    glVertex2d(mesh_->vertices[tri[k]][0], mesh_->vertices[tri[k]][1]);
+            }
+            glEnd();
+        };
+        auto drawTJunctions = [&]() {
+            const double r = std::max(0.25 * avgEdge_, 0.007 * sceneDiag) * view_.zoom;
+            for (const Point &p : traceBlocks_->tJunctionPoints())
+                viewer::drawDisk3D(p, r, 0.95f, 0.1f, 0.1f);
+        };
+
+        if (mboPhase_ >= MBOPhase::Mesh && traceMesh_.has_value()) {
+            const bool matFill = showMaterialFill_ && traceBlocks_->getReport().materials > 1;
+            fillUncovered();
+            drawRefused(2.5f);
+            if (mboPhase_ == MBOPhase::Smoothed && smoothMesh_.has_value())
+                viewer::drawQuadMesh(*smoothMesh_, *traceMesh_, 1.0f, 2.5f, matFill);
+            else
+                viewer::drawQuadMesh(*traceMesh_, 1.0f, 2.5f, matFill);
+        } else {
+            // The same picture UMBER's and ATLAS's block phases draw: the
+            // blocks in light blue with green macrovertices, over the layout
+            // in grey, so the grey showing through is what has no block.
+            // The triangulation light, not in the wireframe colour the
+            // earlier phases use: at this phase it is background, and the
+            // blocks and the uncovered fill are what the picture is for.
+            viewer::drawMeshOverlay(*mesh_, 0.7f, 0.7f, 0.72f, 0.35f, 1.0f);
+            viewer::drawBoundaryEdges(*mesh_);
+            fillUncovered();
+            viewer::drawQuadLayoutArcs(sl, 2.0f, 0.55f, 0.55f, 0.6f);
+            viewer::drawBlockDecomposition(traceBlocks_->decomposition(),
+                                           0.12 * avgEdge_ * view_.zoom, 4.0f);
+        }
+        if (showInterfaces_ && interfaces_.has_value() && interfaces_->multiMaterial() &&
+            mboPhase_ == MBOPhase::Blocks)
+            viewer::drawInterfaceNetwork(*interfaces_, 0.3 * avgEdge_, 2.0f);
+        drawTJunctions();
+    } else if (mode_ == Mode::MBO) {
+        viewer::drawAxis(view_);
+        // The interface network under everything else: the input the field
+        // was aligned to and the layout has to keep, so the question every
+        // picture after it answers is whether the curves drawn over it follow
+        // it. 'i' hides it.
+        const bool showNetwork = showInterfaces_ && interfaces_.has_value() &&
+                                 interfaces_->multiMaterial() && mboPhase_ < MBOPhase::Quantized;
         // The quantized grid is the payoff of this whole mode, and the
         // triangulation underneath only buries it -- the medial axis mode's
         // Quantized phase drops the mesh the same way.
         if (mboPhase_ < MBOPhase::Quantized) viewer::drawMesh(*mesh_);
+        if (showNetwork) viewer::drawInterfaceNetwork(*interfaces_, 0.3 * avgEdge_, 3.0f);
         // The crossfield answers "why did the separatrices go where they
         // went"; once the quantized grid is up that question is moot and
         // the crosses only clutter the block decomposition it took the
@@ -7195,6 +7596,16 @@ void CrossGenWidget::renderNormal() {
              ? std::string("press 'm' to fill the elements by material\n")
              : std::string());
 
+    // The tracing mode's: whatever refused, and the material fill.
+    const std::string mboKeys =
+        (pipelineBlocked_.empty() ? std::string() : pipelineBlocked_ + "\n") +
+        ((mode_ == Mode::MBO && interfaces_.has_value() && interfaces_->multiMaterial())
+             ? std::string("press 'i' to show/hide the interface network\n")
+             : std::string()) +
+        ((mode_ == Mode::MBO && traceBlocks_.has_value() && traceBlocks_->getReport().materials > 1)
+             ? std::string("press 'm' to fill the elements by material\n")
+             : std::string());
+
     if (mode_ == Mode::Unselected) {
         renderOverlay("press '1' for PolyVector mode\npress '2' for MBO mode\n"
                       "press '3' for Medial Axis mode\npress '4' for TORSION mode\n"
@@ -7248,6 +7659,17 @@ void CrossGenWidget::renderNormal() {
         renderOverlay((meridianKeys + "press 'c' to mesh the patches (Stage 10)\n"
                        "press 'n' to change the connectivity settings and trace again\n"
                        "press 'r' to restart\npress 'q' to quit").c_str());
+    } else if (mode_ == Mode::MBO && mboPhase_ == MBOPhase::Blocks) {
+        renderOverlay((mboKeys + "press 'c' to mesh the blocks\n"
+                       "press 'r' to restart\npress 'q' to quit").c_str());
+    } else if (mode_ == Mode::MBO && mboPhase_ == MBOPhase::Mesh) {
+        renderOverlay((mboKeys + "press 'c' to smooth the mesh with TMOP\n"
+                       "press 'e' to mesh again at another target edge length\n"
+                       "press 'r' to restart\npress 'q' to quit").c_str());
+    } else if (mode_ == Mode::MBO && mboPhase_ == MBOPhase::Smoothed) {
+        renderOverlay((mboKeys + "press 'c' to smooth again at other TMOP settings\n"
+                       "press 'e' to mesh again at another target edge length\n"
+                       "press 'r' to restart\npress 'q' to quit").c_str());
     } else if (mode_ == Mode::UMBER && umberPhase_ == UMBERPhase::Decomposition) {
         renderOverlay((umberKeys + "press 'c' to mesh the blocks\n"
                        "press 'r' to restart\npress 'q' to quit").c_str());
@@ -7260,7 +7682,8 @@ void CrossGenWidget::renderNormal() {
                        "press 'e' to mesh again at another target edge length\n"
                        "press 'r' to restart\npress 'q' to quit").c_str());
     } else {
-        renderOverlay((meridianKeys + "press 'c' to continue\npress 'r' to restart\n"
+        renderOverlay(((mode_ == Mode::MBO ? mboKeys : meridianKeys) +
+                       "press 'c' to continue\npress 'r' to restart\n"
                                       "press 'q' to quit").c_str());
     }
 }
@@ -7292,8 +7715,12 @@ void CrossGenWidget::drawLegends() {
     const bool sepLegendShown = (inPipeline() && cones_.has_value() &&
                                  pipePhase_ == PipelinePhase::Separatrices &&
                                  separatrices_.has_value());
-    if ((inPipeline() || mode_ == Mode::UMBER) && showInterfaces_ && interfaces_.has_value() &&
-        interfaces_->multiMaterial()) {
+    // Mode 2 draws the network up to the quantization and at its Blocks
+    // phase, and not over the mesh; the key goes with it.
+    const bool mboNetworkShown =
+        mode_ == Mode::MBO && (mboPhase_ < MBOPhase::Quantized || mboPhase_ == MBOPhase::Blocks);
+    if ((inPipeline() || mode_ == Mode::UMBER || mboNetworkShown) && showInterfaces_ &&
+        interfaces_.has_value() && interfaces_->multiMaterial()) {
         viewer::drawInterfaceLegend(fbw(), fbh(), sepLegendShown);
     }
 

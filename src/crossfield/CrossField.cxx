@@ -4,6 +4,13 @@
 #include <limits>
 #include <iostream>
 
+void CrossField::setAlignedInteriorEdges(const std::vector<int> &edges) {
+    edgeAligned.assign(mesh->edges.size(), 0);
+    for (int e : edges)
+        if (e >= 0 && e < static_cast<int>(edgeAligned.size()) && !mesh->isBoundaryEdge[e])
+            edgeAligned[e] = 1;
+}
+
 void CrossField::initialize(int method, unsigned seed) {
     // For all boundary vertices, set dirichlet boundary conditions to be (nx + i*ny)^4 where (nx, ny) is the outward normal of the boundary edge
 
@@ -253,6 +260,56 @@ void CrossField::initialize(int method, unsigned seed) {
         if (usedVertex[v]) continue;
         boundarySet.insert(v);
         u_k_prev[v] = one;
+    }
+
+    // The interface vertices, pinned to the interface's own tangent (see
+    // setAlignedInteriorEdges). exp(4i phi) is the same for a direction and
+    // its reverse and for a direction and its quarter turn, so an edge's
+    // orientation does not matter and a right-angled corner averages to
+    // itself.
+    alignedInterface = freeInterface = 0;
+    if (!edgeAligned.empty()) {
+        std::vector<std::complex<double>> sum(numVertices, zero);
+        std::vector<double> weight(numVertices, 0.0);
+        for (int e = 0; e < static_cast<int>(edgeAligned.size()); ++e) {
+            if (!edgeAligned[e]) continue;
+            const int a = mesh->edges[e][0], b = mesh->edges[e][1];
+            const Point d = mesh->vertices[b] - mesh->vertices[a];
+            const double len = normP(d);
+            if (len < 1e-14) continue;
+            const std::complex<double> g = std::polar(len, 4.0 * std::atan2(d[1], d[0]));
+            for (const int v : {a, b}) { sum[v] += g; weight[v] += len; }
+        }
+        // DualMBO::kCornerCoherenceMin, for the same reason: below it the
+        // mean is a direction no incident interface has.
+        constexpr double kCoherenceMin = 0.2;
+        for (int v = 0; v < numVertices; ++v) {
+            if (!(weight[v] > 0.0) || mesh->isBoundaryVertex[v] || boundarySet.count(v)) continue;
+            if (std::abs(sum[v]) < kCoherenceMin * weight[v]) { ++freeInterface; continue; }
+            boundarySet.insert(v);
+            u_k_prev[v] = sum[v] / std::abs(sum[v]);
+            ++alignedInterface;
+        }
+    }
+
+    // The disk centres (see setPinDiskCenters): one vertex each, to the cross
+    // on the axes, unless it is already data.
+    pinnedDisks = 0;
+    if (pinDiskCenters) {
+        for (const auto &comp : mesh->materialComponents) {
+            if (!comp.circle.isCircle || comp.centerTriangle < 0) continue;
+            const Triangle &t = mesh->triangles[comp.centerTriangle];
+            int best = -1;
+            double bestD = std::numeric_limits<double>::max();
+            for (int k = 0; k < 3; ++k) {
+                const double d = normP(mesh->vertices[t[k]] - comp.circle.center);
+                if (d < bestD) { bestD = d; best = t[k]; }
+            }
+            if (best < 0 || boundarySet.count(best)) continue;
+            boundarySet.insert(best);
+            u_k_prev[best] = one;
+            ++pinnedDisks;
+        }
     }
 
     // For column-major matrices, we iterate over all columns and check each entry's row

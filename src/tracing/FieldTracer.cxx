@@ -28,7 +28,8 @@ inline Point dirOf(double angle) { return Point{std::cos(angle), std::sin(angle)
 // ---------------------------------------------------------------------------
 // Construction
 // ---------------------------------------------------------------------------
-FieldTracer::FieldTracer(std::shared_ptr<CrossField> cf, bool useExactCenters)
+FieldTracer::FieldTracer(std::shared_ptr<CrossField> cf, bool useExactCenters,
+                         bool boundaryTriangles, std::vector<char> absorbAt)
     : crossField(std::move(cf)) {
     mesh = crossField->mesh.get();
 
@@ -41,11 +42,31 @@ FieldTracer::FieldTracer(std::shared_ptr<CrossField> cf, bool useExactCenters)
     if (!mesh->edges.empty()) avgEdge = total / static_cast<double>(mesh->edges.size());
     vertexSnap = 1e-9 * avgEdge;
 
-    buildSingularities(useExactCenters);
+    buildSingularities(useExactCenters, boundaryTriangles, absorbAt);
 }
 
 // ---------------------------------------------------------------------------
-// buildSingularities()  --  centres and ports
+// buildSingularities()  --  which triangles, then centres and ports
+//
+// Which triangles are singular is Sec. 3.1's index, read here rather than taken
+// from CrossField::singularTriangles, because that list leaves out every
+// triangle with a vertex on the boundary. That is a statement about the field
+// and not about the boundary: the boundary values are aligned, but the
+// triangle between two boundary vertices and one interior vertex can still see
+// the field wind through a quarter turn, and on the corpus it does -- geom028
+// has six of its twelve singularities there, geom034 six of twenty, geom024
+// both of its two. A singularity that is not seen emits no separatrices, and
+// the components around it come out with three or five corners however well
+// everything else is done. Counting every triangle is also what makes the
+// index sum satisfy Poincare-Hopf (SeparatrixTrace::Report), which the
+// boundary-free list does not on seven of the models.
+//
+// On a planar mesh every tangent plane is the plane itself and every frame the
+// global one, so the transport angle phi_ij of the spec's Sec. 1 is zero on
+// every edge and the holonomy Omega with it: the index is the sum of the three
+// principal matchings, wrap(theta_j - theta_i, pi/2), which is an exact
+// multiple of pi/2 (the spec's E1 and E2 are about what goes wrong when either
+// wrap is left out).
 //
 // The centre is the point of the triangle where the interpolated representation
 // vector vanishes, which is where the cross has no orientation left; the
@@ -78,24 +99,56 @@ FieldTracer::FieldTracer(std::shared_ptr<CrossField> cf, bool useExactCenters)
 // corners rather than trusting one is what makes that error small to begin
 // with.
 // ---------------------------------------------------------------------------
-void FieldTracer::buildSingularities(bool useExactCenters) {
+void FieldTracer::buildSingularities(bool useExactCenters, bool boundaryTriangles,
+                                     const std::vector<char> &absorbAt) {
     singularityOf.assign(mesh->triangles.size(), -1);
     singularities.clear();
+    indexSum4 = 0;
+    multipleSingularities = 0;
+    droppedSingularities = 0;
+    absorbedSingularities = 0;
+    absorbedIndex4 = 0;
+    absorbedAt.assign(absorbAt.empty() ? 0 : mesh->vertices.size(), 0);
+    auto absorbedBy = [&](const Triangle &t) {
+        for (int k = 0; k < 3; ++k)
+            if (t[k] < static_cast<int>(absorbAt.size()) && absorbAt[t[k]]) return t[k];
+        return -1;
+    };
 
-    for (const auto &[triIdx, cfIndex] : crossField->singularTriangles) {
-        if (triIdx < 0 || triIdx >= static_cast<int>(mesh->triangles.size())) continue;
+    for (int triIdx = 0; triIdx < static_cast<int>(mesh->triangles.size()); ++triIdx) {
+        const Triangle &t = mesh->triangles[triIdx];
+        if (!boundaryTriangles && (mesh->isBoundaryVertex[t[0]] || mesh->isBoundaryVertex[t[1]] ||
+                                   mesh->isBoundaryVertex[t[2]]))
+            continue;
+        double sum = 0.0;
+        for (int k = 0; k < 3; ++k) {
+            const double step = vertexTheta[t[(k + 1) % 3]] - vertexTheta[t[k]];
+            sum += step - M_PI_2 * std::round(step / M_PI_2);
+        }
+        const int d = static_cast<int>(std::lround(sum / M_PI_2));
+        if (d == 0) continue;
+        if (const int at = absorbedBy(t); at >= 0) {
+            ++absorbedSingularities;
+            absorbedIndex4 += d;
+            absorbedAt[at] += d;
+            continue;
+        }
+        indexSum4 += d;
+        // Two singularities sharing one triangle. The model below handles any
+        // d < 4, but the paper only ever treats |d| = 1, so these are counted.
+        if (std::abs(d) >= 2) ++multipleSingularities;
 
         Singularity s;
         s.triangleIndex = triIdx;
-        s.singularityIndex = cfIndex;
-        s.d = static_cast<int>(std::lround(cfIndex * 4.0));
+        s.singularityIndex = 0.25 * d;
+        s.d = d;
 
         // 4 - d has to be a usable number of sectors for the conformal model:
         // d = 4 collapses it and d > 4 turns the exponent negative. Neither
         // happens for the simple singularities a smooth field produces, but a
         // ruined field should not take the tracer down with it.
         const int nPorts = 4 - s.d;
-        if (nPorts < 2 || nPorts > 8) continue;
+        if (nPorts < 2 || nPorts > 8) { ++droppedSingularities; continue; }
 
         const Triangle &tri = mesh->triangles[triIdx];
         const Point &p0 = mesh->vertices[tri[0]];

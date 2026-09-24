@@ -1,5 +1,7 @@
 #include "tracing/QuadLayout.hxx"
 
+#include "MERIDIAN/Interfaces.hxx"
+
 #include <algorithm>
 #include <cmath>
 #include <fstream>
@@ -156,12 +158,49 @@ void QuadLayout::collectNodes() {
                                                            nodeOfCorner[i]});
     }
 
+    // The nodes of the material interface network, each where it sits on its
+    // branches and, for a landing, on its boundary loop -- a landing on a
+    // straight stretch of dS is no corner of the boundary, but it is where
+    // the boundary arcs of two different materials meet.
+    const Interfaces *itf = trace->getInterfaces();
+    std::vector<int> nodeOfInterface(trace->interfaceNodes.size(), -1);
+    if (itf) {
+        splitsOfBranch.assign(itf->branches().size(), {});
+        std::vector<int> nodeOfNetworkNode(itf->nodes().size(), -1);
+        for (size_t i = 0; i < trace->interfaceNodes.size(); ++i) {
+            const InterfaceNodeInfo &in = trace->interfaceNodes[i];
+            nodeOfInterface[i] = addNode(mesh->vertices[in.vertex], NodeKind::InterfaceNode,
+                                         static_cast<int>(i));
+            nodeOfNetworkNode[in.node] = nodeOfInterface[i];
+            auto it = loopPos.find(in.vertex);
+            if (in.onBoundary && it != loopPos.end())
+                splitsOfLoop[it->second.first].push_back(
+                    Split{static_cast<double>(it->second.second), nodeOfInterface[i]});
+        }
+        for (size_t b = 0; b < itf->branches().size(); ++b) {
+            const Interfaces::Branch &br = itf->branches()[b];
+            if (br.closed || br.verts.size() < 2) continue;
+            for (const int end : {0, 1}) {
+                const int nn = end ? br.node1 : br.node0;
+                const int v = end ? br.verts.back() : br.verts.front();
+                int nd = (nn >= 0) ? nodeOfNetworkNode[nn] : -1;
+                // A branch ending on nothing is a tagging error the network
+                // already reports; it still needs a node to end on.
+                if (nd < 0) nd = addNode(mesh->vertices[v], NodeKind::Dangling, -1);
+                splitsOfBranch[b].push_back(
+                    Split{end ? static_cast<double>(br.verts.size() - 1) : 0.0, nd});
+            }
+        }
+    }
+
     // The two ends of every separatrix.
     for (const auto &sep : seps) {
         if (sep.path.size() < 2) continue;
 
         const int start = (sep.originKind == SeparatrixOrigin::Singularity)
                               ? nodeOfSingularity[sep.origin_singularity_id]
+                          : (sep.originKind == SeparatrixOrigin::InterfaceNode)
+                              ? nodeOfInterface[sep.origin_singularity_id]
                               : nodeOfCorner[sep.origin_singularity_id];
         splitsOfSeparatrix[sep.id].push_back(Split{0.0, start});
 
@@ -223,7 +262,8 @@ void QuadLayout::collectNodes() {
             }
 
             case TerminationReason::CUT_AT_SINGULARITY:
-            case TerminationReason::CROSSED_TWICE: {
+            case TerminationReason::CROSSED_TWICE:
+            case TerminationReason::TANGENTIAL: {
                 const int nd = addNode(endPos, NodeKind::TJunction, sep.id);
                 splitsOfSeparatrix[sep.id].push_back(Split{endP, nd});
                 const int host = sep.endOnSeparatrix;
@@ -238,6 +278,45 @@ void QuadLayout::collectNodes() {
                 splitsOfSeparatrix[sep.id].push_back(Split{endP, nd});
                 break;
             }
+        }
+    }
+
+    // Every crossing of an interface, which splits the separatrix and the
+    // interface branch both. A crossing recorded on a stretch of separatrix a
+    // later truncation removed is no longer on the path, and is dropped.
+    if (itf) {
+        for (const InterfaceCrossing &x : trace->interfaceCrossings) {
+            if (x.sep < 0 || x.sep >= static_cast<int>(seps.size())) continue;
+            const auto &path = seps[x.sep].path;
+            if (x.pathIndex <= 0 || x.pathIndex >= static_cast<int>(path.size())) continue;
+            if (normP(path[x.pathIndex].global_pos - x.pos) > tol) continue;
+
+            int b = -1;
+            double p = 0.0;
+            if (x.edge >= 0) {
+                b = itf->branchOfEdge(x.edge);
+                if (b < 0) continue;
+                const auto &br = itf->branches()[b];
+                for (size_t i = 0; i < br.edges.size(); ++i) {
+                    if (br.edges[i] != x.edge) continue;
+                    const Point &A = mesh->vertices[br.verts[i]];
+                    const Point d = mesh->vertices[br.verts[i + 1]] - A;
+                    const double dd = dotP(d, d);
+                    const double t = dd > 0.0 ? std::min(1.0, std::max(0.0, dotP(x.pos - A, d) / dd)) : 0.0;
+                    p = i + t;
+                    break;
+                }
+            } else if (x.vertex >= 0) {
+                b = itf->branchAt(x.vertex);   // -1 at a node, which is its own split
+                if (b >= 0) {
+                    const auto &br = itf->branches()[b];
+                    for (size_t i = 0; i < br.verts.size(); ++i)
+                        if (br.verts[i] == x.vertex) { p = static_cast<double>(i); break; }
+                }
+            }
+            const int nd = addNode(x.pos, NodeKind::InterfaceHit, x.sep);
+            splitsOfSeparatrix[x.sep].push_back(Split{static_cast<double>(x.pathIndex), nd});
+            if (b >= 0) splitsOfBranch[b].push_back(Split{p, nd});
         }
     }
 
@@ -355,6 +434,53 @@ void QuadLayout::buildBoundaryArcs() {
             }
             pts.push_back(nodes[s1.node].pos);
             addArc(std::move(pts), s0.node, s1.node, -1, true);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// buildInterfaceArcs()  --  the interface branches, cut at their nodes
+//
+// Exactly as a boundary loop is cut, with two differences: an interface arc
+// has a component on both sides, so it is never the side a face walk leaves
+// the model by (onBoundary stays false), and a closed branch -- an inclusion
+// the network put no node on -- is cut only where separatrices cross it.
+// ---------------------------------------------------------------------------
+void QuadLayout::buildInterfaceArcs() {
+    const Interfaces *itf = trace ? trace->getInterfaces() : nullptr;
+    if (!itf) return;
+    for (size_t b = 0; b < itf->branches().size(); ++b) {
+        const Interfaces::Branch &br = itf->branches()[b];
+        const int n = static_cast<int>(br.verts.size());
+        if (n < 2) continue;
+        auto splits = splitsOfBranch[b];
+        if (br.closed && splits.empty())
+            splits.push_back(Split{0.0, addNode(mesh->vertices[br.verts[0]], NodeKind::InterfaceHit, -1)});
+        std::sort(splits.begin(), splits.end(),
+                  [](const Split &x, const Split &y) { return x.p < y.p; });
+        splits.erase(std::unique(splits.begin(), splits.end(),
+                                 [](const Split &x, const Split &y) {
+                                     return x.node == y.node && std::fabs(x.p - y.p) < 1e-12;
+                                 }),
+                     splits.end());
+        const int m = static_cast<int>(splits.size());
+        // A closed branch wraps: its last split joins its first one round the
+        // loop, whose length in parameter is n - 1 (verts repeats its start).
+        const int arcsHere = br.closed ? m : m - 1;
+        for (int i = 0; i < arcsHere; ++i) {
+            const Split &s0 = splits[i];
+            const Split &s1 = splits[(i + 1) % m];
+            const double p0 = s0.p;
+            const double p1 = (i + 1 < m) ? s1.p : s1.p + (n - 1);
+            std::vector<Point> pts;
+            pts.push_back(nodes[s0.node].pos);
+            for (int k = static_cast<int>(std::floor(p0)) + 1; k <= static_cast<int>(std::ceil(p1)); ++k) {
+                if (k <= p0 + 1e-12 || k >= p1 - 1e-12) continue;
+                pts.push_back(mesh->vertices[br.verts[k % (n - 1 > 0 ? n - 1 : 1)]]);
+            }
+            pts.push_back(nodes[s1.node].pos);
+            const int a = addArc(std::move(pts), s0.node, s1.node, -1, false);
+            if (a >= 0) arcs[a].onInterface = true;
         }
     }
 }
@@ -497,7 +623,7 @@ void QuadLayout::traceFaces() {
                 return false;
             }();
             bool corner = true;
-            if (nd.kind == NodeKind::BoundaryCorner) {
+            if (nd.kind == NodeKind::BoundaryCorner || nd.kind == NodeKind::InterfaceNode) {
                 // A corner of the model is a corner of whatever component sits
                 // in it, at any angle: a convex one has only its two boundary
                 // arcs and no more, and is still where a component turns.
@@ -593,7 +719,13 @@ void QuadLayout::checkEmbedding() {
                     const Point &q0 = arcs[j].pts[y - 1], &q1 = arcs[j].pts[y];
                     const Point r = p1 - p0, s = q1 - q0;
                     const double den = cross2(r, s);
-                    if (std::fabs(den) < 1e-30) continue;
+                    // Parallel to within rounding: relative to the two
+                    // lengths, not absolute. Two collinear pieces of one
+                    // straight edge either side of a node have a cross
+                    // product of ~1e-19, which an absolute 1e-30 lets through,
+                    // and the parameters that come out of it are noise that
+                    // can land inside both -- a crossing that is not there.
+                    if (std::fabs(den) <= 1e-12 * normP(r) * normP(s)) continue;
                     const Point w = q0 - p0;
                     const double t = cross2(w, s) / den;
                     const double u = cross2(w, r) / den;
@@ -620,6 +752,7 @@ void QuadLayout::build() {
     collectNodes();
     buildSeparatrixArcs();
     buildBoundaryArcs();
+    buildInterfaceArcs();
     finish();
 }
 
@@ -637,7 +770,9 @@ void QuadLayout::finish() {
         // Counted by what the node is: three arcs meeting in the interior at
         // something that is not a singularity is a T-junction whatever it was
         // called when it was made.
-        if (n.darts.size() != 3 || n.kind == NodeKind::Singularity) continue;
+        if (n.darts.size() != 3 || n.kind == NodeKind::Singularity ||
+            n.kind == NodeKind::InterfaceNode)
+            continue;
         bool boundary = false;
         for (const int d : n.darts) if (arcs[d >> 1].onBoundary) boundary = true;
         if (!boundary) ++report_.tJunctions;
@@ -657,7 +792,8 @@ void QuadLayout::finish() {
         }
         bool boundaryHere = false;
         for (const int d : n.darts) if (arcs[d >> 1].onBoundary) boundaryHere = true;
-        if (n.darts.size() == 3 && !boundaryHere && n.kind != NodeKind::Singularity) {
+        if (n.darts.size() == 3 && !boundaryHere && n.kind != NodeKind::Singularity &&
+            n.kind != NodeKind::InterfaceNode) {
             // Two right angles and a straight side, not three equal sectors.
             worst = 0.0;
             std::vector<double> w(n.darts.size());

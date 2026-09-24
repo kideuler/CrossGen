@@ -1494,6 +1494,12 @@ void drawQuadLayoutNodes(const QuadLayout &layout, double radius) {
             case QuadLayout::NodeKind::Dangling:
                 drawDisk3D(n.pos, radius, 0.9f, 0.1f, 0.1f);
                 break;
+            case QuadLayout::NodeKind::InterfaceNode:
+                drawDisk3D(n.pos, radius, 0.55f, 0.25f, 0.85f);
+                break;
+            case QuadLayout::NodeKind::InterfaceHit:
+                drawDisk3D(n.pos, radius, 0.75f, 0.55f, 0.95f);
+                break;
         }
     }
 }

@@ -31,6 +31,20 @@ Point pointAlong(const std::vector<Point> &p, double s) {
     return p.back();
 }
 
+// A curve of the model -- dS or a material interface -- rather than a curve
+// the tracing chose: never deleted, never moved, never blended into anything.
+inline bool fixedArc(const QuadLayout::Arc &a) { return a.onBoundary || a.onInterface; }
+
+// The total length of the interface arcs, which a collapse has to leave
+// exactly as it found it. dS is protected by the area check; an interface is
+// interior, so moving one changes which material is where and not the total
+// area, and this is the check that sees it.
+double interfaceLength(const QuadLayout &L) {
+    double s = 0.0;
+    for (const auto &a : L.getArcs()) if (a.onInterface) s += a.length;
+    return s;
+}
+
 // Resample a polyline at the given fractions of its arc length.
 std::vector<Point> sampleAt(const std::vector<Point> &p, const std::vector<double> &s) {
     std::vector<Point> out;
@@ -54,6 +68,7 @@ const char *PartitionSimplify::blockName(Block b) {
         case Block::NoPatches: return "no patches";
         case Block::Energy: return "energy (Sec. 4.1)";
         case Block::Drag: return "wider than maxDrag";
+        case Block::RungAcrossInterface: return "rung between an interface and another curve";
     }
     return "?";
 }
@@ -79,6 +94,8 @@ PartitionSimplify::PartitionSimplify(const QuadLayout &layout, const Settings &s
         if (!m->edges.empty()) meshEdge_ = e / static_cast<double>(m->edges.size());
     }
 
+    if (const SeparatrixTrace *t = layout.getTrace()) tracer_ = &t->getTracer();
+
     const auto &r = layout_.getReport();
     report_.componentsBefore = r.faces;
     report_.tJunctionsBefore = r.tJunctions;
@@ -92,11 +109,26 @@ bool PartitionSimplify::isSingularity(int node) const {
     return node >= 0 && layout_.getNodes()[node].kind == QuadLayout::NodeKind::Singularity;
 }
 
+// On dS or on a material interface: both are curves of the model, and a node
+// on one may not be pulled off it.
 bool PartitionSimplify::isOnBoundary(int node) const {
     if (node < 0) return false;
     for (const int d : layout_.getNodes()[node].darts)
-        if (layout_.getArcs()[d >> 1].onBoundary) return true;
+        if (fixedArc(layout_.getArcs()[d >> 1])) return true;
     return false;
+}
+
+bool PartitionSimplify::isOnInterface(int node) const {
+    if (node < 0) return false;
+    for (const int d : layout_.getNodes()[node].darts)
+        if (layout_.getArcs()[d >> 1].onInterface) return true;
+    return false;
+}
+
+// A node of the interface network: a corner of every region it touches, and
+// like a singularity never merged into anything.
+bool PartitionSimplify::isNetworkNode(int node) const {
+    return node >= 0 && layout_.getNodes()[node].kind == QuadLayout::NodeKind::InterfaceNode;
 }
 
 // At a T-junction three arcs meet: two carry the side that runs past it and
@@ -233,7 +265,8 @@ void PartitionSimplify::analyse(Chord &c) const {
         r.endR = endR;
         for (const int d : r.darts) {
             r.length += arcs[d >> 1].length;
-            if (arcs[d >> 1].onBoundary) r.onBoundary = true;
+            if (fixedArc(arcs[d >> 1])) r.onBoundary = true;
+            if (arcs[d >> 1].onInterface) r.onInterface = true;
         }
         // Contracting a rung merges its two ends into one point, so anything
         // sitting between them is squashed too. A plain join is nothing to
@@ -368,6 +401,27 @@ bool PartitionSimplify::patchOk(const Chord &c, Patch &p, Block &why) const {
             why = Block::RungSingularityToBoundary;
             return false;
         }
+        // A node of the interface network is fixed as a singularity is: it
+        // may absorb the other end of a rung but never be absorbed, so a rung
+        // with one at each end -- or one and a corner of dS -- cannot go.
+        auto fixedKind = [&](int n) {
+            return isSingularity(n) || isNetworkNode(n) ||
+                   (n >= 0 && layout_.getNodes()[n].kind == QuadLayout::NodeKind::BoundaryCorner);
+        };
+        if ((isNetworkNode(r.endL) && fixedKind(r.endR)) ||
+            (isNetworkNode(r.endR) && fixedKind(r.endL))) {
+            why = Block::RungJoinsSingularities;
+            return false;
+        }
+        // A rung that is not itself a piece of an interface, joining a node
+        // on an interface to a node on another curve of the model: whichever
+        // end went, it would leave its curve. dS alone has the area check to
+        // catch that; an interface has only this.
+        if (!r.onBoundary && isOnBoundary(r.endL) && isOnBoundary(r.endR) &&
+            (isOnInterface(r.endL) || isOnInterface(r.endR))) {
+            why = Block::RungAcrossInterface;
+            return false;
+        }
     }
 
     // Which side carries the singularities decides zip against non-zip.
@@ -386,8 +440,8 @@ bool PartitionSimplify::patchOk(const Chord &c, Patch &p, Block &why) const {
         const int comp = c.cyclic ? (i % static_cast<int>(c.faces.size()))
                                   : i;   // component i lies between rungs i and i+1
         if (comp < 0 || comp >= static_cast<int>(c.sideL.size())) continue;
-        for (const int d : c.sideL[comp]) if (arcs[d >> 1].onBoundary) boundaryL = true;
-        for (const int d : c.sideR[comp]) if (arcs[d >> 1].onBoundary) boundaryR = true;
+        for (const int d : c.sideL[comp]) if (fixedArc(arcs[d >> 1])) boundaryL = true;
+        for (const int d : c.sideR[comp]) if (fixedArc(arcs[d >> 1])) boundaryR = true;
     }
     if (boundaryL && boundaryR) { why = Block::StripBetweenBoundaries; return false; }
     if (p.zip && (boundaryL || boundaryR)) { why = Block::ZipAgainstBoundary; return false; }
@@ -623,8 +677,8 @@ bool PartitionSimplify::collapse(const Chord &c) {
             // Which of the two survives: nothing may move a singularity, and
             // nothing may pull a boundary node off the boundary.
             int keep = -1;
-            if (isSingularity(r.endL)) keep = r.endL;
-            else if (isSingularity(r.endR)) keep = r.endR;
+            if (isSingularity(r.endL) || isNetworkNode(r.endL)) keep = r.endL;
+            else if (isSingularity(r.endR) || isNetworkNode(r.endR)) keep = r.endR;
             else if (isOnBoundary(r.endL) && !isOnBoundary(r.endR)) keep = r.endL;
             else if (isOnBoundary(r.endR) && !isOnBoundary(r.endL)) keep = r.endR;
             else keep = p.keepL ? r.endL : r.endR;
@@ -634,10 +688,12 @@ bool PartitionSimplify::collapse(const Chord &c) {
                 // The rung is a piece of the boundary; the merged node stays
                 // where the surviving end already is and the boundary arc
                 // beyond the dying end takes over the rung's geometry.
+                // Of the same kind: an interface piece is carried on by the
+                // interface, a boundary piece by dS.
                 int other = -1;
                 for (const int d : oldNodes[die].darts) {
                     const int arc = d >> 1;
-                    if (!oldArcs[arc].onBoundary) continue;
+                    if (!fixedArc(oldArcs[arc]) || oldArcs[arc].onInterface != r.onInterface) continue;
                     bool inRung = false;
                     for (const int rd : r.darts) if ((rd >> 1) == arc) inRung = true;
                     if (!inRung) { other = arc; break; }
@@ -654,7 +710,9 @@ bool PartitionSimplify::collapse(const Chord &c) {
                 pos[keep] = blend(s);
             }
 
-            if (static_cast<int>(kind[keep]) > static_cast<int>(kind[die])) kind[keep] = kind[die];
+            if (kind[keep] != QuadLayout::NodeKind::InterfaceNode &&
+                static_cast<int>(kind[keep]) > static_cast<int>(kind[die]))
+                kind[keep] = kind[die];
             remap[die] = keep;
             placed.push_back(Placed{s, keep, true});
         }
@@ -683,14 +741,17 @@ bool PartitionSimplify::collapse(const Chord &c) {
 
         // Cut the merged curve at those points and emit one arc between each
         // consecutive pair.
-        const bool mergedIsBoundary = [&] {
+        auto keptSideHas = [&](bool interface) {
             for (int i = p.first; i < p.last; ++i) {
                 const int comp = i % nComp;
                 const auto &side = p.keepL ? c.sideL[comp] : c.sideR[comp];
-                for (const int d : side) if (oldArcs[d >> 1].onBoundary) return true;
+                for (const int d : side)
+                    if (interface ? oldArcs[d >> 1].onInterface : oldArcs[d >> 1].onBoundary) return true;
             }
             return false;
-        }();
+        };
+        const bool mergedIsBoundary = keptSideHas(false);
+        const bool mergedIsInterface = keptSideHas(true);
         // The merged curve is followed at the resolution the two sides already
         // have, not resampled at some fixed count. A side kept whole is emitted
         // point for point: resampling it coarsely would cut the corners off a
@@ -716,6 +777,7 @@ bool PartitionSimplify::collapse(const Chord &c) {
             a.a = placed[i - 1].node;
             a.b = placed[i].node;
             a.onBoundary = mergedIsBoundary;
+            a.onInterface = mergedIsInterface;
             a.separatrix = -1;
             newArcs.push_back(std::move(a));
         }
@@ -836,9 +898,9 @@ int PartitionSimplify::mergeLenses() {
             const int a0 = f.darts[0] >> 1, a1 = f.darts[1] >> 1;
             if (a0 == a1) continue;
             const auto &arcs = layout_.getArcs();
-            if (arcs[a0].onBoundary && arcs[a1].onBoundary) continue;
-            if (arcs[a0].onBoundary) { drop = a1; break; }
-            if (arcs[a1].onBoundary) { drop = a0; break; }
+            if (fixedArc(arcs[a0]) && fixedArc(arcs[a1])) continue;
+            if (fixedArc(arcs[a0])) { drop = a1; break; }
+            if (fixedArc(arcs[a1])) { drop = a0; break; }
             drop = (arcs[a0].length < arcs[a1].length) ? a0 : a1;
             break;
         }
@@ -888,7 +950,14 @@ bool PartitionSimplify::removeOneSliver() {
         const bool sA = isSingularity(a.a), sB = isSingularity(a.b);
         if (sA && sB) continue;                  // Sec. 4 condition 1
         if ((sA && isOnBoundary(a.b)) || (sB && isOnBoundary(a.a))) continue;  // condition 2
-        if (a.onBoundary) {
+        // A node of the interface network goes nowhere, and takes nothing
+        // that is itself fixed.
+        const bool nA = isNetworkNode(a.a), nB = isNetworkNode(a.b);
+        if ((nA && (nB || sB)) || (nB && sA)) continue;
+        if ((nA || nB) && (nodes[a.a].kind == QuadLayout::NodeKind::BoundaryCorner ||
+                           nodes[a.b].kind == QuadLayout::NodeKind::BoundaryCorner))
+            continue;
+        if (fixedArc(a)) {
             // A piece of the boundary may be contracted: the two nodes at its
             // ends become one and the model keeps its shape, because the arc
             // carrying on past the dying end swallows this one's geometry. What
@@ -908,11 +977,13 @@ bool PartitionSimplify::removeOneSliver() {
     // Whichever end may not move decides where the merged node goes.
     int keep = a.a, die = a.b;
     if (isSingularity(a.b) || (isOnBoundary(a.b) && !isOnBoundary(a.a))) { keep = a.b; die = a.a; }
-    if (a.onBoundary && nodes[a.b].kind == QuadLayout::NodeKind::BoundaryCorner) {
+    if (fixedArc(a) && nodes[a.b].kind == QuadLayout::NodeKind::BoundaryCorner) {
         keep = a.b; die = a.a;    // a corner of the model stays put
-    } else if (a.onBoundary && nodes[a.a].kind == QuadLayout::NodeKind::BoundaryCorner) {
+    } else if (fixedArc(a) && nodes[a.a].kind == QuadLayout::NodeKind::BoundaryCorner) {
         keep = a.a; die = a.b;
     }
+    if (isNetworkNode(a.b)) { keep = a.b; die = a.a; }   // and so does a node of the network
+    else if (isNetworkNode(a.a)) { keep = a.a; die = a.b; }
     const Point at = nodes[keep].pos;
 
     // Contracting a piece of the boundary must not shorten the model, so the
@@ -920,10 +991,10 @@ bool PartitionSimplify::removeOneSliver() {
     // the outline is the same curve afterwards, carried by one arc fewer.
     int absorbInto = -1;
     std::vector<Point> absorbed;
-    if (a.onBoundary) {
+    if (fixedArc(a)) {
         for (const int d : nodes[die].darts) {
             const int arc = d >> 1;
-            if (arc == best || !arcs[arc].onBoundary) continue;
+            if (arc == best || !fixedArc(arcs[arc]) || arcs[arc].onInterface != a.onInterface) continue;
             absorbInto = arc;
             break;
         }
@@ -933,8 +1004,9 @@ bool PartitionSimplify::removeOneSliver() {
     }
 
     std::vector<QuadLayout::Node> ns = nodes;
-    ns[keep].kind = (static_cast<int>(nodes[keep].kind) < static_cast<int>(nodes[die].kind))
-                        ? nodes[keep].kind : nodes[die].kind;
+    if (nodes[keep].kind != QuadLayout::NodeKind::InterfaceNode)
+        ns[keep].kind = (static_cast<int>(nodes[keep].kind) < static_cast<int>(nodes[die].kind))
+                            ? nodes[keep].kind : nodes[die].kind;
     for (auto &n : ns) { n.darts.clear(); n.angles.clear(); }
 
     std::vector<QuadLayout::Arc> keptArcs;
@@ -1027,6 +1099,8 @@ void PartitionSimplify::run() {
             if (!removeOneSliver()) break;
             const auto &ra = layout_.getReport();
             const bool ok = !hasSpur() && ra.arcCrossings == 0 && ra.danglingEnds == 0 && ra.faces > 0 &&
+                            std::fabs(interfaceLength(layout_) - interfaceLength(before)) <=
+                                1e-9 * std::max(1.0, interfaceLength(before)) &&
                             ra.faces < rb.faces && ra.singularities == rb.singularities &&
                             std::fabs(ra.totalArea - rb.totalArea) <=
                                 1e-6 * std::max(1.0, rb.totalArea) &&
@@ -1045,6 +1119,8 @@ void PartitionSimplify::run() {
             const auto &rb = before.getReport();
             const auto &ra = layout_.getReport();
             if (hasSpur() || ra.arcCrossings != 0 || ra.danglingEnds != 0 || ra.faces <= 0 ||
+                std::fabs(interfaceLength(layout_) - interfaceLength(before)) >
+                    1e-9 * std::max(1.0, interfaceLength(before)) ||
                 ra.singularities != rb.singularities ||
                 std::fabs(ra.totalArea - rb.totalArea) > 1e-6 * std::max(1.0, rb.totalArea))
                 layout_ = before;
@@ -1054,6 +1130,7 @@ void PartitionSimplify::run() {
     }
     sweepSlivers();
 
+    auto collapseAll = [&]() {
     for (int iter = 0; iter < settings_.maxCollapses; ++iter) {
         enumerateChords();
 
@@ -1136,6 +1213,8 @@ void PartitionSimplify::run() {
             else if (ra.singularities != rb.singularities) { ++report_.rbSing; ok = false; }
             else if (std::fabs(ra.totalArea - rb.totalArea) >
                      1e-6 * std::max(1.0, rb.totalArea)) { ++report_.rbArea; ok = false; }
+            else if (std::fabs(interfaceLength(layout_) - interfaceLength(before)) >
+                     1e-9 * std::max(1.0, interfaceLength(before))) { ++report_.rbInterface; ok = false; }
             else if ((rb.faces - ra.faces) < (rb.quadFaces - ra.quadFaces)) {
                 ++report_.rbWorse; ok = false;
             }
@@ -1144,6 +1223,24 @@ void PartitionSimplify::run() {
             layout_ = before;
         }
         if (!done) break;
+    }
+    };
+    collapseAll();
+
+    // Sec. 12: the T-junctions no collapse could remove, continued to the
+    // boundary where the field allows, and the strips the continuations leave
+    // collapsed in turn. The collapses cannot bring a T-junction back
+    // (Proposition 2, checked above), so what this removes stays removed.
+    report_.tJunctionsBeforeStems = layout_.getReport().tJunctions;
+    if (settings_.extendStems && tracer_ && layout_.getReport().tJunctions > 0) {
+        StemExtension ext(layout_, *tracer_, settings_.stems);
+        ext.run();
+        report_.stems = ext.getReport();
+        if (report_.stems.extended > 0) {
+            layout_ = ext.getLayout();
+            sweepSlivers();
+            collapseAll();
+        }
     }
 
     const auto &r = layout_.getReport();

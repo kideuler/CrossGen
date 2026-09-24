@@ -210,6 +210,11 @@ add_library(PolyVector SHARED
     src/tracing/QuadLayout.cxx
     src/tracing/PartitionSimplify.hxx
     src/tracing/PartitionSimplify.cxx
+    src/tracing/LayoutBlocks.hxx
+    src/tracing/LayoutBlocks.cxx
+    src/tracing/StemExtension.hxx
+    src/tracing/StemExtension.cxx
+    src/tracing/TriangleLocator.hxx
     src/triangle/triangle.cpp
     src/triangle/triangle.h
     src/triangle/TriangleMesher.hpp
@@ -407,11 +412,19 @@ add_test(NAME TriangleMesher_ConcentricShells COMMAND TestTriangleMesher 6)
 
 
 # End-to-end: trace every model in data/meshes and check each layout is a plane
-# graph whose faces tile the model exactly with nothing left dangling. How many
-# of the components come out four-sided is printed but not asserted -- that is
-# the part Sec. 4 of the paper is for.
+# graph whose faces tile the model exactly with nothing left dangling, that the
+# blocks read off it (tracing/LayoutBlocks) are a sound decomposition -- every
+# side running between its block's corners, every Coons patch on its corners --
+# and that the mesh on them is conforming. How many of the components come out
+# four-sided, and how much of the model the blocks cover, are printed but not
+# asserted: that is what the method achieves on a model, not a defect.
 add_test(NAME Tracing_LayoutsOnAllMeshes
-         COMMAND TraceMesh --no-vtu ${MESH_OBJ_FILES})
+         COMMAND TraceMesh --no-vtu --mesh 0.05 ${MESH_OBJ_FILES})
+
+# docs/viertel_2019.md Sec. 11 on closed-form fields: the index, the ports and
+# the hyperbola of a singularity, straight streamlines in a constant field, and
+# the square, the L-shape and a T-junction taken through to blocks and a mesh.
+add_test(NAME Tracing_SelfTest COMMAND TraceMesh --selftest)
 
 # Discrete Ricci flow (Shepherd et al. Sec. 3.2.1) against prescribed cone sets
 # with far more curvature to move than anything in data/meshes asks for, which

@@ -5,6 +5,7 @@
 #include <cmath>
 #include <memory>
 #include <utility>
+#include <vector>
 
 // eigen includes
 #include <Eigen/Dense>
@@ -28,6 +29,48 @@ public:
     // the pipeline be compared against each other rather than against the
     // clock.
     void initialize(int method = 0, unsigned seed = 0);
+
+    // Interior edges the field is to be aligned to, on top of dS: the material
+    // interfaces of a multi-material domain. DualMBO::setAlignedInteriorEdges
+    // is the same call on the p=0 field, and the reason is the same: a field
+    // whose only Dirichlet data is the tangent of dS runs straight through
+    // every interface, and each material region then lacks the singularities
+    // its own index count asks for.
+    //
+    // Per vertex rather than per triangle, which is the one thing that
+    // changes. DualMBO pins the two triangles either side of an interface edge;
+    // here every vertex on one is pinned, to the tangent of the interface, and
+    // since every stiffness entry coupling the two materials runs through such
+    // a vertex that decouples the regions just as DualMBO's pinned triangles
+    // do. The value at a vertex is the length-weighted mean of exp(4i phi)
+    // over its incident interface edges -- exact on a smooth run and at a
+    // right-angled kink, T or cross, where every edge asks for the same cross.
+    // Where they do not (an oblique or 120-degree junction, a 135-degree
+    // kink: the ill-posed nodes of data/geometry/multimat) the mean shrinks,
+    // and below DualMBO's kCornerCoherenceMin the vertex is left free rather
+    // than pinned to a direction no incident curve has; the field then turns
+    // there, and the tracing takes that node over (SeparatrixTrace).
+    //
+    // Boundary vertices keep dS's data. Call before initialize(); an empty set
+    // is the old behaviour, which the single-material baseline keeps.
+    void setAlignedInteriorEdges(const std::vector<int> &edges);
+    // After initialize(): interface vertices pinned, and left free because
+    // their incident interface directions disagreed.
+    int alignedInterfaceVertices() const { return alignedInterface; }
+    int freeInterfaceVertices() const { return freeInterface; }
+
+    // Kill the rotational degree of freedom of a disk:
+    // DualMBO::setPinDiskCenters, per vertex. A disk's four +1/4 cones are
+    // placed by nothing in the boundary data, so an unpinned field lands them
+    // wherever the random start and the arithmetic put them, and the ten
+    // disks of data/geometry/multimat/bubbles.geo come out ten different ways.
+    // Pinning the vertex nearest the centre of each component
+    // Mesh::computeMaterialCircles accepted as a circle to u = 1 puts them on
+    // the diagonals, the cross at the centre axis-aligned -- DualMBO's
+    // canonical position. Off by default, so the baseline is unchanged; call
+    // before initialize().
+    void setPinDiskCenters(bool on) { pinDiskCenters = on; }
+    int pinnedDiskCenters() const { return pinnedDisks; }
 
     // Multiply the tau = D^2/10 heuristic by this factor.
     //
@@ -60,6 +103,10 @@ private:
     Eigen::SparseLU<Eigen::SparseMatrix<std::complex<double>>> solverLU; // sparse direct solver
     Eigen::BiCGSTAB<Eigen::SparseMatrix<std::complex<double>>> solverBiCGSTAB; // sparse iterative solver (fallback)
     bool useBiCGSTAB = false; // flag to indicate which solver to use
+    std::vector<char> edgeAligned; // per mesh edge: see setAlignedInteriorEdges
+    int alignedInterface = 0, freeInterface = 0;
+    bool pinDiskCenters = false;
+    int pinnedDisks = 0;
     double tau; // time step size
     double tauScale = 1.0; // multiplier on the D^2/10 heuristic, see setTauScale
     int maxIterations; // maximum number of iterations

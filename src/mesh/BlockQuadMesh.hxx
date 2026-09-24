@@ -178,6 +178,16 @@ public:
     const Report &getReport() const { return report_; }
     const Options &getOptions() const { return opts_; }
 
+    // The vertices on macro edges with a block on one side only that are not
+    // on dS: the rim of a hole, where the producer left a face out of the
+    // decomposition (a T-junction on its side, say) and there are no elements.
+    // That rim is not a curve of the model, but it is where the mesh of
+    // whatever eventually fills the hole will have to meet this one, so a
+    // caller may want to pin it under a smoother (mesh::QuadMesh::pinVertex).
+    // Whether that is worth its cost is the caller's to measure; TraceMesh's
+    // --pin-open-sides records what it measured.
+    const std::vector<int> &openSideVertices() const { return openVerts_; }
+
     // An .obj of quadrilateral faces, `usemtl mat<id>` per material as
     // mesh::QuadMesh reads it back.
     bool writeOBJ(const std::string &path) const;
@@ -197,6 +207,7 @@ private:
     std::vector<int> intervals_;                // per macro edge
     std::vector<std::vector<int>> edgeNodes_;   // per macro edge, intervals + 1
 
+    std::vector<int> openVerts_;
     std::vector<Point> verts_;
     std::vector<std::array<int, 4>> cells_;
     std::vector<int> cellMaterial_;
