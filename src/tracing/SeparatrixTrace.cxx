@@ -714,6 +714,100 @@ bool SeparatrixTrace::snapTangentialLanding(Separatrix &sep) {
 }
 
 // ---------------------------------------------------------------------------
+// joinCornerLanding()  --  the corner-to-corner heteroclinic connection
+//
+// Where a neck meets the body of a model, the reflex corners at its two sides
+// each send a separatrix straight across it, and in the continuum the two are
+// one streamline running corner to corner. Traced, each lands a fraction of an
+// element beside the other corner, and the layout gets two curves across the
+// neck a ten-thousandth of an edge apart: a strip between two boundaries that
+// Sec. 4 may not collapse (a rung from a corner to the boundary), which cuts
+// every chord running along the neck in two, and leaves a node where the two
+// crossings of each longitudinal separatrix merge. On geom022 that is what
+// keeps the neck, and with it a fifth of the model, from ever becoming blocks.
+//
+// It is the heteroclinic join of Sec. 4.4 with the corner standing in for the
+// other separatrix's origin: square arrival (a tangential one is
+// snapTangentialLanding()'s), within Settings::cornerJoinRadius of the corner,
+// heading within tangentialAngle of straight back along one of the corner's
+// own separatrices. The arrival is moved onto the corner and that separatrix
+// is cut back to its origin through the same retractTail() a join uses, so
+// crossings on it are withdrawn and anything that had stopped on it resumes.
+// ---------------------------------------------------------------------------
+bool SeparatrixTrace::joinCornerLanding(Separatrix &sep) {
+    if (!(settings.cornerJoinRadius > 0.0) || sep.path.size() < 2) return false;
+    const double h = tracer->averageEdgeLength();
+    const Point end = sep.path.back().global_pos;
+
+    // Directions measured over about an edge, not over the last or first
+    // segment alone: a segment can be a sliver of a triangle.
+    auto pointBack = [&](const std::vector<TracePoint> &p, bool fromEnd) {
+        const Point o = fromEnd ? p.back().global_pos : p.front().global_pos;
+        const int n = static_cast<int>(p.size());
+        for (int i = 1; i < n; ++i) {
+            const Point &q = p[fromEnd ? n - 1 - i : i].global_pos;
+            if (normP(q - o) >= h) return q;
+        }
+        return fromEnd ? p.front().global_pos : p.back().global_pos;
+    };
+    Point in = end - pointBack(sep.path, true);
+    if (normP(in) < 1e-12 * h) return false;
+    in = in / normP(in);
+
+    int bestSep = -1, bestCorner = -1;
+    double bestDist = settings.cornerJoinRadius * h;
+    for (size_t ci = 0; ci < boundaryCorners.size(); ++ci) {
+        const Point c = mesh->vertices[boundaryCorners[ci].vertex];
+        const double d = normP(c - end);
+        if (d >= bestDist) continue;
+        if (sep.originKind == SeparatrixOrigin::BoundaryCorner &&
+            sep.origin_singularity_id == static_cast<int>(ci))
+            continue;   // back to where it started: not a connection
+        for (const Separatrix &o : separatrices) {
+            if (o.id == sep.id || o.originKind != SeparatrixOrigin::BoundaryCorner ||
+                o.origin_singularity_id != static_cast<int>(ci) || o.path.size() < 2)
+                continue;
+            Point out = pointBack(o.path, false) - o.path.front().global_pos;
+            if (normP(out) < 1e-12 * h) continue;
+            out = out / normP(out);
+            if (dotP(in, out) > -std::cos(settings.tangentialAngle)) continue;
+            bestSep = o.id;
+            bestCorner = static_cast<int>(ci);
+            bestDist = d;
+        }
+    }
+    if (bestSep < 0) return false;
+    const Point c = mesh->vertices[boundaryCorners[bestCorner].vertex];
+
+    // One that crossed another of the corner's separatrices on its way in, near
+    // the corner, did not arrive end on: it came in across the corner's own
+    // wedge (on geom035 it grazes the corner a hundred-thousandth of an edge
+    // out), and ending it on the corner would leave that crossing sitting on
+    // top of the corner with the two curves still crossing beside it. Those
+    // are left as they landed.
+    for (const SeparatrixCrossing &x : crossings) {
+        const int other = (x.sepA == sep.id) ? x.sepB : (x.sepB == sep.id) ? x.sepA : -1;
+        if (other < 0 || separatrices[other].originKind != SeparatrixOrigin::BoundaryCorner ||
+            separatrices[other].origin_singularity_id != bestCorner)
+            continue;
+        if (normP(x.pos - c) <= settings.cornerJoinRadius * h) return false;
+    }
+
+    sep.path.back().global_pos = c;
+    sep.endBoundaryVertex = boundaryCorners[bestCorner].vertex;
+    sep.endBoundaryEdge = -1;
+
+    Separatrix &o = separatrices[bestSep];
+    retractTail(o.id, 1, c);
+    interfaceCrossings.erase(std::remove_if(interfaceCrossings.begin(), interfaceCrossings.end(),
+                                            [&](const InterfaceCrossing &x) { return x.sep == o.id; }),
+                             interfaceCrossings.end());
+    terminateAt(o, 0, c, TerminationReason::HETEROCLINIC, sep.id,
+                static_cast<int>(sep.path.size()) - 1);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // advanceOne()  --  one triangle of one separatrix, and what it ran into
 // ---------------------------------------------------------------------------
 bool SeparatrixTrace::advanceOne(int k) {
@@ -741,6 +835,7 @@ bool SeparatrixTrace::advanceOne(int k) {
                     ? mesh->triangleEdges[walkers[k].tri][walkers[k].entryEdge]
                     : -1;
             if (snapTangentialLanding(sep)) ++tangentialLandings;
+            else if (joinCornerLanding(sep)) ++report_.cornerJoins;
             break;
 
         case FieldTracer::Status::Cut: {

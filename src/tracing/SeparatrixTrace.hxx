@@ -226,6 +226,13 @@ public:
         // In mean mesh edges.
         double boundaryCornerSnap = 1.5;
 
+        // A separatrix landing squarely on the boundary within this many mean
+        // edges of a corner that emits a separatrix straight back along it
+        // ends on that corner, and the corner's own separatrix -- the same
+        // streamline traced from the other end -- is cut back to nothing
+        // (joinCornerLanding()). Zero turns it off.
+        double cornerJoinRadius = 1.0;
+
         // Divide a corner's wedge into `quarters` equal parts rather than into
         // exact right angles measured off the boundary. On a corner that really
         // is 270 degrees the two agree; on one that measures 226 they do not,
@@ -299,6 +306,7 @@ public:
         int droppedSingularities = 0;     // no ports: d >= 3 or d <= -5
 
         int heteroclinicJoins = 0;
+        int cornerJoins = 0;              // Settings::cornerJoinRadius
         int resumed = 0;                  // separatrices restarted after a truncation
         int crossingsRetracted = 0;       // crossings that were on a removed tail
         int tangentialParallel = 0;       // TerminationReason::TANGENTIAL
@@ -390,6 +398,13 @@ private:
     // and a corner of the model is within reach, move its last point onto that
     // corner, so no node is planted where the arrival happened to land.
     bool snapTangentialLanding(Separatrix &sep);
+
+    // A separatrix that has just reached the boundary squarely, next to a
+    // corner of the model with a separatrix of its own leaving straight back
+    // along it: the two are one corner-to-corner (or singularity-to-corner)
+    // streamline, traced from both ends. This one is ended on the corner and
+    // the corner's is cut back to it, with whatever had stopped on it resumed.
+    bool joinCornerLanding(Separatrix &sep);
 
     void terminateAt(Separatrix &sep, int segIndex, const Point &at, TerminationReason why,
                      int onSep, int onSeg);

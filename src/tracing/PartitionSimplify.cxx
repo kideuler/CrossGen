@@ -53,6 +53,39 @@ std::vector<Point> sampleAt(const std::vector<Point> &p, const std::vector<doubl
     return out;
 }
 
+// 3t^2 - 2t^3 on [0, 1]: from 0 to 1 with zero slope at both ends, so a curve
+// eased from one position to another by it leaves the first and arrives at the
+// second in the direction it had there.
+inline double smoothstep(double t) {
+    t = std::min(std::max(t, 0.0), 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+
+// Cut a polyline at a fraction of its arc length into the run up to the cut
+// and the run from it, both carrying the cut point.
+void splitAt(const std::vector<Point> &p, double f, std::vector<Point> &head,
+             std::vector<Point> &tail) {
+    head.clear();
+    tail.clear();
+    if (p.size() < 2) { head = p; tail = p; return; }
+    const double total = polylineLength(p);
+    double want = std::min(std::max(f, 0.0), 1.0) * total;
+    head.push_back(p[0]);
+    size_t i = 1;
+    for (; i < p.size(); ++i) {
+        const double seg = normP(p[i] - p[i - 1]);
+        if (want <= seg || i + 1 == p.size()) break;
+        want -= seg;
+        head.push_back(p[i]);
+    }
+    const double seg = normP(p[i] - p[i - 1]);
+    const double t = (seg > 0.0) ? std::min(1.0, want / seg) : 0.0;
+    const Point z = p[i - 1] * (1.0 - t) + p[i] * t;
+    head.push_back(z);
+    tail.push_back(z);
+    for (size_t k = i; k < p.size(); ++k) tail.push_back(p[k]);
+}
+
 } // namespace
 
 const char *PartitionSimplify::blockName(Block b) {
@@ -107,6 +140,22 @@ PartitionSimplify::PartitionSimplify(const QuadLayout &layout, const Settings &s
 // ---------------------------------------------------------------------------
 bool PartitionSimplify::isSingularity(int node) const {
     return node >= 0 && layout_.getNodes()[node].kind == QuadLayout::NodeKind::Singularity;
+}
+
+// docs/viertel_2019.md Sec. 6: "fixed nodes = SING u BSING". A corner of the
+// model that is not flat emits separatrices exactly as a singularity does
+// (q - 1 of them), and so does a node of the interface network; a strip whose
+// one side is such a separatrix is a strip that side has to survive, and a
+// rung carrying one is a patch boundary. Counting only interior singularities
+// made the side a non-zip keeps an arbitrary one wherever a corner, not a
+// singularity, was what made the side special -- harmless while every strip
+// collapsed was a sliver, but a wider one drags the corner's own separatrix
+// away and leaves the corner a block of its own with a straight angle in it.
+bool PartitionSimplify::isFixed(int node) const {
+    if (isSingularity(node)) return true;
+    if (!settings_.fixedCorners || node < 0) return false;
+    const auto k = layout_.getNodes()[node].kind;
+    return k == QuadLayout::NodeKind::BoundaryCorner || k == QuadLayout::NodeKind::InterfaceNode;
 }
 
 // On dS or on a material interface: both are curves of the model, and a node
@@ -343,7 +392,7 @@ std::vector<PartitionSimplify::Patch> PartitionSimplify::patchesOf(const Chord &
     if (nr < 2) return out;
 
     auto singular = [&](int i) {
-        return isSingularity(c.rungs[i].endL) || isSingularity(c.rungs[i].endR);
+        return isFixed(c.rungs[i].endL) || isFixed(c.rungs[i].endR);
     };
 
     if (c.cyclic) {
@@ -393,7 +442,7 @@ bool PartitionSimplify::patchOk(const Chord &c, Patch &p, Block &why) const {
         }
         // 1. Contracting a rung merges its two ends, so two singularities on
         //    one rung would have to become one.
-        if (isSingularity(r.endL) && isSingularity(r.endR)) { why = Block::RungJoinsSingularities; return false; }
+        if (isFixed(r.endL) && isFixed(r.endR)) { why = Block::RungJoinsSingularities; return false; }
         // 2. And a singularity on a rung whose other end is on the boundary
         //    would have to move onto the boundary.
         if ((isSingularity(r.endL) && isOnBoundary(r.endR)) ||
@@ -424,11 +473,11 @@ bool PartitionSimplify::patchOk(const Chord &c, Patch &p, Block &why) const {
         }
     }
 
-    // Which side carries the singularities decides zip against non-zip.
+    // Which side carries the fixed nodes decides zip against non-zip.
     const Rung &rp = rung(p.first);
     const Rung &rq = rung(p.last);
-    const bool sLp = isSingularity(rp.endL), sRp = isSingularity(rp.endR);
-    const bool sLq = isSingularity(rq.endL), sRq = isSingularity(rq.endR);
+    const bool sLp = isFixed(rp.endL), sRp = isFixed(rp.endR);
+    const bool sLq = isFixed(rq.endL), sRq = isFixed(rq.endR);
     p.zip = (sLp && sRq) || (sRp && sLq);
     p.keepL = sLp || sLq;
 
@@ -492,7 +541,8 @@ bool PartitionSimplify::patchOk(const Chord &c, Patch &p, Block &why) const {
 // patchEnergy()  --  Sec. 4.1
 // ---------------------------------------------------------------------------
 double PartitionSimplify::patchEnergy(const Chord &c, const Patch &p) const {
-    if (!p.zip) return settings_.collapseNonZip ? 1.0 : -1.0;
+    if (!p.zip && !settings_.collapseNonZip) return -1.0;
+    if (!p.zip && !(settings_.nonZipAngle > 0.0)) return 1.0;
 
     const int nr = static_cast<int>(c.rungs.size());
     // w: the mean length of the patch's rungs.
@@ -511,7 +561,7 @@ double PartitionSimplify::patchEnergy(const Chord &c, const Patch &p) const {
     const double l = 0.5 * (lL + lR);
     if (l <= 0.0) return -1.0;
 
-    return settings_.zipAngle - std::atan(w / l);
+    return (p.zip ? settings_.zipAngle : settings_.nonZipAngle) - std::atan(w / l);
 }
 
 // ---------------------------------------------------------------------------
@@ -590,7 +640,17 @@ bool PartitionSimplify::collapse(const Chord &c) {
     struct Absorb { int arc; int atNode; int intoNode; std::vector<Point> extra; };
     std::vector<Absorb> absorbs;
 
+    // Which case each patch is -- zip, or which side a non-zip keeps -- is
+    // decided by patchOk(), not by patchesOf(), which only finds where the
+    // patches start and end. Taking the bare patches here used to collapse
+    // every one as a non-zip keeping its right-hand side: a zip was never
+    // blended, and wherever the singularity sat on the left the kept curve
+    // ran alongside it and was dragged onto it in its last segment.
     auto patches = patchesOf(c);
+    for (Patch &p : patches) {
+        Block why = Block::None;
+        if (!patchOk(c, p, why)) return false;
+    }
     for (const Patch &p : patches) {
         // The two sides of this patch, each running from its first rung to its
         // last. sideR is stored against the traversal of its component, which
@@ -610,7 +670,7 @@ bool PartitionSimplify::collapse(const Chord &c) {
 
         const Rung &rp = c.rungs[p.first % nRung];
         const Rung &rq = c.rungs[p.last % nRung];
-        const bool sLp = isSingularity(rp.endL), sRq = isSingularity(rq.endR);
+        const bool sLp = isFixed(rp.endL), sRq = isFixed(rq.endR);
 
         // Where the rungs sit along each side, which is what pairs the two.
         std::vector<double> rungSL{0.0}, rungSR{0.0};
@@ -656,9 +716,26 @@ bool PartitionSimplify::collapse(const Chord &c) {
         // A zip blends the two sides so that it starts on whichever carries the
         // singularity there and ends on the other; a non-zip is simply the side
         // that survives, point for point.
+        //
+        // The weight runs with arc length along the patch (docs/viertel_2019.md
+        // Sec. 8: "cumulative mean-side length up to r_i"), not with the
+        // component count u: the components of a chord are anything but equal
+        // in length, and one a fiftieth of the patch long next to a singularity
+        // would otherwise take a whole step of the blend, which is a hook in
+        // the merged curve right where it leaves the singularity. It is then
+        // eased (Settings::smoothCollapse), so that the merged curve leaves
+        // each singularity along the separatrix it was traced as and bends only
+        // in between: the angles separatrices make at a singularity, which is
+        // what Sec. 4.1's energy exists to protect, come out exactly as traced.
+        // weightR(u) is how far across from L to R the merged curve is at u.
+        auto weightR = [&](double u) {
+            double f = (nSeg > 0) ? u / nSeg : 0.0;
+            if (settings_.smoothCollapse)
+                f = smoothstep(0.5 * (atU(rungSL, u) + atU(rungSR, u)));
+            return p.zip ? (sLp && sRq ? f : 1.0 - f) : (p.keepL ? 0.0 : 1.0);
+        };
         auto blend = [&](double u) {
-            const double f = (nSeg > 0) ? u / nSeg : 0.0;
-            const double alpha = p.zip ? (sLp && sRq ? f : 1.0 - f) : (p.keepL ? 0.0 : 1.0);
+            const double alpha = weightR(u);
             if (alpha <= 0.0) return pointAlong(L.pts, atU(rungSL, u));
             if (alpha >= 1.0) return pointAlong(R.pts, atU(rungSR, u));
             return pointAlong(L.pts, atU(rungSL, u)) * (1.0 - alpha) +
@@ -677,8 +754,8 @@ bool PartitionSimplify::collapse(const Chord &c) {
             // Which of the two survives: nothing may move a singularity, and
             // nothing may pull a boundary node off the boundary.
             int keep = -1;
-            if (isSingularity(r.endL) || isNetworkNode(r.endL)) keep = r.endL;
-            else if (isSingularity(r.endR) || isNetworkNode(r.endR)) keep = r.endR;
+            if (isFixed(r.endL) || isNetworkNode(r.endL)) keep = r.endL;
+            else if (isFixed(r.endR) || isNetworkNode(r.endR)) keep = r.endR;
             else if (isOnBoundary(r.endL) && !isOnBoundary(r.endR)) keep = r.endL;
             else if (isOnBoundary(r.endR) && !isOnBoundary(r.endL)) keep = r.endR;
             else keep = p.keepL ? r.endL : r.endR;
@@ -705,7 +782,40 @@ bool PartitionSimplify::collapse(const Chord &c) {
                     std::reverse(rc.nodes.begin(), rc.nodes.end());
                 }
                 if (rc.nodes.front() != die) return false;
-                absorbs.push_back(Absorb{other, die, keep, rc.pts});
+
+                // Across a zip the merged curve runs between the two sides, so
+                // a rung that is a piece of an interface is not contracted onto
+                // either end: the merged node goes where the blend crosses the
+                // rung, which is a point of the rung and so of the interface,
+                // and the interface arcs beyond the two ends take the two
+                // halves. The interface is the same curve afterwards, and the
+                // merged curve passes through its node instead of hooking out
+                // to whichever side of the strip the node would have stayed on.
+                int otherKeep = -1;
+                if (settings_.smoothCollapse && p.zip && r.onInterface && !isNetworkNode(keep) &&
+                    !isSingularity(keep)) {
+                    for (const int d : oldNodes[keep].darts) {
+                        const int arc = d >> 1;
+                        if (arc == other || !oldArcs[arc].onInterface) continue;
+                        bool inRung = false;
+                        for (const int rd : r.darts) if ((rd >> 1) == arc) inRung = true;
+                        if (!inRung) { otherKeep = arc; break; }
+                    }
+                }
+                if (otherKeep >= 0) {
+                    // The blend's weight is measured from L; the rung runs from
+                    // the dying end to the surviving one.
+                    const double a = weightR(s);
+                    const double fromDie = (die == r.endL) ? a : 1.0 - a;
+                    std::vector<Point> head, tail;
+                    splitAt(rc.pts, fromDie, head, tail);   // die..z, z..keep
+                    std::reverse(tail.begin(), tail.end()); // keep..z
+                    absorbs.push_back(Absorb{other, die, keep, head});
+                    absorbs.push_back(Absorb{otherKeep, keep, keep, tail});
+                    pos[keep] = head.back();
+                } else {
+                    absorbs.push_back(Absorb{other, die, keep, rc.pts});
+                }
             } else if (!isSingularity(keep) && !isOnBoundary(keep)) {
                 pos[keep] = blend(s);
             }

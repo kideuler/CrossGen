@@ -110,6 +110,21 @@ int nonDisks(const QuadLayout &L) {
     return n;
 }
 
+// Move a polyline's last point to `to`, and the points before it by the same
+// displacement falling smoothly to nothing `over` back along the line.
+void easeOnto(std::vector<Point> &pts, const Point &to, double over) {
+    if (pts.size() < 2) { if (!pts.empty()) pts.back() = to; return; }
+    const Point d = to - pts.back();
+    double s = 0.0;
+    pts.back() = to;
+    for (size_t i = pts.size() - 1; i-- > 1;) {
+        s += normP(pts[i + 1] - pts[i]);
+        if (s >= over) break;
+        const double t = s / over;
+        pts[i] = pts[i] + d * (1.0 - t * t * (3.0 - 2.0 * t));
+    }
+}
+
 } // namespace
 
 StemExtension::StemExtension(const QuadLayout &layout, const FieldTracer &tracer,
@@ -217,6 +232,25 @@ bool StemExtension::extend(const Junction &j) {
 
     SegmentGrid grid(arcs, 2.0 * h);
 
+    // The other T-junctions, by node, with the direction each one's stem
+    // leaves it in: the ones this continuation may end on (see below).
+    std::vector<Point> stemOut(nodes.size(), Point{0.0, 0.0});
+    std::vector<char> joinable(nodes.size(), 0);
+    if (settings_.joinRadius > 0.0) {
+        for (const Junction &o : findJunctions()) {
+            if (o.node == j.node) continue;
+            std::vector<Point> op = arcs[QuadLayout::arcOfDart(o.stemDart)].pts;
+            if (o.stemDart & 1) std::reverse(op.begin(), op.end());
+            const Point on = nodes[o.node].pos;
+            Point od{0.0, 0.0};
+            for (size_t i = 1; i < op.size() && normP(od) < 1e-9 * h; ++i) od = op[i] - on;
+            if (normP(od) < 1e-12 * h) continue;
+            stemOut[o.node] = od / normP(od);
+            joinable[o.node] = 1;
+        }
+    }
+    int joinedAt = -1;
+
     struct Crossing {
         int arc = -1;
         double param = 0.0;      // seg + u along the arc
@@ -265,6 +299,33 @@ bool StemExtension::extend(const Junction &j) {
                        hits.end());
             for (const Crossing &c : hits) {
                 const auto &a = arcs[c.arc];
+                // Nose to nose with another T-junction: the continuation
+                // crosses the side that one stopped on, within joinRadius of
+                // it, heading the way its stem leaves it. The two stems are
+                // one streamline the discretisation split -- one stopped on a
+                // curve the other then stopped on a fraction of an element
+                // further along -- so the continuation ends there, on that
+                // junction, and both become crossings. Carrying on instead
+                // would run alongside the other stem (refused as tangential)
+                // or through its node (refused as through a node), and the
+                // pair would stay.
+                if (!c.boundary && settings_.joinRadius > 0.0) {
+                    int J = -1;
+                    double best = settings_.joinRadius * h;
+                    for (const int e : {a.a, a.b}) {
+                        if (e < 0 || !joinable[e]) continue;
+                        const double dd = normP(c.at - nodes[e].pos);
+                        const Point d = p1 - p0;
+                        const double cosd = dotP(stemOut[e], d) / std::max(1e-300, normP(d));
+                        if (dd < best && cosd > std::cos(settings_.minCrossingAngle)) { best = dd; J = e; }
+                    }
+                    if (J >= 0) {
+                        joinedAt = J;
+                        xs.push_back(c);   // where it crossed; eased onto J below
+                        done = true;
+                        break;
+                    }
+                }
                 if (normP(c.at - nodes[a.a].pos) < nodeTol || normP(c.at - nodes[a.b].pos) < nodeTol) {
                     ++report_.throughNode;
                     return false;
@@ -327,7 +388,7 @@ bool StemExtension::extend(const Junction &j) {
         }
         if (st != FieldTracer::Status::Ok) { ++report_.noBoundary; return false; }
     }
-    if (!done || xs.empty() || !xs.back().boundary) { ++report_.noBoundary; return false; }
+    if (!done || xs.empty() || (!xs.back().boundary && joinedAt < 0)) { ++report_.noBoundary; return false; }
 
     // --- the new layout ---------------------------------------------------
     std::vector<QuadLayout::Node> newNodes = nodes;
@@ -335,6 +396,11 @@ bool StemExtension::extend(const Junction &j) {
     newNodes[j.node].kind = QuadLayout::NodeKind::Crossing;
     std::vector<int> nodeOf(xs.size());
     for (size_t i = 0; i < xs.size(); ++i) {
+        if (joinedAt >= 0 && i + 1 == xs.size()) {
+            nodeOf[i] = joinedAt;
+            newNodes[joinedAt].kind = QuadLayout::NodeKind::Crossing;
+            continue;
+        }
         QuadLayout::Node n;
         n.pos = xs[i].at;
         n.kind = xs[i].boundary ? QuadLayout::NodeKind::BoundaryHit : QuadLayout::NodeKind::Crossing;
@@ -364,7 +430,8 @@ bool StemExtension::extend(const Junction &j) {
 
     // Every crossed arc cut at its crossings, in order along it.
     std::vector<std::vector<std::pair<double, int>>> cuts(arcs.size());
-    for (size_t i = 0; i < xs.size(); ++i) cuts[xs[i].arc].push_back({xs[i].param, nodeOf[i]});
+    for (size_t i = 0; i < xs.size(); ++i)
+        if (!(joinedAt >= 0 && i + 1 == xs.size())) cuts[xs[i].arc].push_back({xs[i].param, nodeOf[i]});
     std::vector<QuadLayout::Arc> newArcs;
     for (size_t a = 0; a < arcs.size(); ++a) {
         if (cuts[a].empty()) { newArcs.push_back(arcs[a]); continue; }
@@ -400,6 +467,12 @@ bool StemExtension::extend(const Junction &j) {
             if (s > 0) piece.push_back(path[s]);
             while (xi < xs.size() && xs[xi].pathSeg == static_cast<int>(s)) {
                 piece.push_back(xs[xi].at);
+                if (joinedAt >= 0 && xi + 1 == xs.size()) {
+                    // Bent onto the junction over the last stretch rather than
+                    // in the last segment: the continuation passed it at up to
+                    // joinRadius to one side.
+                    easeOnto(piece, nodes[joinedAt].pos, 4.0 * settings_.joinRadius * h);
+                }
                 newArcs.push_back(makeArc(piece, prevNode, nodeOf[xi], -1, false, false));
                 prevNode = nodeOf[xi];
                 piece.assign(1, xs[xi].at);
@@ -423,5 +496,6 @@ bool StemExtension::extend(const Junction &j) {
                     nonDisks(next) <= nonDisks(layout_);
     if (!ok) { ++report_.invalid; return false; }
     layout_ = std::move(next);
+    if (joinedAt >= 0) ++report_.joined;
     return true;
 }

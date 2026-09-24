@@ -24,6 +24,8 @@
 //   --blocks-obj <f>        the decomposition's macro edges as OBJ polylines
 //   --obj <f> --mfem <f>    the mesh (smoothed if --tmop), one model only
 //   --cut-radius r, --tangential deg, --square-rays, --no-simplify, --no-stems,
+//   --no-smooth, --no-fixed-corners, --max-drag edges, --zip-angle deg,
+//   --nonzip-angle deg,
 //   --by-arc-length, --no-parallel-stop, --no-resume, --interior-singularities
 //                           the tracing and simplification settings; see
 //                           SeparatrixTrace::Settings and PartitionSimplify
@@ -320,7 +322,8 @@ static Outcome processMesh(const std::string &path, bool writeVtu, bool verbose,
             std::cout << byReason[i] << " " << reasonName(static_cast<TerminationReason>(i));
             first = false;
         }
-        std::cout << "); " << tr.heteroclinicJoins << " join(s), " << tr.resumed << " resumed, "
+        std::cout << "); " << tr.heteroclinicJoins << " join(s), " << tr.cornerJoins
+                  << " at a corner, " << tr.resumed << " resumed, "
                   << tr.crossingsRetracted << " crossing(s) retracted, "
                   << tr.tangentialBoundaryExits << " tangential landing(s)\n";
         if (interfaces) {
@@ -363,10 +366,32 @@ static Outcome processMesh(const std::string &path, bool writeVtu, bool verbose,
                      "conditions, " << sr.blockedByEnergy << " by the energy, " << sr.rolledBack
                   << " rolled back; area " << std::setprecision(10) << out.sAreaRatio << "\n"
                   << std::setprecision(6);
+        {
+            // What stopped each chord the last pass saw, and how many of those
+            // are strips thinner than two mean edges -- the ones a coarser
+            // layout would want gone.
+            double e = 0.0;
+            for (const auto &ed : mesh->edges) e += normP(mesh->vertices[ed[1]] - mesh->vertices[ed[0]]);
+            if (!mesh->edges.empty()) e /= static_cast<double>(mesh->edges.size());
+            int count[12] = {0}, thin[12] = {0};
+            for (const auto &c : simp.getChords()) {
+                const int b = static_cast<int>(c.block);
+                if (b < 0 || b >= 12) continue;
+                ++count[b];
+                if (e > 0.0 && c.minWidth < 2.0 * e) ++thin[b];
+            }
+            std::cout << "  chords        " << simp.getChords().size() << " at the last pass; by reason (thinner than 2 edges):";
+            for (int b = 0; b < 12; ++b)
+                if (count[b])
+                    std::cout << "\n                  " << count[b] << " (" << thin[b] << ") "
+                              << PartitionSimplify::blockName(static_cast<PartitionSimplify::Block>(b));
+            std::cout << "\n";
+        }
         if (sr.stems.attempted)
             std::cout << "  stems (Sec 12) " << sr.stems.extended << " of " << sr.stems.attempted
                       << " T-junction stem(s) traced on to the boundary (" << sr.tJunctionsBeforeStems
-                      << " -> " << sl.tJunctions << " T-junctions); not: " << sr.stems.noBoundary
+                      << " -> " << sl.tJunctions << " T-junctions; " << sr.stems.joined
+                      << " by joining another); not: " << sr.stems.noBoundary
                       << " never reached it, " << sr.stems.tangential << " ran alongside a separatrix, "
                       << sr.stems.throughNode << " ran into a node, " << sr.stems.tooManyCrossings
                       << " crossed too many, " << sr.stems.invalid << " left a worse layout\n";
@@ -375,7 +400,9 @@ static Outcome processMesh(const std::string &path, bool writeVtu, bool verbose,
                       << sr.rbCrossings << " non-planar, " << sr.rbDangling << " loose ends, "
                       << sr.rbNotFewer << " no fewer components, " << sr.rbMoreT
                       << " more T-junctions, " << sr.rbSing << " lost a singularity, "
-                      << sr.rbArea << " changed area, " << sr.rbWorse << " more bad faces\n";
+                      << sr.rbArea << " changed area, " << sr.rbWorse << " more bad faces, "
+                      << sr.rbSpur << " left a spur, " << sr.rbLens << " left a lens, "
+                      << sr.rbInterface << " moved an interface\n";
         if (rep.badFaces) {
             int shown = 0;
             for (size_t i = 0; i < layout.getFaces().size() && shown < 8; ++i) {
@@ -427,6 +454,7 @@ static Outcome processMesh(const std::string &path, bool writeVtu, bool verbose,
         int base = 1;
         for (const auto &a : simp.getLayout().getArcs()) {
             if (a.pts.size() < 2) continue;
+            lo << "o " << ((a.onBoundary || a.onInterface) ? "fixed" : "free") << "\n";
             for (const Point &p : a.pts) lo << "v " << p[0] << " " << p[1] << " 0\n";
             lo << "l";
             for (size_t i = 0; i < a.pts.size(); ++i) lo << " " << base + static_cast<int>(i);
@@ -436,6 +464,32 @@ static Outcome processMesh(const std::string &path, bool writeVtu, bool verbose,
         blocks.decomposition().writeEdgesOBJ(pre + "_blocks.obj");
         std::ofstream tj(pre + "_tj.txt");
         for (const Point &p : blocks.tJunctionPoints()) tj << p[0] << " " << p[1] << "\n";
+        // The singularities, and each chord of the last pass as the path
+        // through its components' node centroids, headed by why it stayed.
+        const QuadLayout &sL = simp.getLayout();
+        std::ofstream fo(pre + "_folded.txt");
+        for (const auto &b : blocks.blocks())
+            if (b.minCellRatio <= 0.0)
+                for (int k = 0; k < 4; ++k)
+                    fo << sL.getNodes()[b.corners[k]].pos[0] << " " << sL.getNodes()[b.corners[k]].pos[1]
+                       << (k == 3 ? "\n" : " ");
+        std::ofstream nd(pre + "_nodes.txt");
+        for (const auto &n : sL.getNodes())
+            nd << n.pos[0] << " " << n.pos[1] << " " << static_cast<int>(n.kind) << " " << n.darts.size() << "\n";
+        std::ofstream sg(pre + "_sing.txt");
+        for (const auto &n : sL.getNodes())
+            if (n.kind == QuadLayout::NodeKind::Singularity) sg << n.pos[0] << " " << n.pos[1] << "\n";
+        std::ofstream ch(pre + "_chords.txt");
+        for (const auto &c : simp.getChords()) {
+            ch << "c " << static_cast<int>(c.block) << " " << c.minWidth << "\n";
+            for (const int f : c.faces) {
+                Point m{0.0, 0.0};
+                const auto &nodes = sL.getFaces()[f].nodes;
+                for (const int n : nodes) m = m + sL.getNodes()[n].pos;
+                if (!nodes.empty()) m = m * (1.0 / static_cast<double>(nodes.size()));
+                ch << m[0] << " " << m[1] << "\n";
+            }
+        }
     }
 
     if (single && !gFlags.step.empty())
@@ -817,7 +871,86 @@ void interfaces() {
           "four blocks, none in two materials, covering the model (" + std::to_string(blocks) + ")");
 }
 
+// Sec. 4's zip: two singularities whose separatrices pass each other a
+// fiftieth of the model apart, leaving one thin strip with the singularities on
+// opposite corners. The collapse has to join the two with a blend of the two
+// sides -- half way across at half way along, leaving each singularity along
+// the separatrix it was traced as -- and not keep one side and drag its end
+// onto the other singularity, which is what collapse() did while it read every
+// patch as a non-zip keeping its right-hand side.
+void zipCollapse() {
+    std::cout << "a zip: two singularities passing each other\n";
+    using NK = QuadLayout::NodeKind;
+    const double y1 = 0.49, y2 = 0.51;
+    // 0-3 the square's corners; 4 S1, 5 S2; 6 X1 = S1's right-going curve
+    // crossing S2's down-going one, 7 X2 = S2's left-going curve crossing S1's
+    // up-going one; 8-15 where the curves reach the boundary.
+    const std::vector<std::pair<Point, NK>> spec = {
+        {{0, 0}, NK::BoundaryCorner},  {{1, 0}, NK::BoundaryCorner},   {{1, 1}, NK::BoundaryCorner},
+        {{0, 1}, NK::BoundaryCorner},  {{0.3, y1}, NK::Singularity},   {{0.7, y2}, NK::Singularity},
+        {{0.7, y1}, NK::Crossing},     {{0.3, y2}, NK::Crossing},      {{0.3, 0}, NK::BoundaryHit},
+        {{0.3, 1}, NK::BoundaryHit},   {{0.7, 0}, NK::BoundaryHit},    {{0.7, 1}, NK::BoundaryHit},
+        {{1, y1}, NK::BoundaryHit},    {{0, y2}, NK::BoundaryHit}};
+    std::vector<QuadLayout::Node> nodes;
+    for (const auto &[p, k] : spec) { QuadLayout::Node n; n.pos = p; n.kind = k; nodes.push_back(n); }
+    std::vector<QuadLayout::Arc> arcs;
+    auto arc = [&](int a, int b, bool boundary) {
+        QuadLayout::Arc c;
+        const int n = 8;
+        for (int i = 0; i <= n; ++i) c.pts.push_back(nodes[a].pos + (nodes[b].pos - nodes[a].pos) * (double(i) / n));
+        c.a = a; c.b = b; c.onBoundary = boundary; c.separatrix = boundary ? -1 : 0;
+        c.length = normP(nodes[b].pos - nodes[a].pos);
+        arcs.push_back(c);
+    };
+    for (const auto &[a, b] : std::vector<std::pair<int, int>>{
+             {0, 8}, {8, 10}, {10, 1}, {1, 12}, {12, 2}, {2, 11}, {11, 9}, {9, 3}, {3, 13}, {13, 0}})
+        arc(a, b, true);
+    arc(8, 4, false); arc(4, 7, false); arc(7, 9, false);      // S1 down and up
+    arc(4, 6, false); arc(6, 12, false);                        // S1 right
+    arc(10, 6, false); arc(6, 5, false); arc(5, 11, false);     // S2 down and up
+    arc(5, 7, false); arc(7, 13, false);                        // S2 left
+    QuadLayout layout(1e-9);
+    layout.rebuild(nodes, arcs);
+    const int before = layout.getReport().faces;
+
+    PartitionSimplify::Settings ss;
+    ss.extendStems = false;
+    PartitionSimplify simp(layout, ss);
+    simp.run();
+    const QuadLayout &L = simp.getLayout();
+    check(simp.getReport().collapses == 1 && L.getReport().faces == before - 1 &&
+              L.getReport().arcCrossings == 0 && L.getReport().singularities == 2,
+          "one collapse, the strip gone, both singularities kept");
+
+    // The merged curve: the arc from one singularity to the other.
+    const QuadLayout::Arc *m = nullptr;
+    for (const auto &a : L.getArcs()) {
+        const auto ka = L.getNodes()[a.a].kind, kb = L.getNodes()[a.b].kind;
+        if (ka == NK::Singularity && kb == NK::Singularity) m = &a;
+    }
+    check(m != nullptr, "the two singularities are joined by one curve");
+    if (!m) return;
+    std::vector<Point> p = m->pts;
+    if (p.front()[0] > p.back()[0]) std::reverse(p.begin(), p.end());
+    double mid = 0.0, worstTurn = 0.0;
+    for (size_t i = 1; i < p.size(); ++i)
+        if (p[i - 1][0] <= 0.5 && p[i][0] >= 0.5) {
+            const double t = (0.5 - p[i - 1][0]) / std::max(1e-300, p[i][0] - p[i - 1][0]);
+            mid = p[i - 1][1] * (1.0 - t) + p[i][1] * t;
+        }
+    for (size_t i = 1; i + 1 < p.size(); ++i) {
+        const Point a = p[i] - p[i - 1], b = p[i + 1] - p[i];
+        worstTurn = std::max(worstTurn, std::fabs(std::atan2(cross2(a, b), dotP(a, b))));
+    }
+    const Point d0 = p[1] - p[0], d1 = p.back() - p[p.size() - 2];
+    const double leave = std::fabs(std::atan2(d0[1], d0[0])), arrive = std::fabs(std::atan2(d1[1], d1[0]));
+    check(std::fabs(mid - 0.5) < 1e-3, "half way across at half way along (y = " + std::to_string(mid) + ")");
+    check(leave < 0.02 && arrive < 0.02 && worstTurn < 0.1,
+          "leaves and meets each singularity along its separatrix, and never turns sharply");
+}
+
 int run() {
+    zipCollapse();
     singularityModel();
     constantField();
     layouts();
@@ -842,6 +975,13 @@ int main(int argc, char **argv) {
         else if (a == "--square-rays") gFlags.trace.evenCornerRays = false;
         else if (a == "--no-simplify") gFlags.simplify = false;
         else if (a == "--no-stems") gFlags.simplifySettings.extendStems = false;
+        else if (a == "--no-fixed-corners") gFlags.simplifySettings.fixedCorners = false;
+        else if (a == "--no-smooth") gFlags.simplifySettings.smoothCollapse = false;
+        else if (a == "--max-drag") gFlags.simplifySettings.maxDrag = std::atof(next());
+        else if (a == "--nonzip-angle") gFlags.simplifySettings.nonZipAngle = std::atof(next()) * M_PI / 180.0;
+        else if (a == "--zip-angle") gFlags.simplifySettings.zipAngle = std::atof(next()) * M_PI / 180.0;
+        else if (a == "--corner-join") gFlags.trace.cornerJoinRadius = std::atof(next());
+        else if (a == "--stem-join") gFlags.simplifySettings.stems.joinRadius = std::atof(next());
         else if (a == "--stem-crossings") gFlags.simplifySettings.stems.maxCrossings = std::atoi(next());
         else if (a == "--by-arc-length") gFlags.trace.growByArcLength = true;
         else if (a == "--no-parallel-stop") gFlags.trace.stopParallelTangential = false;

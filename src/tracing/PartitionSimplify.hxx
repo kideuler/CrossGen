@@ -80,6 +80,9 @@ public:
         // constant": deleting a side with nothing on it costs the partition
         // nothing, so those are always worth taking.
         bool collapseNonZip = true;
+        // ... unless this is positive, when a non-zip patch is judged by the
+        // same aspect ratio a zip is, against this angle instead of zipAngle.
+        double nonZipAngle = 0.0;
 
         // How far a collapse may drag anything, in mean mesh edges.
         //
@@ -100,7 +103,63 @@ public:
         // lengths, so the bound is in edge lengths. It is a cap on top of
         // Sec. 4.1, not a replacement: the energy still decides among the
         // strips narrow enough to be discretisation error in the first place.
-        double maxDrag = 1.5;
+        //
+        // It was 1.5 while collapse() treated every patch as a non-zip keeping
+        // its right-hand side (see there) and the model's corners were not
+        // fixed nodes (fixedCorners): a wider strip then meant a longer drag in
+        // an arbitrary direction. With both fixed it was measured again over
+        // the 46 models, meshed and smoothed (TMOP, 50 sweeps):
+        //
+        //   cap     blocks  T-jcts  covered  mean worst SJ  models < 0.3
+        //   1.5      2612     36      38/46       0.734            3
+        //   3        2029     23      40/46       0.742            4
+        //   4        1852     24      40/46       0.758            3
+        //   5        1684     17      40/46       0.750            3
+        //   6        1640     16      40/46       0.735            4
+        //   none     ~1540    ~18     37/46       0.275           18
+        //
+        // Four has the best elements of any; five and six trade a tenth fewer
+        // blocks for a drop on a handful of models (geom009 0.81 -> 0.64).
+        // With no cap at all a non-zip strip -- whose Sec. 4.1 energy is a
+        // constant -- of any width is taken, and geom017 and geom019 collapse
+        // to a single block with a straight angle for a corner. Judging a
+        // non-zip by the zip's aspect ratio instead (nonZipAngle) does not
+        // separate those from the good ones, so the cap stays.
+        double maxDrag = 4.0;
+
+        // Keep the curve a zip leaves smooth. Two things put a hook in it
+        // otherwise:
+        //
+        //   * the blend stepping per component rather than by arc length, so a
+        //     component a fiftieth of the patch long next to a singularity
+        //     takes a whole step of the sideways move;
+        //   * a rung that is a piece of a material interface staying on one
+        //     side of the strip -- it may not leave the interface -- while the
+        //     blend runs down the middle, so the merged curve hooks out to it
+        //     at every interface it crosses.
+        //
+        // With this on, the blend runs with arc length and is eased (zero
+        // slope at both ends), so the merged curve leaves and meets each
+        // singularity along the separatrix traced there; and an interface rung
+        // is contracted to the point where the blend crosses it, which is on
+        // the interface, the interface arcs either side taking its two halves.
+        // Off is the per-component blend, for comparison.
+        //
+        // What it does not do is bend the arcs a collapse re-attaches. Moving
+        // an arc's end drags its last segment across the strip, which is a
+        // hook of its own, but easing that move along the arc makes the arc
+        // arrive tangent to the curve it was merged onto: the component
+        // between them gets a cusp for a corner, the corner rule loses it, and
+        // measured over the corpus that cost 49 four-sided components and
+        // seven fully covered models. Those hooks survive only where the
+        // collapse that would merge the two curves next is itself refused.
+        bool smoothCollapse = true;
+
+        // Treat the model's corners and the interface network's nodes as
+        // fixed in Sec. 4's patch logic, as docs/viertel_2019.md Sec. 6 does
+        // ("fixed nodes = SING u BSING"); see isFixed(). Off counts interior
+        // singularities alone, for comparison.
+        bool fixedCorners = true;
 
 
         // Contract a rung even when a node sits along it rather than only at
@@ -249,6 +308,9 @@ private:
     bool collapse(const Chord &c);
 
     bool isSingularity(int node) const;
+    // A singularity, or -- with Settings::fixedCorners -- a corner of the
+    // model or a node of the interface network: Sec. 6's SING u BSING.
+    bool isFixed(int node) const;
     // On dS or on an interface: a curve of the model, which nothing may leave.
     bool isOnBoundary(int node) const;
     bool isOnInterface(int node) const;
