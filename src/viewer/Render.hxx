@@ -35,7 +35,7 @@
 #include "medialaxis/MedialAxis.hxx"
 #include "medialaxis/MedialAxisTMesh.hxx"
 #include "quantization/QuantTMeshConvert.hxx"
-#include "tracing/QuadLayout.hxx"
+#include "ZIPLINE/QuadLayout.hxx"
 #include "UMBER/MotorcycleGraph.hxx"
 #include "UMBER/Polysquare.hxx"
 #include "TORSION/FieldFrames.hxx"

@@ -1,6 +1,7 @@
 #ifndef __MESH_TMOP_HXX__
 #define __MESH_TMOP_HXX__
 
+#include <cstdint>
 #include <string>
 #include <vector>
 #include "QuadMesh.hxx"
@@ -73,11 +74,19 @@
 // ## Untangling
 //
 // Every barrier metric is +infinity on an inverted element, so a mesh that
-// starts with one cannot be started on directly. Options::untangle runs
-// Metric::Untangle022 first, whose barrier sits at tau_0 below the worst
-// determinant on the mesh rather than at zero, and lowers tau_0 as the mesh
-// improves; once nothing is inverted the main metric takes over. This is the
-// standard two-phase arrangement and it is on by default.
+// starts with one cannot be started on directly. Options::untangle runs an
+// untangling phase first, on a metric that is finite on an inverted element,
+// and hands over to the main metric once nothing is inverted -- the standard
+// two-phase arrangement, on by default. Since 2026-09-24 that metric is
+// UntangleRegularized (Garanzha et al.'s regularised shape + size energy)
+// rather than Untangle022 with a tracked tau_0, which crushes a fold instead
+// of opening it; Options::untangler says why and keeps the old one.
+//
+// Element corners that no admissible move can change and that are flat or
+// inverted -- a block corner a layout put on a straight feature -- are
+// "frozen" and left out of the energy altogether (findFrozenCorners), so one
+// of them neither blocks the smoothing of the rest nor, through the |T|^2 it
+// leaves as the only thing to lower, pulls its neighbours onto itself.
 namespace mesh {
 
 class TMOP {
@@ -94,7 +103,7 @@ public:
         // shape metric like 002 but finite on an inverted element -- the one
         // here that can be evaluated on a tangled mesh without a tau_0. Nothing
         // in it stops an element flattening on the way, which is why untangling
-        // still goes through metric 22.
+        // goes through a metric with a (shifted or regularised) barrier.
         Shape004 = 4,
         // 0.5 |T|^2 / tau - 1. **The default.** Pure shape: invariant under
         // scaling T, so it says nothing about how big an element is and
@@ -104,11 +113,12 @@ public:
         // barrier. Use when the target size is meaningful -- a per-element size
         // field from the layout, say -- and not just a placeholder.
         ShapeSize007 = 7,
-        // 0.5 (|T|^2 - 2 tau) / (tau - tau_0). The untangler: finite wherever
+        // 0.5 (|T|^2 - 2 tau) / (tau - tau_0). An untangler: finite wherever
         // tau > tau_0, so putting tau_0 below the worst determinant on the mesh
         // gives every element, inverted or not, a finite energy and a gradient
         // that pushes tau up. Set tau_0 through Options::untangleFloor, or
-        // leave it to run() to track.
+        // leave it to run() to track. Not scale-invariant once tau_0 < 0: an
+        // element shrunk to a point scores zero. See Options::untangler.
         Untangle022 = 22,
         // (tau - 1)^2. Pure size, no barrier: it asks each element to have the
         // target area and does not care what shape it takes to get there.
@@ -117,7 +127,31 @@ public:
         Size056 = 56,
         // (1 - gamma) * Shape002 + gamma * Size056, the usual way to ask for
         // "mostly shape, a little size". gamma = 0 is Shape002 exactly.
-        ShapeSizeCombo = 100
+        ShapeSizeCombo = 100,
+        // ShapeSizeCombo with tau in both denominators replaced by
+        //
+        //     chi(tau, eps) = (tau + sqrt(tau^2 + eps^2)) / 2,
+        //
+        // i.e. (1 - g) (0.5 |T|^2 / chi - 1) + g (0.5 (tau^2 + 1) / chi - 1):
+        // the regularisation of Garanzha and Kaporin, in the form of
+        // Garanzha et al., "Foldover-free maps in 50 lines of code" (TOG 2021).
+        // chi is positive for every tau and tends to tau as eps -> 0, so the
+        // metric is finite on an inverted element and is ShapeSizeCombo again
+        // once eps is gone. The untangler Options::untangler picks by default;
+        // eps rides in the slot Untangle022 uses for tau_0 and g is
+        // Options::untangleSizeWeight. Not a shape metric while eps > 0, and
+        // that is the point of it -- see Options::untangler.
+        UntangleRegularized = 101
+    };
+
+    // How the untangling phase gets an inverted element back out.
+    enum Untangler : int {
+        // Metric 22 with its barrier tau_0 re-placed below the worst
+        // determinant every sweep. What this smoother did until 2026-09-24.
+        UntangleShifted = 0,
+        // Metric UntangleRegularized, eps lowered by the rule of Garanzha et al.
+        // as the energy falls. **The default.**
+        UntangleRegular = 1
     };
 
     // Where W comes from.
@@ -204,13 +238,41 @@ public:
         double maxStepFraction = 0.4;
         double hessianFloor = 1e-6;
 
-        // Run Untangle022 first when the mesh starts with an inverted element,
-        // and again if the main phase somehow produces one.
+        // Run an untangling phase first when the mesh starts with an inverted
+        // element.
         bool untangle = true;
         int untangleMaxSweeps = 100;
-        // tau_0 for Untangle022, as a fraction of the worst determinant on the
-        // mesh: tau_0 = untangleFloor * min(tau) when that minimum is negative.
-        // Above 1 so the barrier stays clear of the worst element.
+
+        // Which untangler, and why the default changed.
+        //
+        // Metric 22 is 0.5 (|T|^2 - 2 tau) / (tau - tau_0), and with tau_0 < 0
+        // it is not scale-invariant: shrink an element by k and the numerator
+        // falls as k^2 while the denominator only falls to -tau_0, so an
+        // element crushed to a point costs *nothing*. On an inverted element,
+        // whose tau - tau_0 is tiny, shrinking is also by far the steepest way
+        // down -- so the phase meant to open a fold closes it instead, dragging
+        // the fold's neighbours in after it, and stops the moment the last
+        // determinant creeps over zero. The main phase then starts on a mesh
+        // with an element of det ~1e-8, whose barrier energy is ~1e20 and
+        // whose nodes' Newton steps are capped at a fraction of their now
+        // microscopic edges. Traced det_rocket at h = 0.03 is the case:
+        // one fold at a singular block corner (scaled Jacobian -0.02) came out
+        // as a star of ten nodes within 1e-4 of each other, worst aspect ratio
+        // 297, worst scaled Jacobian 0.012.
+        //
+        // The regularised untangler has a size term, g (tau^2 + 1) / (2 chi),
+        // that goes to g / eps as an element collapses, so crushing one is
+        // expensive instead of free; and eps is lowered only as fast as the
+        // energy falls, so the mesh leaves the phase as a minimiser of a
+        // barrier shape + size energy rather than as the first mesh with every
+        // determinant positive.
+        Untangler untangler = UntangleRegular;
+        // g in UntangleRegularized: the weight of the size term.
+        // Garanzha et al. use 1/128 in 2-D.
+        double untangleSizeWeight = 1.0 / 128.0;
+        // UntangleShifted only: tau_0 as a fraction of the worst determinant
+        // on the mesh, tau_0 = untangleFloor * min(tau) when that minimum is
+        // negative. Above 1 so the barrier stays clear of the worst element.
         double untangleFloor = 1.5;
 
         // Number of OpenMP threads; 0 leaves it to the runtime.
@@ -237,6 +299,12 @@ public:
 
         int movableNodes = 0;           // free + sliding
         int freeNodes = 0, slidingNodes = 0, fixedNodes = 0;
+
+        // Element corners whose determinant no movable node can change, and
+        // which are flat or inverted: never a reason to untangle, and under
+        // Quadrature::Corners left out of the energy, their elements sampled
+        // at their other corners (see frozenCorner).
+        int frozenCorners = 0;
 
         // Feature curves the mesh was bound to, how many of them are fitted
         // splines rather than the runs' own polylines, and how many sliding
@@ -384,6 +452,8 @@ private:
                     Point *grad, double *hess) const;
 
     void buildColoring();
+    // Mark the frozen corners: see frozenCorner below.
+    void findFrozenCorners();
     double minDeterminant() const;
     int countInverted() const;
     void snapshotQuality(bool before);
@@ -403,11 +473,31 @@ private:
     // to get every determinant positive, and weighting the elements that are
     // already fine would only slow that down.
     Metric activeMetric = Shape002;
-    double activeTau0 = 0.0;
+    double activeTau0 = 0.0;      // tau_0 for 022, eps for UntangleRegularized
+    double activeGamma = 0.0;     // gamma for the combos, the untangler's g
     double activeExponent = 1.0;
 
     std::vector<int> color;                  // per vertex, -1 for an immovable one
     std::vector<std::vector<int>> buckets;   // color -> its vertices, ascending
+
+    // Per element, a bit per corner that is **frozen**: its determinant is
+    // flat or inverted and cannot be changed by any node the smoother may move
+    // -- to first order, which for straight features is exactly. The case is a
+    // fixed node D whose two neighbours in the element can only slide parallel
+    // to D's other edge, and in practice it is a block corner that lies on a
+    // straight feature: D a junction or a pinned layout node, and the element's
+    // two sides at D both running along the same line, so the corner is 180
+    // degrees whatever anyone does. Such a sample is not an obstacle an
+    // optimizer can remove, and left in the energy it is worse than useless:
+    // its det T is pinned at zero, so every barrier and every regularised
+    // untangler reads it as infinite or nearly so, and the only thing left
+    // to lower is |T|^2 -- the two neighbours slide down the line onto D and
+    // drag the rest of the strip with them. Under Quadrature::Corners a
+    // frozen element is sampled at its other corners instead, so it still has
+    // a barrier against folding any further; the Gauss points are not corners
+    // and are left alone. Either way a mesh whose only non-positive corners
+    // are frozen is not sent to the untangler at all.
+    std::vector<std::uint8_t> frozenCorner;
 
     std::vector<Point> startPositions;
     double meanEdge = 1.0;

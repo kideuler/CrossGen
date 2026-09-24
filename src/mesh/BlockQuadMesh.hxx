@@ -184,7 +184,7 @@ public:
     // That rim is not a curve of the model, but it is where the mesh of
     // whatever eventually fills the hole will have to meet this one, so a
     // caller may want to pin it under a smoother (mesh::QuadMesh::pinVertex).
-    // Whether that is worth its cost is the caller's to measure; TraceMesh's
+    // Whether that is worth its cost is the caller's to measure; TestZIPLINE's
     // --pin-open-sides records what it measured.
     const std::vector<int> &openSideVertices() const { return openVerts_; }
 

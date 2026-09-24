@@ -1,4 +1,4 @@
-#include "tracing/PartitionSimplify.hxx"
+#include "ZIPLINE/PartitionSimplify.hxx"
 
 #include <algorithm>
 #include <cmath>
@@ -551,13 +551,23 @@ double PartitionSimplify::patchEnergy(const Chord &c, const Patch &p) const {
     for (int i = p.first; i <= p.last; ++i) { w += c.rungs[i % nr].length; ++nw; }
     if (nw) w /= nw;
 
-    // l: the mean length of the chord's two longitudinal sides. Sec. 4.1 takes
-    // this over the whole chord, not the patch, so a short patch on a long
-    // chord is judged by how far the chord as a whole has to bend.
+    // l: the mean length of the two longitudinal sides. Sec. 4.1 takes this
+    // over the whole chord, not the patch, so a short patch on a long chord
+    // is judged by how far the chord as a whole has to bend; with
+    // Settings::zipLengthOfPatch it is the patch's own sides, components
+    // p.first .. p.last - 1, which is how far the blend itself has to go.
     const auto &arcs = layout_.getArcs();
     double lL = 0.0, lR = 0.0;
-    for (const auto &side : c.sideL) for (const int d : side) lL += arcs[d >> 1].length;
-    for (const auto &side : c.sideR) for (const int d : side) lR += arcs[d >> 1].length;
+    if (settings_.zipLengthOfPatch) {
+        const int nf = static_cast<int>(c.faces.size());
+        for (int i = p.first; i < p.last; ++i) {
+            for (const int d : c.sideL[i % nf]) lL += arcs[d >> 1].length;
+            for (const int d : c.sideR[i % nf]) lR += arcs[d >> 1].length;
+        }
+    } else {
+        for (const auto &side : c.sideL) for (const int d : side) lL += arcs[d >> 1].length;
+        for (const auto &side : c.sideR) for (const int d : side) lR += arcs[d >> 1].length;
+    }
     const double l = 0.5 * (lL + lR);
     if (l <= 0.0) return -1.0;
 

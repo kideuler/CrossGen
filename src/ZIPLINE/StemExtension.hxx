@@ -4,9 +4,9 @@
 #include <memory>
 #include <vector>
 
-#include "tracing/FieldTracer.hxx"
-#include "tracing/QuadLayout.hxx"
-#include "tracing/TriangleLocator.hxx"
+#include "ZIPLINE/FieldTracer.hxx"
+#include "ZIPLINE/QuadLayout.hxx"
+#include "ZIPLINE/TriangleLocator.hxx"
 
 // ---------------------------------------------------------------------------
 // The optional post-pass of docs/viertel_2019.md Sec. 12 for the T-junctions

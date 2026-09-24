@@ -37,11 +37,11 @@ cmake --build build -j8                                 # or: --target TestMERID
 
 ## Test
 
-- `cd build && ctest` (or `ctest -R MERIDIAN`, `-R TORSION`, `-R Geom`, `-R Paper_`).
+- `cd build && ctest` (or `ctest -R MERIDIAN`, `-R TORSION`, `-R ZIPLINE`, `-R Geom`, `-R Paper_`).
   A project PreToolUse hook (`.claude/hooks/filter-test-output.sh`) cuts `ctest`/`make test`
   output down to the FAIL/ERROR lines. The end-to-end cases have 2400 s timeouts; the
   bubbles template cases are the slow ones.
-- Self-tests: `TestMERIDIAN --selftest`, `TestTORSION --selftest`, `TestTMOP --selftest`, `TestGeom`, `TraceMesh --selftest`.
+- Self-tests: `TestMERIDIAN --selftest`, `TestTORSION --selftest`, `TestTMOP --selftest`, `TestGeom`, `TestZIPLINE --selftest`.
 - A single model: `./build/TestMERIDIAN data/meshes/singlemat/geom012.obj [flags]`
   (TestTORSION works the same way). The flag parser is in `src/utils/TestMERIDIAN.cxx`
   around line 330. Useful flags: `--disk-templates --near-miss 0.04` (bubbles),
@@ -62,7 +62,7 @@ cmake --build build -j8                                 # or: --target TestMERID
 | `src/MERIDIAN` | **Pipeline A**, Shepherd 2022 Stages 0b–11: Interfaces → ConeSingularities → ConeCut → RicciFlow → Immersion → SubdomainLabels → LayoutEnergy → Separatrices → Arrangement → SplineFit → QuadMesh, plus DiskTemplate (0c/11). The stage map is in the header comment of `MERIDIAN.hxx` |
 | `src/TORSION` | **Pipeline B**: the same stages, but Stages 3–4 are swapped for integrating the DualMBO field (ConeMetric, FieldFrames, FieldIntegration, TutteEmbedding). Both pipelines meet at `Immersion`, and every stage after that is shared |
 | `src/geom` | Splines, polylines, Coons, B-rep (`Vertex/Edge/Face/Shape`), STEP/BREP output, all on top of OCC |
-| `src/tracing` | Viertel IMR19 (viewer mode 2, driver `TraceMesh`): separatrices → T-layout → Sec. 4 simplification + Sec. 12 stem extension → `LayoutBlocks` (the shared BlockDecomposition on src/geom splines; faces with a T-junction are not blocks, so read it by coverage) → BlockQuadMesh/TMOP. Honours material interfaces through MERIDIAN's Stage 0b `Interfaces` and an interface-aligned `CrossField`. `docs/viertel_2019.md` Sec. 14 maps the spec to the code |
+| `src/ZIPLINE` | **ZIPLINE**, Viertel IMR19 (class `ZIPLINE` in `ZIPLINE.hxx` runs every stage; viewer mode 2 and driver `TestZIPLINE` both go through it): separatrices → T-layout → Sec. 4 simplification + Sec. 12 stem extension → `LayoutBlocks` (the shared BlockDecomposition on src/geom splines; faces with a T-junction are not blocks, so read it by coverage) → BlockQuadMesh/TMOP. Honours material interfaces through MERIDIAN's Stage 0b `Interfaces` and an interface-aligned `CrossField`. `docs/viertel_2019.md` Sec. 14 maps the spec to the code |
 | `src/quantization`, `src/medialaxis`, `src/UMBER`, `src/OASIS`, `src/Parameterization` | Older approaches (QGP, medial axis, polysquare, spectral, seam cuts). Rarely touched now |
 | `src/viewer` | Qt6 `Viewer`. `run_meshes.sh` opens every mesh in turn; it has figure/SVG export |
 | `paper_tests/` | E1–E5 paper experiments (`make paper`; E1/E2 are also ctests). **Read `paper_tests/README.md` first.** It is the running log of findings, methods and protocol. Results go in `paper_tests/results/` |
@@ -73,6 +73,6 @@ cmake --build build -j8                                 # or: --target TestMERID
 
 ## Before changing a pipeline stage
 
-The memory index has a note for each area (stages 6–10, tracing, multimat, disk
+The memory index has a note for each area (stages 6–10, ZIPLINE, multimat, disk
 templates, TMOP, SIPG/DualMBO, geom/OCC). Read the note for the area before
 changing it. Most of them record a trap that already cost a debugging session.

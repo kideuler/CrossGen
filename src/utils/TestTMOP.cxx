@@ -578,6 +578,41 @@ int selfTest() {
         verdict(r3.minScaledJacobianAfter > 0.5,
                 "and left a usable mesh, though wound up: a local method cannot unwind it");
 
+        // A fold that is barely there: the node a hair past the diagonal of
+        // its upper-right neighbours, one corner at scaled Jacobian -0.04 --
+        // what a TFI mesh gives at a block corner the layout left at 181
+        // degrees (traced det_rocket, -0.02). Smoothed the way the block
+        // meshes are, shape + size sampled at the corners. Metric 22 with a
+        // tracked tau_0 treats a crushed element as a perfect one, and this is
+        // where that shows: it crushed the fold and its neighbours into a
+        // point (worst 0.035, smallest element 6e-7 of the target area,
+        // aspect 20) and stopped, and the main phase could not grow them
+        // back. The regularised untangler opens the fold instead.
+        {
+            mesh::TMOP::Options o7;
+            o7.metric = mesh::TMOP::ShapeSize007;
+            o7.quadrature = mesh::TMOP::Corners;
+            mesh::QuadMesh hair = tangled(Point{5.51, 5.51});
+            mesh::TMOP optH(hair, o7);
+            optH.run();
+            const mesh::TMOP::Report &rh = optH.getReport();
+            mesh::QuadMesh hairOld = tangled(Point{5.51, 5.51});
+            mesh::TMOP::Options o7old = o7;
+            o7old.untangler = mesh::TMOP::UntangleShifted;
+            mesh::TMOP optOld(hairOld, o7old);
+            optOld.run();
+            const mesh::TMOP::Report &ro = optOld.getReport();
+            std::cout << "  fold a hair past the diagonal: min scaled Jacobian "
+                      << rh.minScaledJacobianBefore << " -> " << rh.minScaledJacobianAfter
+                      << ", smallest element " << rh.minAreaAfter << " (" << rh.untangleSweeps
+                      << " + " << rh.sweeps << " sweep(s)); the shifted untangler: "
+                      << ro.minScaledJacobianAfter << ", smallest element " << ro.minAreaAfter << "\n";
+            verdict(rh.invertedAfter == 0 && rh.minScaledJacobianAfter > 0.99,
+                    "A barely folded node comes all the way back under shape + size at the corners");
+            verdict(rh.minAreaAfter > 0.9,
+                    "and nothing was crushed on the way: every element is still about the target area");
+        }
+
         // Refusing to start is the correct behaviour when untangling is off.
         mesh::QuadMesh h = tangled(Point{7.6, 7.6});
         mesh::TMOP::Options o2 = o;
@@ -587,6 +622,40 @@ int selfTest() {
         verdict(!ran && !opt2.getReport().ran,
                 "With untangling off, a barrier metric declines a tangled mesh rather than "
                 "dividing by zero");
+
+        // A corner nothing can open. Three quads on [0,2]^2; the bottom one is
+        // (0,0) (1,0) (2,0) (d), so its corner at (1,0) is a straight angle
+        // between two boundary edges -- a block corner a layout put on a
+        // straight feature. With (1,0) pinned, and (0,0) and (2,0) corners of
+        // the model, no admissible move changes that corner. Sampled at the
+        // corners its det T is zero, so the barrier energy of the whole mesh
+        // was infinite and the smoother declined to touch any of it; and an
+        // untangler run at it only ever finds |T|^2 left to lower. It has to
+        // be left out, and the rest smoothed.
+        {
+            std::vector<Point> v = {{0, 0}, {1, 0}, {2, 0}, {1.35, 0.55}, {0, 2}, {1, 2}, {2, 2}};
+            std::vector<mesh::Quad> c = {{0, 1, 2, 3}, {0, 3, 5, 4}, {3, 2, 6, 5}};
+            mesh::QuadMesh flat(v, c);
+            flat.pinVertex(1);
+            flat.classifyNodes();
+            flat.buildFeatureCurves();
+            flat.computeSlideTangents();
+            mesh::TMOP::Options of;
+            of.quadrature = mesh::TMOP::Corners;
+            mesh::TMOP optF(flat, of);
+            const Point before = flat.vertices[3];
+            const bool okF = optF.run();
+            const mesh::TMOP::Report &rf = optF.getReport();
+            std::cout << "  a straight-angle corner at a pinned node: " << rf.frozenCorners
+                      << " frozen corner(s), " << rf.untangleSweeps << " + " << rf.sweeps
+                      << " sweep(s), the free node moved "
+                      << normP(flat.vertices[3] - before) << "\n";
+            verdict(rf.frozenCorners == 1, "The one corner no node can change is found, and only it");
+            verdict(okF && rf.ran && rf.untangleSweeps == 0,
+                    "The mesh is smoothed rather than declined, without an untangling phase");
+            verdict(normP(flat.vertices[3] - before) > 0.05 && std::isfinite(rf.energyAfter),
+                    "and the free node was actually moved, to a finite energy");
+        }
     }
 
     // -- 9. the annulus: rims redistribute, and stay circles ----------------
@@ -849,6 +918,9 @@ void usage(const char *argv0) {
         "  --sweeps N        cap on smoothing sweeps (default 200)\n"
         "  --tol X           stop when no node moves more than X mean edges (default 1e-6)\n"
         "  --no-untangle     do not run the untangling phase first\n"
+        "  --untangler U     regular (default: regularised shape + size, Garanzha et al.)\n"
+        "                    or shifted (metric 22 with a tracked tau_0, the old one)\n"
+        "  --untangle-size g the regularised untangler's size weight (default 1/128)\n"
         "  --threads N       OpenMP threads; 0 (default) leaves it to the runtime\n"
         "  --pin-features    pin every boundary and interface node instead of sliding\n"
         "  --no-interfaces   do not treat material interfaces as features\n"
@@ -894,6 +966,13 @@ int main(int argc, char **argv) {
         else if (a == "--sweeps" && i + 1 < argc)  o.maxSweeps = std::stoi(argv[++i]);
         else if (a == "--tol" && i + 1 < argc)     o.moveTolerance = std::stod(argv[++i]);
         else if (a == "--no-untangle")             o.untangle = false;
+        else if (a == "--untangler" && i + 1 < argc) {
+            const std::string u = argv[++i];
+            if (u == "shifted") o.untangler = mesh::TMOP::UntangleShifted;
+            else if (u == "regular") o.untangler = mesh::TMOP::UntangleRegular;
+            else { std::cerr << "Unknown untangler: " << u << "\n"; return 1; }
+        }
+        else if (a == "--untangle-size" && i + 1 < argc) o.untangleSizeWeight = std::stod(argv[++i]);
         else if (a == "--threads" && i + 1 < argc) o.threads = std::stoi(argv[++i]);
         else if (a == "--pin-features")            mo.fixAllFeatureNodes = true;
         else if (a == "--no-interfaces")           mo.interfacesAreFeatures = false;

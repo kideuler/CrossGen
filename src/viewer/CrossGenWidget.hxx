@@ -38,10 +38,11 @@
 #include "polyvector/PolyVectors.hxx"
 #include "crossfield/CrossField.hxx"
 #include "dualMBO/DualMBO.hxx"
-#include "tracing/LayoutBlocks.hxx"
-#include "tracing/PartitionSimplify.hxx"
-#include "tracing/QuadLayout.hxx"
-#include "tracing/SeparatrixTrace.hxx"
+#include "ZIPLINE/LayoutBlocks.hxx"
+#include "ZIPLINE/PartitionSimplify.hxx"
+#include "ZIPLINE/QuadLayout.hxx"
+#include "ZIPLINE/SeparatrixTrace.hxx"
+#include "ZIPLINE/ZIPLINE.hxx"
 #include "medialaxis/MedialAxis.hxx"
 #include "medialaxis/MedialAxisMap.hxx"
 #include "medialaxis/MedialAxisTMesh.hxx"
@@ -63,7 +64,7 @@
 enum class Mode {
     Unselected = 0,
     PolyVector  = 1,
-    MBO         = 2,
+    ZIPLINE     = 2,
     MedialAxis  = 3,
     TORSION     = 4,
     OASIS       = 5,
@@ -79,9 +80,9 @@ enum class Phase {
     CutSeams     = 4,
 };
 
-// Mode 2 is Viertel, Osting and Staten (IMR 2019): the P1 MBO cross field,
-// its separatrices (Sec. 3), the quad layout with T-junctions they cut out, and
-// the partition simplification of Sec. 4.
+// Mode 2, ZIPLINE (src/ZIPLINE), is Viertel, Osting and Staten (IMR 2019): the
+// P1 MBO cross field, its separatrices (Sec. 3), the quad layout with
+// T-junctions they cut out, and the partition simplification of Sec. 4.
 //
 // Quantize and Quantized run the Campen et al. 2015 quantizer on that T-layout
 // (a QuadLayout's faces are its blocks, T-junctions and all, so this is the
@@ -93,7 +94,7 @@ enum class Phase {
 // The last three finish the method the way every other mode is finished:
 //
 //   Blocks     the simplified layout as the shared BlockDecomposition, on
-//              spline geometry (tracing/LayoutBlocks.hxx): each shared side
+//              spline geometry (ZIPLINE/LayoutBlocks.hxx): each shared side
 //              fitted once as a cubic B-spline, each block its Coons patch.
 //              Drawn as every mode draws its blocks -- light-blue sides, green
 //              macrovertices -- over the whole layout in grey. A component
@@ -108,7 +109,7 @@ enum class Phase {
 //              phase ('c' re-opens it), with mu at the element corners for the
 //              reason ATLAS and UMBER have: a transfinite grid on a block
 //              decomposition.
-enum class MBOPhase {
+enum class ZIPLINEPhase {
     MeshOnly    = 1,
     CrossField  = 2,
     Stepping    = 3,
@@ -469,7 +470,7 @@ private:
     // line for line as ATLAS's and Stage 10's meshes are.
     void runUMBERMesh();
     // The mesh dialog and the mesh report both block-decomposition modes
-    // (UMBER, and the tracing of mode 2) share.
+    // (UMBER and ZIPLINE) share.
     bool promptBlockQuadMesh(const BlockDecomposition &decomp, const char *title);
     void reportBlockQuadMesh(const BlockQuadMesh &bqm, double ms);
 
@@ -701,13 +702,17 @@ private:
     // sides place a tick on the junction and it becomes a regular vertex
     // of the result. What is left hanging is a junction with an incident
     // edge forced to zero, or bordering a component the conversion had to
-    // skip. Empty until traceQuant_ exists.
+    // skip. Empty until ziplineQuant_ exists.
     std::vector<int> hangingTJunctions() const;
+    // The interface network the current mode honours, or null: ZIPLINE's own
+    // in mode 2 (Stage 0b with closed loops unsplit), interfaces_ in every
+    // other mode.
+    const Interfaces *interfaceNetwork() const;
 
-    // Mode 2's last three phases: the blocks, the mesh on them, and its dialog.
-    void buildTraceBlocks();
-    bool promptTraceMesh();
-    void runTraceMesh();
+    // ZIPLINE's last three phases: the blocks, the mesh on them, and its dialog.
+    void buildZIPLINEBlocks();
+    bool promptZIPLINEMesh();
+    void runZIPLINEMesh();
 
     // rendering sub-routines called from paintGL
     void renderMBOAnimation();
@@ -761,30 +766,43 @@ private:
 
     std::optional<PolyField>   field_;
     std::optional<CutMesh>     cutMesh_;
-    std::optional<CrossField>  crossField_;
     std::optional<DualMBO>        dualMBOField_;
-    std::shared_ptr<SeparatrixTrace> separatrixTrace_;
-    // Holds a pointer to the trace above, so it must not outlive it: both are
-    // cleared together in reset().
-    std::optional<QuadLayout>  quadLayout_;
-    // Sec. 4 run on the layout above. It keeps a copy of what it was handed, so
-    // the layout before simplification survives alongside it and the two can be
-    // drawn together.
-    std::optional<PartitionSimplify> simplified_;
-    // simplified_'s layout converted to a QuantTMesh and quantized -- the
+    // ZIPLINE, every stage of it from the interface network to the mesh on the
+    // blocks, the same class and Options TestZIPLINE runs, so that a model
+    // traces the same here as on the command line. Mode 2's phases run its
+    // stages one at a time (the field and the trace a few steps per frame);
+    // the accessors below read them, null until a stage has run. TMOP is not
+    // ZIPLINE's here: Stage 12 is the one dialog and solve every mode shares.
+    std::unique_ptr<ZIPLINE> zipline_;
+    const CrossField *ziplineField() const {
+        return zipline_ && zipline_->hasField() ? &zipline_->getField() : nullptr;
+    }
+    const SeparatrixTrace *ziplineTrace() const {
+        return zipline_ && zipline_->hasTrace() ? &zipline_->getTrace() : nullptr;
+    }
+    const QuadLayout *ziplineLayout() const {
+        return zipline_ && zipline_->hasLayout() ? &zipline_->getLayout() : nullptr;
+    }
+    // Sec. 4's pass; its getLayout() is the simplified layout.
+    const PartitionSimplify *ziplineSimplified() const {
+        return zipline_ && zipline_->hasSimplification() ? &zipline_->getSimplification() : nullptr;
+    }
+    const LayoutBlocks *ziplineBlocks() const {
+        return zipline_ && zipline_->hasBlocks() ? &zipline_->getBlocks() : nullptr;
+    }
+    const BlockQuadMesh *ziplineMesh() const {
+        return zipline_ && zipline_->hasBlockMesh() ? &zipline_->getBlockMesh() : nullptr;
+    }
+    // The simplified layout converted to a QuantTMesh and quantized -- the
     // same Sec. 6 solve blockQuant_ below runs, on the block decomposition
     // tracing left rather than the medial axis one. xIdeal is 1 everywhere,
-    // for the same reason. Built from simplified_ and cleared with it.
-    std::optional<QuadLayoutQuant> traceQuant_;
-    TMeshQuantizer::Report traceQuantReport_;
-    // simplified_'s layout as blocks on spline geometry, and the mesh on them
-    // (MBOPhase::Blocks and Mesh). Both copy what they need, so neither holds
-    // on to the layout.
-    std::optional<LayoutBlocks> traceBlocks_;
-    std::optional<BlockQuadMesh> traceMesh_;
+    // for the same reason. A viewer-only detour, not a stage of ZIPLINE, and
+    // cleared with it.
+    std::optional<QuadLayoutQuant> ziplineQuant_;
+    TMeshQuantizer::Report ziplineQuantReport_;
     // Triangles of the model inside a component that is not a block, found
     // once when the blocks are built: the uncovered area, filled.
-    std::vector<int> traceUncoveredTris_;
+    std::vector<int> ziplineUncoveredTris_;
     std::shared_ptr<Mesh>      delaunayMesh_;
     std::shared_ptr<MedialAxis> medialAxis_;
     // The Sec. 3 map phi from the boundary to the axis above; holds a
@@ -931,13 +949,13 @@ private:
 
     // Guiding field for the OASIS orientation term. Held by shared_ptr because
     // OASIS keeps a reference to it for as long as it lives; separate from
-    // crossField_, which belongs to MBO mode and follows its own state machine.
+    // ZIPLINE's field (zipline_), which follows its own state machine.
     std::shared_ptr<CrossField> oasisGuide_;
 
     // ── state machine ────────────────────────────────────────────────────────
     Mode           mode_     = Mode::Unselected;
     Phase          phase_    = Phase::MeshOnly;
-    MBOPhase       mboPhase_ = MBOPhase::MeshOnly;
+    ZIPLINEPhase   ziplinePhase_ = ZIPLINEPhase::MeshOnly;
     MedialAxisPhase maPhase_ = MedialAxisPhase::MeshOnly;
     OASISPhase     oasisPhase_ = OASISPhase::MeshOnly;
     UMBERPhase     umberPhase_ = UMBERPhase::MeshOnly;
@@ -964,11 +982,11 @@ private:
     double oasisGuideClearanceQuads_ = 2.0;
 
     bool singularitiesLogged_  = false;
+    // ZIPLINE's two animations, each announced once when it starts and once
+    // when it ends; the counts themselves are zipline_->getStatus()'s.
     bool mboSteppingStarted_   = false;
-    bool mboConverged_         = false;
-    bool mboTracingStarted_    = false;
-    bool mboTracingFinished_   = false;
-    int  mboStepCount_         = 0;
+    bool ziplineTracingStarted_    = false;
+    bool ziplineTracingFinished_   = false;
     bool dualMBOSteppingStarted_  = false;
     bool dualMBOConverged_        = false;
     int  dualMBOStepCount_        = 0;
@@ -982,7 +1000,7 @@ private:
     bool polysquareAttempted_  = false;
     bool blocksAttempted_      = false;
     bool umberMeshAttempted_   = false;
-    bool traceMeshAttempted_   = false;
+    bool ziplineMeshAttempted_   = false;
     // One-shot discipline for the three MERIDIAN stages. Each is attempted once
     // per run and not retried: a failure leaves its optional empty, and keying
     // off the optional alone would run the whole stage again on every frame --
@@ -1151,9 +1169,9 @@ private:
     // it worse -- on singlemat/geom012 the worst scaled Jacobian goes 0.033 ->
     // 0.162 at the corners and 0.033 -> 0.012 at the 2x2 Gauss points.
     TMOPSettings umberTmopSettings_ = [] { TMOPSettings t; t.corners = true; return t; }();
-    // Mode 2's, for the same reason again: its mesh is BlockQuadMesh's
+    // ZIPLINE's, for the same reason again: its mesh is BlockQuadMesh's
     // transfinite grid, exactly UMBER's kind of mesh.
-    TMOPSettings traceTmopSettings_ = [] { TMOPSettings t; t.corners = true; return t; }();
+    TMOPSettings ziplineTmopSettings_ = [] { TMOPSettings t; t.corners = true; return t; }();
     // The copy above that the current mode's TMOP dialog and solve both use.
     TMOPSettings &tmopSettingsForMode();
 
@@ -1191,8 +1209,6 @@ private:
 
     // ── timer driving animation frames ───────────────────────────────────────
     QTimer *timer_ = nullptr;
-
-    static constexpr int MBO_MAX_STEPS = 500;
 
     // The MBO convergence test both pipelines use, as `error < 2 N tol` with N
     // the triangle count. 1e-5 is what TORSION::runField() and MERIDIAN's

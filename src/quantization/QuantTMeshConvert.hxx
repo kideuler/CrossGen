@@ -3,7 +3,7 @@
 
 #include "medialaxis/MedialAxisTMesh.hxx"
 #include "quantization/QuantTMesh.hxx"
-#include "tracing/QuadLayout.hxx"
+#include "ZIPLINE/QuadLayout.hxx"
 
 #include <array>
 #include <string>

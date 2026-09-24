@@ -1,4 +1,4 @@
-#include "tracing/LayoutBlocks.hxx"
+#include "ZIPLINE/LayoutBlocks.hxx"
 
 #include <algorithm>
 #include <cmath>
@@ -9,7 +9,7 @@
 
 #include "geom/Coons.hxx"
 #include "geom/Fitting.hxx"
-#include "tracing/TriangleLocator.hxx"
+#include "ZIPLINE/TriangleLocator.hxx"
 
 namespace {
 

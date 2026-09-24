@@ -202,19 +202,21 @@ add_library(PolyVector SHARED
     src/UMBER/MotorcycleGraph.cxx
     src/UMBER/BlockLayout.hxx
     src/UMBER/BlockLayout.cxx
-    src/tracing/FieldTracer.hxx
-    src/tracing/FieldTracer.cxx
-    src/tracing/SeparatrixTrace.hxx
-    src/tracing/SeparatrixTrace.cxx
-    src/tracing/QuadLayout.hxx
-    src/tracing/QuadLayout.cxx
-    src/tracing/PartitionSimplify.hxx
-    src/tracing/PartitionSimplify.cxx
-    src/tracing/LayoutBlocks.hxx
-    src/tracing/LayoutBlocks.cxx
-    src/tracing/StemExtension.hxx
-    src/tracing/StemExtension.cxx
-    src/tracing/TriangleLocator.hxx
+    src/ZIPLINE/FieldTracer.hxx
+    src/ZIPLINE/FieldTracer.cxx
+    src/ZIPLINE/SeparatrixTrace.hxx
+    src/ZIPLINE/SeparatrixTrace.cxx
+    src/ZIPLINE/QuadLayout.hxx
+    src/ZIPLINE/QuadLayout.cxx
+    src/ZIPLINE/PartitionSimplify.hxx
+    src/ZIPLINE/PartitionSimplify.cxx
+    src/ZIPLINE/LayoutBlocks.hxx
+    src/ZIPLINE/LayoutBlocks.cxx
+    src/ZIPLINE/StemExtension.hxx
+    src/ZIPLINE/StemExtension.cxx
+    src/ZIPLINE/TriangleLocator.hxx
+    src/ZIPLINE/ZIPLINE.hxx
+    src/ZIPLINE/ZIPLINE.cxx
     src/triangle/triangle.cpp
     src/triangle/triangle.h
     src/triangle/TriangleMesher.hpp
@@ -245,9 +247,10 @@ endif()
 add_executable(LoadMesh src/utils/LoadMesh.cxx)
 target_link_libraries(LoadMesh PRIVATE PolyVector)
 
-# Utility to trace separatrices on a mesh
-add_executable(TraceMesh src/utils/TraceMesh.cxx)
-target_link_libraries(TraceMesh PRIVATE PolyVector)
+# ZIPLINE, the Viertel et al. 2019 tracing method (src/ZIPLINE): separatrices,
+# the T-layout they cut out, its Sec. 4 simplification, blocks and a mesh
+add_executable(TestZIPLINE src/utils/TestZIPLINE.cxx)
+target_link_libraries(TestZIPLINE PRIVATE PolyVector)
 
 # Utility to cut a mesh into a disk and run sanity checks
 add_executable(TestCutMesh src/utils/TestCutMesh.cxx)
@@ -413,18 +416,18 @@ add_test(NAME TriangleMesher_ConcentricShells COMMAND TestTriangleMesher 6)
 
 # End-to-end: trace every model in data/meshes and check each layout is a plane
 # graph whose faces tile the model exactly with nothing left dangling, that the
-# blocks read off it (tracing/LayoutBlocks) are a sound decomposition -- every
+# blocks read off it (ZIPLINE/LayoutBlocks) are a sound decomposition -- every
 # side running between its block's corners, every Coons patch on its corners --
 # and that the mesh on them is conforming. How many of the components come out
 # four-sided, and how much of the model the blocks cover, are printed but not
 # asserted: that is what the method achieves on a model, not a defect.
-add_test(NAME Tracing_LayoutsOnAllMeshes
-         COMMAND TraceMesh --no-vtu --mesh 0.05 ${MESH_OBJ_FILES})
+add_test(NAME ZIPLINE_LayoutsOnAllMeshes
+         COMMAND TestZIPLINE --no-vtu --mesh 0.05 ${MESH_OBJ_FILES})
 
 # docs/viertel_2019.md Sec. 11 on closed-form fields: the index, the ports and
 # the hyperbola of a singularity, straight streamlines in a constant field, and
 # the square, the L-shape and a T-junction taken through to blocks and a mesh.
-add_test(NAME Tracing_SelfTest COMMAND TraceMesh --selftest)
+add_test(NAME ZIPLINE_SelfTest COMMAND TestZIPLINE --selftest)
 
 # Discrete Ricci flow (Shepherd et al. Sec. 3.2.1) against prescribed cone sets
 # with far more curvature to move than anything in data/meshes asks for, which

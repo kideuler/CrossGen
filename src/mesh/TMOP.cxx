@@ -45,6 +45,16 @@ inline Jacobian2 cofactor(const Jacobian2 &T) {
     return {T[3], -T[2], -T[1], T[0]};
 }
 
+// chi(t, eps) = (t + sqrt(t^2 + eps^2)) / 2, the positive stand-in for det T
+// in Metric::UntangleRegularized. For t < 0 the textbook form subtracts two
+// nearly equal numbers; multiplying through by the conjugate gives the same
+// value without the cancellation, which matters because a badly inverted
+// element is exactly where chi is small and the energy is 1/chi.
+inline double regularizedDet(double t, double eps) {
+    const double r = std::sqrt(t * t + eps * eps);
+    return t >= 0.0 ? 0.5 * (t + r) : 0.5 * eps * eps / (r - t);
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -113,6 +123,30 @@ TMOP::MetricPartials TMOP::partialsOf(Metric m, double s, double t,
             p.f  = 0.5 * (t + 1.0 / t) - 1.0;
             p.ft = 0.5 * (1.0 - 1.0 / (t * t));
             p.ftt = 1.0 / (t * t * t);
+            return p;
+        }
+        case UntangleRegularized: {
+            // f = N / chi - 1 with N = (1 - g) s / 2 + g (t^2 + 1) / 2 and
+            // chi = chi(t, eps); tau0 carries eps. With r = sqrt(t^2 + eps^2),
+            // chi' = chi / r and chi'' = eps^2 / (2 r^3), and the rest is the
+            // quotient rule.
+            const double g = std::min(std::max(gamma, 0.0), 1.0);
+            const double eps = std::fabs(tau0);
+            const double c = regularizedDet(t, eps);
+            if (!(c > 0.0)) return p;
+            const double r = std::sqrt(t * t + eps * eps);
+            const double c1 = c / r;
+            const double c2 = 0.5 * eps * eps / (r * r * r);
+            const double n = 0.5 * (1.0 - g) * s + 0.5 * g * (t * t + 1.0);
+            const double ns = 0.5 * (1.0 - g);
+            const double nt = g * t;
+            const double c_2 = c * c;
+            p.valid = true;
+            p.f   = n / c - 1.0;
+            p.fs  = ns / c;
+            p.ft  = nt / c - n * c1 / c_2;
+            p.fst = -ns * c1 / c_2;
+            p.ftt = g / c - 2.0 * nt * c1 / c_2 - n * c2 / c_2 + 2.0 * n * c1 * c1 / (c_2 * c);
             return p;
         }
         case ShapeSizeCombo: {
@@ -253,6 +287,7 @@ void TMOP::prepare() {
 
     activeMetric = options.metric;
     activeTau0 = 0.0;
+    activeGamma = options.gamma;
     activeExponent = options.exponent;
 }
 
@@ -287,10 +322,21 @@ bool TMOP::accumulate(int q, int c, double *energyOut, double *minTau,
     const QuadPoint *rule = (options.quadrature == Corners) ? kCorners : kGauss2x2;
     const Jacobian2 &Wi = targetInverse[q];
     const double dW = targetDet[q];
+    // Sampled at the corners, an element with a frozen corner is sampled at
+    // its other corners, weighted so it keeps its full target area in the
+    // sum. The Gauss points are not corners, so that rule is left alone.
+    const std::uint8_t frozen = (options.quadrature == Corners &&
+                                 q < static_cast<int>(frozenCorner.size())) ? frozenCorner[q] : 0;
+    int live = 4;
+    for (int k = 0; k < 4; ++k)
+        if (frozen & (1u << k)) --live;
+    const double wScale = frozen ? 4.0 / std::max(live, 1) : 1.0;
 
     bool valid = true;
     for (int k = 0; k < 4; ++k) {
-        const QuadPoint &qp = rule[k];
+        if (frozen & (1u << k)) continue;
+        QuadPoint qp = rule[k];
+        qp.w *= wScale;
         const Jacobian2 A = mesh.jacobianAt(q, qp.xi, qp.eta);
         const Jacobian2 T = mul2(A, Wi);
 
@@ -299,7 +345,7 @@ bool TMOP::accumulate(int q, int c, double *energyOut, double *minTau,
         if (minTau) *minTau = std::min(*minTau, t);
 
         const MetricPartials p = raiseTo(
-            partialsOf(activeMetric, s, t, options.gamma, activeTau0), activeExponent);
+            partialsOf(activeMetric, s, t, activeGamma, activeTau0), activeExponent);
         if (!p.valid) {
             valid = false;
             if (energyOut) *energyOut = kInf;
@@ -625,18 +671,78 @@ double TMOP::sweep() {
 // the run
 // ---------------------------------------------------------------------------
 
+// A corner's determinant is det = (A - D) x (C - D), with D the corner's node
+// and A, C its two neighbours in the element. Its gradient is perp(C - D) in A,
+// -perp(A - D) in C and minus their sum in D; projected onto what each node may
+// do -- the whole plane for a free node, the slide tangent for a sliding one,
+// nothing for a fixed one -- it is zero exactly when no admissible move changes
+// the determinant to first order. On a straight feature that is exact: sliding
+// A parallel to C - D shears the parallelogram and keeps its area.
+//
+// Only a flat or inverted corner is frozen. A rigid corner with a healthy
+// determinant (the sheared parallelogram) is left in the energy: its det T is
+// constant, the barrier on it is finite, and what it asks of |T|^2 -- to square
+// up within the shear -- is a fair request.
+void TMOP::findFrozenCorners() {
+    const int nQ = static_cast<int>(mesh.quads.size());
+    frozenCorner.assign(nQ, 0);
+    report.frozenCorners = 0;
+    mesh.computeSlideTangents();
+
+    // How much of a node's first-order freedom lies along g, relative to |g|.
+    auto along = [&](int v, const Point &g) -> double {
+        if (v < 0 || v >= static_cast<int>(mesh.nodeType.size())) return 0.0;
+        const double n = normP(g);
+        if (!(n > 0.0)) return 0.0;
+        switch (mesh.nodeType[v]) {
+            case QuadMesh::NodeFree:    return 1.0;
+            case QuadMesh::NodeSliding: return std::fabs(dotP(mesh.slideTangent[v], g)) / n;
+            default:                    return 0.0;
+        }
+    };
+    const double rigid = 1e-6;
+    for (int q = 0; q < nQ; ++q) {
+        const Quad &Q = mesh.quads[q];
+        for (int k = 0; k < 4; ++k) {
+            if (mesh.scaledJacobian(q, k) > 1e-6) continue;
+            const int d = Q[k], a = Q[(k + 1) % 4], c = Q[(k + 3) % 4];
+            const Point ad = mesh.vertices[a] - mesh.vertices[d];
+            const Point cd = mesh.vertices[c] - mesh.vertices[d];
+            const Point gA{cd[1], -cd[0]};
+            const Point gC{-ad[1], ad[0]};
+            const Point gD = (gA + gC) * -1.0;
+            if (along(a, gA) > rigid || along(c, gC) > rigid || along(d, gD) > rigid) continue;
+            frozenCorner[q] |= static_cast<std::uint8_t>(1u << k);
+            ++report.frozenCorners;
+        }
+    }
+    if (report.frozenCorners > 0) {
+        std::ostringstream os;
+        os << report.frozenCorners << " element corner(s) are flat or inverted and no "
+           << "node that may move can change them (a fixed node with both sides along "
+           << "one straight feature); they are not folds to untangle"
+           << (options.quadrature == Corners ? ", were left out of the energy," : "")
+           << " and stay as they are";
+        report.messages.push_back(os.str());
+    }
+}
+
 double TMOP::minDeterminant() const {
     const int nQ = static_cast<int>(mesh.quads.size());
     double worst = kInf;
     CG_OMP(parallel for schedule(static) reduction(min:worst))
     for (int q = 0; q < nQ; ++q) {
         const Jacobian2 &Wi = targetInverse[q];
+        const std::uint8_t frozen = (q < static_cast<int>(frozenCorner.size())) ? frozenCorner[q] : 0;
         // Corners as well as the active rule: a barrier placed below the
-        // quadrature points alone can still be above a folded corner.
+        // quadrature points alone can still be above a folded corner. A frozen
+        // corner is no one's to fix, so it does not count.
         for (int k = 0; k < 4; ++k) {
             const QuadPoint &a = kCorners[k];
             const QuadPoint &b = (options.quadrature == Corners) ? kCorners[k] : kGauss2x2[k];
-            worst = std::min(worst, det2(mul2(mesh.jacobianAt(q, a.xi, a.eta), Wi)));
+            if (!(frozen & (1u << k)))
+                worst = std::min(worst, det2(mul2(mesh.jacobianAt(q, a.xi, a.eta), Wi)));
+            if (options.quadrature == Corners && (frozen & (1u << k))) continue;
             worst = std::min(worst, det2(mul2(mesh.jacobianAt(q, b.xi, b.eta), Wi)));
         }
     }
@@ -705,6 +811,7 @@ bool TMOP::run() {
     prepare();
     buildColoring();
     snapshotQuality(true);
+    findFrozenCorners();
 
     if (mesh.quads.empty() || report.movableNodes == 0) {
         report.messages.push_back(mesh.quads.empty()
@@ -727,8 +834,10 @@ bool TMOP::run() {
     // tau_0 below the worst determinant instead of at zero, which makes the
     // energy finite everywhere and its gradient push the determinants up; tau_0
     // is re-tracked each sweep, so the barrier follows the mesh as it recovers.
-    if (options.untangle && report.invertedBefore > 0) {
+    const bool tangled = report.invertedBefore > 0 && minDeterminant() <= 0.0;
+    if (options.untangle && tangled && options.untangler == UntangleShifted) {
         activeMetric = Untangle022;
+        activeGamma = 0.0;
         activeExponent = 1.0;
         for (int s = 0; s < options.untangleMaxSweeps; ++s) {
             const double tmin = minDeterminant();
@@ -738,6 +847,45 @@ bool TMOP::run() {
             const double move = sweep();
             ++report.untangleSweeps;
             if (move < options.moveTolerance * meanEdge) break;
+        }
+    } else if (options.untangle && tangled) {
+        // Garanzha et al. (TOG 2021), Sec. 3 and their Listing 1, with one
+        // Gauss-Seidel sweep standing in for their inner L-BFGS solve. eps
+        // starts at a fifth of the worst determinant. After each sweep, sigma
+        // says how much of the energy that sweep removed, and eps is re-chosen
+        // so that chi at the worst element falls to (1 - sigma) of what it
+        // was: chi(t_min, eps') = mu solves to eps' = 2 sqrt(mu (mu - t_min)).
+        // A sweep that bought a lot lets the regularisation go quickly, one
+        // that bought little keeps it. Once the worst element is at least mu
+        // the regularisation has done its job and eps drops to (near) zero,
+        // which leaves the energy ShapeSizeCombo, a barrier metric -- one
+        // further sweep with it, and the main phase starts on a mesh that
+        // is valid and already relaxed under a barrier, not on the first one
+        // whose determinants all crept over zero.
+        //
+        // sigma is read off N / chi, the energy without the -1 that makes
+        // mu(I) = 0: with eps > 0 a good element sits slightly *below* zero,
+        // and a ratio of two sums that can change sign means nothing.
+        const double epsFloor = 1e-10;
+        activeMetric = UntangleRegularized;
+        activeGamma = options.untangleSizeWeight;
+        activeExponent = 1.0;
+        double tmin = minDeterminant();
+        double eps = std::sqrt(1e-12 + 0.04 * std::min(tmin, 0.0) * std::min(tmin, 0.0));
+        activeTau0 = eps;
+        double before = energy() + targetArea;
+        for (int s = 0; s < options.untangleMaxSweeps; ++s) {
+            const double move = sweep();
+            ++report.untangleSweeps;
+            const double after = energy() + targetArea;
+            tmin = minDeterminant();
+            if (tmin > 0.0 && eps <= epsFloor) break;
+            if (move < options.moveTolerance * meanEdge && tmin > 0.0) break;
+            const double sigma = std::max(1.0 - after / before, 0.1);
+            const double mu = (1.0 - sigma) * regularizedDet(tmin, eps);
+            eps = (tmin < mu) ? 2.0 * std::sqrt(mu * (mu - tmin)) : epsFloor;
+            activeTau0 = eps;
+            before = energy() + targetArea;
         }
         const int left = countInverted();
         std::ostringstream os;
@@ -749,8 +897,14 @@ bool TMOP::run() {
     // -- phase 2: the metric the caller asked for ---------------------------
     activeMetric = options.metric;
     activeTau0 = 0.0;
+    activeGamma = options.gamma;
     activeExponent = options.exponent;
-    if (activeMetric == Untangle022) {
+    if (activeMetric == UntangleRegularized) {
+        // Asked for as the main metric: one eps, from the mesh as it is.
+        const double tmin = std::min(minDeterminant(), 0.0);
+        activeTau0 = std::sqrt(1e-12 + 0.04 * tmin * tmin);
+        activeGamma = options.untangleSizeWeight;
+    } else if (activeMetric == Untangle022) {
         // Asked for directly rather than as a phase: place the barrier once,
         // below whatever the mesh currently is, and leave it there.
         const double tmin = minDeterminant();

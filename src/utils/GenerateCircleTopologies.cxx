@@ -1,4 +1,4 @@
-#include "tracing/SeparatrixTrace.hxx"
+#include "ZIPLINE/SeparatrixTrace.hxx"
 #include "TestHelper.hxx"
 
 // for file writing

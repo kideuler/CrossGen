@@ -5,7 +5,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "tracing/FieldTracer.hxx"
+#include "ZIPLINE/FieldTracer.hxx"
 
 class Interfaces;
 

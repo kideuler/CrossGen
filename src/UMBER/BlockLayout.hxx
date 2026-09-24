@@ -6,7 +6,7 @@
 
 #include "UMBER/MotorcycleGraph.hxx"
 #include "mesh/BlockDecomposition.hxx"
-#include "tracing/QuadLayout.hxx"
+#include "ZIPLINE/QuadLayout.hxx"
 
 // ---------------------------------------------------------------------------
 // The meta-blocks of MotorcycleGraph as a graph rather than as a colouring.

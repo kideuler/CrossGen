@@ -4,7 +4,7 @@
 #include <string>
 #include <vector>
 
-#include "tracing/SeparatrixTrace.hxx"
+#include "ZIPLINE/SeparatrixTrace.hxx"
 
 // ---------------------------------------------------------------------------
 // The quad layout with T-junctions of Viertel, Osting and Staten, IMR 2019,

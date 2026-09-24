@@ -69,22 +69,22 @@ Phase nextPhase(Phase p) {
     return Phase::CutSeams;
 }
 
-MBOPhase nextMBOPhase(MBOPhase p) {
+ZIPLINEPhase nextZIPLINEPhase(ZIPLINEPhase p) {
     switch (p) {
-        case MBOPhase::MeshOnly:     return MBOPhase::CrossField;
-        case MBOPhase::CrossField:   return MBOPhase::Stepping;
-        case MBOPhase::Stepping:     return MBOPhase::Separatrices;
-        case MBOPhase::Separatrices: return MBOPhase::Trace;
-        case MBOPhase::Trace:        return MBOPhase::Layout;
-        case MBOPhase::Layout:       return MBOPhase::Simplified;
-        case MBOPhase::Simplified:   return MBOPhase::Quantize;
-        case MBOPhase::Quantize:     return MBOPhase::Quantized;
-        case MBOPhase::Quantized:    return MBOPhase::Blocks;
-        case MBOPhase::Blocks:       return MBOPhase::Mesh;
-        case MBOPhase::Mesh:         return MBOPhase::Smoothed;
-        case MBOPhase::Smoothed:     return MBOPhase::Smoothed;
+        case ZIPLINEPhase::MeshOnly:     return ZIPLINEPhase::CrossField;
+        case ZIPLINEPhase::CrossField:   return ZIPLINEPhase::Stepping;
+        case ZIPLINEPhase::Stepping:     return ZIPLINEPhase::Separatrices;
+        case ZIPLINEPhase::Separatrices: return ZIPLINEPhase::Trace;
+        case ZIPLINEPhase::Trace:        return ZIPLINEPhase::Layout;
+        case ZIPLINEPhase::Layout:       return ZIPLINEPhase::Simplified;
+        case ZIPLINEPhase::Simplified:   return ZIPLINEPhase::Quantize;
+        case ZIPLINEPhase::Quantize:     return ZIPLINEPhase::Quantized;
+        case ZIPLINEPhase::Quantized:    return ZIPLINEPhase::Blocks;
+        case ZIPLINEPhase::Blocks:       return ZIPLINEPhase::Mesh;
+        case ZIPLINEPhase::Mesh:         return ZIPLINEPhase::Smoothed;
+        case ZIPLINEPhase::Smoothed:     return ZIPLINEPhase::Smoothed;
     }
-    return MBOPhase::Smoothed;
+    return ZIPLINEPhase::Smoothed;
 }
 
 UMBERPhase nextUMBERPhase(UMBERPhase p) {
@@ -157,20 +157,20 @@ const char *phaseName(Phase p) {
     return "?";
 }
 
-const char *mboPhaseName(MBOPhase p) {
+const char *ziplinePhaseName(ZIPLINEPhase p) {
     switch (p) {
-        case MBOPhase::MeshOnly:     return "1) mesh";
-        case MBOPhase::CrossField:   return "2) MBO crossfield";
-        case MBOPhase::Stepping:     return "3) MBO stepping";
-        case MBOPhase::Separatrices: return "4) separatrices";
-        case MBOPhase::Trace:        return "5) trace";
-        case MBOPhase::Layout:       return "6) quad layout";
-        case MBOPhase::Simplified:   return "7) simplified partition";
-        case MBOPhase::Quantize:     return "8) Quantization";
-        case MBOPhase::Quantized:    return "9) Quantized block decomposition";
-        case MBOPhase::Blocks:       return "10) block decomposition";
-        case MBOPhase::Mesh:         return "11) quad mesh";
-        case MBOPhase::Smoothed:     return "12) TMOP smoothing";
+        case ZIPLINEPhase::MeshOnly:     return "1) mesh";
+        case ZIPLINEPhase::CrossField:   return "2) MBO crossfield";
+        case ZIPLINEPhase::Stepping:     return "3) MBO stepping";
+        case ZIPLINEPhase::Separatrices: return "4) separatrices";
+        case ZIPLINEPhase::Trace:        return "5) trace";
+        case ZIPLINEPhase::Layout:       return "6) quad layout";
+        case ZIPLINEPhase::Simplified:   return "7) simplified partition";
+        case ZIPLINEPhase::Quantize:     return "8) Quantization";
+        case ZIPLINEPhase::Quantized:    return "9) Quantized block decomposition";
+        case ZIPLINEPhase::Blocks:       return "10) block decomposition";
+        case ZIPLINEPhase::Mesh:         return "11) quad mesh";
+        case ZIPLINEPhase::Smoothed:     return "12) TMOP smoothing";
     }
     return "?";
 }
@@ -256,7 +256,7 @@ const char *modeName(Mode m) {
     switch (m) {
         case Mode::Unselected: return "unselected";
         case Mode::PolyVector: return "PolyVector";
-        case Mode::MBO:        return "MBO";
+        case Mode::ZIPLINE:    return "ZIPLINE";
         case Mode::MedialAxis: return "Medial Axis";
         case Mode::TORSION:    return "TORSION";
         case Mode::OASIS:      return "OASIS";
@@ -270,7 +270,7 @@ const char *modeName(Mode m) {
 // The line every mode-selection prompt prints, kept in one place so adding a
 // mode does not mean chasing three copies of it.
 const char *kModeMenu =
-    "press '1' for PolyVector, '2' for MBO, '3' for Medial Axis, '4' for TORSION, "
+    "press '1' for PolyVector, '2' for ZIPLINE, '3' for Medial Axis, '4' for TORSION, "
     "'5' for OASIS, '6' for UMBER, '7' for MERIDIAN, '8' for ATLAS";
 
 } // anonymous namespace
@@ -368,20 +368,19 @@ void CrossGenWidget::paintGL() {
 
 void CrossGenWidget::drawScene() {
     // Choose render path
-    bool isMBOStepping = (mode_ == Mode::MBO &&
-                          mboPhase_ == MBOPhase::Stepping &&
+    bool isMBOStepping = (mode_ == Mode::ZIPLINE &&
+                          ziplinePhase_ == ZIPLINEPhase::Stepping &&
                           mboSteppingStarted_ &&
-                          mboStepCount_ < MBO_MAX_STEPS &&
-                          !mboConverged_);
+                          ziplineField() && !zipline_->fieldFinished());
 
     bool isDualMBOStepping = (dualMBOStageIsStepping() &&
                            dualMBOSteppingStarted_ &&
                            !dualMBOConverged_);
 
-    bool isTracing = (mode_ == Mode::MBO &&
-                      mboPhase_ == MBOPhase::Trace &&
-                      separatrixTrace_ &&
-                      !mboTracingFinished_);
+    bool isTracing = (mode_ == Mode::ZIPLINE &&
+                      ziplinePhase_ == ZIPLINEPhase::Trace &&
+                      ziplineTrace() &&
+                      !ziplineTracingFinished_);
 
     if (isMBOStepping) {
         renderMBOAnimation();
@@ -482,13 +481,13 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
                 umberPhase_ = UMBERPhase::Mesh;
             }
         }
-        // And the tracing mode's.
-        if (mode_ == Mode::MBO && mboPhase_ >= MBOPhase::Mesh && traceBlocks_.has_value() &&
-            !traceBlocks_->blocks().empty()) {
-            traceMeshAttempted_ = true;
-            if (promptTraceMesh()) {
-                runTraceMesh();
-                mboPhase_ = MBOPhase::Mesh;
+        // And ZIPLINE's.
+        if (mode_ == Mode::ZIPLINE && ziplinePhase_ >= ZIPLINEPhase::Mesh && ziplineBlocks() &&
+            !ziplineBlocks()->blocks().empty()) {
+            ziplineMeshAttempted_ = true;
+            if (promptZIPLINEMesh()) {
+                runZIPLINEMesh();
+                ziplinePhase_ = ZIPLINEPhase::Mesh;
             }
         }
         break;
@@ -498,8 +497,8 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
         // either pipeline, which is what makes it useful and also what makes a
         // key to hide it necessary: at the mesh phase it lies on top of the
         // elements it is there to be compared against.
-        if ((inPipeline() || mode_ == Mode::UMBER || mode_ == Mode::MBO) && interfaces_.has_value() &&
-            interfaces_->multiMaterial()) {
+        if ((inPipeline() || mode_ == Mode::UMBER || mode_ == Mode::ZIPLINE) && interfaceNetwork() &&
+            interfaceNetwork()->multiMaterial()) {
             showInterfaces_ = !showInterfaces_;
             console_.log(showInterfaces_ ? "[Interfaces] network shown"
                                          : "[Interfaces] network hidden");
@@ -514,8 +513,8 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
         if ((inPipeline() && interfaces_.has_value() && interfaces_->multiMaterial()) ||
             (mode_ == Mode::ATLAS && atlasMultiMaterial_) ||
             (mode_ == Mode::UMBER && umberDecompReport_.materials > 1) ||
-            (mode_ == Mode::MBO && traceBlocks_.has_value() &&
-             traceBlocks_->getReport().materials > 1)) {
+            (mode_ == Mode::ZIPLINE && ziplineBlocks() &&
+             ziplineBlocks()->getReport().materials > 1)) {
             showMaterialFill_ = !showMaterialFill_;
             if (mode_ == Mode::ATLAS)
                 console_.log(showMaterialFill_ ? "[ATLAS] cells and elements filled by material"
@@ -523,7 +522,7 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
             else if (mode_ == Mode::UMBER)
                 console_.log(showMaterialFill_ ? "[UMBER] elements filled by material"
                                                : "[UMBER] material fill off");
-            else if (mode_ == Mode::MBO)
+            else if (mode_ == Mode::ZIPLINE)
                 console_.log(showMaterialFill_ ? "[Blocks] elements filled by material"
                                                : "[Blocks] material fill off");
             else
@@ -635,9 +634,9 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
 
     case Qt::Key_2:
         if (mode_ == Mode::Unselected && phase_ == Phase::MeshOnly) {
-            mode_ = Mode::MBO;
+            mode_ = Mode::ZIPLINE;
             std::cerr << "[Viewer] Selected mode: " << modeName(mode_) << " (press 'c' to advance)\n";
-            console_.log("Selected mode: MBO");
+            console_.log("Selected mode: ZIPLINE");
         }
         break;
 
@@ -786,15 +785,10 @@ void CrossGenWidget::wheelEvent(QWheelEvent *event) {
 void CrossGenWidget::doReset() {
     field_.reset();
     cutMesh_.reset();
-    crossField_.reset();
     dualMBOField_.reset();
-    separatrixTrace_.reset();
-    quadLayout_.reset();
-    simplified_.reset();
-    traceQuant_.reset();
-    traceQuantReport_ = TMeshQuantizer::Report{};
-    traceMesh_.reset();
-    traceBlocks_.reset();
+    ziplineQuant_.reset();
+    ziplineQuantReport_ = TMeshQuantizer::Report{};
+    zipline_.reset();
     delaunayMesh_.reset();
     blockQuant_.reset();
     quantReport_ = TMeshQuantizer::Report{};
@@ -865,7 +859,7 @@ void CrossGenWidget::doReset() {
 
     mode_     = Mode::Unselected;
     phase_    = Phase::MeshOnly;
-    mboPhase_ = MBOPhase::MeshOnly;
+    ziplinePhase_ = ZIPLINEPhase::MeshOnly;
     maPhase_  = MedialAxisPhase::MeshOnly;
     oasisPhase_ = OASISPhase::MeshOnly;
     umberPhase_ = UMBERPhase::MeshOnly;
@@ -876,17 +870,15 @@ void CrossGenWidget::doReset() {
 
     singularitiesLogged_  = false;
     mboSteppingStarted_   = false;
-    mboConverged_         = false;
-    mboTracingStarted_    = false;
-    mboTracingFinished_   = false;
-    mboStepCount_         = 0;
+    ziplineTracingStarted_    = false;
+    ziplineTracingFinished_   = false;
     dualMBOSteppingStarted_  = false;
     dualMBOConverged_        = false;
     dualMBOStepCount_        = 0;
     umberAnnounced_       = false;
     umberAttempted_       = false;
     umberMeshAttempted_   = false;
-    traceMeshAttempted_   = false;
+    ziplineMeshAttempted_   = false;
     polysquareAnnounced_  = false;
     polysquareAttempted_  = false;
     blocksAttempted_      = false;
@@ -1503,9 +1495,9 @@ bool CrossGenWidget::promptUMBERMesh() {
     return promptBlockQuadMesh(*umberDecomp_, "UMBER — quadrilateral mesh on the blocks");
 }
 
-// The dialog both UMBER and the tracing mode open on their Mesh phase: the
-// target edge length and the chord bounds of mesh/BlockQuadMesh, on the one
-// settings object the pipelines' Stage 10 and ATLAS's mesh use too.
+// The dialog both UMBER and ZIPLINE open on their Mesh phase: the target edge
+// length and the chord bounds of mesh/BlockQuadMesh, on the one settings object
+// the pipelines' Stage 10 and ATLAS's mesh use too.
 bool CrossGenWidget::promptBlockQuadMesh(const BlockDecomposition &decomp, const char *title) {
     if (decomp.blocks.empty() || !mesh_) return false;
 
@@ -4166,8 +4158,8 @@ void CrossGenWidget::runMERIDIANMesh() {
 // what a given metric can even be started on is a fact about *this* mesh. The
 // counts are read off the mesh that is about to be smoothed and not off the
 // last one.
-// The TMOP settings the current mode smooths with. ATLAS, UMBER and the
-// tracing mode keep their own (atlasTmopSettings_ and the two after it), which
+// The TMOP settings the current mode smooths with. ATLAS, UMBER and ZIPLINE
+// keep their own (atlasTmopSettings_ and the two after it), which
 // differ from the pipelines' in one default for one reason: each smooths a
 // transfinite grid on a block decomposition. The dialog and the solve both read
 // them through here, so what the dialog sets is what the solve runs -- in UMBER
@@ -4175,7 +4167,7 @@ void CrossGenWidget::runMERIDIANMesh() {
 CrossGenWidget::TMOPSettings &CrossGenWidget::tmopSettingsForMode() {
     if (mode_ == Mode::ATLAS) return atlasTmopSettings_;
     if (mode_ == Mode::UMBER) return umberTmopSettings_;
-    if (mode_ == Mode::MBO) return traceTmopSettings_;
+    if (mode_ == Mode::ZIPLINE) return ziplineTmopSettings_;
     return tmopSettings_;
 }
 
@@ -4183,13 +4175,13 @@ bool CrossGenWidget::promptTMOP() {
     TMOPSettings &ts = tmopSettingsForMode();
     if (!haveFinishedMesh()) return false;
     const bool atlas = (mode_ == Mode::ATLAS);
-    const bool blockMode = atlas || mode_ == Mode::UMBER || mode_ == Mode::MBO;
+    const bool blockMode = atlas || mode_ == Mode::UMBER || mode_ == Mode::ZIPLINE;
 
     QDialog dlg(this);
     dlg.setWindowTitle(atlas ? "ATLAS — TMOP smoothing"
                              : (mode_ == Mode::UMBER ? "UMBER — TMOP smoothing"
-                                                     : (mode_ == Mode::MBO ? "Viertel — TMOP smoothing"
-                                                                           : "Stage 12 — TMOP smoothing")));
+                                                     : (mode_ == Mode::ZIPLINE ? "ZIPLINE — TMOP smoothing"
+                                                                               : "Stage 12 — TMOP smoothing")));
 
     auto *metricBox = new QComboBox(&dlg);
     // Ordered as the header lists them, and paired with the enum value rather
@@ -4417,14 +4409,14 @@ bool CrossGenWidget::promptTMOP() {
 // different scale: a thousand sweeps over a mesh of this size is a fraction of
 // a second, so it is not announced a frame ahead the way the Ricci solve is.
 void CrossGenWidget::runTMOP() {
-    // ATLAS, UMBER and the tracing mode keep their own settings; see
+    // ATLAS, UMBER and ZIPLINE keep their own settings; see
     // tmopSettingsForMode().
     const bool atlas = (mode_ == Mode::ATLAS);
-    // UMBER and the tracing mode: the two that smooth a BlockQuadMesh.
-    const bool blockMesh = (mode_ == Mode::UMBER) || (mode_ == Mode::MBO);
+    // UMBER and ZIPLINE: the two that smooth a BlockQuadMesh.
+    const bool blockMesh = (mode_ == Mode::UMBER) || (mode_ == Mode::ZIPLINE);
     TMOPSettings &ts = tmopSettingsForMode();
     // The pipelines number this Stage 12 after their Stage 10; ATLAS's stages
-    // stop at 6, UMBER's at its decomposition and the tracing's at Sec. 4, so
+    // stop at 6, UMBER's at its decomposition and ZIPLINE's at Sec. 4, so
     // there it is named for what it smooths.
     const std::string stage = (atlas || blockMesh) ? "TMOP" : "Stage 12";
     if (!haveFinishedMesh()) {
@@ -4563,14 +4555,14 @@ void CrossGenWidget::runTMOP() {
 bool CrossGenWidget::haveFinishedMesh() const {
     if (mode_ == Mode::ATLAS) return atlasMesh_.has_value();
     if (mode_ == Mode::UMBER) return umberMesh_.has_value();
-    if (mode_ == Mode::MBO) return traceMesh_.has_value();
+    if (mode_ == Mode::ZIPLINE) return ziplineMesh();
     return quadMesh_.has_value();
 }
 
 mesh::QuadMesh CrossGenWidget::finishedMesh(const mesh::QuadMesh::Options &o) const {
     if (mode_ == Mode::ATLAS) return mesh::QuadMesh::from(*atlasMesh_, o);
     if (mode_ == Mode::UMBER) return mesh::QuadMesh::from(*umberMesh_, o);
-    if (mode_ == Mode::MBO) return mesh::QuadMesh::from(*traceMesh_, o);
+    if (mode_ == Mode::ZIPLINE) return mesh::QuadMesh::from(*ziplineMesh(), o);
     return diskFill_.has_value() ? mesh::QuadMesh::from(*diskFill_, o)
                                  : mesh::QuadMesh::from(*quadMesh_, o);
 }
@@ -5434,25 +5426,25 @@ void CrossGenWidget::advancePhase() {
         phase_ = nextPhase(phase_);
         if (phase_ != old)
             std::cerr << "[Viewer] Phase " << phaseName(phase_) << "\n";
-    } else if (mode_ == Mode::MBO) {
-        MBOPhase old = mboPhase_;
-        mboPhase_ = nextMBOPhase(mboPhase_);
-        if (mboPhase_ != old)
-            std::cerr << "[Viewer] MBO Phase " << mboPhaseName(mboPhase_) << "\n";
+    } else if (mode_ == Mode::ZIPLINE) {
+        ZIPLINEPhase old = ziplinePhase_;
+        ziplinePhase_ = nextZIPLINEPhase(ziplinePhase_);
+        if (ziplinePhase_ != old)
+            std::cerr << "[Viewer] ZIPLINE Phase " << ziplinePhaseName(ziplinePhase_) << "\n";
 
         // The last two phases as every other mode has them: the mesh dialog on
         // the way into Mesh, the TMOP one on the way into Smoothed and on
         // every 'c' there, each marked as asked before it opens so that the
         // catch-up in runComputations() does not open a second one on top.
-        if (old == MBOPhase::Blocks && mboPhase_ == MBOPhase::Mesh) {
+        if (old == ZIPLINEPhase::Blocks && ziplinePhase_ == ZIPLINEPhase::Mesh) {
             // 'c' pressed again before the frame that builds the blocks.
-            if (!traceBlocks_.has_value()) buildTraceBlocks();
-            if (traceBlocks_.has_value() && !traceBlocks_->blocks().empty()) {
-                traceMeshAttempted_ = true;
-                if (promptTraceMesh()) runTraceMesh();
+            if (!ziplineBlocks()) buildZIPLINEBlocks();
+            if (ziplineBlocks() && !ziplineBlocks()->blocks().empty()) {
+                ziplineMeshAttempted_ = true;
+                if (promptZIPLINEMesh()) runZIPLINEMesh();
             }
         }
-        if (mboPhase_ == MBOPhase::Smoothed && traceMesh_.has_value()) {
+        if (ziplinePhase_ == ZIPLINEPhase::Smoothed && ziplineMesh()) {
             tmopAttempted_ = true;
             if (promptTMOP()) runTMOP();
         }
@@ -5560,10 +5552,18 @@ bool CrossGenWidget::dualMBOStageIsStepping() const {
            (inPipeline() && pipePhase_ == PipelinePhase::Stepping);
 }
 
+// ZIPLINE keeps the network it traced against (ZIPLINE::findInterfaces, only
+// when there is more than one material); every other mode builds interfaces_.
+const Interfaces *CrossGenWidget::interfaceNetwork() const {
+    if (mode_ == Mode::ZIPLINE)
+        return (zipline_ && zipline_->hasInterfaces()) ? &zipline_->getInterfaces() : nullptr;
+    return interfaces_.has_value() ? &*interfaces_ : nullptr;
+}
+
 std::vector<int> CrossGenWidget::hangingTJunctions() const {
     std::vector<int> out;
-    if (!traceQuant_.has_value() || !simplified_.has_value()) return out;
-    const QuadLayout &sl = simplified_->getLayout();
+    if (!ziplineQuant_.has_value() || !ziplineSimplified()) return out;
+    const QuadLayout &sl = ziplineSimplified()->getLayout();
     const auto &nodes = sl.getNodes();
     const auto &arcs = sl.getArcs();
     for (size_t n = 0; n < nodes.size(); ++n) {
@@ -5587,8 +5587,8 @@ std::vector<int> CrossGenWidget::hangingTJunctions() const {
         // borders a skipped component, where no grid exists to weld with).
         bool hanging = false;
         for (const int d : node.darts) {
-            const int e = traceQuant_->edgeOfArc[QuadLayout::arcOfDart(d)];
-            if (e < 0 || traceQuant_->tmesh.edges[e].x <= 0) {
+            const int e = ziplineQuant_->edgeOfArc[QuadLayout::arcOfDart(d)];
+            if (e < 0 || ziplineQuant_->tmesh.edges[e].x <= 0) {
                 hanging = true;
                 break;
             }
@@ -5598,28 +5598,26 @@ std::vector<int> CrossGenWidget::hangingTJunctions() const {
     return out;
 }
 
-// ── the tracing mode's blocks, mesh and dialog ──────────────────────────────
+// ── ZIPLINE's blocks, mesh and dialog ─────────────────────────────────────
 //
 // Sec. 4's partition read as the shared BlockDecomposition on spline geometry
-// (tracing/LayoutBlocks.hxx), then meshed and smoothed by the classes UMBER
+// (ZIPLINE/LayoutBlocks.hxx), then meshed and smoothed by the classes UMBER
 // uses. A component with a T-junction on a side is not a block: T-junctions
 // are not meshed yet, so it stays grey with a red disk on the junction, and the
 // coverage the console prints is how much of the model is left once those are
 // taken out.
-void CrossGenWidget::buildTraceBlocks() {
-    traceBlocks_.reset();
-    traceUncoveredTris_.clear();
-    traceMesh_.reset();
+void CrossGenWidget::buildZIPLINEBlocks() {
+    ziplineUncoveredTris_.clear();
     smoothMesh_.reset();
-    traceMeshAttempted_ = false;
+    ziplineMeshAttempted_ = false;
     tmopAttempted_ = false;
-    if (!simplified_.has_value() || !mesh_) return;
+    if (!ziplineSimplified() || !mesh_) return;
 
     auto t0 = Clock::now();
     try {
-        traceBlocks_.emplace(simplified_->getLayout(), *mesh_);
+        // Discards any mesh on the old blocks with them.
+        zipline_->buildBlocks();
     } catch (const std::exception &e) {
-        traceBlocks_.reset();
         console_.log(std::string("[Blocks] FAILED: ") + e.what());
         std::cerr << "[Viewer] LayoutBlocks failed: " << e.what() << "\n";
         return;
@@ -5629,8 +5627,8 @@ void CrossGenWidget::buildTraceBlocks() {
     // The uncovered area as triangles of the model, by centroid: what the
     // picture fills so that it reads as a region rather than as an outline.
     {
-        const QuadLayout &sl = simplified_->getLayout();
-        const std::vector<char> &isBlock = traceBlocks_->faceIsBlock();
+        const QuadLayout &sl = ziplineSimplified()->getLayout();
+        const std::vector<char> &isBlock = ziplineBlocks()->faceIsBlock();
         for (size_t f = 0; f < sl.getFaces().size(); ++f) {
             if (f < isBlock.size() && isBlock[f]) continue;
             std::vector<Point> poly;
@@ -5659,17 +5657,17 @@ void CrossGenWidget::buildTraceBlocks() {
                         --wind;
                     }
                 }
-                if (wind != 0) traceUncoveredTris_.push_back(static_cast<int>(t));
+                if (wind != 0) ziplineUncoveredTris_.push_back(static_cast<int>(t));
             }
         }
     }
 
-    const LayoutBlocks::Report &r = traceBlocks_->getReport();
+    const LayoutBlocks::Report &r = ziplineBlocks()->getReport();
     {
         std::ostringstream oss;
         oss << "[Blocks] " << r.blocks << " block(s) of " << r.faces << " component(s), "
-            << traceBlocks_->decomposition().edges.size() << " macro edge(s), "
-            << traceBlocks_->decomposition().vertices.size() << " macrovertex/-ices: "
+            << ziplineBlocks()->decomposition().edges.size() << " macro edge(s), "
+            << ziplineBlocks()->decomposition().vertices.size() << " macrovertex/-ices: "
             << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
         console_.log(oss.str());
     }
@@ -5703,7 +5701,7 @@ void CrossGenWidget::buildTraceBlocks() {
 
     // The number to read the method by, said every time and loudly when it is
     // short: what is not covered is not meshed.
-    const double coverage = traceBlocks_->coverage();
+    const double coverage = ziplineBlocks()->coverage();
     std::ostringstream cov;
     cov << std::fixed << std::setprecision(1) << "[Blocks] covering " << 100.0 * coverage
         << "% of the model";
@@ -5720,20 +5718,19 @@ void CrossGenWidget::buildTraceBlocks() {
     }
 }
 
-bool CrossGenWidget::promptTraceMesh() {
-    if (!traceBlocks_.has_value()) return false;
-    return promptBlockQuadMesh(traceBlocks_->decomposition(),
-                               "Viertel — quadrilateral mesh on the blocks");
+bool CrossGenWidget::promptZIPLINEMesh() {
+    if (!ziplineBlocks()) return false;
+    return promptBlockQuadMesh(ziplineBlocks()->decomposition(),
+                               "ZIPLINE — quadrilateral mesh on the blocks");
 }
 
 // BlockQuadMesh at the dialog's settings, as UMBER's Mesh phase runs it.
-void CrossGenWidget::runTraceMesh() {
-    if (!traceBlocks_.has_value() || traceBlocks_->blocks().empty()) {
+void CrossGenWidget::runZIPLINEMesh() {
+    if (!ziplineBlocks() || ziplineBlocks()->blocks().empty()) {
         blockPipeline("the mesh not built", "the tracing left no conforming block to mesh");
         return;
     }
-    traceMeshAttempted_ = true;
-    traceMesh_.reset();
+    ziplineMeshAttempted_ = true;
     smoothMesh_.reset();
     tmopAttempted_ = false;
     pipelineBlocked_.clear();
@@ -5747,17 +5744,16 @@ void CrossGenWidget::runTraceMesh() {
 
     auto t0 = Clock::now();
     try {
-        traceMesh_.emplace(traceBlocks_->decomposition(), mo);
+        zipline_->buildMesh(mo);
     } catch (const std::exception &e) {
-        traceMesh_.reset();
         blockPipeline("the mesh failed", e.what());
         return;
     }
     auto t1 = Clock::now();
-    reportBlockQuadMesh(*traceMesh_, std::chrono::duration<double, std::milli>(t1 - t0).count());
-    if (traceBlocks_->coverage() < 0.999) {
+    reportBlockQuadMesh(*ziplineMesh(), std::chrono::duration<double, std::milli>(t1 - t0).count());
+    if (ziplineBlocks()->coverage() < 0.999) {
         std::ostringstream oss;
-        oss << std::fixed << std::setprecision(1) << "[Mesh] " << 100.0 * traceBlocks_->coverage()
+        oss << std::fixed << std::setprecision(1) << "[Mesh] " << 100.0 * ziplineBlocks()->coverage()
             << "% of the model meshed: the shaded components carry a T-junction or are not "
                "four-sided";
         console_.log(oss.str());
@@ -5767,26 +5763,26 @@ void CrossGenWidget::runTraceMesh() {
 // ── lazy computations ────────────────────────────────────────────────────────
 
 void CrossGenWidget::runComputations() {
-    // ── MBO: Initialize CrossField ────────────────────────────────────────────
-    if (mode_ == Mode::MBO && mboPhase_ >= MBOPhase::CrossField && !crossField_.has_value()) {
-        // Stage 0b first, as the pipelines run it: the field is aligned to the
-        // material interfaces and each disk inclusion's centre is pinned
-        // (CrossField::setAlignedInteriorEdges, setPinDiskCenters), and the
-        // tracing emits from the network's nodes and cuts its branches where
-        // separatrices cross them. Closed loops are left unsplit; a separatrix
-        // crossing an inclusion's rim cuts it where the layout turns.
-        if (!interfacesAttempted_) {
-            interfacesAttempted_ = true;
+    // ── ZIPLINE: Initialize CrossField ────────────────────────────────────────
+    if (mode_ == Mode::ZIPLINE && ziplinePhase_ >= ZIPLINEPhase::CrossField && !ziplineField()) {
+        // Stage 0b first, as TestZIPLINE runs it (ZIPLINE::findInterfaces): the
+        // field is aligned to the material interfaces and each disk inclusion's
+        // centre is pinned, and the tracing emits from the network's nodes and
+        // cuts its branches where separatrices cross them. A network that
+        // cannot be built is reported and the model traced as one material.
+        if (!zipline_) {
+            zipline_ = std::make_unique<ZIPLINE>(mesh_);
             try {
-                Interfaces::Options io;
-                io.splitLoops = false;
-                interfaces_.emplace(mesh_, io);
+                zipline_->findInterfaces();
             } catch (const std::exception &e) {
-                interfaces_.reset();
                 console_.log(std::string("[Interfaces] FAILED: ") + e.what());
+                ZIPLINE::Options single;
+                single.materialInterfaces = false;
+                zipline_ = std::make_unique<ZIPLINE>(mesh_, single);
+                zipline_->findInterfaces();
             }
-            if (interfaces_.has_value() && interfaces_->multiMaterial()) {
-                const Interfaces::Report &ir = interfaces_->getReport();
+            if (zipline_->hasInterfaces()) {
+                const Interfaces::Report &ir = zipline_->getInterfaces().getReport();
                 std::ostringstream oss;
                 oss << "[Interfaces] " << ir.materials << " material(s), " << ir.interfaceEdges
                     << " interface edge(s) in " << ir.branches << " branch(es) (" << ir.closedLoops
@@ -5797,70 +5793,61 @@ void CrossGenWidget::runComputations() {
             }
         }
         auto t0 = Clock::now();
-        crossField_.emplace(mesh_);
-        if (interfaces_.has_value() && interfaces_->multiMaterial()) {
-            crossField_->setAlignedInteriorEdges(interfaces_->interfaceEdges());
-            crossField_->setPinDiskCenters(true);
-        }
-        crossField_->initialize(1);
+        zipline_->startField();
         auto t1 = Clock::now();
         console_.log("[MBO] Initialized CrossField: " +
                      formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count()));
     }
 
-    // ── MBO: Kick off stepping ────────────────────────────────────────────────
-    if (mode_ == Mode::MBO && mboPhase_ == MBOPhase::Stepping &&
-        crossField_.has_value() && !mboSteppingStarted_) {
+    // ── ZIPLINE: Kick off stepping ────────────────────────────────────────────
+    if (mode_ == Mode::ZIPLINE && ziplinePhase_ == ZIPLINEPhase::Stepping &&
+        ziplineField() && !mboSteppingStarted_) {
         mboSteppingStarted_ = true;
-        mboStepCount_       = 0;
-        console_.log("[MBO] Starting " + std::to_string(MBO_MAX_STEPS) + " iterations...");
+        console_.log("[MBO] Starting " + std::to_string(zipline_->getOptions().fieldMaxSteps) +
+                     " iterations...");
     }
 
-    // ── MBO: Run 2 stepping iterations per frame ──────────────────────────────
-    if (mode_ == Mode::MBO && mboPhase_ == MBOPhase::Stepping &&
-        mboSteppingStarted_ && mboStepCount_ < MBO_MAX_STEPS && !mboConverged_) {
-        double nv = static_cast<double>(crossField_->u_k.size());
-        for (int i = 0; i < 2 && mboStepCount_ < MBO_MAX_STEPS; ++i) {
-            crossField_->step();
-            ++mboStepCount_;
-            if (crossField_->error < 2.0 * nv * 1e-7) {
-                console_.log("[MBO] Convergence at step " + std::to_string(mboStepCount_) +
-                             " error=" + std::to_string(crossField_->error));
-                mboConverged_ = true;
-                break;
-            }
-        }
-        crossField_->computeSingularities();
-
+    // ── ZIPLINE: Run 2 stepping iterations per frame ──────────────────────────
+    if (mode_ == Mode::ZIPLINE && ziplinePhase_ == ZIPLINEPhase::Stepping &&
+        mboSteppingStarted_ && ziplineField() && !zipline_->fieldFinished()) {
+        zipline_->stepField(2);
+        const ZIPLINE::Status &st = zipline_->getStatus();
+        if (st.fieldConverged)
+            console_.log("[MBO] Convergence at step " + std::to_string(st.fieldSteps) +
+                         " error=" + std::to_string(st.fieldError));
         std::ostringstream oss;
-        oss << "[MBO] Step " << mboStepCount_ << "/" << MBO_MAX_STEPS;
+        oss << "[MBO] Step " << st.fieldSteps << "/" << zipline_->getOptions().fieldMaxSteps;
         console_.log(oss.str());
     }
 
-    // ── MBO: Build SeparatrixTrace ────────────────────────────────────────────
-    if (mode_ == Mode::MBO && mboPhase_ >= MBOPhase::Separatrices &&
-        crossField_.has_value() && !separatrixTrace_) {
+    // ── ZIPLINE: Build SeparatrixTrace ────────────────────────────────────────
+    if (mode_ == Mode::ZIPLINE && ziplinePhase_ >= ZIPLINEPhase::Separatrices &&
+        ziplineField() && !ziplineTrace()) {
+        // The field is finished first (ZIPLINE::startTrace), so a 'c' pressed
+        // during the stepping animation no longer traces a field that is still
+        // moving; say so when that is what happened.
+        const int stepsBefore = zipline_->getStatus().fieldSteps;
+        const bool finishing = !zipline_->fieldFinished();
         auto t0 = Clock::now();
-        auto cfPtr = std::shared_ptr<CrossField>(&*crossField_, [](CrossField *) {});
-        // Solve for where in its triangle the singularity actually sits rather
-        // than taking the barycentre. The ports are launched from that point,
-        // so a barycentre displaces every separatrix leaving it, and the
-        // partition pays for it at the far end: over the sixteen models it
-        // costs 40 components and 12 T-junctions, and on geom006 -- a box with
-        // a round hole -- the difference is 12 components and none against 14
-        // and four.
-        separatrixTrace_ = std::make_shared<SeparatrixTrace>(
-            cfPtr, true, SeparatrixTrace::Settings(),
-            (interfaces_.has_value() && interfaces_->multiMaterial()) ? &*interfaces_ : nullptr);
+        zipline_->startTrace();
         auto t1 = Clock::now();
+        if (finishing) {
+            const ZIPLINE::Status &st = zipline_->getStatus();
+            std::ostringstream fin;
+            fin << "[MBO] finished the field before tracing it: steps " << stepsBefore << " -> "
+                << st.fieldSteps << (st.fieldConverged ? ", converged" : ", out of steps")
+                << ", error " << st.fieldError;
+            console_.log(fin.str());
+        }
+        const SeparatrixTrace &trace = *ziplineTrace();
         std::ostringstream oss;
-        oss << "[Separatrices] Initialized " << separatrixTrace_->separatrices.size()
-            << " separatrices from " << separatrixTrace_->singularities.size()
+        oss << "[Separatrices] Initialized " << trace.separatrices.size()
+            << " separatrices from " << trace.singularities.size()
             << " singularities: "
             << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
         console_.log(oss.str());
-        const SeparatrixTrace::Report &tr = separatrixTrace_->getReport();
-        if (tr.interfaceNodes > 0 || separatrixTrace_->getInterfaces()) {
+        const SeparatrixTrace::Report &tr = trace.getReport();
+        if (tr.interfaceNodes > 0 || trace.getInterfaces()) {
             std::ostringstream it;
             it << "[Separatrices] " << tr.interfaceEmitted << " of them from " << tr.interfaceNodes
                << " interface node(s), which absorbed " << tr.absorbedSingularities
@@ -5874,35 +5861,33 @@ void CrossGenWidget::runComputations() {
         console_.log(ph.str());
     }
 
-    // ── MBO: Step tracing one iteration per frame ─────────────────────────────
-    if (mode_ == Mode::MBO && mboPhase_ == MBOPhase::Trace &&
-        separatrixTrace_ && !mboTracingFinished_) {
-        if (!mboTracingStarted_) {
-            mboTracingStarted_ = true;
+    // ── ZIPLINE: Step tracing one iteration per frame ─────────────────────────
+    if (mode_ == Mode::ZIPLINE && ziplinePhase_ == ZIPLINEPhase::Trace &&
+        ziplineTrace() && !ziplineTracingFinished_) {
+        if (!ziplineTracingStarted_) {
+            ziplineTracingStarted_ = true;
             console_.log("[Trace] Starting separatrix tracing...");
         }
-        separatrixTrace_->stepAndCheck();
-        if (separatrixTrace_->finishedTracing) {
-            mboTracingFinished_ = true;
+        if (zipline_->stepTrace()) {
+            ziplineTracingFinished_ = true;
             console_.log("[Trace] Tracing complete.");
         }
     }
 
-    // ── MBO: Build the quad layout the separatrices cut out ───────────────────
-    if (mode_ == Mode::MBO && mboPhase_ >= MBOPhase::Layout && separatrixTrace_ &&
-        !quadLayout_.has_value()) {
+    // ── ZIPLINE: Build the quad layout the separatrices cut out ───────────────
+    if (mode_ == Mode::ZIPLINE && ziplinePhase_ >= ZIPLINEPhase::Layout && ziplineTrace() &&
+        !ziplineLayout()) {
         // Skipping ahead past the trace animation is allowed, so finish the
         // tracing here rather than assuming a frame of it has run.
-        if (!separatrixTrace_->finishedTracing) {
-            separatrixTrace_->run();
-            mboTracingFinished_ = true;
+        if (!zipline_->traceFinished()) {
+            zipline_->finishTrace();
+            ziplineTracingFinished_ = true;
         }
         auto t0 = Clock::now();
-        quadLayout_.emplace(*separatrixTrace_);
-        quadLayout_->build();
+        zipline_->buildLayout();
         auto t1 = Clock::now();
 
-        const QuadLayout::Report &r = quadLayout_->getReport();
+        const QuadLayout::Report &r = ziplineLayout()->getReport();
         std::ostringstream oss;
         oss << "[Layout] " << r.faces << " component(s), " << r.quadFaces << " four-sided, "
             << r.nodes << " node(s), " << r.arcs << " arc(s), " << r.tJunctions
@@ -5917,16 +5902,15 @@ void CrossGenWidget::runComputations() {
         }
     }
 
-    // ── MBO: Sec. 4, collapse the chords the layout does not need ─────────────
-    if (mode_ == Mode::MBO && mboPhase_ >= MBOPhase::Simplified && quadLayout_.has_value() &&
-        !simplified_.has_value()) {
+    // ── ZIPLINE: Sec. 4, collapse the chords the layout does not need ─────────
+    if (mode_ == Mode::ZIPLINE && ziplinePhase_ >= ZIPLINEPhase::Simplified && ziplineLayout() &&
+        !ziplineSimplified()) {
         auto t0 = Clock::now();
-        simplified_.emplace(*quadLayout_);
-        simplified_->run();
+        zipline_->simplifyLayout();
         auto t1 = Clock::now();
 
-        const PartitionSimplify::Report &r = simplified_->getReport();
-        const QuadLayout::Report &sl = simplified_->getLayout().getReport();
+        const PartitionSimplify::Report &r = ziplineSimplified()->getReport();
+        const QuadLayout::Report &sl = ziplineSimplified()->getLayout().getReport();
         std::ostringstream oss;
         oss << "[Simplify] " << r.componentsBefore << " -> " << sl.faces << " component(s) ("
             << sl.quadFaces << " four-sided), " << r.tJunctionsBefore << " -> " << sl.tJunctions
@@ -5953,7 +5937,7 @@ void CrossGenWidget::runComputations() {
         }
     }
 
-    // ── MBO: the simplified layout as blocks, then the mesh on them ─────────
+    // ── ZIPLINE: the simplified layout as blocks, then the mesh on them ─────
     //
     // Not after the quantization but beside it: the blocks read the simplified
     // layout, not the quantized grid, so a model the quantizer refuses still
@@ -5961,22 +5945,22 @@ void CrossGenWidget::runComputations() {
     // these two are the catch-ups for a phase reached without passing through
     // it, marked as asked before the dialog opens for the pipelines' reason
     // (the dialog paints, and painting comes back here).
-    if (mode_ == Mode::MBO && mboPhase_ >= MBOPhase::Blocks && simplified_.has_value() &&
-        !traceBlocks_.has_value()) {
-        buildTraceBlocks();
+    if (mode_ == Mode::ZIPLINE && ziplinePhase_ >= ZIPLINEPhase::Blocks && ziplineSimplified() &&
+        !ziplineBlocks()) {
+        buildZIPLINEBlocks();
     }
-    if (mode_ == Mode::MBO && mboPhase_ == MBOPhase::Mesh && traceBlocks_.has_value() &&
-        !traceBlocks_->blocks().empty() && !traceMeshAttempted_) {
-        traceMeshAttempted_ = true;
-        if (promptTraceMesh()) runTraceMesh();
+    if (mode_ == Mode::ZIPLINE && ziplinePhase_ == ZIPLINEPhase::Mesh && ziplineBlocks() &&
+        !ziplineBlocks()->blocks().empty() && !ziplineMeshAttempted_) {
+        ziplineMeshAttempted_ = true;
+        if (promptZIPLINEMesh()) runZIPLINEMesh();
     }
-    if (mode_ == Mode::MBO && mboPhase_ == MBOPhase::Smoothed && traceMesh_.has_value() &&
+    if (mode_ == Mode::ZIPLINE && ziplinePhase_ == ZIPLINEPhase::Smoothed && ziplineMesh() &&
         !tmopAttempted_) {
         tmopAttempted_ = true;
         if (promptTMOP()) runTMOP();
     }
 
-    // ── MBO: quantize the block decomposition the layout already is (QGP) ────
+    // ── ZIPLINE: quantize the block decomposition the layout already is (QGP) ──
     //
     // A simplified QuadLayout's faces are already the blocks -- Sec. 4 of
     // Viertel et al. is a block decomposition in the same sense Sec. 4 of
@@ -5985,18 +5969,18 @@ void CrossGenWidget::runComputations() {
     // medial axis blocks need. xIdeal is 1 on every edge, same as there:
     // Stage II drives each edge to its minimum and acts as an automatic
     // block-merging operator on top of what chord collapse already did.
-    if (mode_ == Mode::MBO &&
-        (mboPhase_ == MBOPhase::Quantize || mboPhase_ == MBOPhase::Quantized) &&
-        simplified_.has_value() && !traceQuant_.has_value()) {
+    if (mode_ == Mode::ZIPLINE &&
+        (ziplinePhase_ == ZIPLINEPhase::Quantize || ziplinePhase_ == ZIPLINEPhase::Quantized) &&
+        ziplineSimplified() && !ziplineQuant_.has_value()) {
         auto t0 = Clock::now();
-        traceQuant_.emplace(makeQuantTMesh(simplified_->getLayout()));
+        ziplineQuant_.emplace(makeQuantTMesh(ziplineSimplified()->getLayout()));
         auto t1 = Clock::now();
 
-        const QuadLayoutQuant &lq = *traceQuant_;
+        const QuadLayoutQuant &lq = *ziplineQuant_;
         std::ostringstream oss;
         oss << "[Trace] T-mesh: " << lq.tmesh.edges.size() << " edges, "
             << lq.tmesh.faces.size() << " faces, " << lq.tmesh.rows.size()
-            << " constraints, from " << simplified_->getLayout().getFaces().size()
+            << " constraints, from " << ziplineSimplified()->getLayout().getFaces().size()
             << " components: "
             << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
         console_.log(oss.str());
@@ -6007,7 +5991,7 @@ void CrossGenWidget::runComputations() {
         }
         // The report's count is structural (QuadLayout::finish), so it can
         // be trusted after the collapses; the node kinds cannot.
-        const int tJunctions = simplified_->getLayout().getReport().tJunctions;
+        const int tJunctions = ziplineSimplified()->getLayout().getReport().tJunctions;
         if (tJunctions > 0) {
             console_.log("[Trace] " + std::to_string(tJunctions) +
                          " T-junction(s) in the block structure; the "
@@ -6019,26 +6003,26 @@ void CrossGenWidget::runComputations() {
             console_.log("[Trace] Quantization aborted: " + lq.error);
         } else {
             auto q0 = Clock::now();
-            traceQuantReport_ = TMeshQuantizer(traceQuant_->tmesh).run();
+            ziplineQuantReport_ = TMeshQuantizer(ziplineQuant_->tmesh).run();
             auto q1 = Clock::now();
 
             int total = 0, maxLen = 0;
-            for (const auto &e : traceQuant_->tmesh.edges) {
+            for (const auto &e : ziplineQuant_->tmesh.edges) {
                 total += e.x;
                 maxLen = std::max(maxLen, e.x);
             }
             std::ostringstream qss;
-            qss << "[Trace] Quantized: " << traceQuantReport_.stage1Vectors
-                << " stage-I strips, " << traceQuantReport_.stage2Moves << "/"
-                << traceQuantReport_.stage2Tried << " stage-II moves, objective "
-                << std::fixed << std::setprecision(3) << traceQuantReport_.objective
+            qss << "[Trace] Quantized: " << ziplineQuantReport_.stage1Vectors
+                << " stage-I strips, " << ziplineQuantReport_.stage2Moves << "/"
+                << ziplineQuantReport_.stage2Tried << " stage-II moves, objective "
+                << std::fixed << std::setprecision(3) << ziplineQuantReport_.objective
                 << ", " << total << " quads across the boundary (longest edge "
                 << maxLen << "): "
                 << formatMs(std::chrono::duration<double, std::milli>(q1 - q0).count());
             console_.log(qss.str());
-            if (traceQuantReport_.forcedZeroEdges > 0) {
+            if (ziplineQuantReport_.forcedZeroEdges > 0) {
                 std::ostringstream zss;
-                zss << "[Trace] " << traceQuantReport_.forcedZeroEdges
+                zss << "[Trace] " << ziplineQuantReport_.forcedZeroEdges
                     << " edges are forced to zero by the decomposition itself: "
                        "no consistent assignment can lift them";
                 console_.log(zss.str());
@@ -6049,7 +6033,7 @@ void CrossGenWidget::runComputations() {
                              " T-junction(s) left hanging by zero edges or "
                              "skipped components -- shown in red");
             }
-            if (!traceQuantReport_.consistent) {
+            if (!ziplineQuantReport_.consistent) {
                 console_.log("[Trace] WARNING: quantization violates the "
                              "consistency system Ax = 0");
             }
@@ -6685,10 +6669,10 @@ void CrossGenWidget::runComputations() {
 void CrossGenWidget::renderMBOAnimation() {
     viewer::drawAxis(view_);
     viewer::drawMesh(*mesh_);
-    viewer::drawVertexCrossFieldUK(*mesh_, *crossField_, scale_);
+    viewer::drawVertexCrossFieldUK(*mesh_, *ziplineField(), scale_);
 
     double ballRadius = 0.5 * avgEdge_;
-    for (const auto &sig : crossField_->singularTriangles) {
+    for (const auto &sig : ziplineField()->singularTriangles) {
         int triIdx = sig.first;
         double crossIndex = sig.second;
         if (triIdx < 0 || triIdx >= static_cast<int>(mesh_->triangles.size())) continue;
@@ -6730,7 +6714,7 @@ void CrossGenWidget::renderTraceAnimation() {
     viewer::drawMesh(*mesh_);
 
     viewer::lineWidth(3.0f);
-    for (const auto &sep : separatrixTrace_->separatrices) {
+    for (const auto &sep : ziplineTrace()->separatrices) {
         if (sep.path.size() < 2) continue;
         if (sep.active)
             viewer::color3f(0.95f, 0.1f, 0.1f);
@@ -6927,8 +6911,8 @@ void CrossGenWidget::renderMERIDIANModel() {
 // ── normal render ─────────────────────────────────────────────────────────────
 
 void CrossGenWidget::renderNormal() {
-    if (mode_ == Mode::MBO && mboPhase_ >= MBOPhase::Blocks && traceBlocks_.has_value() &&
-        simplified_.has_value()) {
+    if (mode_ == Mode::ZIPLINE && ziplinePhase_ >= ZIPLINEPhase::Blocks && ziplineBlocks() &&
+        ziplineSimplified()) {
         // ── The blocks, and the mesh on them ────────────────────────────────
         //
         // What is not a block is shaded and outlined in grey, so that in
@@ -6937,10 +6921,10 @@ void CrossGenWidget::renderNormal() {
         // picture -- and a red disk sits on every T-junction that put a
         // component there.
         viewer::drawAxis(view_);
-        const QuadLayout &sl = simplified_->getLayout();
+        const QuadLayout &sl = ziplineSimplified()->getLayout();
         const auto &faces = sl.getFaces();
         const auto &arcs = sl.getArcs();
-        const std::vector<char> &isBlock = traceBlocks_->faceIsBlock();
+        const std::vector<char> &isBlock = ziplineBlocks()->faceIsBlock();
         auto drawRefused = [&](float width) {
             viewer::color3f(0.55f, 0.55f, 0.6f);
             viewer::lineWidth(width);
@@ -6957,12 +6941,12 @@ void CrossGenWidget::renderNormal() {
         };
         const double sceneDiag = std::hypot(bounds_.maxx - bounds_.minx, bounds_.maxy - bounds_.miny);
         auto fillUncovered = [&]() {
-            if (traceUncoveredTris_.empty()) return;
+            if (ziplineUncoveredTris_.empty()) return;
             glEnable(GL_BLEND);
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
             viewer::color4f(1.0f, 0.55f, 0.5f, 0.35f);
             glBegin(GL_TRIANGLES);
-            for (const int t : traceUncoveredTris_) {
+            for (const int t : ziplineUncoveredTris_) {
                 const Triangle &tri = mesh_->triangles[t];
                 for (int k = 0; k < 3; ++k)
                     glVertex2d(mesh_->vertices[tri[k]][0], mesh_->vertices[tri[k]][1]);
@@ -6971,18 +6955,18 @@ void CrossGenWidget::renderNormal() {
         };
         auto drawTJunctions = [&]() {
             const double r = std::max(0.25 * avgEdge_, 0.007 * sceneDiag) * view_.zoom;
-            for (const Point &p : traceBlocks_->tJunctionPoints())
+            for (const Point &p : ziplineBlocks()->tJunctionPoints())
                 viewer::drawDisk3D(p, r, 0.95f, 0.1f, 0.1f);
         };
 
-        if (mboPhase_ >= MBOPhase::Mesh && traceMesh_.has_value()) {
-            const bool matFill = showMaterialFill_ && traceBlocks_->getReport().materials > 1;
+        if (ziplinePhase_ >= ZIPLINEPhase::Mesh && ziplineMesh()) {
+            const bool matFill = showMaterialFill_ && ziplineBlocks()->getReport().materials > 1;
             fillUncovered();
             drawRefused(2.5f);
-            if (mboPhase_ == MBOPhase::Smoothed && smoothMesh_.has_value())
-                viewer::drawQuadMesh(*smoothMesh_, *traceMesh_, 1.0f, 2.5f, matFill);
+            if (ziplinePhase_ == ZIPLINEPhase::Smoothed && smoothMesh_.has_value())
+                viewer::drawQuadMesh(*smoothMesh_, *ziplineMesh(), 1.0f, 2.5f, matFill);
             else
-                viewer::drawQuadMesh(*traceMesh_, 1.0f, 2.5f, matFill);
+                viewer::drawQuadMesh(*ziplineMesh(), 1.0f, 2.5f, matFill);
         } else {
             // The same picture UMBER's and ATLAS's block phases draw: the
             // blocks in light blue with green macrovertices, over the layout
@@ -6994,40 +6978,39 @@ void CrossGenWidget::renderNormal() {
             viewer::drawBoundaryEdges(*mesh_);
             fillUncovered();
             viewer::drawQuadLayoutArcs(sl, 2.0f, 0.55f, 0.55f, 0.6f);
-            viewer::drawBlockDecomposition(traceBlocks_->decomposition(),
+            viewer::drawBlockDecomposition(ziplineBlocks()->decomposition(),
                                            0.12 * avgEdge_ * view_.zoom, 4.0f);
         }
-        if (showInterfaces_ && interfaces_.has_value() && interfaces_->multiMaterial() &&
-            mboPhase_ == MBOPhase::Blocks)
-            viewer::drawInterfaceNetwork(*interfaces_, 0.3 * avgEdge_, 2.0f);
+        if (showInterfaces_ && interfaceNetwork() && ziplinePhase_ == ZIPLINEPhase::Blocks)
+            viewer::drawInterfaceNetwork(*interfaceNetwork(), 0.3 * avgEdge_, 2.0f);
         drawTJunctions();
-    } else if (mode_ == Mode::MBO) {
+    } else if (mode_ == Mode::ZIPLINE) {
         viewer::drawAxis(view_);
         // The interface network under everything else: the input the field
         // was aligned to and the layout has to keep, so the question every
         // picture after it answers is whether the curves drawn over it follow
         // it. 'i' hides it.
-        const bool showNetwork = showInterfaces_ && interfaces_.has_value() &&
-                                 interfaces_->multiMaterial() && mboPhase_ < MBOPhase::Quantized;
+        const bool showNetwork = showInterfaces_ && interfaceNetwork() &&
+                                 ziplinePhase_ < ZIPLINEPhase::Quantized;
         // The quantized grid is the payoff of this whole mode, and the
         // triangulation underneath only buries it -- the medial axis mode's
         // Quantized phase drops the mesh the same way.
-        if (mboPhase_ < MBOPhase::Quantized) viewer::drawMesh(*mesh_);
-        if (showNetwork) viewer::drawInterfaceNetwork(*interfaces_, 0.3 * avgEdge_, 3.0f);
+        if (ziplinePhase_ < ZIPLINEPhase::Quantized) viewer::drawMesh(*mesh_);
+        if (showNetwork) viewer::drawInterfaceNetwork(*interfaceNetwork(), 0.3 * avgEdge_, 3.0f);
         // The crossfield answers "why did the separatrices go where they
         // went"; once the quantized grid is up that question is moot and
         // the crosses only clutter the block decomposition it took the
         // rest of the pipeline to produce.
-        if (mboPhase_ >= MBOPhase::CrossField && mboPhase_ < MBOPhase::Quantized &&
-            crossField_.has_value()) {
-            if (mboPhase_ >= MBOPhase::Stepping && mboStepCount_ > 0)
-                viewer::drawVertexCrossFieldUK(*mesh_, *crossField_, scale_);
+        if (ziplinePhase_ >= ZIPLINEPhase::CrossField && ziplinePhase_ < ZIPLINEPhase::Quantized &&
+            ziplineField()) {
+            if (ziplinePhase_ >= ZIPLINEPhase::Stepping && zipline_->getStatus().fieldSteps > 0)
+                viewer::drawVertexCrossFieldUK(*mesh_, *ziplineField(), scale_);
             else
-                viewer::drawVertexCrossField(*mesh_, *crossField_, scale_);
+                viewer::drawVertexCrossField(*mesh_, *ziplineField(), scale_);
 
-            if (mboPhase_ < MBOPhase::Separatrices) {
+            if (ziplinePhase_ < ZIPLINEPhase::Separatrices) {
                 double ballRadius = 0.5 * avgEdge_;
-                for (const auto &sig : crossField_->singularTriangles) {
+                for (const auto &sig : ziplineField()->singularTriangles) {
                     int triIdx = sig.first;
                     double crossIndex = sig.second;
                     if (triIdx < 0 || triIdx >= static_cast<int>(mesh_->triangles.size())) continue;
@@ -7049,7 +7032,7 @@ void CrossGenWidget::renderNormal() {
         // the same curves cut at the nodes, plus the pieces of the boundary
         // that close the components, so drawing both would only double the
         // interior lines and still leave the outline out.
-        if (mboPhase_ >= MBOPhase::Quantized && traceQuant_.has_value() && traceQuant_->ok) {
+        if (ziplinePhase_ >= ZIPLINEPhase::Quantized && ziplineQuant_.has_value() && ziplineQuant_->ok) {
             // The integer edge lengths as the quad grid they prescribe, same
             // as the medial axis mode's Quantized phase: transfinite curves
             // through each component's four sides -- plus a yellow disk on
@@ -7068,28 +7051,28 @@ void CrossGenWidget::renderNormal() {
             const double sceneDiag = std::hypot(bounds_.maxx - bounds_.minx,
                                                 bounds_.maxy - bounds_.miny);
             const double nodeRadius = 0.010 * sceneDiag * view_.zoom;
-            viewer::drawQuantizedLayout(*traceQuant_, nodeRadius);
+            viewer::drawQuantizedLayout(*ziplineQuant_, nodeRadius);
 
             // Red only for the junctions quantization could NOT resolve:
             // an incident edge forced to zero, or a component the
             // conversion skipped. Found structurally, since the stored
             // node kinds go stale once chord collapses merge nodes.
             for (const int n : hangingTJunctions()) {
-                viewer::drawDisk3D(simplified_->getLayout().getNodes()[n].pos,
+                viewer::drawDisk3D(ziplineSimplified()->getLayout().getNodes()[n].pos,
                                    1.3 * nodeRadius, 0.95f, 0.1f, 0.1f);
             }
-        } else if (mboPhase_ >= MBOPhase::Simplified && simplified_.has_value()) {
-            viewer::drawQuadLayoutArcs(simplified_->getLayout(), 3.0f, 0.95f, 0.2f, 0.2f);
+        } else if (ziplinePhase_ >= ZIPLINEPhase::Simplified && ziplineSimplified()) {
+            viewer::drawQuadLayoutArcs(ziplineSimplified()->getLayout(), 3.0f, 0.95f, 0.2f, 0.2f);
             // view_.zoom is 1.0 at fit and shrinks as the view zooms in, so
             // scaling the radius by it makes the markers shrink along with it
             // rather than staying a fixed size in mesh space and so covering
             // more and more of the screen as you zoom in on a component.
-            viewer::drawQuadLayoutNodes(simplified_->getLayout(), 0.12 * avgEdge_ * view_.zoom);
-        } else if (mboPhase_ >= MBOPhase::Layout && quadLayout_.has_value()) {
-            viewer::drawQuadLayoutArcs(*quadLayout_, 3.0f, 0.95f, 0.2f, 0.2f);
-        } else if (mboPhase_ >= MBOPhase::Separatrices && separatrixTrace_) {
+            viewer::drawQuadLayoutNodes(ziplineSimplified()->getLayout(), 0.12 * avgEdge_ * view_.zoom);
+        } else if (ziplinePhase_ >= ZIPLINEPhase::Layout && ziplineLayout()) {
+            viewer::drawQuadLayoutArcs(*ziplineLayout(), 3.0f, 0.95f, 0.2f, 0.2f);
+        } else if (ziplinePhase_ >= ZIPLINEPhase::Separatrices && ziplineTrace()) {
             viewer::lineWidth(3.0f);
-            for (const auto &sep : separatrixTrace_->separatrices) {
+            for (const auto &sep : ziplineTrace()->separatrices) {
                 if (sep.path.size() < 2) continue;
                 if (sep.active)
                     viewer::color3f(0.95f, 0.1f, 0.1f);
@@ -7596,18 +7579,18 @@ void CrossGenWidget::renderNormal() {
              ? std::string("press 'm' to fill the elements by material\n")
              : std::string());
 
-    // The tracing mode's: whatever refused, and the material fill.
-    const std::string mboKeys =
+    // ZIPLINE's: whatever refused, and the material fill.
+    const std::string ziplineKeys =
         (pipelineBlocked_.empty() ? std::string() : pipelineBlocked_ + "\n") +
-        ((mode_ == Mode::MBO && interfaces_.has_value() && interfaces_->multiMaterial())
+        ((mode_ == Mode::ZIPLINE && interfaceNetwork())
              ? std::string("press 'i' to show/hide the interface network\n")
              : std::string()) +
-        ((mode_ == Mode::MBO && traceBlocks_.has_value() && traceBlocks_->getReport().materials > 1)
+        ((mode_ == Mode::ZIPLINE && ziplineBlocks() && ziplineBlocks()->getReport().materials > 1)
              ? std::string("press 'm' to fill the elements by material\n")
              : std::string());
 
     if (mode_ == Mode::Unselected) {
-        renderOverlay("press '1' for PolyVector mode\npress '2' for MBO mode\n"
+        renderOverlay("press '1' for PolyVector mode\npress '2' for ZIPLINE mode\n"
                       "press '3' for Medial Axis mode\npress '4' for TORSION mode\n"
                       "press '5' for OASIS mode\npress '6' for UMBER mode\n"
                       "press '7' for MERIDIAN mode\npress '8' for ATLAS mode\n"
@@ -7659,15 +7642,15 @@ void CrossGenWidget::renderNormal() {
         renderOverlay((meridianKeys + "press 'c' to mesh the patches (Stage 10)\n"
                        "press 'n' to change the connectivity settings and trace again\n"
                        "press 'r' to restart\npress 'q' to quit").c_str());
-    } else if (mode_ == Mode::MBO && mboPhase_ == MBOPhase::Blocks) {
-        renderOverlay((mboKeys + "press 'c' to mesh the blocks\n"
+    } else if (mode_ == Mode::ZIPLINE && ziplinePhase_ == ZIPLINEPhase::Blocks) {
+        renderOverlay((ziplineKeys + "press 'c' to mesh the blocks\n"
                        "press 'r' to restart\npress 'q' to quit").c_str());
-    } else if (mode_ == Mode::MBO && mboPhase_ == MBOPhase::Mesh) {
-        renderOverlay((mboKeys + "press 'c' to smooth the mesh with TMOP\n"
+    } else if (mode_ == Mode::ZIPLINE && ziplinePhase_ == ZIPLINEPhase::Mesh) {
+        renderOverlay((ziplineKeys + "press 'c' to smooth the mesh with TMOP\n"
                        "press 'e' to mesh again at another target edge length\n"
                        "press 'r' to restart\npress 'q' to quit").c_str());
-    } else if (mode_ == Mode::MBO && mboPhase_ == MBOPhase::Smoothed) {
-        renderOverlay((mboKeys + "press 'c' to smooth again at other TMOP settings\n"
+    } else if (mode_ == Mode::ZIPLINE && ziplinePhase_ == ZIPLINEPhase::Smoothed) {
+        renderOverlay((ziplineKeys + "press 'c' to smooth again at other TMOP settings\n"
                        "press 'e' to mesh again at another target edge length\n"
                        "press 'r' to restart\npress 'q' to quit").c_str());
     } else if (mode_ == Mode::UMBER && umberPhase_ == UMBERPhase::Decomposition) {
@@ -7682,7 +7665,7 @@ void CrossGenWidget::renderNormal() {
                        "press 'e' to mesh again at another target edge length\n"
                        "press 'r' to restart\npress 'q' to quit").c_str());
     } else {
-        renderOverlay(((mode_ == Mode::MBO ? mboKeys : meridianKeys) +
+        renderOverlay(((mode_ == Mode::ZIPLINE ? ziplineKeys : meridianKeys) +
                        "press 'c' to continue\npress 'r' to restart\n"
                                       "press 'q' to quit").c_str());
     }
@@ -7715,12 +7698,12 @@ void CrossGenWidget::drawLegends() {
     const bool sepLegendShown = (inPipeline() && cones_.has_value() &&
                                  pipePhase_ == PipelinePhase::Separatrices &&
                                  separatrices_.has_value());
-    // Mode 2 draws the network up to the quantization and at its Blocks
+    // ZIPLINE draws the network up to the quantization and at its Blocks
     // phase, and not over the mesh; the key goes with it.
-    const bool mboNetworkShown =
-        mode_ == Mode::MBO && (mboPhase_ < MBOPhase::Quantized || mboPhase_ == MBOPhase::Blocks);
-    if ((inPipeline() || mode_ == Mode::UMBER || mboNetworkShown) && showInterfaces_ &&
-        interfaces_.has_value() && interfaces_->multiMaterial()) {
+    const bool ziplineNetworkShown =
+        mode_ == Mode::ZIPLINE && (ziplinePhase_ < ZIPLINEPhase::Quantized || ziplinePhase_ == ZIPLINEPhase::Blocks);
+    if ((inPipeline() || mode_ == Mode::UMBER || ziplineNetworkShown) && showInterfaces_ &&
+        interfaceNetwork() && interfaceNetwork()->multiMaterial()) {
         viewer::drawInterfaceLegend(fbw(), fbh(), sepLegendShown);
     }
 
@@ -7797,7 +7780,7 @@ QString CrossGenWidget::nextFigurePath(const char *extension) const {
     switch (mode_) {
     case Mode::TORSION:
     case Mode::MERIDIAN:   phase = pipelinePhaseName(pipePhase_, mode_); break;
-    case Mode::MBO:        phase = mboPhaseName(mboPhase_);              break;
+    case Mode::ZIPLINE:        phase = ziplinePhaseName(ziplinePhase_);              break;
     case Mode::MedialAxis: phase = medialAxisPhaseName(maPhase_);        break;
     case Mode::OASIS:      phase = oasisPhaseName(oasisPhase_);          break;
     case Mode::UMBER:      phase = umberPhaseName(umberPhase_);          break;

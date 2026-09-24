@@ -1,12 +1,13 @@
-// Viertel, Osting and Staten, IMR 2019, end to end on one model or many: the
-// MBO cross field, its separatrices (Sec. 3), the quad layout with T-junctions
-// they cut the model into, the partition simplification of Sec. 4, and then
-// what this codebase finishes every method with -- the layout as the shared
-// block decomposition on spline geometry (tracing/LayoutBlocks.hxx), meshed by
-// mesh/BlockQuadMesh and smoothed by mesh::TMOP.
+// Utility to run ZIPLINE -- Viertel, Osting and Staten, IMR 2019, src/ZIPLINE --
+// end to end on one model or many: the MBO cross field, its separatrices
+// (Sec. 3), the quad layout with T-junctions they cut the model into, the
+// partition simplification of Sec. 4, and then what this codebase finishes
+// every method with -- the layout as the shared block decomposition on spline
+// geometry (ZIPLINE/LayoutBlocks.hxx), meshed by mesh/BlockQuadMesh and
+// smoothed by mesh::TMOP.
 //
-//   TraceMesh [options] <mesh.obj> [more.obj ...]
-//   TraceMesh --selftest
+//   TestZIPLINE [options] <mesh.obj> [more.obj ...]
+//   TestZIPLINE --selftest
 //
 // Per mesh it prints a line of counts, and the number to read the method by:
 // what fraction of the model the blocks cover. A component with a T-junction
@@ -25,14 +26,18 @@
 //   --obj <f> --mfem <f>    the mesh (smoothed if --tmop), one model only
 //   --cut-radius r, --tangential deg, --square-rays, --no-simplify, --no-stems,
 //   --no-smooth, --no-fixed-corners, --max-drag edges, --zip-angle deg,
-//   --nonzip-angle deg,
+//   --nonzip-angle deg, --zip-l patch|chord,
 //   --by-arc-length, --no-parallel-stop, --no-resume, --interior-singularities
 //                           the tracing and simplification settings; see
 //                           SeparatrixTrace::Settings and PartitionSimplify
 //   --pin-open-sides        hold the rim of unmeshed components under TMOP
+//   --shifted-untangler     untangle with metric 22 and a tracked tau_0 (the
+//                           old untangler; see mesh::TMOP::Options::untangler)
 //   --no-interfaces         trace a multi-material model as if it had one
 //                           material (the field not aligned to the interfaces)
 //   --no-disk-pin           leave disk inclusions' centres free in the field
+//   --seed n, --field-tol t the MBO field's random start and its stopping
+//                           tolerance (ZIPLINE::Options; 0 seeds from the clock)
 //   --dump <prefix>         <prefix>_<model>_{layout,blocks,mesh}.obj and
 //                           _tj.txt: the simplified layout, the blocks, the mesh
 //                           and the T-junctions, for looking at
@@ -51,6 +56,7 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -59,12 +65,11 @@
 #include "mesh/BlockQuadMesh.hxx"
 #include "mesh/QuadMesh.hxx"
 #include "mesh/TMOP.hxx"
-#include "tracing/LayoutBlocks.hxx"
-#include "tracing/PartitionSimplify.hxx"
-#include "tracing/QuadLayout.hxx"
-#include "tracing/SeparatrixTrace.hxx"
-
-static const int MBO_MAX_STEPS = 500;
+#include "ZIPLINE/LayoutBlocks.hxx"
+#include "ZIPLINE/PartitionSimplify.hxx"
+#include "ZIPLINE/QuadLayout.hxx"
+#include "ZIPLINE/SeparatrixTrace.hxx"
+#include "ZIPLINE/ZIPLINE.hxx"
 
 static const char *reasonName(TerminationReason r) {
     switch (r) {
@@ -88,16 +93,12 @@ static std::string stemOf(const std::string &path) {
 }
 
 struct Flags {
-    bool simplify = true;
-    PartitionSimplify::Settings simplifySettings;
-    SeparatrixTrace::Settings trace;
+    // Everything the stages are run with; the flags below only choose how far.
+    ZIPLINE::Options zipline;
     double meshTarget = 0.0;   // 0: no mesh
     int tmopSweeps = 0;        // 0: no smoothing
     std::string step, brep, blocksObj, obj, mfem;
     std::string dump;          // prefix for the debugging dumps
-    bool interfaces = true;    // honour material interfaces (--no-interfaces)
-    bool pinDisks = true;      // ... and pin disk inclusions' centres (--no-disk-pin)
-    bool pinOpenSides = false; // hold the rim of unmeshed components under TMOP
 };
 static Flags gFlags;
 
@@ -228,38 +229,20 @@ static Outcome processMesh(const std::string &path, bool writeVtu, bool verbose,
         return out;
     }
 
-    // Stage 0b, as the pipelines run it: the material interface network, which
-    // the field is aligned to and the tracing honours. Closed loops are not
-    // split: a separatrix crossing an inclusion's rim cuts it where the layout
-    // actually turns (Interfaces::Options::splitCircleLoops has the argument).
-    std::unique_ptr<Interfaces> interfaces;
-    if (gFlags.interfaces) {
-        Interfaces::Options io;
-        io.splitLoops = false;
-        interfaces = std::make_unique<Interfaces>(mesh, io);
-        if (!interfaces->multiMaterial()) interfaces.reset();
-    }
-
-    auto crossField = std::make_shared<CrossField>(mesh);
-    if (interfaces) {
-        crossField->setAlignedInteriorEdges(interfaces->interfaceEdges());
-        crossField->setPinDiskCenters(gFlags.pinDisks);
-    }
-    crossField->initialize(1, 12345);
-    const double nv = static_cast<double>(mesh->vertices.size());
-    for (int i = 0; i < MBO_MAX_STEPS; ++i) {
-        crossField->step();
-        if (crossField->error < 2.0 * nv * 1e-9) break;
-    }
-    crossField->computeSingularities();
-
-    SeparatrixTrace trace(crossField, true, gFlags.trace, interfaces.get());
-    trace.run();
+    // Stages 0b to 5 (ZIPLINE.hxx); the mesh and the smoothing below, once the
+    // blocks are known to be there to mesh.
+    ZIPLINE::Options opts = gFlags.zipline;
+    if (gFlags.meshTarget > 0.0) opts.mesh.targetEdgeLength = gFlags.meshTarget;
+    if (gFlags.tmopSweeps > 0) opts.tmop.maxSweeps = gFlags.tmopSweeps;
+    ZIPLINE zipline(mesh, opts);
+    zipline.run(ZIPLINE::Stage::Blocks);
+    const Interfaces *interfaces = zipline.hasInterfaces() ? &zipline.getInterfaces() : nullptr;
+    const CrossField &crossField = zipline.getField();
+    const SeparatrixTrace &trace = zipline.getTrace();
     const SeparatrixTrace::Report &tr = trace.getReport();
     out.poincareHopf = tr.poincareHopf;
 
-    QuadLayout layout(trace);
-    layout.build();
+    const QuadLayout &layout = zipline.getLayout();
     const auto &rep = layout.getReport();
 
     out.singularities = static_cast<int>(trace.singularities.size());
@@ -277,8 +260,7 @@ static Outcome processMesh(const std::string &path, bool writeVtu, bool verbose,
                 (std::fabs(out.areaRatio - 1.0) < 1e-9) && rep.faces > 0;
     out.allQuads = out.sound && rep.badFaces == 0;
 
-    PartitionSimplify simp(layout, gFlags.simplifySettings);
-    if (gFlags.simplify) simp.run();
+    const PartitionSimplify &simp = zipline.getSimplification();
     const auto &sr = simp.getReport();
     const auto &sl = simp.getLayout().getReport();
     out.sFaces = sl.faces;
@@ -290,7 +272,7 @@ static Outcome processMesh(const std::string &path, bool writeVtu, bool verbose,
     out.sSound = sl.arcCrossings == 0 && sl.danglingEnds == 0 && sl.faces > 0 &&
                  std::fabs(out.sAreaRatio - 1.0) < 1e-9;
 
-    const LayoutBlocks blocks(simp.getLayout(), *mesh);
+    const LayoutBlocks &blocks = zipline.getBlocks();
     const LayoutBlocks::Report &br = blocks.getReport();
     out.blocks = br.blocks;
     out.straddling = br.straddlingBlocks;
@@ -302,7 +284,7 @@ static Outcome processMesh(const std::string &path, bool writeVtu, bool verbose,
         std::cout << "  mesh          " << mesh->triangles.size() << " triangles, "
                   << mesh->vertices.size() << " vertices\n";
         std::cout << "  cross field   " << trace.singularities.size() << " singularities, error "
-                  << crossField->error << "\n";
+                  << crossField.error << "\n";
         std::cout << "  Poincare-Hopf sum d " << tr.interiorIndexSum4 << " + sum(2 - q) "
                   << tr.boundaryIndexSum4 << " = " << (tr.interiorIndexSum4 + tr.boundaryIndexSum4)
                   << " against 4 chi = " << 4 * tr.eulerCharacteristic
@@ -332,9 +314,9 @@ static Outcome processMesh(const std::string &path, bool writeVtu, bool verbose,
                       << " interface edges in " << ir.branches << " branch(es) (" << ir.closedLoops
                       << " closed), " << ir.nodes << " node(s): " << ir.junctions << " junction, "
                       << ir.landings << " landing, " << ir.kinks << " kink, " << ir.illPosedNodes
-                      << " ill-posed; field pinned at " << crossField->alignedInterfaceVertices()
-                      << " interface vertices, free at " << crossField->freeInterfaceVertices()
-                      << ", " << crossField->pinnedDiskCenters() << " disk centre(s) pinned"
+                      << " ill-posed; field pinned at " << crossField.alignedInterfaceVertices()
+                      << " interface vertices, free at " << crossField.freeInterfaceVertices()
+                      << ", " << crossField.pinnedDiskCenters() << " disk centre(s) pinned"
                       << "\n                " << tr.interfaceEmitted << " separatrice(s) from the nodes, "
                       << tr.absorbedSingularities << " singular triangle(s) absorbed by them, "
                       << tr.interfaceCrossings << " crossing(s) of an interface (" << tr.interfaceGrazes
@@ -502,14 +484,10 @@ static Outcome processMesh(const std::string &path, bool writeVtu, bool verbose,
     // --- the mesh, and the smoothing ---------------------------------------
     //
     // BlockQuadMesh and mesh::TMOP, the pair UMBER runs, at a target edge
-    // length that means what it means to every other method. TMOP samples mu
-    // at the element corners: these are transfinite grids on a block
-    // decomposition, where a corner can turn over without the Gauss points
-    // seeing it (ATLAS's and UMBER's setting, for that reason).
+    // length that means what it means to every other method (Stages 6 and 7).
     if (gFlags.meshTarget > 0.0 && br.blocks > 0) {
-        BlockQuadMesh::Options qo;
-        qo.targetEdgeLength = gFlags.meshTarget;
-        const BlockQuadMesh qm(blocks.decomposition(), qo);
+        zipline.buildMesh();
+        const BlockQuadMesh &qm = zipline.getBlockMesh();
         const BlockQuadMesh::Report &qr = qm.getReport();
         out.meshed = true;
         out.meshQuads = qr.quads;
@@ -526,29 +504,8 @@ static Outcome processMesh(const std::string &path, bool writeVtu, bool verbose,
                       << std::defaultfloat << std::setprecision(6);
             for (const std::string &m : qr.messages) std::cout << "    " << m << "\n";
         }
-        mesh::QuadMesh qmOut = mesh::QuadMesh::from(qm);
-        // --pin-open-sides holds the rim of every unmeshed component, where a
-        // mesh of that component would one day have to meet this one. Off by
-        // default because it costs the smoother measurably: over the corpus
-        // at h = 0.05 and 1000 sweeps the worst scaled Jacobian after TMOP is
-        // lower pinned than sliding on every partially covered model where
-        // the two differ (geom031 0.32 against 0.74, geom010 0.16 against
-        // 0.29, geom007 0.69 against 0.86) -- the ring of elements along a
-        // pinned rim cannot redistribute and absorbs the whole mismatch.
-        if (gFlags.pinOpenSides && !qm.openSideVertices().empty()) {
-            for (const int v : qm.openSideVertices()) qmOut.pinVertex(v);
-            qmOut.classifyNodes();
-            qmOut.buildFeatureCurves();
-            qmOut.computeSlideTangents();
-        }
-        if (gFlags.tmopSweeps > 0 && qr.quads > 0) {
-            mesh::TMOP::Options topt;
-            topt.metric = mesh::TMOP::ShapeSize007;
-            topt.maxSweeps = gFlags.tmopSweeps;
-            topt.quadrature = mesh::TMOP::Corners;
-            mesh::TMOP smoother(qmOut, topt);
-            smoother.run();
-            const mesh::TMOP::Report &tm = smoother.getReport();
+        if (gFlags.tmopSweeps > 0 && zipline.smooth()) {
+            const mesh::TMOP::Report &tm = zipline.getTMOPReport();
             out.smoothed = true;
             out.tmopWorst = tm.minScaledJacobianAfter;
             if (verbose)
@@ -556,12 +513,22 @@ static Outcome processMesh(const std::string &path, bool writeVtu, bool verbose,
                           << " sweep(s), scaled Jacobian " << tm.minScaledJacobianBefore << " -> "
                           << tm.minScaledJacobianAfter << " worst, " << tm.meanScaledJacobianBefore
                           << " -> " << tm.meanScaledJacobianAfter << " mean, folds "
-                          << tm.invertedBefore << " -> " << tm.invertedAfter << "\n"
+                          << tm.invertedBefore << " -> " << tm.invertedAfter << ", worst aspect "
+                          << tm.worstAspectBefore << " -> " << tm.worstAspectAfter << " ("
+                          << tm.untangleSweeps << " untangling)\n"
                           << std::defaultfloat << std::setprecision(6);
         }
-        if (single && !gFlags.obj.empty()) qmOut.writeOBJ(gFlags.obj);
-        if (!gFlags.dump.empty()) qmOut.writeOBJ(gFlags.dump + "_" + out.name + "_mesh.obj");
-        if (single && !gFlags.mfem.empty()) qmOut.writeMFEM(gFlags.mfem);
+        // The mesh as written: smoothed when Stage 7 ran, the grid otherwise.
+        const bool writeMesh = (single && (!gFlags.obj.empty() || !gFlags.mfem.empty())) ||
+                               !gFlags.dump.empty();
+        if (writeMesh) {
+            std::optional<mesh::QuadMesh> grid;
+            if (!zipline.hasSmoothedMesh()) grid.emplace(mesh::QuadMesh::from(qm));
+            const mesh::QuadMesh &qmOut = zipline.hasSmoothedMesh() ? zipline.getSmoothedMesh() : *grid;
+            if (single && !gFlags.obj.empty()) qmOut.writeOBJ(gFlags.obj);
+            if (!gFlags.dump.empty()) qmOut.writeOBJ(gFlags.dump + "_" + out.name + "_mesh.obj");
+            if (single && !gFlags.mfem.empty()) qmOut.writeMFEM(gFlags.mfem);
+        }
     }
 
     if (writeVtu) {
@@ -949,7 +916,59 @@ void zipCollapse() {
           "leaves and meets each singularity along its separatrix, and never turns sharply");
 }
 
+// The ZIPLINE class, which TestZIPLINE and the viewer both run. The viewer's
+// way through it -- the field two MBO steps at a time, the trace a round at a
+// time -- has to arrive at exactly the field, layout and blocks run() does, and
+// two runs have to agree with each other: until 2026-09-24 the viewer seeded
+// the field from the clock, so no two sessions traced the same one.
+void ziplineClass() {
+    std::cout << "the ZIPLINE class: run twice, and stepped the way the viewer steps it\n";
+    // An L of two materials: a reflex corner, and a network to honour.
+    const auto m = grid(12, [](double x, double y) { return x < 0.5 || y < 0.5; },
+                        [](double x, double) { return x < 0.25 ? 1 : 2; });
+    ZIPLINE::Options o;
+    o.fieldMaxSteps = 200;
+    ZIPLINE a(m, o), b(m, o), c(m, o);
+    a.run(ZIPLINE::Stage::Blocks);
+    b.run(ZIPLINE::Stage::Blocks);
+    c.findInterfaces();
+    c.startField();
+    while (!c.stepField(2)) {}
+    c.startTrace();
+    while (!c.stepTrace()) {}
+    c.buildLayout();
+    c.simplifyLayout();
+    c.buildBlocks();
+    auto same = [](const ZIPLINE &x, const ZIPLINE &y) {
+        const Eigen::VectorXcd &u = x.getField().u_k, &v = y.getField().u_k;
+        const QuadLayout::Report &p = x.getSimplifiedLayout().getReport();
+        const QuadLayout::Report &q = y.getSimplifiedLayout().getReport();
+        return u.size() == v.size() && (u - v).norm() == 0.0 &&
+               x.getStatus().fieldSteps == y.getStatus().fieldSteps &&
+               x.getTrace().separatrices.size() == y.getTrace().separatrices.size() &&
+               p.faces == q.faces && p.nodes == q.nodes && p.tJunctions == q.tJunctions &&
+               x.getBlocks().getReport().blocks == y.getBlocks().getReport().blocks;
+    };
+    check(same(a, b), "two runs agree exactly (" + std::to_string(a.getStatus().fieldSteps) +
+                          " MBO steps, " + std::to_string(a.getBlocks().getReport().blocks) + " blocks)");
+    check(same(a, c), "stepping it gives exactly what run() gives");
+    check(a.hasInterfaces() && a.getBlocks().getReport().materials == 2 &&
+              a.getBlocks().getReport().straddlingBlocks == 0,
+          "the network found and honoured: no block in two materials");
+
+    // Running a stage again discards the stages after it and nothing before.
+    check(a.buildMesh() && a.smooth() && a.hasSmoothedMesh(), "meshed and smoothed");
+    BlockQuadMesh::Options coarse;
+    coarse.targetEdgeLength = 0.25;
+    const int fine = a.getBlockMesh().getReport().quads;
+    a.buildMesh(coarse);
+    check(a.hasBlocks() && a.hasBlockMesh() && !a.hasSmoothedMesh() &&
+              a.getBlockMesh().getReport().quads < fine,
+          "re-meshing coarser keeps the blocks and drops the smoothed mesh");
+}
+
 int run() {
+    ziplineClass();
     zipCollapse();
     singularityModel();
     constantField();
@@ -970,27 +989,31 @@ int main(int argc, char **argv) {
         auto next = [&]() -> const char * { return (i + 1 < argc) ? argv[++i] : ""; };
         if (a == "--selftest") return selftest::run();
         else if (a == "--no-vtu") writeVtu = false;
-        else if (a == "--cut-radius") gFlags.trace.singularityCutRadius = std::atof(next());
-        else if (a == "--tangential") gFlags.trace.tangentialAngle = std::atof(next()) * M_PI / 180.0;
-        else if (a == "--square-rays") gFlags.trace.evenCornerRays = false;
-        else if (a == "--no-simplify") gFlags.simplify = false;
-        else if (a == "--no-stems") gFlags.simplifySettings.extendStems = false;
-        else if (a == "--no-fixed-corners") gFlags.simplifySettings.fixedCorners = false;
-        else if (a == "--no-smooth") gFlags.simplifySettings.smoothCollapse = false;
-        else if (a == "--max-drag") gFlags.simplifySettings.maxDrag = std::atof(next());
-        else if (a == "--nonzip-angle") gFlags.simplifySettings.nonZipAngle = std::atof(next()) * M_PI / 180.0;
-        else if (a == "--zip-angle") gFlags.simplifySettings.zipAngle = std::atof(next()) * M_PI / 180.0;
-        else if (a == "--corner-join") gFlags.trace.cornerJoinRadius = std::atof(next());
-        else if (a == "--stem-join") gFlags.simplifySettings.stems.joinRadius = std::atof(next());
-        else if (a == "--stem-crossings") gFlags.simplifySettings.stems.maxCrossings = std::atoi(next());
-        else if (a == "--by-arc-length") gFlags.trace.growByArcLength = true;
-        else if (a == "--no-parallel-stop") gFlags.trace.stopParallelTangential = false;
-        else if (a == "--no-resume") gFlags.trace.resumeAfterTruncation = false;
-        else if (a == "--interior-singularities") gFlags.trace.singularitiesAtBoundary = false;
+        else if (a == "--cut-radius") gFlags.zipline.trace.singularityCutRadius = std::atof(next());
+        else if (a == "--tangential") gFlags.zipline.trace.tangentialAngle = std::atof(next()) * M_PI / 180.0;
+        else if (a == "--square-rays") gFlags.zipline.trace.evenCornerRays = false;
+        else if (a == "--no-simplify") gFlags.zipline.simplify = false;
+        else if (a == "--no-stems") gFlags.zipline.simplification.extendStems = false;
+        else if (a == "--no-fixed-corners") gFlags.zipline.simplification.fixedCorners = false;
+        else if (a == "--no-smooth") gFlags.zipline.simplification.smoothCollapse = false;
+        else if (a == "--max-drag") gFlags.zipline.simplification.maxDrag = std::atof(next());
+        else if (a == "--nonzip-angle") gFlags.zipline.simplification.nonZipAngle = std::atof(next()) * M_PI / 180.0;
+        else if (a == "--zip-angle") gFlags.zipline.simplification.zipAngle = std::atof(next()) * M_PI / 180.0;
+        else if (a == "--zip-l") gFlags.zipline.simplification.zipLengthOfPatch = std::string(next()) == "patch";
+        else if (a == "--corner-join") gFlags.zipline.trace.cornerJoinRadius = std::atof(next());
+        else if (a == "--stem-join") gFlags.zipline.simplification.stems.joinRadius = std::atof(next());
+        else if (a == "--stem-crossings") gFlags.zipline.simplification.stems.maxCrossings = std::atoi(next());
+        else if (a == "--by-arc-length") gFlags.zipline.trace.growByArcLength = true;
+        else if (a == "--no-parallel-stop") gFlags.zipline.trace.stopParallelTangential = false;
+        else if (a == "--no-resume") gFlags.zipline.trace.resumeAfterTruncation = false;
+        else if (a == "--interior-singularities") gFlags.zipline.trace.singularitiesAtBoundary = false;
         else if (a == "--dump") gFlags.dump = next();
-        else if (a == "--pin-open-sides") gFlags.pinOpenSides = true;
-        else if (a == "--no-interfaces") gFlags.interfaces = false;
-        else if (a == "--no-disk-pin") gFlags.pinDisks = false;
+        else if (a == "--pin-open-sides") gFlags.zipline.pinOpenSides = true;
+        else if (a == "--shifted-untangler") gFlags.zipline.tmop.untangler = mesh::TMOP::UntangleShifted;
+        else if (a == "--no-interfaces") gFlags.zipline.materialInterfaces = false;
+        else if (a == "--no-disk-pin") gFlags.zipline.pinDiskCenters = false;
+        else if (a == "--seed") gFlags.zipline.fieldSeed = static_cast<unsigned>(std::atol(next()));
+        else if (a == "--field-tol") gFlags.zipline.fieldTolerance = std::atof(next());
         else if (a == "--mesh") gFlags.meshTarget = std::atof(next());
         else if (a == "--tmop") gFlags.tmopSweeps = std::atoi(next());
         else if (a == "--step") gFlags.step = next();

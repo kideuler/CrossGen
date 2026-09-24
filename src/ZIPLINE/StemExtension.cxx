@@ -1,11 +1,11 @@
-#include "tracing/StemExtension.hxx"
+#include "ZIPLINE/StemExtension.hxx"
 
 #include <algorithm>
 #include <cmath>
 #include <limits>
 #include <unordered_set>
 
-#include "tracing/TriangleLocator.hxx"
+#include "ZIPLINE/TriangleLocator.hxx"
 
 namespace {
 

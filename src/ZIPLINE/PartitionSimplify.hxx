@@ -3,8 +3,8 @@
 
 #include <vector>
 
-#include "tracing/QuadLayout.hxx"
-#include "tracing/StemExtension.hxx"
+#include "ZIPLINE/QuadLayout.hxx"
+#include "ZIPLINE/StemExtension.hxx"
 
 // ---------------------------------------------------------------------------
 // Partition simplification: Sec. 4 of Viertel, Osting and Staten, IMR 2019,
@@ -75,6 +75,21 @@ public:
         // more than about 2.4 times as long as it is wide. Collapsing a fatter
         // one bends the separatrices too far at the singularities it joins.
         double zipAngle = M_PI / 8.0;
+
+        // The l in that aspect ratio (spec A7, `zip_l_scope`). Sec. 4.1 writes
+        // it as the mean length of the *chord's* longitudinal sides, and
+        // justifies it as the diagonal angle of the zip patch were it a
+        // rectangle -- which is the *patch's* own length. The two disagree
+        // exactly when a zip patch is short on a long chord, and it is the
+        // patch that says how steeply the merged curve has to cross from one
+        // side to the other: the blend (Sec. 8) runs from one fixed corner to
+        // the other along the patch and nowhere else. On det_rocket a zip
+        // patch as long as it is wide, on a chord several times longer, passed
+        // at 22.5 degrees by the chord and went across at 45; the singularity
+        // at its end was left with two of its three arcs 180 degrees apart,
+        // and the TFI mesh folded in the corner between them. Default Chord,
+        // as written; see docs/viertel_2019.md Sec. 14 for what Patch costs.
+        bool zipLengthOfPatch = false;
 
         // Sec. 4.1 leaves the energy of a non-zip patch at "a positive
         // constant": deleting a side with nothing on it costs the partition
