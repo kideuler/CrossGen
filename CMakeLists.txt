@@ -746,5 +746,68 @@ endif()
 add_executable(TopoDiag src/utils/TopoDiag.cxx)
 target_link_libraries(TopoDiag PRIVATE PolyVector)
 
+# The Python API (src/python): `crossgen`, a CPython extension module written
+# against Python.h, over PolyVector.
+#
+#     PYTHONPATH=build/python python3 -c "import crossgen; help(crossgen)"
+#
+# It is built for the interpreter FindPython picks (the first python3 on PATH;
+# -DPython3_EXECUTABLE=... chooses another) and imports only into that Python's
+# minor version. Development.Module is the headers-only part of Python: an
+# extension module takes its Python symbols from the interpreter that loads it
+# (on macOS through -undefined dynamic_lookup, which Python3::Module carries),
+# and linking one against libpython instead would give a process two
+# interpreters' worth of state the moment it is loaded into a Python other than
+# the one it was built against. numpy is not a build dependency: the module
+# imports it at run time to hand back arrays.
+option(BUILD_PYTHON_MODULE "Build the crossgen CPython extension module" ON)
+if (BUILD_PYTHON_MODULE)
+    if (CMAKE_VERSION VERSION_LESS 3.18)
+        message(FATAL_ERROR "BUILD_PYTHON_MODULE needs CMake 3.18 or later "
+                            "(FindPython's Development.Module); or pass -DBUILD_PYTHON_MODULE=OFF")
+    endif()
+    # The python3 on PATH -- the one that will `import crossgen` -- rather than
+    # whichever framework FindPython reaches first on macOS, which on a machine
+    # with Homebrew's Python beside python.org's is the wrong one.
+    if (NOT DEFINED Python3_FIND_FRAMEWORK)
+        set(Python3_FIND_FRAMEWORK LAST)
+    endif()
+    if (NOT DEFINED Python3_FIND_UNVERSIONED_NAMES)
+        set(Python3_FIND_UNVERSIONED_NAMES FIRST)
+    endif()
+    find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Module)
+    message(STATUS "Python module for ${Python3_EXECUTABLE} (${Python3_VERSION})")
+
+    Python3_add_library(crossgen MODULE WITH_SOABI
+        src/python/PyOptions.hxx
+        src/python/PyOptions.cxx
+        src/python/PyUtil.hxx
+        src/python/PyUtil.cxx
+        src/python/PyTables.hxx
+        src/python/PyTables.cxx
+        src/python/Methods.hxx
+        src/python/Methods.cxx
+        src/python/MethodZIPLINE.cxx
+        src/python/MethodUMBER.cxx
+        src/python/MethodLayout.cxx
+        src/python/MethodATLAS.cxx
+        src/python/CrossGenModule.cxx
+    )
+    target_link_libraries(crossgen PRIVATE PolyVector)
+    # Its own directory, so that PYTHONPATH can point at the module and at
+    # nothing else of the build tree.
+    set_target_properties(crossgen PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/python)
+
+    # Every Mesh method end to end on one model -- a block decomposition, a
+    # mesh on it and a few smoothing sweeps -- plus the Shape-DNA, the array
+    # round trip, and the keyword errors. See the script's header.
+    add_test(NAME Python_Module
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/src/python/test_crossgen.py
+                     ${CMAKE_CURRENT_SOURCE_DIR}/data/meshes/singlemat/geom001.obj)
+    set_tests_properties(Python_Module PROPERTIES
+                         ENVIRONMENT "PYTHONPATH=${CMAKE_BINARY_DIR}/python"
+                         TIMEOUT 600)
+endif()
+
 # The Tier-1 experiments of the paper (Sec. 6): E1 to E5.
 add_subdirectory(paper_tests)
