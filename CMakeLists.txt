@@ -16,15 +16,17 @@ message(STATUS "Using local Eigen3 from: ${EIGEN3_INCLUDE_DIR}")
 
 # OpenMP
 #
-# Used by the TMOP smoother (src/mesh/TMOP.cxx) and by nothing else so far. The
-# smoother sweeps in colour order, so its answer does not depend on the thread
-# count and a build without OpenMP is a correct build, only a slower one --
-# every pragma is compiled out through _OPENMP.
+# Used by the TMOP smoother (src/mesh/TMOP.cxx) and by the Shape-DNA module
+# (src/ShapeDNA: assembly, the nested-dissection Cholesky, the Lanczos
+# eigensolver). The smoother sweeps in colour order and every ShapeDNA loop
+# writes disjoint outputs or reduces in a fixed order, so neither answer depends
+# on the thread count, and a build without OpenMP is a correct build, only a
+# slower one -- every pragma is compiled out through _OPENMP.
 #
 # AppleClang is the awkward case: it understands the pragmas but ships no
 # runtime, so plain find_package(OpenMP) fails on a Mac that has Homebrew's
 # libomp installed and working. Fall back to wiring libomp up by hand there.
-option(CROSSGEN_ENABLE_OPENMP "Use OpenMP to parallelise the TMOP smoother" ON)
+option(CROSSGEN_ENABLE_OPENMP "Use OpenMP to parallelise TMOP and the Shape-DNA solver" ON)
 
 set(CROSSGEN_OPENMP_TARGET "")
 if (CROSSGEN_ENABLE_OPENMP)
@@ -54,7 +56,7 @@ if (CROSSGEN_ENABLE_OPENMP)
     endif()
 endif()
 if (NOT CROSSGEN_OPENMP_TARGET)
-    message(STATUS "No OpenMP: TMOP will run single-threaded")
+    message(STATUS "No OpenMP: TMOP and ShapeDNA will run single-threaded")
 endif()
 
 # OpenCASCADE: the geometry kernel
@@ -119,6 +121,19 @@ add_library(PolyVector SHARED
     src/mesh/BlockDecomposition.cxx
     src/mesh/BlockQuadMesh.hxx
     src/mesh/BlockQuadMesh.cxx
+    src/ShapeDNA/Parallel.hxx
+    src/ShapeDNA/SparseMatrix.hxx
+    src/ShapeDNA/SparseMatrix.cxx
+    src/ShapeDNA/DenseEigen.hxx
+    src/ShapeDNA/DenseEigen.cxx
+    src/ShapeDNA/SparseCholesky.hxx
+    src/ShapeDNA/SparseCholesky.cxx
+    src/ShapeDNA/Lanczos.hxx
+    src/ShapeDNA/Lanczos.cxx
+    src/ShapeDNA/LagrangeFEM.hxx
+    src/ShapeDNA/LagrangeFEM.cxx
+    src/ShapeDNA/ShapeDNA.hxx
+    src/ShapeDNA/ShapeDNA.cxx
     src/polyvector/PolyVectors.hxx
     src/polyvector/PolyVectors.cxx
     src/dualmbo/DualMBO.hxx
@@ -311,6 +326,14 @@ target_link_libraries(TestMERIDIAN PRIVATE PolyVector)
 # and Reference::Field -- on meshes whose answers are known in closed form.
 add_executable(TestTORSION src/utils/TestTORSION.cxx)
 target_link_libraries(TestTORSION PRIVATE PolyVector)
+
+# The Shape-DNA of a planar mesh (src/ShapeDNA, docs/shape_dna.md): Lagrange
+# P1-P3 elements, a nested-dissection Cholesky and a shift-invert block Lanczos
+# eigensolver, all in-house and OpenMP-parallel. Given meshes, prints each one's
+# DNA and their pairwise distances; --selftest checks the module against the
+# rectangle and disk spectra and needs no files.
+add_executable(TestShapeDNA src/utils/TestShapeDNA.cxx)
+target_link_libraries(TestShapeDNA PRIVATE PolyVector)
 
 # Test ATLAS, the square-transport blocking of
 # docs/square_transport_2d_theory_and_implementation.md, Stages 1-6: the
@@ -641,6 +664,26 @@ foreach(ATLAS_CASE singlemat/geom001 multimat/geom001)
     add_test(NAME ATLAS_Blocking_${ATLAS_CASE_NAME}
              COMMAND TestATLAS ${CMAKE_CURRENT_SOURCE_DIR}/data/meshes/${ATLAS_CASE}.obj)
     set_tests_properties(ATLAS_Blocking_${ATLAS_CASE_NAME} PROPERTIES TIMEOUT 2400)
+endforeach()
+
+# The Shape-DNA module against closed forms (src/ShapeDNA): exact reference
+# integrals for P1-P3, the dense eigensolver against Eigen's, the Cholesky's
+# solves, the rectangle and disk spectra (and the convergence orders 2, 4, 6),
+# the square's exact double eigenvalues on a mesh with all its symmetries, the
+# heat trace handing back area, perimeter and the corner term, invariance under
+# similarity and remeshing, Lanczos against two dense solvers, and the
+# spectrum bit-identical on one thread and on all of them.
+add_test(NAME ShapeDNA_SelfTest COMMAND TestShapeDNA --selftest)
+set_tests_properties(ShapeDNA_SelfTest PROPERTIES TIMEOUT 600)
+
+# The default run (cubic elements, 50 eigenvalues, Dirichlet) on two corpus
+# models: geom012, a plate with ten holes, and multimat/geom001, where the
+# interface is ignored and the DNA is the unit square's. Exit code: convergence.
+foreach(SHAPEDNA_CASE singlemat/geom012 multimat/geom001)
+    string(REPLACE "/" "_" SHAPEDNA_CASE_NAME ${SHAPEDNA_CASE})
+    add_test(NAME ShapeDNA_${SHAPEDNA_CASE_NAME}
+             COMMAND TestShapeDNA ${CMAKE_CURRENT_SOURCE_DIR}/data/meshes/${SHAPEDNA_CASE}.obj --heat)
+    set_tests_properties(ShapeDNA_${SHAPEDNA_CASE_NAME} PROPERTIES TIMEOUT 600)
 endforeach()
 
 # The TMOP smoother and the node-mobility layer under it, on meshes built in

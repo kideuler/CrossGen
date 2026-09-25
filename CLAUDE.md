@@ -37,11 +37,11 @@ cmake --build build -j8                                 # or: --target TestMERID
 
 ## Test
 
-- `cd build && ctest` (or `ctest -R MERIDIAN`, `-R TORSION`, `-R ZIPLINE`, `-R Geom`, `-R Paper_`).
+- `cd build && ctest` (or `ctest -R MERIDIAN`, `-R TORSION`, `-R ZIPLINE`, `-R Geom`, `-R ShapeDNA`, `-R Paper_`).
   A project PreToolUse hook (`.claude/hooks/filter-test-output.sh`) cuts `ctest`/`make test`
   output down to the FAIL/ERROR lines. The end-to-end cases have 2400 s timeouts; the
   bubbles template cases are the slow ones.
-- Self-tests: `TestMERIDIAN --selftest`, `TestTORSION --selftest`, `TestTMOP --selftest`, `TestGeom`, `TestZIPLINE --selftest`.
+- Self-tests: `TestMERIDIAN --selftest`, `TestTORSION --selftest`, `TestTMOP --selftest`, `TestGeom`, `TestZIPLINE --selftest`, `TestShapeDNA --selftest`.
 - A single model: `./build/TestMERIDIAN data/meshes/singlemat/geom012.obj [flags]`
   (TestTORSION works the same way). The flag parser is in `src/utils/TestMERIDIAN.cxx`
   around line 330. Useful flags: `--disk-templates --near-miss 0.04` (bubbles),
@@ -69,7 +69,8 @@ cmake --build build -j8                                 # or: --target TestMERID
 | `data/geometry/{singlemat,multimat}` | `.geo` sources. `Mesh2Dgmsh` turns them into `data/meshes/<kind>/*.obj` (gitignored) |
 | `data/meshes/{singlemat,multimat,mechanism}` | Corpus: 24 + 11 + mechanism set (built by `MakeDomains`, kept separate from the corpus on purpose) |
 | `data/geometry_extra/` | Models dropped from the corpus. Not used |
-| `docs/` | Design notes: `ricci_flow_pipeline.md` (A), `cf_flow_pipeline.md` (B), `multimaterial.md`, `tmop_node_mobility.md`, `shepherd2022.pdf` |
+| `src/ShapeDNA` | **Shape-DNA** (Reuter et al. 2006, `docs/shape_dna.md`): the first n Laplacian eigenvalues of the whole domain (materials ignored), normalised for scale. P1–P3 Lagrange FEM with exact reference integrals → our own nested-dissection multifrontal Cholesky → our own shift-invert block Lanczos (thick restart, B-inner product). All OpenMP, and bit-identical for any thread count. Driver `TestShapeDNA <mesh.obj>...` prints each DNA and the pairwise distances. P3/50 eigenvalues on the largest corpus model takes ~1.8 s |
+| `docs/` | Design notes: `ricci_flow_pipeline.md` (A), `cf_flow_pipeline.md` (B), `multimaterial.md`, `tmop_node_mobility.md`, `shape_dna.md`, `shepherd2022.pdf` |
 
 ## Before changing a pipeline stage
 
