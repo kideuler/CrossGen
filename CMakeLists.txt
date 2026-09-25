@@ -798,6 +798,31 @@ if (BUILD_PYTHON_MODULE)
     # nothing else of the build tree.
     set_target_properties(crossgen PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/python)
 
+    # A build cannot change the PYTHONPATH of the shell that started it, so this
+    # is the other way to make `import crossgen` work without one: a one-line
+    # .pth file in the site-packages of the interpreter the module was built
+    # for, naming build/python. Python reads it at start-up in every shell,
+    # IDE and notebook, and it follows rebuilds because it names the directory
+    # and not the .so. The site directory is the user's when the interpreter
+    # has one, and the environment's own inside a venv, where the user site is
+    # switched off. It is written at configure time and only when asked for,
+    # since it puts a file outside the repository.
+    option(CROSSGEN_PYTHON_DEV_PTH "Make the built crossgen module importable from this Python (writes crossgen-dev.pth into its site-packages)" OFF)
+    if (CROSSGEN_PYTHON_DEV_PTH)
+        execute_process(
+            COMMAND ${Python3_EXECUTABLE} -c
+                "import site, sysconfig; print(site.getusersitepackages() if site.ENABLE_USER_SITE else sysconfig.get_paths()['purelib'])"
+            OUTPUT_VARIABLE CROSSGEN_PTH_DIR OUTPUT_STRIP_TRAILING_WHITESPACE
+            RESULT_VARIABLE CROSSGEN_PTH_RC)
+        if (NOT CROSSGEN_PTH_RC EQUAL 0 OR CROSSGEN_PTH_DIR STREQUAL "")
+            message(FATAL_ERROR "CROSSGEN_PYTHON_DEV_PTH: could not ask ${Python3_EXECUTABLE} for its site-packages")
+        endif()
+        file(MAKE_DIRECTORY "${CROSSGEN_PTH_DIR}")
+        file(WRITE "${CROSSGEN_PTH_DIR}/crossgen-dev.pth" "${CMAKE_BINARY_DIR}/python\n")
+        message(STATUS "crossgen importable: ${CROSSGEN_PTH_DIR}/crossgen-dev.pth -> ${CMAKE_BINARY_DIR}/python "
+                       "(delete that file to undo)")
+    endif()
+
     # Every Mesh method end to end on one model -- a block decomposition, a
     # mesh on it and a few smoothing sweeps -- plus the Shape-DNA, the array
     # round trip, and the keyword errors. See the script's header.

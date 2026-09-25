@@ -30,7 +30,7 @@ cmake --build build -j8                                 # or: --target TestMERID
   `clean.sh`, which deletes the `.msh`/`.obj` meshes. Don't run either unless asked.
 - Options: `BUILD_OPENGL_VIEWER` (Qt6 `Viewer`), `CROSSGEN_ENABLE_OPENMP` (TMOP; finds Homebrew
   libomp), `BUILD_MESH2GMSH`, `BUILD_PYTHON_MODULE` (ON: the `crossgen` extension module in
-  `build/python`, built for the `python3` on PATH; use it with `PYTHONPATH=build/python`).
+  `build/python`, built for the `python3` on PATH; use it with `PYTHONPATH=build/python`, or configure once with `-DCROSSGEN_PYTHON_DEV_PTH=ON`, which writes `crossgen-dev.pth` into that Python's site-packages so no `PYTHONPATH` is needed).
 - Libraries: `CrossGenGeom` (src/geom, OCC) and `PolyVector` (all the rest, links
   CrossGenGeom PUBLIC). Every executable is a thin driver in `src/utils/`.
 - `data/meshes/**` is copied into `build/data/meshes` **at configure time**. Re-run
