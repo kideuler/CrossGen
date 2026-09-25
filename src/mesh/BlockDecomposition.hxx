@@ -122,6 +122,94 @@ public:
     // instead. Returns false only for a block whose outline is degenerate.
     bool interiorPoint(int block, Point &out) const;
 
+    // ── Comparing decompositions ────────────────────────────────────────────
+    //
+    // Three scores from docs/block_decomposition_metrics.md, each a weighted
+    // form of one of its unweighted counts, so that five methods' answers on
+    // one model can be put in one column. They read the decomposition as the
+    // method drew it: its topology, which smoothing does not change (Sec. 2 of
+    // the note), and its own polylines, which smoothing does -- the note's
+    // after-smoothing reading needs the meshed block grids, which this class
+    // does not hold. A block with a side that has no polyline is left out of
+    // all three, as BlockQuadMesh leaves it unmeshed.
+    //
+    // All three are scores in [0, 1]: 0 is the best a layout can do on that
+    // count, and 1 is the worst, which is also what any decomposition that
+    // fails covers() gets. Two of the raw counts have no upper bound, so each
+    // is bent into [0, 1) by a map named below; the maps are monotone, so they
+    // rank exactly as the raw counts do, but a difference near 1 means less
+    // than the same difference near 0.
+    //
+    // Two of them share one notion, the *sector*: at a macrovertex, a run of
+    // block corners joined across the macro edges between them, stopping at an
+    // edge of dS, at a material interface, and at an edge with no block on its
+    // far side. So an interior vertex is one sector of 2 pi, a boundary vertex
+    // is one sector of the model's own angle there, and a vertex on an
+    // interface is one sector per material, the interfaces acting as boundary
+    // exactly as T3 has them. Its angle is the sum of its block corners, each
+    // corner measured between the tangents of its two sides, each tangent read
+    // from the first tenth of the side (B1) by a least-squares quadratic, so
+    // that a side which bends -- dS round a hole, a ring of an O-grid -- does
+    // not tilt the tangent by the chord's sagitta. The .cxx has the numbers.
+
+    // T2 and T4 in one number, each irregular vertex weighted by how far it is
+    // from regular rather than counted once. A sector of angle theta split into
+    // n blocks scores |2 theta / pi - n| -- the number of quarter turns its
+    // block count is off by -- and the score is the sum over every sector.
+    // An interior vertex of valence d scores |4 - d|, so valence 3 and 5 count
+    // one and valence 6 counts two, which is the note's reason for keeping high
+    // valence visible (it costs twice the angle). A smooth point of dS scores
+    // |3 - d|. A model corner scores its fractional mismatch: a 90-degree
+    // corner in one block 0 and in two blocks 1, and a 135-degree corner 1/2
+    // either way, which settles T4's "ambiguous corner" by weight instead of
+    // by exemption. A boundary sector within 20 degrees of pi is taken as a
+    // smooth point (G3's 160-degree rule), since a polygonal dS turns a little
+    // at every vertex and that turning is the mesh's, not the model's.
+    // Returned as W / (W + N), W that sum and N the number of sectors, so it is
+    // the defect per sector and compares across models of different sizes: 0
+    // with no irregular vertex, 1/2 at one quarter turn per sector. 0 is not
+    // reachable on most models -- the model's own corners force some defect
+    // (the quarter disk owes exactly one quarter turn, T3) -- so compare
+    // methods on one model rather than reading it against 0.
+    double weightedIrregularity() const;
+
+    // Every block has all four sides, and every side is either on dS or shared
+    // with a second block: no gap is left anywhere against a block. The three
+    // metrics return 1, the worst score, when this fails, so that a method which leaves part of the
+    // model out cannot win on what it left out (G2). A decomposition with no
+    // blocks does not cover either.
+    bool covers() const;
+
+    // B1, area-weighted: the RMS difference between each block
+    // corner and the ideal angle of its sector, theta / n. Measuring against
+    // theta / n rather than 90 degrees leaves out what the valence forces --
+    // weightedIrregularity() has that -- and keeps only how evenly the method
+    // spread its blocks round each vertex. Each corner is weighted by its
+    // block's area: at one target edge length a block holds elements in
+    // proportion to its area, and a corner angle is inherited by the whole of
+    // its block's transfinite grid, not by one element, so this is the
+    // deviation an average element sits in. Returned over a right angle and
+    // capped at 1, 90 degrees being where a corner has folded flat or split a
+    // right angle wrongly by all of it: 0 when every vertex splits its sector
+    // evenly.
+    double weightedCornerDeviation() const;
+
+    // T5, area-weighted: the span ratio S = (longest macro edge) / (shortest)
+    // of each chord -- every macro edge of a chord carries one interval count,
+    // so S is the ratio of element lengths it forces from one end of the chord
+    // to the other -- as a geometric mean over the chords, each weighted by
+    // the area of the blocks it runs through (a block twice, if its chord
+    // crosses it both ways). A chord's S is paid by every element along it, so
+    // a thin channel coupled to a wide region costs in proportion to how much
+    // of the model it drags, and a short chord between two nearly equal sides
+    // costs almost nothing however large its ratio. Chords are the classes
+    // BlockQuadMesh::assignIntervals() builds (side 0 with 2, 1 with 3, over
+    // every block), so they are the ones that actually share a count.
+    // Returned as 1 - 1/S of that mean, which needs no chosen scale: 0 when
+    // every chord's sides are equal, 1/2 when elements along a typical chord
+    // differ in size by a factor of two.
+    double weightedChordSpan() const;
+
     // The macro edges as OBJ polylines, and the blocks as closed OBJ loops --
     // one pair of writers standing in for what used to be BlockCover::
     // writeOBJ and Arrangement::writeOBJ / writePatchOBJ.

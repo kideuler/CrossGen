@@ -3,6 +3,9 @@
 #include <algorithm>
 #include <cmath>
 #include <fstream>
+#include <limits>
+#include <numeric>
+#include <unordered_map>
 
 namespace {
 
@@ -50,6 +53,192 @@ bool insidePolygon(const std::vector<Point> &poly, const Point &q) {
         }
     }
     return wind != 0;
+}
+
+// ── For the comparison metrics ──────────────────────────────────────────────
+
+// The same relation BlockQuadMesh::assignIntervals() builds its chords from,
+// kept private to each file rather than exported for two users.
+struct UnionFind {
+    std::vector<int> parent;
+    explicit UnionFind(size_t n) : parent(n) { std::iota(parent.begin(), parent.end(), 0); }
+    int find(int x) {
+        while (parent[x] != x) x = parent[x] = parent[parent[x]];
+        return x;
+    }
+    void unite(int a, int b) { parent[find(b)] = find(a); }
+};
+
+// Every side has a polyline to measure. BlockQuadMesh meshes nothing else, so
+// nothing else is scored.
+bool completeBlock(const BlockDecomposition &D, int b) {
+    for (int e : D.blocks[b].edges) {
+        if (e < 0 || e >= static_cast<int>(D.edges.size())) return false;
+        if (D.edges[e].points.size() < 2) return false;
+    }
+    return true;
+}
+
+// Positive for a counter-clockwise outline. The same shoelace the coverage
+// uses: each side repeats the corner the last one ended on, which adds nothing.
+double signedBlockArea(const BlockDecomposition &D, int b) {
+    double twice = 0.0;
+    for (int s = 0; s < 4; ++s) {
+        const std::vector<Point> side = D.sidePolyline(b, s);
+        for (size_t i = 0; i + 1 < side.size(); ++i) twice += cross2(side[i], side[i + 1]);
+    }
+    return 0.5 * twice;
+}
+
+// The unit tangent into a polyline at one of its ends, read from the first
+// tenth of it (B1: not from the first segment, which on a traced curve
+// measures the tracing step). The chord to the tenth would lean inward on a
+// bending side by half the angle the side turns in that tenth -- 2.25 degrees
+// on a 45-degree arc, enough to leave the quarter disk's three right-angled
+// corners scoring 1.05 in weightedIrregularity() where the answer is exactly 1.
+// So the tangent is the linear term of the least-squares quadratic
+// p0 + t s + c s^2 through the points of that tenth -- the polyline's own, and
+// two resampled at 1/20 and 1/10 so that a side of few points still has two --
+// which is exact on a circle to second order and averages tracing noise
+// instead of taking it from one point. Measured over the corpus, the quarter
+// disk then scores 1.001 and geom006 4.01 (against 1.05 and 4.24 by chord). A
+// side that really hooks within its first tenth is reported at its angle at
+// the vertex, not at the tenth: UMBER's geom006 has two sides leaving a point
+// of the hole 7 degrees apart and 20 degrees apart a tenth later, and scores
+// the corner at the first. A fit that points backwards, which only a polyline
+// doubling back on itself could give, falls back to the chord.
+Point endTangent(const std::vector<Point> &p, bool atBack) {
+    const std::vector<double> s = arcLengths(p);
+    const double L = s.back();
+    if (!(L > 0.0)) return Point{0.0, 0.0};
+    const Point p0 = atBack ? p.back() : p.front();
+    const Point tenth = atFraction(p, s, atBack ? 0.90 : 0.10);
+
+    // Normal equations of min sum |q - p0 - t u - c u^2|^2 in the fraction
+    // u = s / L, which leaves t's direction alone and keeps the sums of order 1.
+    double u2 = 0.0, u3 = 0.0, u4 = 0.0;
+    Point r1{0.0, 0.0}, r2{0.0, 0.0};
+    auto add = [&](double u, const Point &q) {
+        const Point d = q - p0;
+        u2 += u * u;
+        u3 += u * u * u;
+        u4 += u * u * u * u;
+        r1 = r1 + d * u;
+        r2 = r2 + d * (u * u);
+    };
+    for (size_t i = 0; i < p.size(); ++i) {
+        const double u = (atBack ? L - s[i] : s[i]) / L;
+        if (u > 0.0 && u < 0.1) add(u, p[i]);
+    }
+    add(0.05, atFraction(p, s, atBack ? 0.95 : 0.05));
+    add(0.10, tenth);
+
+    const Point chord = tenth - p0;
+    const double det = u2 * u4 - u3 * u3;
+    const Point t = (det > 0.0) ? (r1 * u4 - r2 * u3) / det : chord;
+    return normalizeP(dotP(t, chord) > 0.0 ? t : chord);
+}
+
+// The sectors of the header comment. Block corner c = 4 b + k is corner k of
+// block b; `of[c]` is its sector, or -1 for a corner of a block not scored.
+struct Sectors {
+    std::vector<double> alpha;   // per corner, in [0, 2 pi)
+    std::vector<int> of;         // per corner
+    std::vector<double> area;    // per block, unsigned
+    std::vector<double> theta;   // per sector: 2 pi for a closed ring, else the sum of its corners
+    std::vector<int> count;      // per sector: its block corners
+    std::vector<bool> ring;      // per sector: joined all the way round, so an interior vertex
+};
+
+Sectors findSectors(const BlockDecomposition &D) {
+    const int nB = static_cast<int>(D.blocks.size());
+    const int nE = static_cast<int>(D.edges.size());
+
+    // One tangent per end of each macro edge, shared by the two corners that
+    // edge separates there, so that the corners of a sector add up to the
+    // angle between its two bounding tangents exactly, whatever the estimate.
+    std::vector<Point> tFrom(nE, Point{0.0, 0.0}), tTo(nE, Point{0.0, 0.0});
+    for (int e = 0; e < nE; ++e) {
+        if (D.edges[e].points.size() < 2) continue;
+        tFrom[e] = endTangent(D.edges[e].points, false);
+        tTo[e] = endTangent(D.edges[e].points, true);
+    }
+
+    Sectors S;
+    S.alpha.assign(4 * static_cast<size_t>(nB), 0.0);
+    S.of.assign(4 * static_cast<size_t>(nB), -1);
+    S.area.assign(nB, 0.0);
+
+    // Each corner meets two edge ends: the start of its own side k and the end
+    // of side k - 1. An end is keyed 2 e + (0 at `from`, 1 at `to`), and the
+    // two corners holding the same key are neighbours round the vertex.
+    std::unordered_map<int, std::vector<int>> holders;
+    std::vector<bool> scored(4 * static_cast<size_t>(nB), false);
+    for (int b = 0; b < nB; ++b) {
+        if (!completeBlock(D, b)) continue;
+        const BlockDecomposition::Block &B = D.blocks[b];
+        const double a = signedBlockArea(D, b);
+        S.area[b] = std::fabs(a);
+        const double turn = (a < 0.0) ? -1.0 : 1.0;   // the side the block lies on
+        for (int k = 0; k < 4; ++k) {
+            const int km = (k + 3) % 4;
+            // Side k leaves the corner: read forwards it starts at its edge's
+            // `from`. Side k - 1 arrives at it: read forwards it ends at `to`.
+            const int eo = B.edges[k], endO = B.flip[k] ? 1 : 0;
+            const int ei = B.edges[km], endI = B.flip[km] ? 0 : 1;
+            const Point to = endO ? tTo[eo] : tFrom[eo];
+            const Point ti = endI ? tTo[ei] : tFrom[ei];
+            // Swept from the leaving side to the arriving one through the
+            // block: counter-clockwise for a counter-clockwise outline.
+            double alpha = std::atan2(turn * cross2(to, ti), dotP(to, ti));
+            if (alpha < 0.0) alpha += 2.0 * M_PI;
+            const int c = 4 * b + k;
+            S.alpha[c] = alpha;
+            scored[c] = true;
+            holders[2 * eo + endO].push_back(c);
+            holders[2 * ei + endI].push_back(c);
+        }
+    }
+
+    // Joined across an edge only where the edge is neither dS nor an interface
+    // and both its blocks are of one material -- the last because not every
+    // adapter flags an interface edge that borders a gap.
+    UnionFind uf(4 * static_cast<size_t>(nB));
+    std::vector<int> joins(4 * static_cast<size_t>(nB), 0);
+    for (const auto &kv : holders) {
+        const std::vector<int> &cs = kv.second;
+        if (cs.size() != 2) continue;
+        const BlockDecomposition::MacroEdge &me = D.edges[kv.first / 2];
+        if (me.boundary || me.interface) continue;
+        if (D.blocks[cs[0] / 4].material != D.blocks[cs[1] / 4].material) continue;
+        uf.unite(cs[0], cs[1]);
+        ++joins[cs[0]];
+        ++joins[cs[1]];
+    }
+
+    std::unordered_map<int, int> sectorOf;
+    for (int c = 0; c < 4 * nB; ++c) {
+        if (!scored[c]) continue;
+        const int root = uf.find(c);
+        auto it = sectorOf.find(root);
+        if (it == sectorOf.end()) {
+            it = sectorOf.emplace(root, static_cast<int>(S.theta.size())).first;
+            S.theta.push_back(0.0);
+            S.count.push_back(0);
+            S.ring.push_back(true);
+        }
+        const int s = it->second;
+        S.of[c] = s;
+        S.theta[s] += S.alpha[c];
+        ++S.count[s];
+        if (joins[c] < 2) S.ring[s] = false;
+    }
+    // A closed ring is a full turn by topology. Its corners sum to 2 pi anyway
+    // unless a block is folded, and a fold is not a reason to expect a sixth
+    // block at the vertex.
+    for (size_t s = 0; s < S.theta.size(); ++s)
+        if (S.ring[s]) S.theta[s] = 2.0 * M_PI;
+    return S;
 }
 
 } // namespace
@@ -166,6 +355,92 @@ bool BlockDecomposition::interiorPoint(int block, Point &out) const {
     }
     out = (deepest == poly.size()) ? (a + c) * 0.5 : (p + poly[deepest]) * 0.5;
     return true;
+}
+
+bool BlockDecomposition::covers() const {
+    if (blocks.empty()) return false;
+    for (int b = 0; b < static_cast<int>(blocks.size()); ++b) {
+        if (!completeBlock(*this, b)) return false;
+        for (int e : blocks[b].edges)
+            if (!edges[e].boundary && (edges[e].blockA < 0 || edges[e].blockB < 0)) return false;
+    }
+    return true;
+}
+
+double BlockDecomposition::weightedIrregularity() const {
+    if (!covers()) return 1.0;
+    constexpr double kSmooth = 20.0 * M_PI / 180.0;
+    const Sectors S = findSectors(*this);
+    double sum = 0.0;
+    for (size_t s = 0; s < S.theta.size(); ++s) {
+        double theta = S.theta[s];
+        if (!S.ring[s] && std::fabs(theta - M_PI) < kSmooth) theta = M_PI;
+        sum += std::fabs(2.0 * theta / M_PI - S.count[s]);
+    }
+    // Quarter turns per sector, W / (W + N): one quarter turn of defect for
+    // every sector of the layout is 1/2.
+    const double n = static_cast<double>(S.theta.size());
+    return (n > 0.0) ? sum / (sum + n) : 1.0;
+}
+
+double BlockDecomposition::weightedCornerDeviation() const {
+    if (!covers()) return 1.0;
+    const Sectors S = findSectors(*this);
+    double num = 0.0, den = 0.0;
+    for (size_t c = 0; c < S.of.size(); ++c) {
+        const int s = S.of[c];
+        if (s < 0) continue;
+        const double dev = S.alpha[c] - S.theta[s] / S.count[s];
+        const double w = S.area[c / 4];
+        num += w * dev * dev;
+        den += w;
+    }
+    if (!(den > 0.0)) return 1.0;
+    // Over a right angle, the deviation at which a corner has folded flat.
+    return std::min(std::sqrt(num / den) / M_PI_2, 1.0);
+}
+
+double BlockDecomposition::weightedChordSpan() const {
+    if (!covers()) return 1.0;
+    const int nB = static_cast<int>(blocks.size());
+    const int nE = static_cast<int>(edges.size());
+    UnionFind uf(static_cast<size_t>(nE));
+    std::vector<double> blockArea(nB, 0.0);
+    for (int b = 0; b < nB; ++b) {
+        if (!completeBlock(*this, b)) continue;
+        blockArea[b] = std::fabs(signedBlockArea(*this, b));
+        uf.unite(blocks[b].edges[0], blocks[b].edges[2]);
+        uf.unite(blocks[b].edges[1], blocks[b].edges[3]);
+    }
+
+    // A chord's weight is the area it runs through, one block-direction at a
+    // time, so its pair of sides 0/2 and its pair 1/3 each give the block's
+    // area to the chord that crosses them.
+    std::vector<double> area(nE, 0.0);
+    for (int b = 0; b < nB; ++b) {
+        if (!(blockArea[b] > 0.0)) continue;
+        area[uf.find(blocks[b].edges[0])] += blockArea[b];
+        area[uf.find(blocks[b].edges[1])] += blockArea[b];
+    }
+    std::vector<double> shortest(nE, std::numeric_limits<double>::infinity()), longest(nE, 0.0);
+    for (int e = 0; e < nE; ++e) {
+        const int r = uf.find(e);
+        if (!(area[r] > 0.0)) continue;
+        const std::vector<double> s = arcLengths(edges[e].points);
+        shortest[r] = std::min(shortest[r], s.back());
+        longest[r] = std::max(longest[r], s.back());
+    }
+
+    double num = 0.0, den = 0.0;
+    for (int r = 0; r < nE; ++r) {
+        if (!(area[r] > 0.0)) continue;
+        num += area[r] * std::log(longest[r] / shortest[r]);
+        den += area[r];
+    }
+    if (!(den > 0.0)) return 1.0;
+    // 1 - 1/S of the weighted geometric mean S: no free scale, and 1/2 is a
+    // chord whose elements differ in size by a factor of two end to end.
+    return 1.0 - std::exp(-num / den);
 }
 
 bool BlockDecomposition::writeEdgesOBJ(const std::string &path) const {
