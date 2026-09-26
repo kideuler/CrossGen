@@ -338,7 +338,7 @@ const char *kShapeDNADoc =
     "Laplacian on the whole domain (materials ignored), normalised for scale.\n"
     "Keywords are ShapeDNA::Options in snake_case: count=50, degree=3 (P1-P3),\n"
     "refine=1, boundary='dirichlet'|'neumann', normalization='area'|'none'|\n"
-    "'first_eigenvalue'|'weyl_slope', tolerance, eigenfunctions=False, threads,\n"
+    "'first_eigenvalue'|'weyl_slope'|'weyl_ratio', tolerance, eigenfunctions=False, threads,\n"
     "...; crossgen.options('shape_dna') lists them. With report=True, returns\n"
     "(dna, report): the solver's report, the raw spectrum under 'eigenvalues',\n"
     "and with eigenfunctions=True a (count, num_vertices) array under\n"
@@ -502,16 +502,16 @@ PyObject *Blocks_writeBlocksOBJ(PyObject *self, PyObject *args) {
 // leaves no unmatched edge behind, but it does leave area.
 bool fullCoverage(PyObject *self) { return asBlocks(self)->method->coverage() >= 0.999; }
 
-PyObject *Blocks_weightedIrregularity(PyObject *self, PyObject *) {
-    return PyFloat_FromDouble(fullCoverage(self) ? decompOf(self).weightedIrregularity() : 1.0);
+PyObject *Blocks_regularity(PyObject *self, PyObject *) {
+    return PyFloat_FromDouble(fullCoverage(self) ? decompOf(self).regularity() : 0.0);
 }
 
-PyObject *Blocks_weightedCornerDeviation(PyObject *self, PyObject *) {
-    return PyFloat_FromDouble(fullCoverage(self) ? decompOf(self).weightedCornerDeviation() : 1.0);
+PyObject *Blocks_angleQuality(PyObject *self, PyObject *) {
+    return PyFloat_FromDouble(fullCoverage(self) ? decompOf(self).angleQuality() : 0.0);
 }
 
-PyObject *Blocks_weightedChordSpan(PyObject *self, PyObject *) {
-    return PyFloat_FromDouble(fullCoverage(self) ? decompOf(self).weightedChordSpan() : 1.0);
+PyObject *Blocks_chordQuality(PyObject *self, PyObject *) {
+    return PyFloat_FromDouble(fullCoverage(self) ? decompOf(self).chordQuality() : 0.0);
 }
 
 PyMethodDef blocksMethods[] = {
@@ -528,27 +528,28 @@ PyMethodDef blocksMethods[] = {
      "write_obj(path): the macro edges as OBJ polylines."},
     {"write_blocks_obj", Blocks_writeBlocksOBJ, METH_VARARGS,
      "write_blocks_obj(path): each block as a closed OBJ loop."},
-    {"weighted_irregularity", Blocks_weightedIrregularity, METH_NOARGS,
-     "weighted_irregularity() -> float in [0, 1], 0 best\n\n"
+    {"regularity", Blocks_regularity, METH_NOARGS,
+     "regularity() -> float in [0, 1], higher better\n\n"
      "Irregular macrovertices (T2, T4 of docs/block_decomposition_metrics.md),\n"
-     "each weighted by the quarter turns its block count is off by: |4 - d| inside,\n"
-     "|3 - d| on smooth boundary, |2 theta/pi - n| at a corner of angle theta in n\n"
-     "blocks; interfaces act as boundary. Returned as W / (W + sectors), so 1/2 is\n"
-     "one quarter turn per sector. The model's corners force some defect, so\n"
-     "compare methods on one model. 1 below 100% coverage."},
-    {"weighted_corner_deviation", Blocks_weightedCornerDeviation, METH_NOARGS,
-     "weighted_corner_deviation() -> float in [0, 1], 0 best\n\n"
-     "Block corner angles (B1): area-weighted RMS deviation from the even split\n"
-     "of their vertex's sector (2 pi/d inside, theta/n at a corner), over 90\n"
-     "degrees and capped at 1. How evenly the blocks are spread, not what the\n"
+     "each weighted by the quarter turns W its block count is off by: |4 - d|\n"
+     "inside, |3 - d| on smooth boundary, |2 theta/pi - n| at a corner of angle\n"
+     "theta in n blocks; interfaces act as boundary. Returned as N / (N + W) over\n"
+     "N sectors: 1 fully regular, 1/2 at one quarter turn per sector. The model's\n"
+     "corners force some defect, so compare methods on one model. 0 below 100%\n"
+     "coverage."},
+    {"angle_quality", Blocks_angleQuality, METH_NOARGS,
+     "angle_quality() -> float in [0, 1], higher better\n\n"
+     "Block corner angles (B1): 1 - (area-weighted RMS deviation from the even\n"
+     "split of their vertex's sector, 2 pi/d inside, theta/n at a corner) / 90\n"
+     "degrees, floored at 0. How evenly the blocks are spread, not what the\n"
      "valence forces; read on the decomposition as drawn, before smoothing.\n"
-     "1 below 100% coverage."},
-    {"weighted_chord_span", Blocks_weightedChordSpan, METH_NOARGS,
-     "weighted_chord_span() -> float in [0, 1), 0 best\n\n"
-     "Chord span ratio (T5): S = longest over shortest macro edge of each chord,\n"
-     "the element-size ratio its one interval count forces, as a geometric mean\n"
-     "weighted by the area each chord runs through, returned as 1 - 1/S: 0 when\n"
-     "every chord's sides are equal, 1/2 at a factor of two. 1 below 100% coverage."},
+     "0 below 100% coverage."},
+    {"chord_quality", Blocks_chordQuality, METH_NOARGS,
+     "chord_quality() -> float in (0, 1], higher better\n\n"
+     "Chord span (T5): 1/S, S the geometric mean over chords, weighted by the\n"
+     "area each runs through, of longest over shortest macro edge -- the\n"
+     "element-size ratio its one interval count forces. 1 when every chord's\n"
+     "sides are equal, 1/2 at a factor of two. 0 below 100% coverage."},
     {nullptr, nullptr, 0, nullptr},
 };
 

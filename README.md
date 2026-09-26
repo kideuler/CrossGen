@@ -40,6 +40,8 @@ A purely 2D implementation of Cross-fields along with block decomposition
 - [ ] Stalled because we need ALE.
 
 # Direction 3. (ATLAS)
-- [ ] implement docs/square_transport_2d_theory_and_implementation.md
-- [ ] Get general workflow working.
-- [ ] Replace ILP parts with google or-tools
+- [x] implement docs/square_transport_2d_theory_and_implementation.md
+- [x] Get general workflow working.
+- [x] Replace ILP parts with google or-tools
+- [x] Python API for everything
+- [ ] 

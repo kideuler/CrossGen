@@ -1,9 +1,22 @@
 #!/bin/bash
 
+# Options:
+#   --mambo   also mesh the planar faces of every .step/.stp file under
+#             MAMBO_DIR (recursively) with Mesh3Dto2Dfacesgmsh, writing
+#             data/meshes/mambo/<stem>_<face>.obj
+MAMBO=false
+for arg in "$@"; do
+	case "$arg" in
+		--mambo) MAMBO=true ;;
+		*) echo "Unknown option: $arg" >&2; exit 1 ;;
+	esac
+done
+
 source clean.sh
 source build.sh --all
 
 export NP=100
+MAMBO_DIR=$HOME/Documents/mambo
 
 # Geometry lives in per-material-kind subdirectories (singlemat/, multimat/,
 # ...); each one is meshed into the matching subdirectory of data/meshes.
@@ -27,6 +40,31 @@ for geo in "$GEOM_ROOT"/*/*.geo; do
 	}
 done
 shopt -u nullglob
+
+if [ "$MAMBO" = true ]; then
+	EXEC3D="$(pwd)/build/Mesh3Dto2Dfacesgmsh"
+	MAMBO_OUT="$OUT_ROOT/mambo"
+	if [ ! -x "$EXEC3D" ]; then
+		echo "Error: executable not found: $EXEC3D" >&2
+		exit 1
+	fi
+	if [ ! -d "$MAMBO_DIR" ]; then
+		echo "Error: MAMBO_DIR not found: $MAMBO_DIR" >&2
+		exit 1
+	fi
+	mkdir -p "$MAMBO_OUT"
+	# A model can lose faces between runs, so drop the old ones first.
+	rm -f "$MAMBO_OUT"/*.obj
+	while IFS= read -r -d '' step; do
+		stem="$(basename "${step%.*}")"
+		# The output name is a printf format, so escape any literal '%'.
+		fmt="$MAMBO_OUT/${stem//%/%%}_%d.obj"
+		echo "Meshing mambo/$(basename "$step") with NP=$NP"
+		"$EXEC3D" "$step" "$fmt" 0 "$NP" || {
+			echo "Failed to mesh $step" >&2
+		}
+	done < <(find "$MAMBO_DIR" -type f \( -iname '*.step' -o -iname '*.stp' \) -print0 | sort -z)
+fi
 
 echo "All done. Meshes are in $OUT_ROOT"
 cd build

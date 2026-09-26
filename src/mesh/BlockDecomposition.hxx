@@ -133,12 +133,14 @@ public:
     // does not hold. A block with a side that has no polyline is left out of
     // all three, as BlockQuadMesh leaves it unmeshed.
     //
-    // All three are scores in [0, 1]: 0 is the best a layout can do on that
-    // count, and 1 is the worst, which is also what any decomposition that
-    // fails covers() gets. Two of the raw counts have no upper bound, so each
-    // is bent into [0, 1) by a map named below; the maps are monotone, so they
-    // rank exactly as the raw counts do, but a difference near 1 means less
-    // than the same difference near 0.
+    // All three are qualities in [0, 1], higher better: 1 is the best a layout
+    // can do on that count, and 0 the worst, which is also what any
+    // decomposition that fails covers() gets. Two of the raw counts have no
+    // upper bound, so each is bent into (0, 1] by a map named below; the maps
+    // are monotone, so they rank exactly as the raw counts do, but a
+    // difference near 0 means less than the same difference near 1. They are
+    // what a learner is trained to predict (py/build_dataset.py writes them as
+    // they come), hence one direction for all three.
     //
     // Two of them share one notion, the *sector*: at a macrovertex, a run of
     // block corners joined across the macro edges between them, stopping at an
@@ -165,34 +167,34 @@ public:
     // by exemption. A boundary sector within 20 degrees of pi is taken as a
     // smooth point (G3's 160-degree rule), since a polygonal dS turns a little
     // at every vertex and that turning is the mesh's, not the model's.
-    // Returned as W / (W + N), W that sum and N the number of sectors, so it is
-    // the defect per sector and compares across models of different sizes: 0
-    // with no irregular vertex, 1/2 at one quarter turn per sector. 0 is not
-    // reachable on most models -- the model's own corners force some defect
-    // (the quarter disk owes exactly one quarter turn, T3) -- so compare
-    // methods on one model rather than reading it against 0.
-    double weightedIrregularity() const;
+    // Returned as N / (N + W), W that sum and N the number of sectors, so it
+    // reads the defect per sector and compares across models of different
+    // sizes: 1 with no irregular vertex, 1/2 at one quarter turn per sector. 1
+    // is not reachable on most models -- the model's own corners force some
+    // defect (the quarter disk owes exactly one quarter turn, T3) -- so
+    // compare methods on one model rather than reading it against 1.
+    double regularity() const;
 
     // Every block has all four sides, and every side is either on dS or shared
     // with a second block: no gap is left anywhere against a block. The three
-    // metrics return 1, the worst score, when this fails, so that a method which leaves part of the
-    // model out cannot win on what it left out (G2). A decomposition with no
+    // metrics return 0, the worst score, when this fails, so that a method
+    // which leaves part of the model out cannot win on what it left out (G2). A decomposition with no
     // blocks does not cover either.
     bool covers() const;
 
     // B1, area-weighted: the RMS difference between each block
     // corner and the ideal angle of its sector, theta / n. Measuring against
     // theta / n rather than 90 degrees leaves out what the valence forces --
-    // weightedIrregularity() has that -- and keeps only how evenly the method
+    // regularity() has that -- and keeps only how evenly the method
     // spread its blocks round each vertex. Each corner is weighted by its
     // block's area: at one target edge length a block holds elements in
     // proportion to its area, and a corner angle is inherited by the whole of
     // its block's transfinite grid, not by one element, so this is the
-    // deviation an average element sits in. Returned over a right angle and
-    // capped at 1, 90 degrees being where a corner has folded flat or split a
-    // right angle wrongly by all of it: 0 when every vertex splits its sector
-    // evenly.
-    double weightedCornerDeviation() const;
+    // deviation an average element sits in. Returned as 1 - RMS / 90 degrees,
+    // floored at 0, 90 degrees being where a corner has folded flat or split
+    // a right angle wrongly by all of it: 1 when every vertex splits its
+    // sector evenly.
+    double angleQuality() const;
 
     // T5, area-weighted: the span ratio S = (longest macro edge) / (shortest)
     // of each chord -- every macro edge of a chord carries one interval count,
@@ -205,10 +207,10 @@ public:
     // costs almost nothing however large its ratio. Chords are the classes
     // BlockQuadMesh::assignIntervals() builds (side 0 with 2, 1 with 3, over
     // every block), so they are the ones that actually share a count.
-    // Returned as 1 - 1/S of that mean, which needs no chosen scale: 0 when
-    // every chord's sides are equal, 1/2 when elements along a typical chord
-    // differ in size by a factor of two.
-    double weightedChordSpan() const;
+    // Returned as 1/S of that mean, which needs no chosen scale: 1 when every
+    // chord's sides are equal, 1/2 when elements along a typical chord differ
+    // in size by a factor of two.
+    double chordQuality() const;
 
     // The macro edges as OBJ polylines, and the blocks as closed OBJ loops --
     // one pair of writers standing in for what used to be BlockCover::

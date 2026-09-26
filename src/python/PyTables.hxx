@@ -88,6 +88,7 @@ struct EnumNames<shapedna::ShapeDNA::Normalization> {
         {shapedna::ShapeDNA::AreaNormalization, "area"},
         {shapedna::ShapeDNA::FirstEigenvalue, "first_eigenvalue"},
         {shapedna::ShapeDNA::WeylSlope, "weyl_slope"},
+        {shapedna::ShapeDNA::WeylRatio, "weyl_ratio"},
     };
 };
 

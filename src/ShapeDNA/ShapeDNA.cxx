@@ -280,7 +280,8 @@ bool ShapeDNA::run() {
     double normalizer = 1.0;
     switch (options.normalization) {
         case NoNormalization: normalizer = 1.0; break;
-        case AreaNormalization: normalizer = 1.0 / geo.area; break;
+        case AreaNormalization:
+        case WeylRatio: normalizer = 1.0 / geo.area; break;
         case FirstEigenvalue: normalizer = raw.empty() ? 1.0 : raw[0]; break;
         case WeylSlope: {
             double num = 0.0, den = 0.0;
@@ -295,6 +296,8 @@ bool ShapeDNA::run() {
     report.normalizer = normalizer;
     shapeDNA.resize(raw.size());
     for (std::size_t k = 0; k < raw.size(); ++k) shapeDNA[k] = raw[k] / normalizer;
+    if (options.normalization == WeylRatio)
+        for (std::size_t k = 0; k < raw.size(); ++k) shapeDNA[k] /= 4.0 * M_PI * (k + 1.0);
 
     // -- the eigenfunctions, and their residuals on the assembled matrices --
     if (options.eigenfunctions && !vectors.empty()) {

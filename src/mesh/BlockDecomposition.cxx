@@ -95,7 +95,7 @@ double signedBlockArea(const BlockDecomposition &D, int b) {
 // measures the tracing step). The chord to the tenth would lean inward on a
 // bending side by half the angle the side turns in that tenth -- 2.25 degrees
 // on a 45-degree arc, enough to leave the quarter disk's three right-angled
-// corners scoring 1.05 in weightedIrregularity() where the answer is exactly 1.
+// corners owing 1.05 quarter turns in regularity()'s count where it is exactly 1.
 // So the tangent is the linear term of the least-squares quadratic
 // p0 + t s + c s^2 through the points of that tenth -- the polyline's own, and
 // two resampled at 1/20 and 1/10 so that a side of few points still has two --
@@ -367,8 +367,8 @@ bool BlockDecomposition::covers() const {
     return true;
 }
 
-double BlockDecomposition::weightedIrregularity() const {
-    if (!covers()) return 1.0;
+double BlockDecomposition::regularity() const {
+    if (!covers()) return 0.0;
     constexpr double kSmooth = 20.0 * M_PI / 180.0;
     const Sectors S = findSectors(*this);
     double sum = 0.0;
@@ -377,14 +377,14 @@ double BlockDecomposition::weightedIrregularity() const {
         if (!S.ring[s] && std::fabs(theta - M_PI) < kSmooth) theta = M_PI;
         sum += std::fabs(2.0 * theta / M_PI - S.count[s]);
     }
-    // Quarter turns per sector, W / (W + N): one quarter turn of defect for
-    // every sector of the layout is 1/2.
+    // N / (N + W): one quarter turn of defect for every sector of the layout
+    // is 1/2.
     const double n = static_cast<double>(S.theta.size());
-    return (n > 0.0) ? sum / (sum + n) : 1.0;
+    return (n > 0.0) ? n / (n + sum) : 0.0;
 }
 
-double BlockDecomposition::weightedCornerDeviation() const {
-    if (!covers()) return 1.0;
+double BlockDecomposition::angleQuality() const {
+    if (!covers()) return 0.0;
     const Sectors S = findSectors(*this);
     double num = 0.0, den = 0.0;
     for (size_t c = 0; c < S.of.size(); ++c) {
@@ -395,13 +395,13 @@ double BlockDecomposition::weightedCornerDeviation() const {
         num += w * dev * dev;
         den += w;
     }
-    if (!(den > 0.0)) return 1.0;
-    // Over a right angle, the deviation at which a corner has folded flat.
-    return std::min(std::sqrt(num / den) / M_PI_2, 1.0);
+    if (!(den > 0.0)) return 0.0;
+    // Against a right angle, the deviation at which a corner has folded flat.
+    return std::max(1.0 - std::sqrt(num / den) / M_PI_2, 0.0);
 }
 
-double BlockDecomposition::weightedChordSpan() const {
-    if (!covers()) return 1.0;
+double BlockDecomposition::chordQuality() const {
+    if (!covers()) return 0.0;
     const int nB = static_cast<int>(blocks.size());
     const int nE = static_cast<int>(edges.size());
     UnionFind uf(static_cast<size_t>(nE));
@@ -437,10 +437,10 @@ double BlockDecomposition::weightedChordSpan() const {
         num += area[r] * std::log(longest[r] / shortest[r]);
         den += area[r];
     }
-    if (!(den > 0.0)) return 1.0;
-    // 1 - 1/S of the weighted geometric mean S: no free scale, and 1/2 is a
-    // chord whose elements differ in size by a factor of two end to end.
-    return 1.0 - std::exp(-num / den);
+    if (!(den > 0.0)) return 0.0;
+    // 1/S of the weighted geometric mean S: no free scale, and 1/2 is a chord
+    // whose elements differ in size by a factor of two end to end.
+    return std::exp(-num / den);
 }
 
 bool BlockDecomposition::writeEdgesOBJ(const std::string &path) const {

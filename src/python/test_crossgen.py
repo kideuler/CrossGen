@@ -6,8 +6,8 @@ On the one model given, every Mesh method is taken through the whole chain --
 a block decomposition, a quad mesh on it at h = 0.05, a few TMOP sweeps -- and
 what is asserted is structural: the blocks exist and index what they claim to,
 the mesh has elements and no fold after smoothing, and the arrays have the
-shapes and types the docstrings promise, and the three weighted
-decomposition metrics are in range. The Shape-DNA is checked against
+shapes and types the docstrings promise, and the three decomposition
+qualities are in range. The Shape-DNA is checked against
 itself (ascending, positive, and the same through a Mesh rebuilt from the
 arrays), and the keyword errors are checked for being errors. How good a layout
 is, is not asserted here: that is the drivers' business, and their ctests'.
@@ -62,6 +62,9 @@ def main(path):
     e2, rep = m2.shape_dna(count=12, degree=2, report=True)
     check(np.allclose(e, e2, rtol=1e-9), "the same DNA from the rebuilt mesh")
     check(rep["converged"] and len(rep["eigenvalues"]) >= 12, "shape_dna report")
+    w = m.shape_dna(count=12, degree=2, normalization="weyl_ratio")
+    check(np.allclose(w, e / (4 * np.pi * np.arange(1, 13)), rtol=1e-12),
+          f"weyl_ratio is the area-normalised DNA over 4 pi k: {w[0]:.4f} ... {w[-1]:.4f}")
 
     # ---- options and their errors ---------------------------------------------
     for name in crossgen.methods:
@@ -86,12 +89,12 @@ def main(path):
         check(b.block_edges.max() < len(b.edges), f"{name}: sides index macro edges")
         check(0.0 < b.coverage <= 1.0 + 1e-9, f"{name}: coverage {b.coverage:.3f}")
         check(isinstance(b.report, dict) and isinstance(b.options, dict), f"{name}: report and options")
-        # Scores in [0, 1], 0 best. geom001 is a quarter disk: its three right
-        # angles leave any quad layout one quarter turn short, so irregularity
-        # cannot be 0 there.
-        irr, dev, span = b.weighted_irregularity(), b.weighted_corner_deviation(), b.weighted_chord_span()
-        check(0.0 < irr < 1.0 and 0.0 <= dev < 1.0 and 0.0 <= span < 1.0,
-              f"{name}: weighted irregularity {irr:.3f}, corner deviation {dev:.3f}, chord span {span:.3f}")
+        # Qualities in [0, 1], higher better. geom001 is a quarter disk: its
+        # three right angles leave any quad layout one quarter turn short, so
+        # regularity cannot be 1 there.
+        reg, ang, cho = b.regularity(), b.angle_quality(), b.chord_quality()
+        check(0.0 < reg < 1.0 and 0.0 < ang <= 1.0 and 0.0 < cho <= 1.0,
+              f"{name}: regularity {reg:.3f}, angle quality {ang:.3f}, chord quality {cho:.3f}")
 
         q = b.mesh(0.05)
         print(f"  {q}")

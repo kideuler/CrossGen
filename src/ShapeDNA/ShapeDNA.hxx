@@ -62,7 +62,17 @@ public:
         FirstEigenvalue = 2,
         // lambda / c, c the least-squares slope of lambda_k ~ c k over the DNA
         // (Weyl's law: c -> 4 pi / |Omega| as k grows).
-        WeylSlope = 3
+        WeylSlope = 3,
+        // lambda_k |Omega| / (4 pi k): the area-normalised DNA over Weyl's
+        // leading term, k counted from 1 over the DNA (zero modes left out).
+        // Scale-free like AreaNormalization, but with the linear trend of
+        // Weyl's law divided out, so every entry sits near 1 and what differs
+        // between shapes is what the leading term does not know -- the
+        // boundary term, ~ |dS| / sqrt(|Omega| k) under Dirichlet, and below
+        // it. Without it the n-th entry is ~n times the first on every shape,
+        // and a learner reading the DNA as features mostly learns the index.
+        // Report::normalizer is 1 / |Omega| here; the 4 pi k is per entry.
+        WeylRatio = 4
     };
 
     struct Options {
@@ -134,7 +144,7 @@ public:
         // With Options::eigenfunctions, the largest || A x - lambda B x || /
         // (lambda || B x ||) measured on the assembled matrices directly.
         double maxTrueResidual = 0.0;
-        double normalizer = 1.0;        // DNA = raw / normalizer
+        double normalizer = 1.0;        // DNA = raw / normalizer (WeylRatio: also / (4 pi k))
 
         int threads = 1;
         bool openMP = false;

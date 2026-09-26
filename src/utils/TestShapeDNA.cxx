@@ -13,7 +13,7 @@
 //   --degree p         Lagrange degree, 1-3 (3)
 //   --refine r         split every edge into r parts first (1)
 //   --neumann          Neumann instead of Dirichlet boundary conditions
-//   --norm area|first|weyl|none   scale normalisation (area)
+//   --norm area|first|weyl|weyl-ratio|none   scale normalisation (area)
 //   --threads k        OpenMP threads (runtime default)
 //   --block b          Lanczos block size (4)
 //   --basis m          Lanczos basis size (2 nev + 2 b)
@@ -727,9 +727,10 @@ int main(int argc, char **argv) {
             if (n == "area") opts.normalization = ShapeDNA::AreaNormalization;
             else if (n == "first") opts.normalization = ShapeDNA::FirstEigenvalue;
             else if (n == "weyl") opts.normalization = ShapeDNA::WeylSlope;
+            else if (n == "weyl-ratio") opts.normalization = ShapeDNA::WeylRatio;
             else if (n == "none") opts.normalization = ShapeDNA::NoNormalization;
             else {
-                std::cerr << "unknown normalisation " << n << " (area|first|weyl|none)\n";
+                std::cerr << "unknown normalisation " << n << " (area|first|weyl|weyl-ratio|none)\n";
                 return 2;
             }
         } else if (!a.empty() && a[0] == '-') {
@@ -742,7 +743,8 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    const char *normName[] = {"raw", "area-normalised", "divided by the first", "divided by the Weyl slope"};
+    const char *normName[] = {"raw", "area-normalised", "divided by the first", "divided by the Weyl slope",
+                              "area-normalised over 4 pi k"};
     std::vector<std::vector<double>> dnas;
     std::vector<std::string> names;
     int failures = 0;
