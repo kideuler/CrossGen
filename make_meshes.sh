@@ -3,7 +3,10 @@
 # Options:
 #   --mambo   also mesh the planar faces of every .step/.stp file under
 #             MAMBO_DIR (recursively) with Mesh3Dto2Dfacesgmsh, writing
-#             data/meshes/mambo/<stem>_<face>.obj
+#             data/meshes/mambo/<stem>_<face>.obj -- only the nice faces, and
+#             each shape once across all the files: data/meshes/mambo/
+#             shapes.txt is the registry the runs share (see the header of
+#             src/utils/Mesh3Dto2Dfacesgmsh.cxx).
 MAMBO=false
 for arg in "$@"; do
 	case "$arg" in
@@ -53,14 +56,17 @@ if [ "$MAMBO" = true ]; then
 		exit 1
 	fi
 	mkdir -p "$MAMBO_OUT"
-	# A model can lose faces between runs, so drop the old ones first.
-	rm -f "$MAMBO_OUT"/*.obj
+	# A model can lose faces between runs, and the registry of shapes already
+	# written decides which faces are new, so drop both first.
+	rm -f "$MAMBO_OUT"/*.obj "$MAMBO_OUT/shapes.txt"
 	while IFS= read -r -d '' step; do
 		stem="$(basename "${step%.*}")"
-		# The output name is a printf format, so escape any literal '%'.
-		fmt="$MAMBO_OUT/${stem//%/%%}_%d.obj"
+		# The output name is a printf format, so escape any literal '%'. The
+		# backslash matters: zsh reads an unescaped leading % in the pattern
+		# as "at the end", which appended %% to every name (B0%_2.obj).
+		fmt="$MAMBO_OUT/${stem//\%/%%}_%d.obj"
 		echo "Meshing mambo/$(basename "$step") with NP=$NP"
-		"$EXEC3D" "$step" "$fmt" 0 "$NP" || {
+		"$EXEC3D" "$step" "$fmt" 0 "$NP" --registry "$MAMBO_OUT/shapes.txt" || {
 			echo "Failed to mesh $step" >&2
 		}
 	done < <(find "$MAMBO_DIR" -type f \( -iname '*.step' -o -iname '*.stp' \) -print0 | sort -z)

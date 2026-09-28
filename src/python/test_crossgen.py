@@ -6,11 +6,13 @@ On the one model given, every Mesh method is taken through the whole chain --
 a block decomposition, a quad mesh on it at h = 0.05, a few TMOP sweeps -- and
 what is asserted is structural: the blocks exist and index what they claim to,
 the mesh has elements and no fold after smoothing, and the arrays have the
-shapes and types the docstrings promise, and the three decomposition
-qualities are in range. The Shape-DNA is checked against
+shapes and types the docstrings promise, every layout is valid and its three
+decomposition qualities are in range. The Shape-DNA is checked against
 itself (ascending, positive, and the same through a Mesh rebuilt from the
-arrays), and the keyword errors are checked for being errors. How good a layout
-is, is not asserted here: that is the drivers' business, and their ctests'.
+arrays), the boundary features against what a quarter disk owes and against a
+mirrored copy, and the keyword errors are checked for being errors. How good a
+layout is, is not asserted here: that is the drivers' business, and their
+ctests'.
 """
 import sys
 import time
@@ -66,6 +68,19 @@ def main(path):
     check(np.allclose(w, e / (4 * np.pi * np.arange(1, 13)), rtol=1e-12),
           f"weyl_ratio is the area-normalised DNA over 4 pi k: {w[0]:.4f} ... {w[-1]:.4f}")
 
+    # ---- boundary features ----------------------------------------------------
+    # geom001 is a quarter disk: three right angles, no hole, and T3 leaves any
+    # quad layout of it one quarter turn short.
+    f, rep = m.boundary_features(report=True)
+    check(f["corners"] == 3 and f["corners_one_block"] == 3 and f["holes"] == 0,
+          f"boundary_features: {f['corners']} right angles, {f['holes']} holes")
+    check(abs(f["minimum_defect"] - 1.0) < 0.05, f"minimum_defect {f['minimum_defect']:.3f}: one quarter turn")
+    check(rep["corners"].shape == (3, 2) and len(rep["loops"]) == 1, "boundary_features report")
+    mirrored = crossgen.Mesh(V * np.array([-1.0, 1.0]), T, M).boundary_features()
+    check(all(np.isclose(mirrored[k], f[k], rtol=1e-9, atol=1e-12) for k in f),
+          "the same features from a mirrored copy")
+    expect(TypeError, lambda: m.boundary_features(corner_angel=10.0), "a misspelt boundary_features keyword")
+
     # ---- options and their errors ---------------------------------------------
     for name in crossgen.methods:
         for stage in ("method", "mesh", "smooth"):
@@ -89,11 +104,12 @@ def main(path):
         check(b.block_edges.max() < len(b.edges), f"{name}: sides index macro edges")
         check(0.0 < b.coverage <= 1.0 + 1e-9, f"{name}: coverage {b.coverage:.3f}")
         check(isinstance(b.report, dict) and isinstance(b.options, dict), f"{name}: report and options")
-        # Qualities in [0, 1], higher better. geom001 is a quarter disk: its
-        # three right angles leave any quad layout one quarter turn short, so
-        # regularity cannot be 1 there.
+        # Qualities in (0, 1], higher better, on a valid layout (NaN on one
+        # that is not). regularity is measured against the quarter turn the
+        # quarter disk owes, so a layout that owes no more reaches 1.
+        check(b.valid, f"{name}: a valid decomposition")
         reg, ang, cho = b.regularity(), b.angle_quality(), b.chord_quality()
-        check(0.0 < reg < 1.0 and 0.0 < ang <= 1.0 and 0.0 < cho <= 1.0,
+        check(0.0 < reg <= 1.0 and 0.0 < ang <= 1.0 and 0.0 < cho <= 1.0,
               f"{name}: regularity {reg:.3f}, angle quality {ang:.3f}, chord quality {cho:.3f}")
 
         q = b.mesh(0.05)

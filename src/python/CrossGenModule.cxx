@@ -6,6 +6,7 @@
 //     q = b.mesh(0.05)                 # quad mesh at a target edge length
 //     q.smooth(1000)                   # TMOP, in place
 //     e = m.shape_dna(count=50)        # numpy array of normalised eigenvalues
+//     f = m.boundary_features()        # corners, holes, T3's bound, as a dict
 //
 // Three types, each a thin handle on C++ objects the rest of the codebase
 // already has:
@@ -31,12 +32,14 @@
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <new>
 #include <set>
 #include <stdexcept>
 #include <string>
 
 #include "ShapeDNA/ShapeDNA.hxx"
+#include "mesh/BoundaryFeatures.hxx"
 #include "mesh/Mesh.hxx"
 
 namespace pycg {
@@ -56,11 +59,16 @@ PyCFunction asCFunction(F f) {
 struct MeshObject {
     PyObject_HEAD
     std::shared_ptr<const Mesh> mesh;
+    // BoundaryFeatures at the default options, made on first use: what every
+    // BlockDecomposition of this mesh grades its regularity against.
+    std::shared_ptr<const BoundaryFeatures> features;
 };
 
 struct BlocksObject {
     PyObject_HEAD
     std::shared_ptr<const Method> method;
+    // The model's, from the Mesh it was made from (regularity() reads them).
+    std::shared_ptr<const BoundaryFeatures> features;
 };
 
 struct QuadMeshObject {
@@ -125,12 +133,27 @@ PyObject *newMesh(std::shared_ptr<const Mesh> m) {
     PyObject *o = MeshType.tp_alloc(&MeshType, 0);
     if (!o) return nullptr;
     new (&asMesh(o)->mesh) std::shared_ptr<const Mesh>(std::move(m));
+    new (&asMesh(o)->features) std::shared_ptr<const BoundaryFeatures>();
     return o;
 }
 
 void Mesh_dealloc(PyObject *self) {
+    asMesh(self)->features.~shared_ptr();
     asMesh(self)->mesh.~shared_ptr();
     Py_TYPE(self)->tp_free(self);
+}
+
+// The mesh's BoundaryFeatures at the default options, made once. Null with an
+// exception set if they could not be.
+std::shared_ptr<const BoundaryFeatures> defaultFeatures(PyObject *self) {
+    MeshObject *m = asMesh(self);
+    if (!m->features) {
+        const std::shared_ptr<const Mesh> model = m->mesh;
+        std::shared_ptr<const BoundaryFeatures> f;
+        if (!compute([&] { f = std::make_shared<const BoundaryFeatures>(*model); })) return nullptr;
+        m->features = std::move(f);
+    }
+    return m->features;
 }
 
 // Mesh(vertices, triangles, materials=None)
@@ -177,6 +200,7 @@ PyObject *Mesh_new(PyTypeObject *type, PyObject *args, PyObject *kwargs) {
     PyObject *o = type->tp_alloc(type, 0);
     if (!o) return nullptr;
     new (&asMesh(o)->mesh) std::shared_ptr<const Mesh>(std::move(m));
+    new (&asMesh(o)->features) std::shared_ptr<const BoundaryFeatures>();
     return o;
 }
 
@@ -219,10 +243,11 @@ PyGetSetDef meshGetSet[] = {
     {nullptr, nullptr, nullptr, nullptr, nullptr},
 };
 
-PyObject *newBlocks(std::shared_ptr<const Method> method) {
+PyObject *newBlocks(std::shared_ptr<const Method> method, std::shared_ptr<const BoundaryFeatures> features) {
     PyObject *o = BlocksType.tp_alloc(&BlocksType, 0);
     if (!o) return nullptr;
     new (&asBlocks(o)->method) std::shared_ptr<const Method>(std::move(method));
+    new (&asBlocks(o)->features) std::shared_ptr<const BoundaryFeatures>(std::move(features));
     return o;
 }
 
@@ -235,9 +260,11 @@ PyObject *Mesh_runMethod(PyObject *self, PyObject *args, PyObject *kwargs) {
     }
     // Held for the call, so the mesh outlives the run whatever else lets go of it.
     const std::shared_ptr<const Mesh> model = asMesh(self)->mesh;
+    std::shared_ptr<const BoundaryFeatures> features = defaultFeatures(self);
+    if (!features) return nullptr;
     std::shared_ptr<Method> m = S->run(*model, kwargs);
     if (!m) return nullptr;
-    PyObject *b = newBlocks(m);
+    PyObject *b = newBlocks(m, std::move(features));
     if (b && m->decomposition().blocks.empty()) {
         if (PyErr_WarnFormat(PyExc_RuntimeWarning, 1,
                              "%s produced no blocks; BlockDecomposition.report['messages'] says why",
@@ -344,13 +371,104 @@ const char *kShapeDNADoc =
     "and with eigenfunctions=True a (count, num_vertices) array under\n"
     "'eigenfunctions'.";
 
-// Filled in readyTypes(): the five methods, shape_dna, the sentinel.
-PyMethodDef meshMethods[kNumMethods + 2];
+// Mesh.boundary_features(report=False, **options)
+PyObject *Mesh_boundaryFeatures(PyObject *self, PyObject *args, PyObject *kwargs) {
+    if (PyTuple_GET_SIZE(args) != 0) {
+        PyErr_SetString(PyExc_TypeError, "boundary_features() takes keyword arguments only");
+        return nullptr;
+    }
+    PyObject *wantReport = nullptr;
+    bool ok = true;
+    PyObject *rest = popKeyword(kwargs, "report", &wantReport, ok);
+    if (!ok) return nullptr;
+    bool full = false;
+    if (wantReport && fromPy(wantReport, full) < 0) {
+        Py_XDECREF(rest);
+        return nullptr;
+    }
+    BoundaryFeatures::Options opts;
+    const int rc = applyKwargs(rest, "boundary_features", {target(boundaryFeaturesOptionsTable(), opts)});
+    Py_XDECREF(rest);
+    if (rc < 0) return nullptr;
+
+    // The default options are the ones regularity() grades against, and are
+    // made once per mesh; any others are made for this call.
+    const BoundaryFeatures::Options defaults;
+    std::shared_ptr<const BoundaryFeatures> f;
+    if (opts.cornerAngle == defaults.cornerAngle && opts.curvedAngle == defaults.curvedAngle) {
+        f = defaultFeatures(self);
+        if (!f) return nullptr;
+    } else {
+        const std::shared_ptr<const Mesh> model = asMesh(self)->mesh;
+        if (!compute([&] { f = std::make_shared<const BoundaryFeatures>(*model, opts); })) return nullptr;
+    }
+
+    PyObject *summary = toDict({source(boundaryFeaturesSummaryTable(), f->summary())});
+    if (!summary || !full) return summary;
+
+    std::vector<Point> at;
+    std::vector<double> angle;
+    std::vector<int> blocks, vertex, region;
+    for (const BoundaryFeatures::Corner &c : f->corners()) {
+        at.push_back(c.p);
+        angle.push_back(c.angle * 180.0 / M_PI);
+        blocks.push_back(c.blocks);
+        vertex.push_back(c.vertex);
+        region.push_back(c.region);
+    }
+    PyObject *rep = PyDict_New();
+    PyObject *loops = rep ? PyList_New(static_cast<Py_ssize_t>(f->loops().size())) : nullptr;
+    bool built = loops != nullptr;
+    for (size_t l = 0; built && l < f->loops().size(); ++l) {
+        PyObject *a = indexArray(f->loops()[l].vertices);
+        if (!a) built = false;
+        else PyList_SET_ITEM(loops, static_cast<Py_ssize_t>(l), a);
+    }
+    const std::pair<const char *, PyObject *> items[] = {
+        {"corners", built ? pointArray(at) : nullptr},
+        {"corner_angles", built ? doubleArray(angle) : nullptr},
+        {"corner_blocks", built ? indexArray(blocks) : nullptr},
+        {"corner_vertices", built ? indexArray(vertex) : nullptr},
+        {"corner_regions", built ? indexArray(region) : nullptr},
+        {"loops", loops},
+    };
+    for (const auto &kv : items) {
+        built = built && kv.second && PyDict_SetItemString(rep, kv.first, kv.second) == 0;
+        Py_XDECREF(kv.second);
+    }
+    if (!built) {
+        Py_DECREF(summary);
+        Py_XDECREF(rep);
+        return nullptr;
+    }
+    PyObject *pair = PyTuple_Pack(2, summary, rep);
+    Py_DECREF(summary);
+    Py_DECREF(rep);
+    return pair;
+}
+
+const char *kBoundaryFeaturesDoc =
+    "boundary_features(report=False, **options) -> dict\n\n"
+    "What a quad layout of this mesh owes to its boundary (mesh::BoundaryFeatures):\n"
+    "corners (a boundary vertex turning by more than corner_angle=20 degrees), by\n"
+    "their ideal block count k = round(2 theta/pi); holes and the Euler\n"
+    "characteristic; corner_defect, the quarter turns the corners owe on their own;\n"
+    "singularity_bound, T3's interior singularities at the ideal corner split; and\n"
+    "minimum_defect, the fewest quarter turns any conforming quad layout can have,\n"
+    "which BlockDecomposition.regularity() grades against. Also the isoperimetric\n"
+    "ratio, the bent share of the boundary and the shortest corner-to-corner run\n"
+    "over sqrt(area). Material regions count separately, interfaces as boundary.\n"
+    "With report=True, returns (summary, report): each corner's position, angle in\n"
+    "degrees, k, vertex and region, and each boundary loop's vertices.";
+
+// Filled in readyTypes(): the five methods, shape_dna, boundary_features, the sentinel.
+PyMethodDef meshMethods[kNumMethods + 3];
 
 // ===========================================================================
 // BlockDecomposition
 // ===========================================================================
 void Blocks_dealloc(PyObject *self) {
+    asBlocks(self)->features.~shared_ptr();
     asBlocks(self)->method.~shared_ptr();
     Py_TYPE(self)->tp_free(self);
 }
@@ -414,11 +532,25 @@ PyObject *Blocks_edgeVertices(PyObject *self, void *) {
 PyObject *Blocks_report(PyObject *self, void *) { return asBlocks(self)->method->report(); }
 PyObject *Blocks_options(PyObject *self, void *) { return asBlocks(self)->method->options(); }
 
+// A decomposition of the model, by both tests: covers() -- every side on dS or
+// shared -- and the area check, since a region with no block on any side of
+// it leaves no unmatched side behind, but does leave area.
+bool isValid(PyObject *self) {
+    return asBlocks(self)->method->coverage() >= 0.999 && decompOf(self).covers();
+}
+
+PyObject *Blocks_valid(PyObject *self, void *) { return PyBool_FromLong(isValid(self) ? 1 : 0); }
+
 PyGetSetDef blocksGetSet[] = {
     {"method", Blocks_method, nullptr, "The method that made it: 'zipline', 'umber', ...", nullptr},
     {"num_blocks", Blocks_numBlocks, nullptr, "Number of blocks.", nullptr},
     {"coverage", Blocks_coverage, nullptr,
      "Fraction of the model's area inside a block, by the method's own account.", nullptr},
+    {"valid", Blocks_valid, nullptr,
+     "True when the blocks are a decomposition of the model: every side on the\n"
+     "boundary or shared by two blocks, and coverage at least 99.9%. The three\n"
+     "qualities are NaN when it is False.",
+     nullptr},
     {"vertices", Blocks_vertices, nullptr, "(k, 2) array of macrovertex positions.", nullptr},
     {"blocks", Blocks_blocks, nullptr,
      "(b, 4) array: each block's corners (macrovertex indices), in cyclic order.", nullptr},
@@ -498,20 +630,22 @@ PyObject *Blocks_writeBlocksOBJ(PyObject *self, PyObject *args) {
     return writeResult(decompOf(self).writeBlocksOBJ(path), path);
 }
 
-// The area check as well as covers(): a region with no block on any side of it
-// leaves no unmatched edge behind, but it does leave area.
-bool fullCoverage(PyObject *self) { return asBlocks(self)->method->coverage() >= 0.999; }
+// NaN, not 0, for blocks that are no decomposition of the model: whether a
+// method produced one is `valid`'s question, and a score of 0 would answer it
+// a second time in every quality column.
+constexpr double kNotValid = std::numeric_limits<double>::quiet_NaN();
 
 PyObject *Blocks_regularity(PyObject *self, PyObject *) {
-    return PyFloat_FromDouble(fullCoverage(self) ? decompOf(self).regularity() : 0.0);
+    const BlocksObject *b = asBlocks(self);
+    return PyFloat_FromDouble(isValid(self) ? b->method->decomposition().regularity(*b->features) : kNotValid);
 }
 
 PyObject *Blocks_angleQuality(PyObject *self, PyObject *) {
-    return PyFloat_FromDouble(fullCoverage(self) ? decompOf(self).angleQuality() : 0.0);
+    return PyFloat_FromDouble(isValid(self) ? decompOf(self).angleQuality() : kNotValid);
 }
 
 PyObject *Blocks_chordQuality(PyObject *self, PyObject *) {
-    return PyFloat_FromDouble(fullCoverage(self) ? decompOf(self).chordQuality() : 0.0);
+    return PyFloat_FromDouble(isValid(self) ? decompOf(self).chordQuality() : kNotValid);
 }
 
 PyMethodDef blocksMethods[] = {
@@ -529,27 +663,28 @@ PyMethodDef blocksMethods[] = {
     {"write_blocks_obj", Blocks_writeBlocksOBJ, METH_VARARGS,
      "write_blocks_obj(path): each block as a closed OBJ loop."},
     {"regularity", Blocks_regularity, METH_NOARGS,
-     "regularity() -> float in [0, 1], higher better\n\n"
+     "regularity() -> float in (0, 1], higher better; NaN when not valid\n\n"
      "Irregular macrovertices (T2, T4 of docs/block_decomposition_metrics.md),\n"
-     "each weighted by the quarter turns W its block count is off by: |4 - d|\n"
+     "each weighted by the quarter turns its block count is off by: |4 - d|\n"
      "inside, |3 - d| on smooth boundary, |2 theta/pi - n| at a corner of angle\n"
-     "theta in n blocks; interfaces act as boundary. Returned as N / (N + W) over\n"
-     "N sectors: 1 fully regular, 1/2 at one quarter turn per sector. The model's\n"
-     "corners force some defect, so compare methods on one model. 0 below 100%\n"
-     "coverage."},
+     "theta in n blocks, and |2 theta/pi - 2| at a model corner no macrovertex\n"
+     "sits on; interfaces act as boundary. W is the sum, and the result\n"
+     "(1 + W_min) / (1 + W), W_min being the fewest quarter turns any layout of\n"
+     "this model can have (Mesh.boundary_features()['minimum_defect']): 1 for a\n"
+     "layout as regular as the model allows."},
     {"angle_quality", Blocks_angleQuality, METH_NOARGS,
-     "angle_quality() -> float in [0, 1], higher better\n\n"
+     "angle_quality() -> float in [0, 1], higher better; NaN when not valid\n\n"
      "Block corner angles (B1): 1 - (area-weighted RMS deviation from the even\n"
      "split of their vertex's sector, 2 pi/d inside, theta/n at a corner) / 90\n"
      "degrees, floored at 0. How evenly the blocks are spread, not what the\n"
-     "valence forces; read on the decomposition as drawn, before smoothing.\n"
-     "0 below 100% coverage."},
+     "valence forces; read on the decomposition as drawn, before smoothing,\n"
+     "which moves it -- a diagnostic of the method (B4), not a ranking score."},
     {"chord_quality", Blocks_chordQuality, METH_NOARGS,
-     "chord_quality() -> float in (0, 1], higher better\n\n"
+     "chord_quality() -> float in (0, 1], higher better; NaN when not valid\n\n"
      "Chord span (T5): 1/S, S the geometric mean over chords, weighted by the\n"
      "area each runs through, of longest over shortest macro edge -- the\n"
      "element-size ratio its one interval count forces. 1 when every chord's\n"
-     "sides are equal, 1/2 at a factor of two. 0 below 100% coverage."},
+     "sides are equal, 1/2 at a factor of two."},
     {nullptr, nullptr, 0, nullptr},
 };
 
@@ -750,18 +885,19 @@ PyObject *crossgen_options(PyObject *, PyObject *args, PyObject *kwargs) {
                                      &stage))
         return nullptr;
     const std::string n(name), s(stage);
-    if (n == "shape_dna") {
+    if (n == "shape_dna" || n == "boundary_features") {
         if (s != "method") {
-            PyErr_SetString(PyExc_ValueError, "crossgen.options(): 'shape_dna' has only the stage 'method'");
+            PyErr_Format(PyExc_ValueError, "crossgen.options(): '%s' has only the stage 'method'", name);
             return nullptr;
         }
-        return toDict({source(shapeDNAOptionsTable(), shapedna::ShapeDNA::Options())});
+        if (n == "shape_dna") return toDict({source(shapeDNAOptionsTable(), shapedna::ShapeDNA::Options())});
+        return toDict({source(boundaryFeaturesOptionsTable(), BoundaryFeatures::Options())});
     }
     for (const MeshMethod &mm : kMethods)
         if (n == mm.spec->name) return mm.spec->defaults(s);
     PyErr_Format(PyExc_ValueError,
-                 "crossgen.options(): unknown method '%s' (expected one of crossgen.methods, or "
-                 "'shape_dna')",
+                 "crossgen.options(): unknown method '%s' (expected one of crossgen.methods, "
+                 "'shape_dna' or 'boundary_features')",
                  name);
     return nullptr;
 }
@@ -774,8 +910,9 @@ PyMethodDef moduleMethods[] = {
     {"options", asCFunction(crossgen_options), METH_VARARGS | METH_KEYWORDS,
      "options(method, stage='method') -> dict\n\n"
      "The keywords a stage takes, with their defaults. method is one of\n"
-     "crossgen.methods or 'shape_dna'; stage is 'method' (Mesh.<method>()),\n"
-     "'mesh' (BlockDecomposition.mesh()) or 'smooth' (QuadMesh.smooth())."},
+     "crossgen.methods, 'shape_dna' or 'boundary_features'; stage is 'method'\n"
+     "(Mesh.<method>()), 'mesh' (BlockDecomposition.mesh()) or 'smooth'\n"
+     "(QuadMesh.smooth())."},
     {nullptr, nullptr, 0, nullptr},
 };
 
@@ -787,7 +924,8 @@ const char *kModuleDoc =
     "    b = m.meridian()          # zipline, umber, meridian, torsion or atlas\n"
     "    q = b.mesh(0.05)          # quad mesh at a target edge length\n"
     "    q.smooth(1000)            # TMOP, in place\n"
-    "    e = m.shape_dna()         # numpy array of the Shape-DNA\n\n"
+    "    e = m.shape_dna()         # numpy array of the Shape-DNA\n"
+    "    f = m.boundary_features() # corners, holes, T3's bound, as a dict\n\n"
     "Every option is a keyword with the C++ default; crossgen.options(method,\n"
     "stage) lists them. Calls release the GIL but run one at a time; use\n"
     "processes to run several models in parallel.";
@@ -818,6 +956,8 @@ int readyTypes() {
                             mm.spec->doc};
     meshMethods[k++] = {"shape_dna", asCFunction(Mesh_shapeDNA), METH_VARARGS | METH_KEYWORDS,
                         kShapeDNADoc};
+    meshMethods[k++] = {"boundary_features", asCFunction(Mesh_boundaryFeatures),
+                        METH_VARARGS | METH_KEYWORDS, kBoundaryFeaturesDoc};
     meshMethods[k] = {nullptr, nullptr, 0, nullptr};
     MeshType.tp_methods = meshMethods;
 

@@ -1,5 +1,7 @@
 #include "mesh/BlockDecomposition.hxx"
 
+#include "mesh/BoundaryFeatures.hxx"
+
 #include <algorithm>
 #include <cmath>
 #include <fstream>
@@ -367,24 +369,39 @@ bool BlockDecomposition::covers() const {
     return true;
 }
 
-double BlockDecomposition::regularity() const {
-    if (!covers()) return 0.0;
-    constexpr double kSmooth = 20.0 * M_PI / 180.0;
+double BlockDecomposition::regularity(const BoundaryFeatures &model) const {
+    if (!covers()) return std::numeric_limits<double>::quiet_NaN();
+    // The smooth band is the model's corner rule, so that a boundary point is
+    // a corner to the layout exactly when it is one to minimumDefect().
+    const double smooth = model.options().cornerAngle * M_PI / 180.0;
     const Sectors S = findSectors(*this);
     double sum = 0.0;
     for (size_t s = 0; s < S.theta.size(); ++s) {
         double theta = S.theta[s];
-        if (!S.ring[s] && std::fabs(theta - M_PI) < kSmooth) theta = M_PI;
+        if (!S.ring[s] && std::fabs(theta - M_PI) < smooth) theta = M_PI;
         sum += std::fabs(2.0 * theta / M_PI - S.count[s]);
     }
-    // N / (N + W): one quarter turn of defect for every sector of the layout
-    // is 1/2.
-    const double n = static_cast<double>(S.theta.size());
-    return (n > 0.0) ? n / (n + sum) : 0.0;
+    // A model corner with no macrovertex on it lies inside a side. Half its
+    // shorter boundary edge is the tolerance: a macrovertex a whole mesh edge
+    // away has put the corner inside a side just the same.
+    for (const BoundaryFeatures::Corner &c : model.corners()) {
+        bool onVertex = false;
+        for (const MacroVertex &v : vertices) {
+            if (normP(v.p - c.p) <= 0.5 * c.step) {
+                onVertex = true;
+                break;
+            }
+        }
+        if (!onVertex) sum += std::fabs(2.0 * c.angle / M_PI - 2.0);
+    }
+    // W_min is a lower bound on W for any conforming layout; the tangents
+    // this class measures sector angles with can leave W a hair under it, and
+    // no layout is more regular than the model allows.
+    return std::min(1.0, (1.0 + model.minimumDefect()) / (1.0 + sum));
 }
 
 double BlockDecomposition::angleQuality() const {
-    if (!covers()) return 0.0;
+    if (!covers()) return std::numeric_limits<double>::quiet_NaN();
     const Sectors S = findSectors(*this);
     double num = 0.0, den = 0.0;
     for (size_t c = 0; c < S.of.size(); ++c) {
@@ -401,7 +418,7 @@ double BlockDecomposition::angleQuality() const {
 }
 
 double BlockDecomposition::chordQuality() const {
-    if (!covers()) return 0.0;
+    if (!covers()) return std::numeric_limits<double>::quiet_NaN();
     const int nB = static_cast<int>(blocks.size());
     const int nE = static_cast<int>(edges.size());
     UnionFind uf(static_cast<size_t>(nE));

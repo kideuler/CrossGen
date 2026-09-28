@@ -102,8 +102,10 @@ if (BUILD_MESH2GMSH)
     add_executable(Mesh2Dgmsh src/utils/Mesh2Dgmsh.cxx)
     target_link_libraries(Mesh2Dgmsh PRIVATE Gmsh::gmsh)
 
+    # PolyVector for mesh::Mesh and BoundaryFeatures: the nice-and-unique test
+    # reads a face's corners with the same rule the selection dataset does.
     add_executable(Mesh3Dto2Dfacesgmsh src/utils/Mesh3Dto2Dfacesgmsh.cxx)
-    target_link_libraries(Mesh3Dto2Dfacesgmsh PRIVATE Gmsh::gmsh)
+    target_link_libraries(Mesh3Dto2Dfacesgmsh PRIVATE Gmsh::gmsh PolyVector)
 else()
     message(STATUS "Skipping Mesh2Dgmsh utility")
 endif()
@@ -119,6 +121,8 @@ add_library(PolyVector SHARED
     src/mesh/TMOP.hxx
     src/mesh/BlockDecomposition.hxx
     src/mesh/BlockDecomposition.cxx
+    src/mesh/BoundaryFeatures.hxx
+    src/mesh/BoundaryFeatures.cxx
     src/mesh/BlockQuadMesh.hxx
     src/mesh/BlockQuadMesh.cxx
     src/ShapeDNA/Parallel.hxx

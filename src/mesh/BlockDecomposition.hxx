@@ -7,6 +7,8 @@
 
 #include "mesh/Mesh.hxx"
 
+class BoundaryFeatures;
+
 // The quadrilateral block decomposition -- the object every pipeline's
 // "Blocks" or "Patches" phase draws on the model as light-blue sides and
 // green macrovertices, once it has one: a set of quadrilaterals, each of
@@ -134,13 +136,22 @@ public:
     // all three, as BlockQuadMesh leaves it unmeshed.
     //
     // All three are qualities in [0, 1], higher better: 1 is the best a layout
-    // can do on that count, and 0 the worst, which is also what any
-    // decomposition that fails covers() gets. Two of the raw counts have no
-    // upper bound, so each is bent into (0, 1] by a map named below; the maps
-    // are monotone, so they rank exactly as the raw counts do, but a
-    // difference near 0 means less than the same difference near 1. They are
-    // what a learner is trained to predict (py/build_dataset.py writes them as
-    // they come), hence one direction for all three.
+    // can do on that count. Two of the raw counts have no upper bound, so each
+    // is bent into (0, 1] by a map named below; the maps are monotone, so on
+    // one model they rank exactly as the raw counts do, but a difference near 0
+    // means less than the same difference near 1. They are what a learner is
+    // trained to predict (py/build_dataset.py writes them as they come), hence
+    // one direction for all three.
+    //
+    // A decomposition that fails covers() gets NaN from all three, not a
+    // score. It is not a decomposition of the model, so there is nothing to
+    // grade, and whether a method produced one at all is a separate question
+    // with its own answer -- covers(), and BlockDecomposition.valid in Python
+    // -- which a learner models on its own. Until 2026-09-27 a failure scored
+    // 0 on all three, and on py/dataset.csv that zero was 94%, 84% and 64% of
+    // what separated the methods on regularity, angle and chord, so each
+    // column mostly repeated the one pass/fail bit and hid the quality
+    // differences behind it.
     //
     // Two of them share one notion, the *sector*: at a macrovertex, a run of
     // block corners joined across the macro edges between them, stopping at an
@@ -166,20 +177,31 @@ public:
     // either way, which settles T4's "ambiguous corner" by weight instead of
     // by exemption. A boundary sector within 20 degrees of pi is taken as a
     // smooth point (G3's 160-degree rule), since a polygonal dS turns a little
-    // at every vertex and that turning is the mesh's, not the model's.
-    // Returned as N / (N + W), W that sum and N the number of sectors, so it
-    // reads the defect per sector and compares across models of different
-    // sizes: 1 with no irregular vertex, 1/2 at one quarter turn per sector. 1
-    // is not reachable on most models -- the model's own corners force some
-    // defect (the quarter disk owes exactly one quarter turn, T3) -- so
-    // compare methods on one model rather than reading it against 1.
-    double regularity() const;
+    // at every vertex and that turning is the mesh's, not the model's. A model
+    // corner the layout has no macrovertex at -- a side runs straight through
+    // it -- scores |2 theta / pi - 2|, as the point inside a side it then is:
+    // G3 asks for every corner to be a macrovertex, and without this a layout
+    // that rounds a corner off would escape that corner's defect altogether.
+    //
+    // Returned as (1 + W_min) / (1 + W), W that sum and W_min the fewest
+    // quarter turns any conforming layout of the model can have (`model`'s
+    // minimumDefect(), from its corners and holes alone): 1 for a layout as
+    // regular as the model allows, 1/2 at one avoidable quarter turn on a model
+    // that forces none. W_min is the same for every method on one model, so on
+    // one model this ranks as W does. It used to be N / (N + W) over the
+    // layout's own N sectors, which a layout could raise by adding regular
+    // sectors: in 79% of the within-model pairs of py/dataset.csv whose block
+    // counts differed, the finer layout scored higher, and geom006, a raw W of
+    // 4 for all five methods -- T4's tie -- spread from 0.67 to 0.87 by block
+    // count alone. `model` is BoundaryFeatures of the mesh the method ran on.
+    // NaN when the decomposition does not cover.
+    double regularity(const BoundaryFeatures &model) const;
 
     // Every block has all four sides, and every side is either on dS or shared
     // with a second block: no gap is left anywhere against a block. The three
-    // metrics return 0, the worst score, when this fails, so that a method
-    // which leaves part of the model out cannot win on what it left out (G2). A decomposition with no
-    // blocks does not cover either.
+    // metrics are NaN when this fails, so that a method which leaves part of
+    // the model out is not graded on the part it kept (G2). A decomposition
+    // with no blocks does not cover either.
     bool covers() const;
 
     // B1, area-weighted: the RMS difference between each block
@@ -193,7 +215,16 @@ public:
     // deviation an average element sits in. Returned as 1 - RMS / 90 degrees,
     // floored at 0, 90 degrees being where a corner has folded flat or split
     // a right angle wrongly by all of it: 1 when every vertex splits its
-    // sector evenly.
+    // sector evenly. NaN when the decomposition does not cover.
+    //
+    // It reads the method's own polylines, which TMOP moves (every interior
+    // macro edge and macrovertex), so it is B4's kind of number -- how far
+    // from finished the method left the geometry -- and the note says to
+    // report that and not rank on it. py/train_classifier.py gives it no
+    // weight in its utility. It is also the least repeatable of the three: on
+    // the models py/dataset.csv holds more than once, the same shape gave the
+    // same between-method differences with R^2 0.72, against 0.96 for
+    // regularity and 0.91 for chord.
     double angleQuality() const;
 
     // T5, area-weighted: the span ratio S = (longest macro edge) / (shortest)
@@ -209,7 +240,7 @@ public:
     // every block), so they are the ones that actually share a count.
     // Returned as 1/S of that mean, which needs no chosen scale: 1 when every
     // chord's sides are equal, 1/2 when elements along a typical chord differ
-    // in size by a factor of two.
+    // in size by a factor of two. NaN when the decomposition does not cover.
     double chordQuality() const;
 
     // The macro edges as OBJ polylines, and the blocks as closed OBJ loops --

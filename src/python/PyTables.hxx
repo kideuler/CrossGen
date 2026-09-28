@@ -6,6 +6,7 @@
 #include "ShapeDNA/ShapeDNA.hxx"
 #include "dualmbo/DualMBO.hxx"
 #include "mesh/BlockQuadMesh.hxx"
+#include "mesh/BoundaryFeatures.hxx"
 #include "mesh/QuadMesh.hxx"
 #include "mesh/TMOP.hxx"
 
@@ -111,6 +112,10 @@ const Table<BlockQuadMesh::Report> &blockQuadMeshReportTable();
 
 const Table<shapedna::ShapeDNA::Options> &shapeDNAOptionsTable();
 const Table<shapedna::ShapeDNA::Report> &shapeDNAReportTable();
+
+// Mesh.boundary_features(): the corner rule's two angles in, the Summary out.
+const Table<BoundaryFeatures::Options> &boundaryFeaturesOptionsTable();
+const Table<BoundaryFeatures::Summary> &boundaryFeaturesSummaryTable();
 
 // The TMOP settings for a transfinite grid on a block decomposition -- ATLAS,
 // UMBER and ZIPLINE, and the viewer's copy of each: metric 7, mu sampled at

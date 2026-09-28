@@ -124,6 +124,26 @@ const Table<shapedna::ShapeDNA::Report> &shapeDNAReportTable() {
     return t;
 }
 
+const Table<BoundaryFeatures::Options> &boundaryFeaturesOptionsTable() {
+    using O = BoundaryFeatures::Options;
+    static const Table<O> t{OPT(cornerAngle), OPT(curvedAngle)};
+    return t;
+}
+
+const Table<BoundaryFeatures::Summary> &boundaryFeaturesSummaryTable() {
+    using O = BoundaryFeatures::Summary;
+    static const Table<O> t{
+        REP(regions),            REP(holes),              REP(euler),
+        REP(corners),            REP(cornersOneBlock),    REP(cornersTwoBlocks),
+        REP(cornersThreeBlocks), REP(cornersFourBlocks),  REP(acuteCorners),
+        REP(ambiguousCorners),   REP(cornerDefect),       REP(singularityBound),
+        REP(minimumDefect),      REP(isoperimetricRatio), REP(curvedFraction),
+        REP(shortestRun),        REP(interfaceLength),    REP(area),
+        REP(perimeter),
+    };
+    return t;
+}
+
 mesh::TMOP::Options blockGridSmoothing() {
     mesh::TMOP::Options t;
     t.metric = mesh::TMOP::ShapeSize007;
@@ -165,6 +185,8 @@ void buildSharedTables() {
     blockQuadMeshReportTable();
     shapeDNAOptionsTable();
     shapeDNAReportTable();
+    boundaryFeaturesOptionsTable();
+    boundaryFeaturesSummaryTable();
 }
 
 }  // namespace pycg
