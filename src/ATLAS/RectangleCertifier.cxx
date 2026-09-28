@@ -274,11 +274,26 @@ std::vector<std::vector<int>> RectangleCertifier::baseComplex(const std::vector<
     return patches;
 }
 
+namespace {
+
+// basePatchCount()'s working arrays, kept per thread: the annealer scores every
+// trial carrier with it, tens of thousands of times a search.
+struct PatchCountScratch {
+    std::vector<char> cut;
+    std::vector<int> es, es2, seen, stack, edgeMark, vertexMark;
+};
+
+thread_local PatchCountScratch patchCountScratch;
+
+} // namespace
+
 int RectangleCertifier::basePatchCount(const SquareCarrier &C, int *holeDeficit) {
     const int NE = C.numEdges(), NV = C.numVertices(), NQ = C.numCells();
-    std::vector<char> cut(NE, 0);
+    PatchCountScratch &S = patchCountScratch;
+    std::vector<char> &cut = S.cut;
+    cut.assign(NE, 0);
     for (int e = 0; e < NE; ++e) cut[e] = C.isFeatureEdge(e) ? 1 : 0;
-    std::vector<int> es, es2;
+    std::vector<int> &es = S.es, &es2 = S.es2;
     for (int v = 0; v < NV; ++v) {
         if (!(C.forcedMacrovertex(v) || C.designatedVertex[v])) continue;
         C.vertexEdges(v, es);
@@ -302,12 +317,13 @@ int RectangleCertifier::basePatchCount(const SquareCarrier &C, int *holeDeficit)
             }
         }
     }
-    std::vector<int> seen(NQ, 0);
+    std::vector<int> &seen = S.seen;
+    seen.assign(NQ, 0);
     int patches = 0;
-    std::vector<int> stack;
+    std::vector<int> &stack = S.stack;
     // For the patches' Euler characteristics: the last patch that counted
     // each edge and vertex.
-    std::vector<int> edgeMark, vertexMark;
+    std::vector<int> &edgeMark = S.edgeMark, &vertexMark = S.vertexMark;
     if (holeDeficit) {
         *holeDeficit = 0;
         edgeMark.assign(NE, 0);

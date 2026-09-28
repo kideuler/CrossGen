@@ -166,6 +166,8 @@ add_library(PolyVector SHARED
     src/MERIDIAN/SubdomainLabels.cxx
     src/MERIDIAN/LayoutEnergy.hxx
     src/MERIDIAN/LayoutEnergy.cxx
+    src/MERIDIAN/ParallelLDLT.hxx
+    src/MERIDIAN/ParallelLDLT.cxx
     src/MERIDIAN/Separatrices.hxx
     src/MERIDIAN/Separatrices.cxx
     src/MERIDIAN/Arrangement.hxx

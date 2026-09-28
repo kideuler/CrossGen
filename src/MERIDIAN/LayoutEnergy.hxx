@@ -9,6 +9,7 @@
 #include <Eigen/Sparse>
 
 #include "MERIDIAN/Immersion.hxx"
+#include "MERIDIAN/ParallelLDLT.hxx"
 #include "MERIDIAN/SubdomainLabels.hxx"
 #include "mesh/Mesh.hxx"
 
@@ -658,10 +659,28 @@ private:
     std::vector<int> termSlot;       // k*k per term
     std::vector<int> diagSlot;       // nReduced, for the Tikhonov shift
 
+    // model()'s per-triangle half: what E1's SLIM proxy needs of one triangle
+    // -- its weight, W^2, the 2x2 B = W^2 (J - R), and the gradients g of the
+    // barycentric coordinates with their 3x3 Gram matrix G -- computed on
+    // every thread at once and then scattered into the gradient and the
+    // Hessian in triangle order, as they always were. See model().
+    struct TriangleModel {
+        double w;
+        double W2[4];
+        double B[4];
+        double g[2][3];
+        double G[3][3];
+    };
+    mutable std::vector<TriangleModel> triModel;
+    // energy()'s per-triangle E1 terms, summed in order after.
+    mutable std::vector<double> triEnergy;
+
     // The symbolic half of the factorisation, which depends on the pattern and
     // not on the values, so it survives every inner iteration at every level of
-    // lambda. `analysed` is cleared with the pattern.
-    Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> ldlt;
+    // lambda. `analysed` is cleared with the pattern. ParallelLDLT is Eigen's
+    // SimplicialLDLT with the numeric half on OpenMP threads and the same
+    // factor to the last bit; see its class comment.
+    ParallelLDLT ldlt;
     bool analysed = false;
 
     double lambda[7] = {1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0};   // lambda[1..6]

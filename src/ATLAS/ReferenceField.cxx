@@ -12,23 +12,27 @@ typedef std::complex<double> cplx;
 
 // Minimum-cost assignment of n rows to distinct columns among m >= n
 // (Kuhn-Munkres with potentials, O(n^2 m)). Returns the column of each row.
-std::vector<int> assignRows(const std::vector<std::vector<double>> &a, int n, int m) {
+// a is n x m, row-major.
+std::vector<int> assignRows(const std::vector<double> &a, int n, int m) {
     const double INF = std::numeric_limits<double>::infinity();
     std::vector<double> u(n + 1, 0.0), v(m + 1, 0.0);
     std::vector<int> p(m + 1, 0), way(m + 1, 0);
+    std::vector<double> minv(m + 1);
+    std::vector<char> used(m + 1);
     for (int i = 1; i <= n; ++i) {
         p[0] = i;
         int j0 = 0;
-        std::vector<double> minv(m + 1, INF);
-        std::vector<char> used(m + 1, 0);
+        std::fill(minv.begin(), minv.end(), INF);
+        std::fill(used.begin(), used.end(), 0);
         do {
             used[j0] = 1;
             const int i0 = p[j0];
             int j1 = 0;
             double delta = INF;
+            const double *row = a.data() + static_cast<size_t>(i0 - 1) * m;
             for (int j = 1; j <= m; ++j) {
                 if (used[j]) continue;
-                const double cur = a[i0 - 1][j - 1] - u[i0] - v[j];
+                const double cur = row[j - 1] - u[i0] - v[j];
                 if (cur < minv[j]) { minv[j] = cur; way[j] = j0; }
                 if (minv[j] < delta) { delta = minv[j]; j1 = j; }
             }
@@ -439,13 +443,64 @@ double ReferenceField::singularityEnergy(const std::vector<Singularity> &S, cons
     {
         struct Pair { double d; int a, b; };
         std::vector<Pair> pairs;
-        for (size_t x = 0; x < I.size(); ++x) {
-            for (size_t y = x + 1; y < I.size(); ++y) {
-                const Singularity &a = S[I[x]], &b = S[I[y]];
-                if (a.sign == b.sign) continue;
-                const double d = normP(a.x - b.x);
-                if (d < r0) pairs.push_back({d, static_cast<int>(x), static_cast<int>(y)});
+        auto consider = [&](size_t x, size_t y) {
+            const Singularity &a = S[I[x]], &b = S[I[y]];
+            if (a.sign == b.sign) return;
+            const double d = normP(a.x - b.x);
+            if (d < r0) pairs.push_back({d, static_cast<int>(x), static_cast<int>(y)});
+        };
+        if (I.size() <= 256) {
+            for (size_t x = 0; x < I.size(); ++x) {
+                for (size_t y = x + 1; y < I.size(); ++y) consider(x, y);
             }
+        } else {
+            // A fine carrier has tens of thousands of singularities and the
+            // loop above is then 10^8 distances for the few pairs within r0:
+            // the whole of what the arbiter spent on a fine carrier. The same
+            // pairs come out of a grid of cells no smaller than r0, where two
+            // points closer than r0 are in the same cell or adjacent ones --
+            // and are then put back in the loop's (x, y) order, so that the
+            // sort below, which is not stable, sees the same sequence and
+            // breaks its ties the same way.
+            Point lo = S[I[0]].x, hi = lo;
+            for (int i : I) {
+                lo[0] = std::min(lo[0], S[i].x[0]); lo[1] = std::min(lo[1], S[i].x[1]);
+                hi[0] = std::max(hi[0], S[i].x[0]); hi[1] = std::max(hi[1], S[i].x[1]);
+            }
+            double cell = r0;
+            const double span = std::max(hi[0] - lo[0], hi[1] - lo[1]);
+            const double maxCells = 4.0 * static_cast<double>(I.size());
+            if ((span / cell) * (span / cell) > maxCells) cell = span / std::sqrt(maxCells);
+            const int gx = std::max(1, static_cast<int>((hi[0] - lo[0]) / cell) + 1);
+            const int gy = std::max(1, static_cast<int>((hi[1] - lo[1]) / cell) + 1);
+            auto cellOf = [&](const Point &p, int &cx, int &cy) {
+                cx = std::min(gx - 1, std::max(0, static_cast<int>((p[0] - lo[0]) / cell)));
+                cy = std::min(gy - 1, std::max(0, static_cast<int>((p[1] - lo[1]) / cell)));
+            };
+            std::vector<int> start(static_cast<size_t>(gx) * gy + 1, 0), members(I.size());
+            std::vector<int> at(I.size());
+            for (size_t x = 0; x < I.size(); ++x) {
+                int cx, cy;
+                cellOf(S[I[x]].x, cx, cy);
+                at[x] = cy * gx + cx;
+                ++start[at[x] + 1];
+            }
+            for (size_t c = 0; c + 1 < start.size(); ++c) start[c + 1] += start[c];
+            std::vector<int> fill(start.begin(), start.end() - 1);
+            for (size_t x = 0; x < I.size(); ++x) members[fill[at[x]]++] = static_cast<int>(x);
+            for (size_t x = 0; x < I.size(); ++x) {
+                const int cx = at[x] % gx, cy = at[x] / gx;
+                for (int ny = std::max(0, cy - 1); ny <= std::min(gy - 1, cy + 1); ++ny) {
+                    for (int nx = std::max(0, cx - 1); nx <= std::min(gx - 1, cx + 1); ++nx) {
+                        const int c = ny * gx + nx;
+                        for (int k = start[c]; k < start[c + 1]; ++k) {
+                            if (static_cast<size_t>(members[k]) > x) consider(x, members[k]);
+                        }
+                    }
+                }
+            }
+            std::sort(pairs.begin(), pairs.end(),
+                      [](const Pair &p, const Pair &q) { return p.a != q.a ? p.a < q.a : p.b < q.b; });
         }
         std::sort(pairs.begin(), pairs.end(), [](const Pair &p, const Pair &q) { return p.d < q.d; });
         std::vector<char> gone(I.size(), 0);
@@ -478,8 +533,8 @@ double ReferenceField::singularityEnergy(const std::vector<Singularity> &S, cons
     if (n > 0 && nF > 0) {
         if (n <= 200 && nF <= 400) {
             const int m = nF + n;
-            std::vector<std::vector<double>> a(n, std::vector<double>(m));
-            for (int r = 0; r < n; ++r) for (int j = 0; j < m; ++j) a[r][j] = rowCost(r, j);
+            std::vector<double> a(static_cast<size_t>(n) * m);
+            for (int r = 0; r < n; ++r) for (int j = 0; j < m; ++j) a[static_cast<size_t>(r) * m + j] = rowCost(r, j);
             col = assignRows(a, n, m);
         } else {
             // Too many for the exact assignment (a fine carrier): greedy by

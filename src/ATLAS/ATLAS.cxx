@@ -3,7 +3,14 @@
 #include <algorithm>
 #include <chrono>
 #include <sstream>
-#include <thread>
+
+#ifdef _OPENMP
+#  include <omp.h>
+#  define CG_PRAGMA(x) _Pragma(#x)
+#  define CG_OMP(x) CG_PRAGMA(omp x)
+#else
+#  define CG_OMP(x)
+#endif
 
 namespace {
 
@@ -104,11 +111,27 @@ bool ATLAS::run() {
         search(f, fineRewrite, opts_.rewriteRounds, opts_.rewritePassesPerRound, opts_.maxRings, false);
         f.seconds = since(tf);
     };
+    // One OpenMP thread per search, whatever OMP_NUM_THREADS says -- as many as
+    // the searches always had, so a process told to use one thread still runs
+    // them side by side. The regions inside a search (TMOP in Realisation) are
+    // allowed one level of nesting, so each still gets the team it had when the
+    // searches were plain threads: they reach it at different times, and with
+    // nesting off the four realisations of a model take 1.2-1.5 s each where
+    // they took 0.4-0.9 (singlemat/geom012). Every region inside is
+    // thread-count independent, so none of this can change an answer.
+#ifdef _OPENMP
+    const int savedLevels = omp_get_max_active_levels();
+    if (opts_.parallel) omp_set_max_active_levels(std::max(savedLevels, 2));
+#endif
     if (opts_.parallel && searches_.size() > 1) {
-        std::vector<std::thread> pool;
-        pool.emplace_back(runFine);
-        for (size_t i = 1; i < searches_.size(); ++i) pool.emplace_back([this, i]() { runCoarse(*searches_[i]); });
-        for (std::thread &t : pool) t.join();
+        const int n = static_cast<int>(searches_.size());
+        activeSearches_ = n;
+        CG_OMP(parallel for schedule(dynamic, 1) num_threads(n))
+        for (int i = 0; i < n; ++i) {
+            if (i == 0) runFine();
+            else runCoarse(*searches_[i]);
+            --activeSearches_;
+        }
     } else {
         for (size_t i = 1; i < searches_.size(); ++i) runCoarse(*searches_[i]);
         runFine();
@@ -136,24 +159,40 @@ bool ATLAS::run() {
                 }
             };
             if (opts_.parallel && searches_.size() > 2) {
-                std::vector<std::thread> pool;
-                for (size_t i = 1; i < searches_.size(); ++i) pool.emplace_back(more, i);
-                for (std::thread &th : pool) th.join();
+                const int n = static_cast<int>(searches_.size());
+                activeSearches_ = n - 1;
+                CG_OMP(parallel for schedule(dynamic, 1) num_threads(n - 1))
+                for (int i = 1; i < n; ++i) {
+                    more(static_cast<size_t>(i));
+                    --activeSearches_;
+                }
             } else {
                 for (size_t i = 1; i < searches_.size(); ++i) more(i);
             }
         }
     }
+#ifdef _OPENMP
+    omp_set_max_active_levels(savedLevels);
+#endif
     status_.secondsSearch = since(searchStart);
 
     // ---- Pick the answer ------------------------------------------------------
     // On the arbiter's score, computed on each search's final carrier -- the
-    // realised one for a coarse search, the geometry that is meshed.
-    for (int i = 0; i < numSearches(); ++i) {
+    // realised one for a coarse search, the geometry that is meshed. The scores
+    // are independent of each other and each is a fine carrier's worth of work,
+    // so they are computed side by side; the pick itself runs in search order.
+    const int nSearches = numSearches();
+    CG_OMP(parallel for schedule(dynamic, 1) if (opts_.parallel))
+    for (int i = 0; i < nSearches; ++i) {
         Search &s = *searches_[i];
         if (!s.succeeded()) continue;
         const double obj = s.finalCover()->getReport().objective;
         s.finalScore = obj + arbiterTerms(*s.finalCarrier(), &s.finalDir, &s.finalSing, &s.finalShape);
+    }
+    for (int i = 0; i < nSearches; ++i) {
+        Search &s = *searches_[i];
+        if (!s.succeeded()) continue;
+        const double obj = s.finalCover()->getReport().objective;
         if (status_.chosen < 0 || s.finalScore < status_.bestScore - 1e-9) {
             status_.chosen = i;
             status_.bestObjective = obj;
@@ -221,6 +260,18 @@ void ATLAS::runCoarse(Search &s) {
 // ---------------------------------------------------------------------------
 void ATLAS::realise(Search &s, int maxAttempts) {
     const Clock::time_point tr = Clock::now();
+#ifdef _OPENMP
+    // Alongside the other searches, TMOP in Realisation takes this search's
+    // share of the cores rather than a full team each: every search opening
+    // eight threads on an eight-core machine left most of them spinning at
+    // the colour barriers (singlemat/geom030: three fifths of TMOP's samples).
+    // A search that finishes hands its share on to the ones still running.
+    // TMOP's answer does not depend on the thread count.
+    if (omp_in_parallel()) {
+        const int active = std::max(1, activeSearches_.load());
+        omp_set_num_threads(std::max(1, omp_get_num_procs() / active));
+    }
+#endif
     std::vector<Search::Candidate> order = s.candidates;
     std::stable_sort(order.begin(), order.end(),
                      [](const Search::Candidate &a, const Search::Candidate &b) { return a.score < b.score; });

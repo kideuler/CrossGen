@@ -1,6 +1,7 @@
 #ifndef __ATLAS_HXX__
 #define __ATLAS_HXX__
 
+#include <atomic>
 #include <memory>
 #include <string>
 #include <vector>
@@ -57,7 +58,8 @@
 //     realise, the search's other rounds are tried in order of objective.
 //
 // The searches share nothing but the read-only domains, so they run in
-// parallel threads (Options::parallel), and each is deterministic.
+// parallel, one OpenMP thread each (Options::parallel), and each is
+// deterministic.
 //
 // Every search that produces a valid, conforming cover of the *input* domain
 // competes on Stage 5's objective, and the lowest wins; the fine incumbent
@@ -340,6 +342,9 @@ private:
     std::unique_ptr<PlanarDomain> domain_;
     std::shared_ptr<ReferenceField> field_;
     std::vector<std::unique_ptr<Search>> searches_;
+    // Searches still running while they run side by side; a realisation takes
+    // its share of the cores for TMOP from it (see realise()).
+    std::atomic<int> activeSearches_{0};
 };
 
 #endif // __ATLAS_HXX__

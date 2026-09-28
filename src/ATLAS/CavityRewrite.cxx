@@ -3,15 +3,68 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <functional>
 #include <random>
-#include <set>
 #include <unordered_set>
 
 namespace {
 
 typedef CavityFill::Patch Patch;
 typedef SquareCarrier::Origin Origin;
+
+// The corner sets propose() has already tried, as a flat open-addressed set of
+// packed quadruples kept per thread. Only membership is ever asked of it, so
+// which set it is makes no difference to the proposals; std::set spent a heap
+// node on each of the hundreds of sets one cavity enumerates.
+class CornerSetSeen {
+public:
+    void clear() {
+        for (size_t s : used) keys[s] = Key{kEmpty, kEmpty};
+        used.clear();
+    }
+    // True when q was not there yet.
+    bool insert(const std::array<int, 4> &q) {
+        const Key k{(static_cast<unsigned long long>(static_cast<unsigned>(q[0])) << 32) |
+                        static_cast<unsigned>(q[1]),
+                    (static_cast<unsigned long long>(static_cast<unsigned>(q[2])) << 32) |
+                        static_cast<unsigned>(q[3])};
+        if (2 * (used.size() + 1) > keys.size()) grow();
+        size_t s = slot(k);
+        while (keys[s].hi != kEmpty) {
+            if (keys[s].hi == k.hi && keys[s].lo == k.lo) return false;
+            s = (s + 1) & (keys.size() - 1);
+        }
+        keys[s] = k;
+        used.push_back(s);
+        return true;
+    }
+
+private:
+    struct Key { unsigned long long hi, lo; };
+    static constexpr unsigned long long kEmpty = ~0ull;   // no corner index is -1
+    size_t slot(const Key &k) const {
+        const unsigned long long h = (k.hi * 0x9E3779B97F4A7C15ull) ^ (k.lo * 0xBF58476D1CE4E5B9ull);
+        return static_cast<size_t>(h ^ (h >> 29)) & (keys.size() - 1);
+    }
+    void grow() {
+        std::vector<Key> old;
+        old.reserve(used.size());
+        for (size_t s : used) old.push_back(keys[s]);
+        keys.assign(std::max<size_t>(1024, keys.size() * 2), Key{kEmpty, kEmpty});
+        used.clear();
+        for (const Key &k : old) {
+            size_t s = slot(k);
+            while (keys[s].hi != kEmpty) s = (s + 1) & (keys.size() - 1);
+            keys[s] = k;
+            used.push_back(s);
+        }
+    }
+    std::vector<Key> keys;
+    std::vector<size_t> used;
+};
+
+thread_local CornerSetSeen cornerSetSeen;
 
 } // namespace
 
@@ -96,9 +149,10 @@ void CavityRewrite::propose(const Loop &L, std::vector<Proposal> &out) {
     };
 
     if (opts_.grids && N >= 3) {
-        std::set<std::array<int, 4>> seen;
+        CornerSetSeen &seen = cornerSetSeen;
+        seen.clear();
         auto addGrid = [&](std::array<int, 4> c) {
-            if (!seen.insert(c).second) return;
+            if (!seen.insert(c)) return;
             int n[4], lo[4], hi[4];
             for (int k = 0; k < 4; ++k) sideRange(L, c[k], c[(k + 1) % 4], n[k], lo[k], hi[k]);
             int m[2];
@@ -153,12 +207,15 @@ void CavityRewrite::propose(const Loop &L, std::vector<Proposal> &out) {
     if (opts_.stars && N >= 3) {
         const std::vector<int> P = pool(9);
         const int np = static_cast<int>(P.size());
+        std::vector<int> n, lo, hi, s, have;
         for (int K : {3, 5}) {
             if (np < K) continue;
             std::vector<int> pick(K);
+            n.assign(K, 0);
+            lo.assign(K, 0);
+            hi.assign(K, 0);
             std::function<void(int, int)> rec = [&](int start, int depth) {
                 if (depth == K) {
-                    std::vector<int> n(K), lo(K), hi(K), s, have;
                     for (int k = 0; k < K; ++k) sideRange(L, pick[k], pick[(k + 1) % K], n[k], lo[k], hi[k]);
                     if (!CavityFill::rangeStar(n, lo, hi, s, have, 3)) return;
                     Proposal pr;
@@ -506,7 +563,40 @@ bool CavityRewrite::growCavity(const std::vector<int> &seeds, int rings, const s
     return true;
 }
 
+size_t CavityRewrite::CornerBitsHash::operator()(const CornerBits &k) const {
+    unsigned long long h = 0x9E3779B97F4A7C15ull;
+    for (unsigned long long b : k.bits) {
+        h ^= b + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+        h *= 0xBF58476D1CE4E5B9ull;
+    }
+    return static_cast<size_t>(h ^ (h >> 31));
+}
+
+double CavityRewrite::directionEnergy(const SquareCarrier &C, const ReferenceField &F) {
+    if (misalignmentOf_ != &F || misalignment_.size() > 100000) {
+        misalignment_.clear();
+        misalignmentOf_ = &F;
+    }
+    double s = 0.0;
+    CornerBits key;
+    for (int q = 0; q < C.numCells(); ++q) {
+        const auto &c = C.cells[q];
+        for (int k = 0; k < 4; ++k) {
+            std::memcpy(&key.bits[2 * k], &C.vertices[c[k]][0], sizeof(double));
+            std::memcpy(&key.bits[2 * k + 1], &C.vertices[c[k]][1], sizeof(double));
+        }
+        auto it = misalignment_.find(key);
+        if (it == misalignment_.end()) it = misalignment_.emplace(key, F.misalignment(C, q)).first;
+        s += it->second;
+    }
+    return s / F.area();
+}
+
 double CavityRewrite::energy(const SquareCarrier &C, const AnnealOptions &ao, int *blocks) {
+    return energy(C, ao, blocks, nullptr);
+}
+
+double CavityRewrite::energy(const SquareCarrier &C, const AnnealOptions &ao, int *blocks, CavityRewrite *cache) {
     int holeDeficit = 0;
     const int nb = RectangleCertifier::basePatchCount(C, ao.patchTopology ? &holeDeficit : nullptr) + 2 * holeDeficit;
     const bool signedBoundary = ao.wBoundaryDefectPlus >= 0.0 || ao.wBoundaryDefectMinus >= 0.0;
@@ -531,8 +621,8 @@ double CavityRewrite::energy(const SquareCarrier &C, const AnnealOptions &ao, in
     }
     if (ao.reference) {
         // The reference field's terms, in blocks, in place of `field`'s.
-        const double E = ao.wDir * ao.reference->directionEnergy(C) +
-                         ao.reference->singularityEnergy(C, ao.singularity);
+        const double dir = cache ? cache->directionEnergy(C, *ao.reference) : ao.reference->directionEnergy(C);
+        const double E = ao.wDir * dir + ao.reference->singularityEnergy(C, ao.singularity);
         if (blocks) *blocks = nb;
         return ao.wBlocks * nb + d + ao.wCells * C.numCells() + ao.wShape * shape + E;
     }
@@ -563,10 +653,11 @@ const CavityRewrite::AnnealReport &CavityRewrite::anneal(const AnnealOptions &ao
     std::mt19937 rng(ao.seed);
     std::uniform_real_distribution<double> U(0.0, 1.0);
     int blocks = 0;
-    double E = energy(C_, ao, &blocks);
+    double E = energy(C_, ao, &blocks, this);
     R.energyBefore = E;
     R.blocksBefore = blocks;
     SquareCarrier best = C_;
+    SquareCarrier trial = C_;
     double Ebest = E;
     int blocksBest = blocks;
 
@@ -745,7 +836,11 @@ const CavityRewrite::AnnealReport &CavityRewrite::anneal(const AnnealOptions &ao
             const CavityFill::Verdict V = CavityFill::settle(C_, cav, P, floor, opts_.smoothingIterations);
             if (!V.valid) continue;
             ++R.certified;
-            SquareCarrier trial = C_;
+            // Copied into the one trial carrier the whole schedule reuses, so
+            // its arrays keep their storage from move to move; an accepted
+            // trial is swapped in rather than moved, which hands the old state's
+            // storage back for the next copy.
+            trial = C_;
             SquareCarrier::Edit ed;
             ed.removeCells = cav;
             ed.newVertices = P.newVertices;
@@ -756,12 +851,12 @@ const CavityRewrite::AnnealReport &CavityRewrite::anneal(const AnnealOptions &ao
             ed.cellOrigin = SquareCarrier::CellOrigin::Rewrite;
             trial.apply({ed});
             int nb = 0;
-            const double E2 = energy(trial, ao, &nb);
+            const double E2 = energy(trial, ao, &nb, this);
             const double dE = E2 - E;
             if (dE <= 0.0 || U(rng) < std::exp(-dE / T)) {
                 if (dE > 0.0) ++R.uphill;
                 ++R.accepted;
-                C_ = std::move(trial);
+                std::swap(C_, trial);
                 E = E2;
                 directedStale = true;
                 if (E < Ebest - 1e-9) {

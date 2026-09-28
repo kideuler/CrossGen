@@ -3,18 +3,11 @@
 #include <algorithm>
 #include <cmath>
 #include <fstream>
-#include <functional>
 #include <map>
 #include <numeric>
 #include <sstream>
-#include <unordered_map>
 
 namespace {
-
-inline long long edgeKey(int a, int b) {
-    const long long lo = std::min(a, b), hi = std::max(a, b);
-    return (lo << 32) | hi;
-}
 
 double angleBetween(const Point &u, const Point &v) {
     const double nu = normP(u), nv = normP(v);
@@ -22,6 +15,21 @@ double angleBetween(const Point &u, const Point &v) {
     // atan2 of cross and dot is accurate at every angle, unlike acos near 0 and pi.
     return std::atan2(cross2(u, v), dotP(u, v));
 }
+
+// rebuild()'s temporaries, kept per thread between calls. A search rebuilds its
+// carrier after every trial edit -- tens of thousands of times in an annealed
+// search -- and allocating these afresh each time, with a hash map for the edge
+// index on top, was a third of what the search cost.
+struct RebuildScratch {
+    std::vector<int> remap;
+    std::vector<char> used;
+    std::vector<int> edgeHead, edgeLink;   // edges by their lower vertex, as linked lists
+    std::vector<int> fill, walkCell, walkCorner;
+    std::vector<int> stack, parent, loopsOf;
+    std::vector<char> rootSeen;
+};
+
+thread_local RebuildScratch rebuildScratch;
 
 } // namespace
 
@@ -117,10 +125,13 @@ SquareCarrier::SquareCarrier(const PlanarDomain &domain, const Options &opts, co
 void SquareCarrier::rebuild() {
     // Compact: drop every vertex no cell references. A replacement removes the
     // interior vertices of its cavity by removing the cells around them.
+    RebuildScratch &S = rebuildScratch;
     {
         const int NV = numVertices();
-        std::vector<int> remap(NV, -1);
-        std::vector<char> used(NV, 0);
+        std::vector<int> &remap = S.remap;
+        std::vector<char> &used = S.used;
+        remap.assign(NV, -1);
+        used.assign(NV, 0);
         for (const auto &q : cells) for (int v : q) used[v] = 1;
         int next = 0;
         for (int v = 0; v < NV; ++v) if (used[v]) remap[v] = next++;
@@ -151,22 +162,29 @@ void SquareCarrier::rebuild() {
     transport.assign(NQ, {});
     report_.nonManifoldEdges = 0;
 
-    std::unordered_map<long long, int> index;
-    index.reserve(static_cast<size_t>(NQ) * 2 + 16);
+    // Edges are numbered in the order they are first met. Each is found again
+    // through a short list of the edges at its lower vertex rather than a hash
+    // map, which gives the same numbering without hashing anything.
+    std::vector<int> &head = S.edgeHead;
+    std::vector<int> &link = S.edgeLink;
+    head.assign(NV, -1);
+    link.clear();
     for (int q = 0; q < NQ; ++q) {
         for (int i = 0; i < 4; ++i) {
             const int a = cells[q][i], b = cells[q][(i + 1) & 3];
-            const long long k = edgeKey(a, b);
-            auto it = index.find(k);
-            if (it == index.end()) {
+            const int lo = std::min(a, b), hi = std::max(a, b);
+            int found = head[lo];
+            while (found >= 0 && edges[found][1] != hi) found = link[found];
+            if (found < 0) {
                 const int e = numEdges();
-                index.emplace(k, e);
-                edges.push_back({std::min(a, b), std::max(a, b)});
+                edges.push_back({lo, hi});
                 edgeCell.push_back({q, -1});
                 edgeSide.push_back({i, -1});
+                link.push_back(head[lo]);
+                head[lo] = e;
                 cellEdges[q][i] = e;
             } else {
-                const int e = it->second;
+                const int e = found;
                 cellEdges[q][i] = e;
                 if (edgeCell[e][1] < 0) {
                     edgeCell[e][1] = q;
@@ -225,7 +243,9 @@ void SquareCarrier::buildRings() {
     ringCorner.assign(ringPtr[NV], -1);
 
     // Unordered first, then walk.
-    std::vector<int> fill(ringPtr.begin(), ringPtr.end() - 1);
+    RebuildScratch &S = rebuildScratch;
+    std::vector<int> &fill = S.fill;
+    fill.assign(ringPtr.begin(), ringPtr.end() - 1);
     for (int q = 0; q < NQ; ++q) {
         for (int c = 0; c < 4; ++c) {
             const int v = cells[q][c];
@@ -237,7 +257,7 @@ void SquareCarrier::buildRings() {
 
     manifoldVertex.assign(NV, 1);
     report_.nonManifoldVertices = 0;
-    std::vector<int> walkCell, walkCorner;
+    std::vector<int> &walkCell = S.walkCell, &walkCorner = S.walkCorner;
     for (int v = 0; v < NV; ++v) {
         const int b = ringPtr[v], n = valence[v];
         if (n == 0) continue;
@@ -280,12 +300,14 @@ void SquareCarrier::buildRings() {
 }
 
 void SquareCarrier::buildComponents() {
+    RebuildScratch &S = rebuildScratch;
     const int NQ = numCells();
     cellComponent.assign(NQ, -1);
     componentCount = 0;
+    std::vector<int> &stack = S.stack;
     for (int s = 0; s < NQ; ++s) {
         if (cellComponent[s] >= 0) continue;
-        std::vector<int> stack{s};
+        stack.assign(1, s);
         cellComponent[s] = componentCount;
         while (!stack.empty()) {
             const int q = stack.back();
@@ -302,9 +324,10 @@ void SquareCarrier::buildComponents() {
     }
     // Boundary loops per component: connected pieces of the boundary graph.
     const int NV = numVertices();
-    std::vector<int> parent(NV);
+    std::vector<int> &parent = S.parent;
+    parent.resize(NV);
     std::iota(parent.begin(), parent.end(), 0);
-    std::function<int(int)> find = [&](int x) {
+    auto find = [&](int x) {
         while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; }
         return x;
     };
@@ -314,8 +337,10 @@ void SquareCarrier::buildComponents() {
         if (a != b) parent[a] = b;
     }
     componentHoles.assign(componentCount, 0);
-    std::vector<int> loopsOf(componentCount, 0);
-    std::vector<char> rootSeen(NV, 0);
+    std::vector<int> &loopsOf = S.loopsOf;
+    loopsOf.assign(componentCount, 0);
+    std::vector<char> &rootSeen = S.rootSeen;
+    rootSeen.assign(NV, 0);
     for (int e = 0; e < numEdges(); ++e) {
         if (!boundaryEdge[e]) continue;
         const int r = find(edges[e][0]);

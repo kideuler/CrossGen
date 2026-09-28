@@ -44,4 +44,4 @@ A purely 2D implementation of Cross-fields along with block decomposition
 - [x] Get general workflow working.
 - [x] Replace ILP parts with google or-tools
 - [x] Python API for everything
-- [ ] 
+- [ ] working model with onnx

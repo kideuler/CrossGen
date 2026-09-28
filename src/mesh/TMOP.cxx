@@ -183,8 +183,14 @@ TMOP::MetricPartials TMOP::raiseTo(const MetricPartials &b, double p) {
     // so is every derivative of mu^p for p > 2.
     if (!(b.f > 0.0)) { MetricPartials z; z.valid = true; return z; }
     const double f = b.f;
-    const double fm1 = std::pow(f, p - 1.0);
-    const double fm2 = std::pow(f, p - 2.0);
+    // p = 2, the default, without the two library calls, which were a tenth of
+    // TMOP's samples: pow(f, 0) is 1 for every f (C99 Annex F.9.4.4), and
+    // pow(f, 1) is f -- not a guarantee of the standard, but of this libm,
+    // checked on 2e8 random doubles over every binade. The same numbers
+    // either way.
+    const bool squared = (p == 2.0);
+    const double fm1 = squared ? f : std::pow(f, p - 1.0);
+    const double fm2 = squared ? 1.0 : std::pow(f, p - 2.0);
     const double c = p * (p - 1.0) * fm2;
     MetricPartials r;
     r.valid = true;
@@ -407,7 +413,7 @@ double TMOP::elementEnergy(int q) const {
 double TMOP::energy() const {
     const int nQ = static_cast<int>(mesh.quads.size());
     std::vector<double> per(nQ, 0.0);
-    CG_OMP(parallel for schedule(static))
+    CG_OMP(parallel for schedule(dynamic, 256))
     for (int q = 0; q < nQ; ++q) per[q] = elementEnergy(q);
     double total = 0.0;
     for (int q = 0; q < nQ; ++q) total += per[q];
@@ -651,13 +657,18 @@ void TMOP::buildColoring() {
     report.colors = static_cast<int>(buckets.size());
 }
 
+// Dynamic scheduling, because the colouring already makes the answer
+// independent of which thread moves which node (see above) and a static split
+// is only as fast as its slowest thread: on a machine with fast and slow cores
+// (an M2 has four of each) every colour would wait on the slow ones. The max
+// is exact, so its reduction order does not matter either.
 double TMOP::sweep() {
     double maxMove = 0.0;
     for (std::size_t c = 0; c < buckets.size(); ++c) {
         const std::vector<int> &bucket = buckets[c];
         const int n = static_cast<int>(bucket.size());
         double bucketMax = 0.0;
-        CG_OMP(parallel for schedule(static) reduction(max:bucketMax))
+        CG_OMP(parallel for schedule(dynamic, 32) reduction(max:bucketMax))
         for (int i = 0; i < n; ++i) {
             const double d = moveNode(bucket[i]);
             if (d > bucketMax) bucketMax = d;

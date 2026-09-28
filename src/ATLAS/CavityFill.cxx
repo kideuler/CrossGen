@@ -25,6 +25,109 @@ std::vector<double> arcFractions(const std::vector<Point> &pts) {
     return f;
 }
 
+// A set of small non-negative integers that empties in O(1), by moving to a
+// new generation instead of clearing. validate() runs once for every trial
+// fill -- tens of thousands of times in one annealed search -- and the hash
+// sets and maps it used to build afresh each time were most of its cost.
+class StampSet {
+public:
+    void reset(size_t n) {
+        if (mark.size() < n) mark.resize(n, 0u);
+        if (++gen == 0u) {
+            std::fill(mark.begin(), mark.end(), 0u);
+            gen = 1u;
+        }
+    }
+    bool contains(int i) const { return mark[i] == gen; }
+    bool insert(int i) {
+        if (mark[i] == gen) return false;
+        mark[i] = gen;
+        return true;
+    }
+
+private:
+    std::vector<unsigned> mark;
+    unsigned gen = 0u;
+};
+
+// Counts keyed by a pair of vertex keys (pairKey, so never negative), in an
+// open-addressed table kept between calls; only the slots a call used are
+// cleared after it.
+class PairCounts {
+public:
+    void reset(size_t entries) {
+        size_t cap = 64;
+        while (cap < 2 * entries) cap <<= 1;
+        if (keys.size() < cap) {
+            keys.assign(cap, kEmpty);
+            counts.assign(cap, 0);
+            used.clear();
+            return;
+        }
+        for (size_t s : used) keys[s] = kEmpty;
+        used.clear();
+    }
+    int &operator[](long long k) {
+        const size_t mask = keys.size() - 1;
+        unsigned long long h = static_cast<unsigned long long>(k) * 0x9E3779B97F4A7C15ull;
+        size_t s = static_cast<size_t>(h ^ (h >> 29)) & mask;
+        while (keys[s] != kEmpty && keys[s] != k) s = (s + 1) & mask;
+        if (keys[s] == kEmpty) {
+            keys[s] = k;
+            counts[s] = 0;
+            used.push_back(s);
+        }
+        return counts[s];
+    }
+
+private:
+    static constexpr long long kEmpty = -1;
+    std::vector<long long> keys;
+    std::vector<int> counts;
+    std::vector<size_t> used;
+};
+
+// validate()'s working storage, one per thread (the ATLAS searches run side by
+// side), each array standing for one of the hash containers it replaced.
+struct ValidateScratch {
+    struct Half { int a, b; bool domain; };
+    std::vector<Half> oldHalf;
+    StampSet inCav;                                   // cavity cells
+    StampSet onBoundary;                              // oldAngle's keys
+    std::vector<int> boundary;                        // ... in first-seen order
+    std::vector<double> oldAngle;                     // by vertex
+    StampSet hasOldNext;                              // oldNext's keys
+    std::vector<int> oldNextTo;
+    std::vector<char> oldNextDomain;
+    StampSet hasDrop;                                 // drop's keys
+    std::vector<char> drop;
+    StampSet run;
+    StampSet hasNextOf;                               // nextOf's keys
+    std::vector<int> nextOf;                          // by vertex key
+    StampSet hasAngleSum;                             // angleSum's keys
+    std::vector<double> angleSum;                     // by vertex key
+    std::vector<int> angleKeys;                       // ... in first-seen order
+    PairCounts uses, dirUse;
+};
+
+thread_local ValidateScratch validateScratch;
+
+// droppable() against any cavity membership test.
+template <typename InCavity>
+bool droppableIn(const SquareCarrier &C, int v, const InCavity &inCavity) {
+    if (!C.boundaryVertex[v] || C.protectedVertex[v] || C.designatedVertex[v]) return false;
+    if (C.vertexOrigin[v] != CavityFill::Origin::EdgeMidpoint &&
+        C.vertexOrigin[v] != CavityFill::Origin::BoundarySplit) {
+        return false;
+    }
+    const int e = C.sourceEdge[v];
+    if (e < 0 || !C.getDomain().boundaryEdge[e]) return false;
+    for (int r = C.ringPtr[v]; r < C.ringPtr[v + 1]; ++r) {
+        if (!inCavity(C.ringCell[r])) return false;
+    }
+    return true;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -105,14 +208,7 @@ CavityFill::Boundary CavityFill::boundaryOf(const SquareCarrier &C, const std::v
 
 // ---------------------------------------------------------------------------
 bool CavityFill::droppable(const SquareCarrier &C, int v, const std::unordered_set<int> &inCavity) {
-    if (!C.boundaryVertex[v] || C.protectedVertex[v] || C.designatedVertex[v]) return false;
-    if (C.vertexOrigin[v] != Origin::EdgeMidpoint && C.vertexOrigin[v] != Origin::BoundarySplit) return false;
-    const int e = C.sourceEdge[v];
-    if (e < 0 || !C.getDomain().boundaryEdge[e]) return false;
-    for (int r = C.ringPtr[v]; r < C.ringPtr[v + 1]; ++r) {
-        if (!inCavity.count(C.ringCell[r])) return false;
-    }
-    return true;
+    return droppableIn(C, v, [&](int q) { return inCavity.count(q) != 0; });
 }
 
 int CavityFill::domainEdge(const SquareCarrier &C, int a, int b) {
@@ -446,9 +542,11 @@ bool CavityFill::rangeStar(const std::vector<int> &n, const std::vector<int> &lo
                            std::vector<int> &s, std::vector<int> &have, int window) {
     const int K = static_cast<int>(n.size());
     if (K != 3 && K != 5) return false;
-    std::vector<double> ideal(K, 1.0);
+    // Fixed arrays rather than vectors: K is 3 or 5, and this runs for every
+    // star a proposal considers.
+    double ideal[5] = {1.0, 1.0, 1.0, 1.0, 1.0};
     {
-        std::vector<std::vector<double>> M(K, std::vector<double>(K + 1, 0.0));
+        double M[5][6] = {};
         for (int i = 0; i < K; ++i) {
             M[i][(i + K - 1) % K] += 1.0;
             M[i][(i + 1) % K] += 1.0;
@@ -457,7 +555,7 @@ bool CavityFill::rangeStar(const std::vector<int> &n, const std::vector<int> &lo
         for (int c = 0; c < K; ++c) {
             int piv = c;
             for (int r = c + 1; r < K; ++r) if (std::fabs(M[r][c]) > std::fabs(M[piv][c])) piv = r;
-            std::swap(M[c], M[piv]);
+            if (piv != c) std::swap_ranges(M[c], M[c] + K + 1, M[piv]);
             for (int r = 0; r < K; ++r) {
                 if (r == c) continue;
                 const double f = M[r][c] / M[c][c];
@@ -470,7 +568,7 @@ bool CavityFill::rangeStar(const std::vector<int> &n, const std::vector<int> &lo
     for (int x : hi) maxH = std::max(maxH, x);
     long long bestD = -1;
     double bestDev = 0.0;
-    std::vector<long long> cur(K, 1);
+    long long cur[5] = {1, 1, 1, 1, 1};
     auto consider = [&]() {
         long long D = 0;
         double dev = 0.0;
@@ -484,7 +582,7 @@ bool CavityFill::rangeStar(const std::vector<int> &n, const std::vector<int> &lo
         if (bestD < 0 || D < bestD || (D == bestD && dev < bestDev)) {
             bestD = D;
             bestDev = dev;
-            s.assign(cur.begin(), cur.end());
+            s.assign(cur, cur + K);
         }
     };
     // Spoke j, given its two neighbours' partners: side j-1 = s_{j-2} + s_j and
@@ -578,6 +676,15 @@ CavityFill::Verdict CavityFill::settle(const SquareCarrier &C, const std::vector
 
 // ---------------------------------------------------------------------------
 // Sec. 9.2, locally. See the class comment for why these tests suffice.
+//
+// Every set and map below is a flat array over vertex or cell ids from
+// ValidateScratch rather than a hash container built for the call, which is
+// the whole of the difference from how this was first written: the same
+// tests, in the same order, the same sums in the same order. Where the hash
+// maps' operator[] made up an entry for a key that was not there -- oldNext[b]
+// and drop[b] on a boundary that does not close -- the arrays answer with the
+// same default. The one loop that ran over a hash map, the one-ring check,
+// gives the same verdict whichever vertex it looks at first.
 // ---------------------------------------------------------------------------
 CavityFill::Verdict CavityFill::validate(const SquareCarrier &C, const std::vector<int> &cavity,
                                          const Patch &P, double minScaledJacobian) {
@@ -587,88 +694,125 @@ CavityFill::Verdict CavityFill::validate(const SquareCarrier &C, const std::vect
 
     const int NV = C.numVertices();
     auto key = [&](int id) -> long long { return id >= 0 ? id : NV + (-1 - id); };
+    // Vertex keys run to NV plus the new vertices the cells actually name.
+    int newUsed = static_cast<int>(P.newVertices.size());
+    for (const auto &q : P.cells) {
+        for (int id : q) if (id < 0) newUsed = std::max(newUsed, -id);
+    }
+    const size_t nKeys = static_cast<size_t>(NV) + static_cast<size_t>(newUsed);
 
-    std::unordered_set<int> inCav(cavity.begin(), cavity.end());
+    ValidateScratch &S = validateScratch;
+    S.inCav.reset(C.numCells());
+    for (int q : cavity) S.inCav.insert(q);
+    auto inCav = [&](int q) { return S.inCav.contains(q); };
 
     // The cavity's boundary half-edges (cavity on the left) and the interior
     // angle it has at each boundary vertex.
-    struct Half { int a, b; bool domain; };
-    std::vector<Half> oldHalf;
-    std::unordered_map<int, double> oldAngle;
+    using Half = ValidateScratch::Half;
+    std::vector<Half> &oldHalf = S.oldHalf;
+    oldHalf.clear();
     double oldArea = 0.0;
     for (int q : cavity) {
         oldArea += C.cellArea(q);
         for (int i = 0; i < 4; ++i) {
             const int r = C.neighbor[q][i];
-            if (r >= 0 && inCav.count(r)) continue;
+            if (r >= 0 && inCav(r)) continue;
             oldHalf.push_back({C.cells[q][i], C.cells[q][(i + 1) & 3], r < 0});
         }
     }
-    for (const Half &h : oldHalf) oldAngle.emplace(h.a, 0.0);
-    for (auto &kv : oldAngle) {
-        const int v = kv.first;
+    S.onBoundary.reset(NV);
+    if (S.oldAngle.size() < static_cast<size_t>(NV)) S.oldAngle.resize(NV);
+    S.boundary.clear();
+    for (const Half &h : oldHalf) {
+        if (S.onBoundary.insert(h.a)) {
+            S.oldAngle[h.a] = 0.0;
+            S.boundary.push_back(h.a);
+        }
+    }
+    for (int v : S.boundary) {
+        double &angle = S.oldAngle[v];
         for (int r = C.ringPtr[v]; r < C.ringPtr[v + 1]; ++r) {
-            if (inCav.count(C.ringCell[r])) kv.second += C.cornerAngle(C.ringCell[r], C.ringCorner[r]);
+            if (inCav(C.ringCell[r])) angle += C.cornerAngle(C.ringCell[r], C.ringCorner[r]);
         }
     }
 
     // Edge census of the patch: every undirected edge in at most two cells, and
     // in opposite directions when in two.
-    std::unordered_map<long long, int> uses;   // undirected -> count
-    std::unordered_map<long long, int> dirUse; // directed -> count
-    uses.reserve(P.cells.size() * 4);
-    dirUse.reserve(P.cells.size() * 4);
+    S.uses.reset(P.cells.size() * 4);     // undirected -> count
+    S.dirUse.reset(P.cells.size() * 4);   // directed -> count
     for (const auto &q : P.cells) {
         for (int c = 0; c < 4; ++c) {
             const long long a = key(q[c]), b = key(q[(c + 1) & 3]);
             if (a == b) return fail("a cell repeats a vertex");
-            ++uses[pairKey(std::min(a, b), std::max(a, b))];
-            if (++dirUse[pairKey(a, b)] > 1) return fail("two cells run an edge the same way");
+            ++S.uses[pairKey(std::min(a, b), std::max(a, b))];
+            if (++S.dirUse[pairKey(a, b)] > 1) return fail("two cells run an edge the same way");
         }
     }
-    std::unordered_map<long long, int> nextOf;   // patch boundary: start -> end
+    // Patch boundary: start -> end, by the start's vertex key.
+    S.hasNextOf.reset(nKeys);
+    if (S.nextOf.size() < nKeys) S.nextOf.resize(nKeys);
     int patchBoundary = 0;
     for (const auto &q : P.cells) {
         for (int c = 0; c < 4; ++c) {
             const long long a = key(q[c]), b = key(q[(c + 1) & 3]);
-            const int u = uses[pairKey(std::min(a, b), std::max(a, b))];
+            const int u = S.uses[pairKey(std::min(a, b), std::max(a, b))];
             if (u > 2) return fail("an edge of the patch is in three cells");
             if (u == 1) {
-                if (nextOf.count(a)) return fail("the patch boundary is pinched");
-                nextOf[a] = q[(c + 1) & 3];
+                if (!S.hasNextOf.insert(static_cast<int>(a))) return fail("the patch boundary is pinched");
+                S.nextOf[a] = q[(c + 1) & 3];
                 ++patchBoundary;
             }
         }
     }
+    auto nextOf = [&](long long k, int &to) {
+        if (!S.hasNextOf.contains(static_cast<int>(k))) return false;
+        to = S.nextOf[k];
+        return true;
+    };
 
     // Match the cavity's boundary. Between two consecutive vertices the
     // patch must keep (anchors), the old boundary is either one edge -- kept
     // as it is, or, on dS, subdivided by inserted points -- or a run of
     // droppable points along one domain segment, which the patch may walk
     // with any in-order subset of them plus inserted points, all collinear.
-    std::unordered_map<int, std::pair<int, bool>> oldNext;
-    for (const Half &h : oldHalf) oldNext.emplace(h.a, std::make_pair(h.b, h.domain));
-    std::unordered_map<int, char> drop;
-    for (const Half &h : oldHalf) drop.emplace(h.a, droppable(C, h.a, inCav) ? 1 : 0);
+    // oldNext and drop keep the first entry a vertex gets, as emplace did.
+    S.hasOldNext.reset(NV);
+    S.hasDrop.reset(NV);
+    if (S.oldNextTo.size() < static_cast<size_t>(NV)) {
+        S.oldNextTo.resize(NV);
+        S.oldNextDomain.resize(NV);
+        S.drop.resize(NV);
+    }
+    for (const Half &h : oldHalf) {
+        if (S.hasOldNext.insert(h.a)) {
+            S.oldNextTo[h.a] = h.b;
+            S.oldNextDomain[h.a] = h.domain ? 1 : 0;
+        }
+    }
+    for (const Half &h : oldHalf) {
+        const char d = droppableIn(C, h.a, inCav) ? 1 : 0;
+        if (S.hasDrop.insert(h.a)) S.drop[h.a] = d;
+    }
+    auto drop = [&](int v) -> bool { return S.hasDrop.contains(v) && S.drop[v]; };
+    S.run.reset(NV);
     int consumed = 0;
     for (const Half &h0 : oldHalf) {
         const int a = h0.a;
-        if (drop[a]) continue;
+        if (drop(a)) continue;
         // The old run from a to the next anchor b.
-        std::unordered_set<int> run;
+        S.run.reset(NV);
         bool allDomain = true;
         int b = a;
         int guard = 0;
         do {
-            const auto &nx = oldNext[b];
-            allDomain = allDomain && nx.second;
-            b = nx.first;
-            if (drop[b]) run.insert(b);
+            const bool known = S.hasOldNext.contains(b);
+            allDomain = allDomain && known && S.oldNextDomain[b];
+            b = known ? S.oldNextTo[b] : 0;
+            if (drop(b)) S.run.insert(b);
             if (++guard > static_cast<int>(oldHalf.size()) + 1) return fail("the cavity boundary does not close");
-        } while (drop[b]);
-        auto it = nextOf.find(a);
-        if (it == nextOf.end()) return fail("a cavity boundary vertex is not on the patch boundary");
-        int w = it->second;
+        } while (drop(b));
+        int w = 0;
+        if (!nextOf(a, w)) return fail("a cavity boundary vertex is not on the patch boundary");
         ++consumed;
         const Point pa = C.vertices[a], pb = C.vertices[b];
         const Point d = pb - pa;
@@ -678,7 +822,7 @@ CavityFill::Verdict CavityFill::validate(const SquareCarrier &C, const std::vect
         while (w != b) {
             if (!allDomain) return fail("a point was inserted on an edge shared with a neighbour (hanging node)");
             if (w >= 0) {
-                if (!run.count(w)) return fail("the patch boundary leaves the cavity boundary");
+                if (!S.run.contains(w)) return fail("the patch boundary leaves the cavity boundary");
             } else if (P.newOrigin[-1 - w] != Origin::BoundarySplit) {
                 return fail("an inserted boundary point is not marked as one");
             }
@@ -689,9 +833,9 @@ CavityFill::Verdict CavityFill::validate(const SquareCarrier &C, const std::vect
                 return fail("an inserted boundary point is off its segment or out of order");
             }
             lastT = t;
-            auto nt = nextOf.find(key(w));
-            if (nt == nextOf.end() || ++guard > 100000) return fail("the patch boundary breaks off");
-            w = nt->second;
+            int to = 0;
+            if (!nextOf(key(w), to) || ++guard > 100000) return fail("the patch boundary breaks off");
+            w = to;
             ++consumed;
         }
     }
@@ -700,12 +844,14 @@ CavityFill::Verdict CavityFill::validate(const SquareCarrier &C, const std::vect
     // Only boundary vertices of the cavity may be reused; its interior
     // vertices are deleted with it.
     for (const auto &q : P.cells) {
-        for (int v : q) if (v >= 0 && !oldAngle.count(v)) return fail("the patch uses a vertex outside the cavity boundary");
+        for (int v : q) if (v >= 0 && !S.onBoundary.contains(v)) return fail("the patch uses a vertex outside the cavity boundary");
     }
 
     // Cells: Sec. 9.1's four corners, plus the requested quality floor.
     double sjMin = 1.0, sjSum = 0.0, newArea = 0.0;
-    std::unordered_map<long long, double> angleSum;
+    S.hasAngleSum.reset(nKeys);
+    if (S.angleSum.size() < nKeys) S.angleSum.resize(nKeys);
+    S.angleKeys.clear();
     for (const auto &q : P.cells) {
         double cellMin = 1.0;
         for (int c = 0; c < 4; ++c) {
@@ -716,7 +862,12 @@ CavityFill::Verdict CavityFill::validate(const SquareCarrier &C, const std::vect
             const double nn = normP(u) * normP(w);
             if (!(det > 0.0) || !(nn > 0.0)) return fail("a new cell has a non-positive corner Jacobian");
             cellMin = std::min(cellMin, det / nn);
-            angleSum[key(q[c])] += cornerAngleOf(p, nx, pv);
+            const int k = static_cast<int>(key(q[c]));
+            if (S.hasAngleSum.insert(k)) {
+                S.angleSum[k] = 0.0;
+                S.angleKeys.push_back(k);
+            }
+            S.angleSum[k] += cornerAngleOf(p, nx, pv);
             newArea += 0.5 * cross2(p, nx);
         }
         sjMin = std::min(sjMin, cellMin);
@@ -732,19 +883,18 @@ CavityFill::Verdict CavityFill::validate(const SquareCarrier &C, const std::vect
     // One-rings: 2 pi inside, the cavity's own angle on its boundary, pi at an
     // inserted boundary point.
     const double tol = 1e-7;
-    for (const auto &kv : angleSum) {
-        const long long k = kv.first;
+    for (int k : S.angleKeys) {
         double want;
         if (k < NV) {
-            want = oldAngle[static_cast<int>(k)];
+            want = S.oldAngle[k];
         } else {
-            const int idx = static_cast<int>(k - NV);
+            const int idx = k - NV;
             want = P.newOrigin[idx] == Origin::BoundarySplit ? M_PI : 2.0 * M_PI;
         }
-        if (std::fabs(kv.second - want) > tol) return fail("a one-ring does not wind exactly once");
+        if (std::fabs(S.angleSum[k] - want) > tol) return fail("a one-ring does not wind exactly once");
     }
     for (int k = 0; k < static_cast<int>(P.newVertices.size()); ++k) {
-        if (!angleSum.count(NV + k)) return fail("a new vertex is used by no cell");
+        if (!S.hasAngleSum.contains(NV + k)) return fail("a new vertex is used by no cell");
     }
     if (std::fabs(newArea - oldArea) > 1e-9 * std::max(1e-300, std::fabs(oldArea))) {
         return fail("the patch does not have the cavity's area");

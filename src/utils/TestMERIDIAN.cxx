@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -24,6 +25,7 @@
 #include <vector>
 
 #include "MERIDIAN/MERIDIAN.hxx"
+#include "MERIDIAN/ParallelLDLT.hxx"
 #include "dualmbo/DualMBO.hxx"
 #include "mesh/QuadMesh.hxx"
 #include "mesh/TMOP.hxx"
@@ -192,9 +194,84 @@ int selfTest() {
         for (const std::string &m : r.messages) std::cout << "  " << kWarn << " " << m << "\n";
     }
 
+    // ParallelLDLT against Eigen's SimplicialLDLT, which it must reproduce to
+    // the last bit on any number of threads (see its class comment). The
+    // matrix has Stage 6's shape: two unknowns per vertex of a disk, a 6x6
+    // block per triangle coupling them, and a handful of long-range terms
+    // like E5's; the shift after the first round is innerSolve()'s Tikhonov
+    // fallback, new values on the same pattern.
+    {
+        heading("ParallelLDLT == SimplicialLDLT, bit for bit");
+        const std::shared_ptr<Mesh> disk = TestHelper::createCircle(0, 0, 1, 0.03);
+        const int nV = static_cast<int>(disk->vertices.size());
+        std::vector<Eigen::Triplet<double>> trips;
+        for (int t = 0; t < static_cast<int>(disk->triangles.size()); ++t) {
+            const Triangle &tri = disk->triangles[t];
+            const Point &a = disk->vertices[tri[0]], &b = disk->vertices[tri[1]], &c = disk->vertices[tri[2]];
+            const Point e[3] = {c - b, a - c, b - a};
+            const double area = 0.5 * std::fabs((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]));
+            const double w[3] = {2.0 + std::sin(0.7 * t), 1.0 + 0.5 * std::cos(1.3 * t), 0.3 * std::sin(0.1 * t)};
+            for (int i = 0; i < 3; ++i) {
+                for (int j = 0; j < 3; ++j) {
+                    const double g = (e[i][0] * e[j][0] + e[i][1] * e[j][1]) / (4.0 * area);
+                    const double W[2][2] = {{w[0], w[2]}, {w[2], w[1]}};
+                    for (int p = 0; p < 2; ++p)
+                        for (int q = 0; q < 2; ++q)
+                            trips.emplace_back(2 * tri[i] + p, 2 * tri[j] + q, g * W[p][q]);
+                }
+            }
+        }
+        for (int d = 0; d < 2 * nV; ++d) trips.emplace_back(d, d, 1e-3);
+        for (int k = 0; k + 1 < static_cast<int>(disk->boundaryVertices.size()); k += 37) {
+            const int u = 2 * disk->boundaryVertices[k], v = 2 * disk->boundaryVertices[(k * 7 + 11) % disk->boundaryVertices.size()];
+            if (u == v) continue;
+            trips.emplace_back(u, u, 5.0); trips.emplace_back(v, v, 5.0);
+            trips.emplace_back(u, v, -5.0); trips.emplace_back(v, u, -5.0);
+        }
+        Eigen::SparseMatrix<double> A(2 * nV, 2 * nV);
+        A.setFromTriplets(trips.begin(), trips.end());
+        A.makeCompressed();
+        Eigen::VectorXd rhs(2 * nV);
+        for (int d = 0; d < 2 * nV; ++d) rhs[d] = std::sin(0.37 * d) + 0.1;
+
+        bool allSame = true;
+        for (int round = 0; round < 2; ++round) {
+            if (round == 1) {
+                for (int d = 0; d < 2 * nV; ++d) A.coeffRef(d, d) += 1e-6;
+            }
+            Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> ref;
+            ref.analyzePattern(A);
+            ref.factorize(A);
+            const Eigen::VectorXd xRef = ref.solve(rhs);
+            const auto &LRef = ref.matrixL().nestedExpression();
+            for (int threads : {1, 2, 4}) {
+                ParallelLDLT par;
+                par.setThreads(threads);
+                par.analyzePattern(A);
+                par.factorize(A);
+                par.factorize(A);   // twice: the second runs on the first's state
+                const Eigen::VectorXd x = par.solve(rhs);
+                const auto &L = par.matrixL().nestedExpression();
+                const bool same =
+                    par.info() == Eigen::Success && L.nonZeros() == LRef.nonZeros() &&
+                    std::equal(L.innerIndexPtr(), L.innerIndexPtr() + L.nonZeros(), LRef.innerIndexPtr()) &&
+                    std::memcmp(L.valuePtr(), LRef.valuePtr(), sizeof(double) * L.nonZeros()) == 0 &&
+                    std::memcmp(par.vectorD().data(), ref.vectorD().data(), sizeof(double) * ref.vectorD().size()) == 0 &&
+                    std::memcmp(x.data(), xRef.data(), sizeof(double) * x.size()) == 0;
+                verdict(same, std::string(round ? "shifted, " : "") + std::to_string(threads) +
+                                  " thread(s) asked, " + std::to_string(par.lastThreads()) +
+                                  " used: L, D and a solve identical to Eigen's (" +
+                                  std::to_string(2 * nV) + " unknowns)");
+                allSame = allSame && same;
+            }
+        }
+        if (!allSame) ++failures;
+    }
+
     heading("Result");
-    std::cout << "  " << (failures == 0 ? kPass : kFail) << " " << (cases.size() - failures)
-              << " of " << cases.size() << " self-test case(s) passed\n";
+    const size_t total = cases.size() + 1;
+    std::cout << "  " << (failures == 0 ? kPass : kFail) << " " << (total - failures)
+              << " of " << total << " self-test case(s) passed\n";
     return failures == 0 ? 0 : 6;
 }
 

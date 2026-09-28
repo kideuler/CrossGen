@@ -1,11 +1,13 @@
 #ifndef __CAVITY_REWRITE_HXX__
 #define __CAVITY_REWRITE_HXX__
 
+#include <array>
 #include <functional>
 #include <map>
 #include <string>
 #include <vector>
 
+#include <unordered_map>
 #include <unordered_set>
 
 #include "ATLAS/CavityFill.hxx"
@@ -312,6 +314,28 @@ private:
     void reject(const std::string &why) { ++report_.rejections[why]; }
     int totalDefect() const;
     int irregularCount() const;
+
+    // energy(), with E_dir's per-cell terms taken from misalignment_ when the
+    // cell was seen before (the annealer's calls), or computed afresh (cache
+    // null).
+    static double energy(const SquareCarrier &C, const AnnealOptions &ao, int *blocks, CavityRewrite *cache);
+
+    // E_dir's per-cell terms during anneal(), by the bit patterns of the
+    // cell's four corners. A move rewrites one cavity and leaves every other
+    // cell where it was, so most of the terms the next trial's energy adds up
+    // were already computed for the last one. The sum is still taken over
+    // every cell in carrier order, so it is the one ReferenceField::
+    // directionEnergy() forms, to the bit.
+    struct CornerBits {
+        std::array<unsigned long long, 8> bits;
+        bool operator==(const CornerBits &o) const { return bits == o.bits; }
+    };
+    struct CornerBitsHash {
+        size_t operator()(const CornerBits &k) const;
+    };
+    double directionEnergy(const SquareCarrier &C, const ReferenceField &F);
+    std::unordered_map<CornerBits, double, CornerBitsHash> misalignment_;
+    const ReferenceField *misalignmentOf_ = nullptr;
 
     SquareCarrier &C_;
     Options opts_;

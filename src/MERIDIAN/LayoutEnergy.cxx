@@ -8,6 +8,14 @@
 #include <sstream>
 #include <string>
 
+#ifdef _OPENMP
+#  include <omp.h>
+#  define CG_PRAGMA(x) _Pragma(#x)
+#  define CG_OMP(x) CG_PRAGMA(omp x)
+#else
+#  define CG_OMP(x)
+#endif
+
 namespace {
 
 const double kInf = std::numeric_limits<double>::infinity();
@@ -462,14 +470,34 @@ void LayoutEnergy::refreshInterfaceTerms() {
 // ---------------------------------------------------------------------------
 double LayoutEnergy::energy(const std::vector<double> &xx, double *o1, double *o2,
                             double *o3, double *o4, double *o5, double *o6) const {
-    double E1 = 0.0;
-    double J[4];
-    for (int t = 0; t < static_cast<int>(cm->triangles.size()); ++t) {
+    // Each triangle's term on every thread at once, then summed in triangle
+    // order, so E1 is the same sum of the same numbers as a single loop's.
+    const int nT = static_cast<int>(cm->triangles.size());
+    triEnergy.resize(nT);
+    bool injective = true;
+    CG_OMP(parallel for schedule(dynamic, 1024) reduction(&& : injective) if (nT > 4096))
+    for (int t = 0; t < nT; ++t) {
+        double J[4];
         jacobian(xx, t, J);
         const double det = J[0] * J[3] - J[1] * J[2];
-        if (!(det > 0.0)) return kInf;   // outside F of Eq. (12): the barrier
-        E1 += refArea[t] * symmetricDirichlet(J, det);
+        if (!(det > 0.0)) {
+            injective = false;
+            continue;
+        }
+        triEnergy[t] = symmetricDirichlet(J, det);
     }
+    if (!injective) return kInf;   // outside F of Eq. (12): the barrier
+    // Kept a scalar loop on purpose. The single loop this replaces had an
+    // early return in it, so it was never vectorised and each term went in
+    // through one fused multiply-add. This loop has none, and left to itself
+    // the vectoriser turns it into an in-order reduction of separately
+    // rounded products -- one unit in the last place off the old E1 now and
+    // then, and enough to move a finite-difference check by a third.
+    double E1 = 0.0;
+#if defined(__clang__)
+#pragma clang loop vectorize(disable) interleave(disable)
+#endif
+    for (int t = 0; t < nT; ++t) E1 += refArea[t] * triEnergy[t];
 
     double E[7] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
     for (const Term &t : cterms) {
@@ -520,12 +548,27 @@ bool LayoutEnergy::model(const std::vector<double> &xx, std::vector<double> &gra
     // rather than a hundred and forty-four triplets from four heap allocations.
     // The same collection applies to the gradient, where the four residuals
     // W(J - R)_{pq} assemble into the single 2x2 B = W^2 (J - R).
-    double J[4];
+    //
+    // In two passes. The first -- the SVD, the weights and the trigonometry,
+    // which is where the time goes -- depends on nothing but the triangle, and
+    // runs on every thread at once into triModel. The second adds each
+    // triangle's pieces into grad and H in triangle order, statement for
+    // statement as the single loop did, so every sum is formed in the same
+    // order from the same numbers and the model does not depend on the thread
+    // count. An inverted triangle fails the whole model either way; grad and H
+    // are then left unfinished, as they always were, and no caller reads them.
     const int nT = static_cast<int>(cm->triangles.size());
+    triModel.resize(nT);
+    bool injective = true;
+    CG_OMP(parallel for schedule(dynamic, 512) reduction(&& : injective) if (nT > 2048))
     for (int t = 0; t < nT; ++t) {
+        double J[4];
         jacobian(xx, t, J);
         const double det = J[0] * J[3] - J[1] * J[2];
-        if (!(det > 0.0)) return false;
+        if (!(det > 0.0)) {
+            injective = false;
+            continue;
+        }
 
         const SVD2 s = svd2(J);
         const double w0 = weightFor(std::max(s.s0, 1e-12));
@@ -552,11 +595,26 @@ bool LayoutEnergy::model(const std::vector<double> &xx, std::vector<double> &gra
             for (int l = 0; l < 3; ++l) G[k][l] = g[0][k] * g[0][l] + g[1][k] * g[1][l];
         }
 
-        const Triangle &tri = cm->triangles[t];
         // The proxy carries a factor of one half so that its gradient is the
         // true gradient of A * D(sigma) and not twice it; without that, E1
         // would silently outweigh E2..E5 by a factor of two.
-        const double w = 2.0 * (0.5 * lambda[1] * refArea[t]);
+        TriangleModel &m = triModel[t];
+        m.w = 2.0 * (0.5 * lambda[1] * refArea[t]);
+        std::copy(W2, W2 + 4, m.W2);
+        std::copy(B, B + 4, m.B);
+        std::copy(&g[0][0], &g[0][0] + 6, &m.g[0][0]);
+        std::copy(&G[0][0], &G[0][0] + 9, &m.G[0][0]);
+    }
+    if (!injective) return false;
+
+    for (int t = 0; t < nT; ++t) {
+        const TriangleModel &m = triModel[t];
+        const Triangle &tri = cm->triangles[t];
+        const double w = m.w;
+        const double *W2 = m.W2;
+        const double *B = m.B;
+        const double (&g)[2][3] = m.g;
+        const double (&G)[3][3] = m.G;
 
         for (int a = 0; a < 2; ++a) {
             for (int k = 0; k < 3; ++k) {
@@ -717,8 +775,12 @@ void LayoutEnergy::buildHessianPattern() {
 // ---------------------------------------------------------------------------
 double LayoutEnergy::maxStep(const std::vector<double> &xx,
                              const std::vector<double> &d) const {
+    // A minimum, which is exact in any order, over every thread at once.
     double smax = kInf;
-    for (int t = 0; t < static_cast<int>(cm->triangles.size()); ++t) {
+    bool inverted = false;
+    const int nT = static_cast<int>(cm->triangles.size());
+    CG_OMP(parallel for schedule(dynamic, 1024) reduction(min : smax) reduction(|| : inverted) if (nT > 4096))
+    for (int t = 0; t < nT; ++t) {
         const Triangle &tri = cm->triangles[t];
         const double D00 = xx[dofU(tri[1])] - xx[dofU(tri[0])];
         const double D01 = xx[dofU(tri[2])] - xx[dofU(tri[0])];
@@ -732,7 +794,10 @@ double LayoutEnergy::maxStep(const std::vector<double> &xx,
         const double a = E00 * E11 - E01 * E10;
         const double b = D00 * E11 + E00 * D11 - D01 * E10 - E01 * D10;
         const double c = D00 * D11 - D01 * D10;
-        if (!(c > 0.0)) return 0.0;   // already inverted; nothing to step
+        if (!(c > 0.0)) {   // already inverted; nothing to step
+            inverted = true;
+            continue;
+        }
 
         double root = kInf;
         if (std::fabs(a) < 1e-300) {
@@ -750,7 +815,7 @@ double LayoutEnergy::maxStep(const std::vector<double> &xx,
         }
         smax = std::min(smax, root);
     }
-    return smax;
+    return inverted ? 0.0 : smax;
 }
 
 // ---------------------------------------------------------------------------
@@ -1286,6 +1351,7 @@ double LayoutEnergy::checkGradient(int samples, double h) const {
         xm[d] = xt[d];
         if (!std::isfinite(ep) || !std::isfinite(em)) continue;
         const double numeric = (ep - em) / (2.0 * step);
+
         worst = std::max(worst, std::fabs(numeric - grad[d]) / scale);
     }
     return worst;
