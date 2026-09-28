@@ -1,4 +1,5 @@
 #include "ATLAS/ExplicitTemplates.hxx"
+#include "ATLAS/SectionArrangement.hxx"
 
 #include <algorithm>
 #include <cmath>
@@ -109,9 +110,10 @@ ExplicitTemplates::ExplicitTemplates(SquareCarrier &carrier, const Options &opts
         // neighbour -- then the rest, largest first, so that a template's
         // designated corners on an interface are in place before the region
         // across it is tried.
-        std::stable_sort(regions.begin(), regions.end(), [](const Region &a, const Region &b) {
+        const bool smallFirst = opts_.smallestFirst;
+        std::stable_sort(regions.begin(), regions.end(), [smallFirst](const Region &a, const Region &b) {
             if (a.touchesInterface != b.touchesInterface) return !a.touchesInterface;
-            return a.area > b.area;
+            return smallFirst ? a.area < b.area : a.area > b.area;
         });
         bool committed = false;
         for (const Region &R : regions) {
@@ -141,6 +143,44 @@ ExplicitTemplates::ExplicitTemplates(SquareCarrier &carrier, const Options &opts
 
 bool ExplicitTemplates::isNode(int v) const {
     return C_.protectedVertex[v] || C_.designatedVertex[v];
+}
+
+void ExplicitTemplates::propagateNodes(const Region &R, CavityFill::Patch &P,
+                                       const std::array<std::vector<int>, 4> &sides) const {
+    if (!opts_.propagateNodes || !R.touchesInterface) return;
+    // The node at position j of side k faces position (len - j) of side k + 2:
+    // a grid's sides run corner to corner round it, so the far side is walked
+    // the other way.
+    for (int k = 0; k < 4; ++k) {
+        const std::vector<int> &a = sides[k], &b = sides[(k + 2) % 4];
+        if (a.size() != b.size()) continue;
+        const int len = static_cast<int>(a.size()) - 1;
+        for (int j = 1; j < len; ++j) {
+            if (a[j] < 0 || !isNode(a[j])) continue;
+            const int w = b[len - j];
+            // Only onto the region's own boundary, where the next region will
+            // see it: a point inside the region is Stage 5's to find.
+            if (w >= 0 && R.set.count(C_.ringCell[C_.ringPtr[w]]) && C_.valence[w] > 0) {
+                bool onLoop = false;
+                for (const auto &L : R.B.loops) for (int v : L) onLoop = onLoop || v == w;
+                if (onLoop) P.designated.push_back(w);
+            }
+        }
+    }
+}
+
+bool ExplicitTemplates::isCorner(const Region &R, int loop, int i) const {
+    const int v = R.B.loops[loop][i];
+    if (!isNode(v)) return false;
+    // Only next to an interface: a region bounded by dS alone keeps every
+    // node a corner, exactly as before (its nodes are its own protected
+    // corners, and a coarse polygon's angle at one can read as flat).
+    if (!opts_.flatNodes || !R.touchesInterface) return true;
+    // Designated and not protected: a point on a feature curve where the
+    // curve itself has no corner, so flat from both sides, whatever angle
+    // the coarse polygon turns through there.
+    if (!C_.protectedVertex[v]) return false;
+    return std::fabs(R.B.angle[loop][i] - M_PI) >= opts_.cornerTolerance * M_PI / 180.0;
 }
 
 std::vector<ExplicitTemplates::Region> ExplicitTemplates::extractRegions() const {
@@ -205,11 +245,13 @@ bool ExplicitTemplates::attempt(const Region &R, Attempt &A) {
     int K = 0, reflex = 0;
     const double reflexTol = opts_.reflexAngle * M_PI / 180.0;
     for (size_t i = 0; i < L.size(); ++i) {
-        if (!isNode(L[i])) continue;
+        if (!isCorner(R, R.outer, static_cast<int>(i))) continue;
         ++K;
         if (R.B.angle[R.outer][i] > M_PI + reflexTol) ++reflex;
     }
-    for (int h : R.holes) for (int v : R.B.loops[h]) if (isNode(v)) ++K;
+    for (int h : R.holes) {
+        for (size_t i = 0; i < R.B.loops[h].size(); ++i) if (isCorner(R, h, static_cast<int>(i))) ++K;
+    }
     A.corners = K;
 
     // The region's cones, for the families' parameters and their scores.
@@ -226,6 +268,9 @@ bool ExplicitTemplates::attempt(const Region &R, Attempt &A) {
         for (const ReferenceField::Singularity &s : regionCones_) (s.sign > 0 ? A.conesPlus : A.conesMinus)++;
     }
     const bool choose = opts_.field && opts_.chooseByField;
+    // General sections only next to an interface: a single-material region
+    // keeps exactly the families it had.
+    const bool general = opts_.generalSections && R.touchesInterface;
 
     std::vector<std::string> reasons;
     auto commit = [&](const Patch &P, Attempt &trial, double minSJ) {
@@ -304,7 +349,7 @@ bool ExplicitTemplates::attempt(const Region &R, Attempt &A) {
         if (opts_.sections && reflex == 0 && K >= 6 && K % 2 == 0) {
             // A fan of chords from each corner in turn, until one certifies.
             std::vector<int> npos;
-            for (size_t i = 0; i < L.size(); ++i) if (isNode(L[i])) npos.push_back(static_cast<int>(i));
+            for (size_t i = 0; i < L.size(); ++i) if (isCorner(R, R.outer, static_cast<int>(i))) npos.push_back(static_cast<int>(i));
             std::set<std::vector<std::pair<int, int>>> tried;
             const size_t before = reasons.size();
             for (int s0 = 0; s0 < K; ++s0) {
@@ -330,6 +375,7 @@ bool ExplicitTemplates::attempt(const Region &R, Attempt &A) {
         // still there behind it.
         if (opts_.halfOGrids && K == 2 && run("half O-grid", &ExplicitTemplates::tryHalfOGrid)) return true;
         if (opts_.ogrids && K <= 2 && run("O-grid", &ExplicitTemplates::tryOGrid)) return true;
+        if (general && run("general sections", &ExplicitTemplates::trySectionsGeneral)) return true;
         if (chooseBest()) return true;
         if (reasons.empty()) {
             std::ostringstream os;
@@ -338,9 +384,12 @@ bool ExplicitTemplates::attempt(const Region &R, Attempt &A) {
         }
     } else if (R.holes.size() == 1) {
         if (opts_.annuli && run("annulus", &ExplicitTemplates::tryAnnulus)) return true;
+        if (general && run("general sections", &ExplicitTemplates::trySectionsGeneral)) return true;
         if (chooseBest()) return true;
         if (reasons.empty()) reasons.push_back("annulus: disabled");
     } else {
+        if (general && run("general sections", &ExplicitTemplates::trySectionsGeneral)) return true;
+        if (chooseBest()) return true;
         std::ostringstream os;
         os << R.holes.size() << " holes: no single template covers a region of this "
            << "connectivity (Sec. 7.4), the carrier is retained";
@@ -468,8 +517,13 @@ bool ExplicitTemplates::trySections(const Region &R, Patch &P, Attempt &A) {
     }
     const double scale = normP(hi - lo);
     const double eps = 1e-12 * scale * scale;
-    std::vector<char> node(N, 0);
-    for (int i = 0; i < N; ++i) node[i] = isNode(L[i]);
+    // Every node is somewhere a section may end; only a corner emits
+    // sections or has to be a corner of a face.
+    std::vector<char> node(N, 0), corner(N, 0);
+    for (int i = 0; i < N; ++i) {
+        node[i] = isNode(L[i]);
+        corner[i] = isCorner(R, R.outer, i);
+    }
     const double reflexTol = opts_.reflexAngle * M_PI / 180.0;
     const double cornerTol = opts_.cornerTolerance * M_PI / 180.0;
 
@@ -497,7 +551,7 @@ bool ExplicitTemplates::trySections(const Region &R, Patch &P, Attempt &A) {
     std::set<std::pair<int, int>> sectionSet;
     std::vector<std::pair<int, int>> sections;
     for (int i = 0; i < N; ++i) {
-        if (!node[i] || ang[i] <= M_PI + reflexTol) continue;
+        if (!corner[i] || ang[i] <= M_PI + reflexTol) continue;
         const int q = std::max(2, static_cast<int>(std::lround(ang[i] / M_PI_2)));
         const Point d0 = normalizeP(X[mod(i + 1)] - X[i]);
         for (int k = 1; k < q; ++k) {
@@ -540,9 +594,9 @@ bool ExplicitTemplates::trySections(const Region &R, Patch &P, Attempt &A) {
         const std::pair<int, int> key(std::min(ch.first, ch.second), std::max(ch.first, ch.second));
         if (sectionSet.insert(key).second) sections.push_back(ch);
     }
-    int nodeCount = 0;
-    for (int i = 0; i < N; ++i) nodeCount += node[i];
-    if (sections.empty() && nodeCount != 4) return fail("not four corners and nothing to cut at");
+    int cornerCount = 0;
+    for (int i = 0; i < N; ++i) cornerCount += corner[i];
+    if (sections.empty() && cornerCount != 4) return fail("not four corners and nothing to cut at");
 
     // ---- the arrangement: graph nodes, arcs, half-edges -------------------
     struct GNode { int pos = -1; int id = 0; Point x; };
@@ -551,7 +605,7 @@ bool ExplicitTemplates::trySections(const Region &R, Patch &P, Attempt &A) {
     std::vector<char> isEnd(N, 0);
     for (const auto &s : sections) { isEnd[s.first] = 1; isEnd[s.second] = 1; }
     for (int i = 0; i < N; ++i) {
-        if (!node[i] && !isEnd[i]) continue;
+        if (!corner[i] && !isEnd[i]) continue;
         gOfPos[i] = static_cast<int>(G.size());
         G.push_back({i, L[i], X[i]});
     }
@@ -605,6 +659,7 @@ bool ExplicitTemplates::trySections(const Region &R, Patch &P, Attempt &A) {
         std::vector<int> pos;     // loop arcs: loop positions a..b
         int count = 0;
         bool splittable = false;
+        int minCount = 0;         // with its droppable points gone (see below)
         double length = 0.0;
     };
     std::vector<Arc> arcs;
@@ -628,6 +683,12 @@ bool ExplicitTemplates::trySections(const Region &R, Patch &P, Attempt &A) {
         } while (i != e);
         arc.count = static_cast<int>(arc.pos.size()) - 1;
         arc.splittable = allBoundary && opts_.splitBoundary;
+        arc.minCount = arc.count;
+        if (arc.splittable && opts_.dropBoundary) {
+            for (size_t j = 1; j + 1 < arc.pos.size(); ++j) {
+                if (CavityFill::droppable(C_, L[arc.pos[j]], R.set)) --arc.minCount;
+            }
+        }
         arcs.push_back(arc);
     }
     const int loopArcs = static_cast<int>(arcs.size());
@@ -704,7 +765,7 @@ bool ExplicitTemplates::trySections(const Region &R, Patch &P, Attempt &A) {
             double a = wrap2pi(prev.inAng - cur.outAng);
             if (a < 1e-12) a = 2.0 * M_PI;
             const int g = cur.from;
-            const bool required = G[g].pos >= 0 && node[G[g].pos];
+            const bool required = G[g].pos >= 0 && corner[G[g].pos];
             if (required || std::fabs(a - M_PI) > cornerTol) corners.push_back(k);
         }
         if (corners.size() != 4) {
@@ -732,7 +793,7 @@ bool ExplicitTemplates::trySections(const Region &R, Patch &P, Attempt &A) {
     for (int k = 0; k < static_cast<int>(arcs.size()); ++k) classes[uf.find(k)].push_back(k);
     std::vector<int> target(arcs.size(), 1);
     for (const auto &kv : classes) {
-        int fixed = -1, maxCur = 0;
+        int fixed = -1, maxCur = 0, maxMin = 0;
         double idealSum = 0.0;
         int nIdeal = 0;
         bool anyLoop = false;
@@ -745,6 +806,7 @@ bool ExplicitTemplates::trySections(const Region &R, Patch &P, Attempt &A) {
                     fixed = arc.count;
                 }
                 maxCur = std::max(maxCur, arc.count);
+                maxMin = std::max(maxMin, arc.minCount);
             } else {
                 idealSum += std::max(1.0, arc.length / std::max(1e-300, R.h));
                 ++nIdeal;
@@ -752,7 +814,9 @@ bool ExplicitTemplates::trySections(const Region &R, Patch &P, Attempt &A) {
         }
         int n;
         if (fixed >= 0) {
-            if (maxCur > fixed) return fail("an interface arc is coarser than the boundary arc it must match");
+            // A boundary arc longer than the interface arc it must match may
+            // shed its droppable points (the coarse carrier's midpoints).
+            if (maxMin > fixed) return fail("an interface arc is coarser than the boundary arc it must match");
             n = fixed;
         } else if (anyLoop) {
             n = maxCur;
@@ -778,6 +842,11 @@ bool ExplicitTemplates::trySections(const Region &R, Patch &P, Attempt &A) {
                 if (split.empty()) return fail("an arc would need subdividing and cannot be");
                 A.splits += target[k] - arc.count;
                 ids = split;
+            } else if (target[k] < arc.count) {
+                std::vector<char> may(ids.size(), 0);
+                for (size_t j = 1; j + 1 < ids.size(); ++j) may[j] = CavityFill::droppable(C_, ids[j], R.set);
+                ids = CavityFill::dropFromBoundary(C_, P, ids, may, arc.count - target[k]);
+                if (ids.empty()) return fail("an arc would need to shed points and cannot");
             }
             arcIds[k] = ids;
         } else {
@@ -795,6 +864,7 @@ bool ExplicitTemplates::trySections(const Region &R, Patch &P, Attempt &A) {
         }
         ++mapCount[classifyGrid(P, sides)];
         if (!CavityFill::grid(C_, P, sides, Origin::Template)) return fail("a face's sides do not close");
+        propagateNodes(R, P, sides);
     }
     for (size_t g = 0; g < G.size(); ++g) P.designated.push_back(gid[g]);
     P.blocks = static_cast<int>(fsides.size());
@@ -814,7 +884,7 @@ bool ExplicitTemplates::tryStar(const Region &R, Patch &P, Attempt &A) {
     const int N = static_cast<int>(L.size());
     auto fail = [&](const std::string &why) { A.reason = why; return false; };
     std::vector<int> nodes;
-    for (int i = 0; i < N; ++i) if (isNode(L[i])) nodes.push_back(i);
+    for (int i = 0; i < N; ++i) if (isCorner(R, R.outer, i)) nodes.push_back(i);
     const int K = static_cast<int>(nodes.size());
     if (K != 3 && K != 5) return fail("not three or five corners");
 
@@ -835,11 +905,58 @@ bool ExplicitTemplates::tryStar(const Region &R, Patch &P, Attempt &A) {
         }
     }
 
+    // A side with one flat node on it (see "Corners and flat nodes") has its
+    // split point there if the counts allow it: the spoke then continues the
+    // macro edge that already ends at the node, where anywhere else each
+    // side's grid line would cut the other's blocks. Such a side keeps its
+    // count, so the node stays where it is along it.
+    std::vector<int> prescribed(K, -1);
+    std::vector<char> fixedSplittable = splittable;
+    int flatSides = 0;
+    for (int k = 0; k < K; ++k) {
+        int count = 0, at = -1;
+        for (int j = 1; j + 1 < static_cast<int>(arc[k].size()); ++j) {
+            if (isNode(arc[k][j])) { ++count; at = j; }
+        }
+        if (count != 1) continue;
+        prescribed[k] = at;
+        fixedSplittable[k] = 0;
+        ++flatSides;
+    }
+
     // The least subdivision that makes n_i = s_{i-1} + s_{i+1} solvable.
     std::vector<int> sigma;
-    if (!CavityFill::repairStar(n, splittable, sigma)) {
-        return fail("no positive integer spoke counts, even subdividing the domain-boundary sides");
+    bool onFlat = flatSides > 0 && CavityFill::repairStar(n, fixedSplittable, sigma, &prescribed);
+    bool solved = onFlat || CavityFill::repairStar(n, splittable, sigma);
+    // Next to an interface a domain-boundary side may also shed its
+    // droppable points (the coarse carrier's midpoints, which Stage 6 drops
+    // anyway), so that a side too long for the fixed interface sides beside
+    // it -- or for a spoke that has to meet a flat node -- can shrink to fit.
+    // Only when the subdividing solve failed, so a region bounded by dS
+    // alone is templated exactly as before.
+    std::vector<std::vector<char>> mayDrop(K);
+    for (int k = 0; k < K; ++k) {
+        mayDrop[k].assign(arc[k].size(), 0);
+        if (!splittable[k] || !R.touchesInterface || !opts_.dropBoundary) continue;
+        for (size_t j = 1; j + 1 < arc[k].size(); ++j) mayDrop[k][j] = CavityFill::droppable(C_, arc[k][j], R.set);
     }
+    if (R.touchesInterface && opts_.dropBoundary && (!solved || (flatSides > 0 && !onFlat))) {
+        std::vector<int> lo(K), hi(K), s2, have;
+        for (int k = 0; k < K; ++k) {
+            int drops = 0;
+            for (char d : mayDrop[k]) drops += d;
+            lo[k] = splittable[k] && prescribed[k] < 0 ? std::max(1, n[k] - drops) : n[k];
+            hi[k] = splittable[k] && prescribed[k] < 0 ? n[k] + 4 * std::max(1, n[k]) : n[k];
+        }
+        if (flatSides > 0 && CavityFill::rangeStar(n, lo, hi, s2, have, 40, &prescribed)) {
+            sigma = s2;
+            onFlat = solved = true;
+        } else if (!solved && CavityFill::rangeStar(n, lo, hi, s2, have)) {
+            sigma = s2;
+            solved = true;
+        }
+    }
+    if (!solved) return fail("no positive integer spoke counts, even subdividing the domain-boundary sides");
     std::vector<int> bestD(K);
     for (int k = 0; k < K; ++k) bestD[k] = sigma[(k + K - 1) % K] + sigma[(k + 1) % K] - n[k];
     for (int k = 0; k < K; ++k) {
@@ -847,6 +964,9 @@ bool ExplicitTemplates::tryStar(const Region &R, Patch &P, Attempt &A) {
             arc[k] = splitArc(P, arc[k], bestD[k]);
             if (arc[k].empty()) return fail("a side could not be subdivided");
             A.splits += bestD[k];
+        } else if (bestD[k] < 0) {
+            arc[k] = CavityFill::dropFromBoundary(C_, P, arc[k], mayDrop[k], -bestD[k]);
+            if (arc[k].empty()) return fail("a side could not shed its points");
         }
     }
 
@@ -880,6 +1000,7 @@ bool ExplicitTemplates::tryStar(const Region &R, Patch &P, Attempt &A) {
     for (int k = 0; k < K; ++k) { P.designated.push_back(L[nodes[k]]); P.designated.push_back(mid[k]); }
     P.designated.push_back(center);
     A.maps = "star of " + std::to_string(K) + " Coons blocks";
+    if (onFlat) A.maps += ", " + std::to_string(flatSides) + " spoke(s) on flat nodes";
     P.blocks = K;
     P.kind = "star";
     return true;
@@ -899,8 +1020,18 @@ bool ExplicitTemplates::tryOGrid(const Region &R, Patch &P, Attempt &A) {
     const double depth = CavityFill::kernelDepth(X, c);
     if (!(depth > 1e-3 * R.h)) return fail("not star-shaped about any point found (Sec. 7.3 needs a kernel point)");
 
-    std::vector<int> required;
-    for (int i = 0; i < N; ++i) if (isNode(L[i])) required.push_back(i);
+    std::vector<int> required, flatNodes;
+    for (int i = 0; i < N; ++i) {
+        if (isCorner(R, R.outer, i)) required.push_back(i);
+        else if (isNode(L[i]) && R.touchesInterface && opts_.flatNodes) flatNodes.push_back(i);
+    }
+    // Flat nodes are where a neighbour's macro edges end: as split points the
+    // shells' rays continue them, anywhere else each cuts a shell. Tried
+    // first when there are few enough to be split points at all.
+    std::vector<int> preferred = required;
+    if (!flatNodes.empty() && required.size() + flatNodes.size() <= 4) {
+        preferred.insert(preferred.end(), flatNodes.begin(), flatNodes.end());
+    }
 
     // Ideal split directions: the corners of a rectangle on the principal
     // axes with half-widths in proportion to the region's extents.
@@ -952,24 +1083,40 @@ bool ExplicitTemplates::tryOGrid(const Region &R, Patch &P, Attempt &A) {
     int bestI0 = -1, bestA = -1, bestRot = 0;
     double bestScore = 1e300;
     const int half = N / 2;
-    for (int i0 = 0; i0 < half; ++i0) {
-        for (int a = 1; a < half; ++a) {
-            const int p[4] = {i0, (i0 + a) % N, (i0 + half) % N, (i0 + half + a) % N};
-            bool ok = true;
-            for (int r : required) {
-                if (r != p[0] && r != p[1] && r != p[2] && r != p[3]) { ok = false; break; }
-            }
-            if (!ok) continue;
-            for (int rot = 0; rot < 4; ++rot) {
-                double s = 0.0;
-                for (int k = 0; k < 4; ++k) {
-                    const double dd = angDist(theta[p[k]], ideal[(k + rot) % 4]);
-                    s += dd * dd;
+    auto searchSplits = [&](const std::vector<int> &must) {
+        for (int i0 = 0; i0 < half; ++i0) {
+            for (int a = 1; a < half; ++a) {
+                const int p[4] = {i0, (i0 + a) % N, (i0 + half) % N, (i0 + half + a) % N};
+                bool ok = true;
+                for (int r : must) {
+                    if (r != p[0] && r != p[1] && r != p[2] && r != p[3]) { ok = false; break; }
                 }
-                if (s < bestScore) { bestScore = s; bestI0 = i0; bestA = a; bestRot = rot; }
+                if (!ok) continue;
+                for (int rot = 0; rot < 4; ++rot) {
+                    double s = 0.0;
+                    for (int k = 0; k < 4; ++k) {
+                        const double dd = angDist(theta[p[k]], ideal[(k + rot) % 4]);
+                        s += dd * dd;
+                    }
+                    if (s < bestScore) { bestScore = s; bestI0 = i0; bestA = a; bestRot = rot; }
+                }
+            }
+        }
+    };
+    // All the flat nodes if they can be split points together, else as many
+    // of them as can (each one left out is a cut through a shell).
+    if (preferred.size() > required.size()) {
+        const int nf = static_cast<int>(flatNodes.size());
+        for (int keep = nf; keep >= 1 && bestI0 < 0; --keep) {
+            for (int mask = 0; mask < (1 << nf) && bestI0 < 0; ++mask) {
+                if (__builtin_popcount(static_cast<unsigned>(mask)) != keep) continue;
+                std::vector<int> must = required;
+                for (int k = 0; k < nf; ++k) if (mask & (1 << k)) must.push_back(flatNodes[k]);
+                searchSplits(must);
             }
         }
     }
+    if (bestI0 < 0) searchSplits(required);
     if (bestI0 < 0) return fail("the protected corners cannot be four O-grid split points");
     const int a = bestA, b = half - bestA;
     const int p[4] = {bestI0, (bestI0 + a) % N, (bestI0 + half) % N, (bestI0 + half + a) % N};
@@ -1121,7 +1268,7 @@ bool ExplicitTemplates::tryHalfOGrid(const Region &R, Patch &P, Attempt &A) {
     auto fail = [&](const std::string &why) { A.reason = why; return false; };
 
     std::vector<int> npos;
-    for (int i = 0; i < N; ++i) if (isNode(L[i])) npos.push_back(i);
+    for (int i = 0; i < N; ++i) if (isCorner(R, R.outer, i)) npos.push_back(i);
     if (npos.size() != 2) return fail("not two protected corners");
     const double maxCorner = opts_.halfOGridCorner * M_PI / 180.0;
     for (int i : npos) {
@@ -1272,10 +1419,25 @@ bool ExplicitTemplates::tryHalfOGrid(const Region &R, Patch &P, Attempt &A) {
     auto alphaAt = [&](const Point &, bool) { return alpha; };
     const int j2c = nearestArc(ideal2), j1c = nearestArc(ideal1);
     const int window = 2;
-    for (int j2 = std::max(1, j2c - window); j2 <= std::min(Ar - 2, j2c + window); ++j2) {
+    // Flat nodes, where the templates across its two sides ended macro edges:
+    // two on the straight side are where the core's feet belong, two on the
+    // arc where its rays do (multimat/det_rocket's purple head, next to the
+    // fuel region whose sections from the inclusion's corners end on their
+    // shared side: feet anywhere else draw a second line beside each of
+    // theirs, and a sliver of blocks between).
+    std::vector<int> flatB, flatA;
+    if (R.touchesInterface && opts_.flatNodes) {
+        for (int k = 1; k < D; ++k) if (isNode(base[k])) flatB.push_back(k);
+        for (int k = 1; k < Ar; ++k) if (isNode(arc[k])) flatA.push_back(k);
+    }
+    std::set<int> j2s;
+    for (int j2 = std::max(1, j2c - window); j2 <= std::min(Ar - 2, j2c + window); ++j2) j2s.insert(j2);
+    if (flatA.size() == 2) j2s.insert(flatA[0]);
+    for (int j2 : j2s) {
         std::set<int> j1s;
         for (int j1 = j1c - window; j1 <= j1c + window; ++j1) j1s.insert(j1);
         j1s.insert(Ar - j2);   // |B t2| = |t1 A| with nothing inserted on the arc
+        if (flatA.size() == 2) j1s.insert(flatA[1]);
         for (int j1 : j1s) {
             if (j1 <= j2 || j1 > Ar - 1) continue;
             const Point q2 = c + (Xa[j2] - c) * alphaAt(Xa[j2], true), q1 = c + (Xa[j1] - c) * alphaAt(Xa[j1], false);
@@ -1304,12 +1466,23 @@ bool ExplicitTemplates::tryHalfOGrid(const Region &R, Patch &P, Attempt &A) {
                 for (int d1 = -window; d1 <= window; ++d1)
                     for (int d2 = -window; d2 <= window; ++d2) consider(i1c + d1, i2c + d2);
             }
+            if (flatB.size() == 2) consider(flatB[0], flatB[1]);
             // Nothing insertable anywhere: the core as wide as the arc above it.
             const int nT = j1 - j2;
             if (D - nT >= 2 && (D - nT) % 2 == 0) consider((D - nT) / 2, D - (D - nT) / 2);
         }
     }
     if (splits.empty()) return fail("no split of the two sides closes the counts");
+    // A split on the flat nodes, where one closes the counts, over any other.
+    auto onFlat = [&](const Split &sp) {
+        const bool feet = flatB.size() != 2 || (sp.i1 == flatB[0] && sp.i2 == flatB[1]);
+        const bool rays = flatA.size() != 2 || (sp.j2 == flatA[0] && sp.j1 == flatA[1]);
+        return feet && rays;
+    };
+    if ((flatB.size() == 2 || flatA.size() == 2) && std::any_of(splits.begin(), splits.end(), onFlat)) {
+        splits.erase(std::remove_if(splits.begin(), splits.end(), [&](const Split &sp) { return !onFlat(sp); }),
+                     splits.end());
+    }
     std::stable_sort(splits.begin(), splits.end(), [](const Split &a, const Split &b) { return a.cost < b.cost; });
 
     // Build one split; false with a reason when its geometry does not close.
@@ -1483,8 +1656,11 @@ bool ExplicitTemplates::tryAnnulus(const Region &R, Patch &P, Attempt &A) {
     std::vector<int> Li = R.B.loops[R.holes[0]];
     std::reverse(Li.begin(), Li.end());
     std::vector<int> nodesO, nodesI;
-    for (size_t i = 0; i < Lo.size(); ++i) if (isNode(Lo[i])) nodesO.push_back(static_cast<int>(i));
-    for (size_t i = 0; i < Li.size(); ++i) if (isNode(Li[i])) nodesI.push_back(static_cast<int>(i));
+    for (size_t i = 0; i < Lo.size(); ++i) if (isCorner(R, R.outer, static_cast<int>(i))) nodesO.push_back(static_cast<int>(i));
+    // Li is the hole's loop reversed: position i is the loop's Ni - 1 - i.
+    for (size_t i = 0; i < Li.size(); ++i) {
+        if (isCorner(R, R.holes[0], static_cast<int>(Li.size() - 1 - i))) nodesI.push_back(static_cast<int>(i));
+    }
     if (!(nodesO.empty() || nodesO.size() == 4) || !(nodesI.empty() || nodesI.size() == 4)) {
         return fail("protected corners on a loop, and not four of them");
     }
@@ -1521,6 +1697,39 @@ bool ExplicitTemplates::tryAnnulus(const Region &R, Patch &P, Attempt &A) {
     for (int k = 0; k < 4; ++k) {
         si[k] = nodesI.size() == 4 ? nodesI[k] : nearest(Xi, rayAngle[k]);
         so[k] = nodesO.size() == 4 ? nodesO[k] : nearest(Xo, rayAngle[k]);
+    }
+    // A smooth hole with exactly four flat nodes -- the split points of the
+    // O-grid already inside it -- takes its inner split points there, each
+    // paired below with the outer one nearest it in angle, so that the
+    // sectors' rays continue the O-grid's.
+    if (nodesI.empty() && R.touchesInterface && opts_.flatNodes) {
+        std::vector<int> flatI;
+        for (int i = 0; i < Ni; ++i) if (isNode(Li[i])) flatI.push_back(i);
+        if (flatI.size() == 4) {
+            for (int k = 0; k < 4; ++k) si[k] = flatI[k];
+        }
+    }
+    // Where CoarseDomain sampled the input's own rays in (preferredEnds), a
+    // split point a vertex or two from one of those samples moves onto it:
+    // the loop's counts were reconciled for the arcs between them.
+    if (opts_.preferredEnds) {
+        auto snapTo = [&](const std::vector<int> &Lp, int pos) {
+            const int n = static_cast<int>(Lp.size());
+            for (int d = 0; d <= 2; ++d) {
+                for (int sgn : {1, -1}) {
+                    const int j = ((pos + sgn * d) % n + n) % n;
+                    const int sv = C_.sourceVertex[Lp[j]];
+                    if (sv >= 0 && sv < static_cast<int>(opts_.preferredEnds->size()) && (*opts_.preferredEnds)[sv]) {
+                        return j;
+                    }
+                }
+            }
+            return pos;
+        };
+        for (int k = 0; k < 4; ++k) {
+            if (nodesI.size() != 4) si[k] = snapTo(Li, si[k]);
+            if (nodesO.size() != 4) so[k] = snapTo(Lo, so[k]);
+        }
     }
     // Pair the two loops' split points by angle: rotate the inner list so
     // its first point is the one nearest the outer's first ray.
@@ -1573,6 +1782,41 @@ bool ExplicitTemplates::tryAnnulus(const Region &R, Patch &P, Attempt &A) {
         const int ni = static_cast<int>(ai[k].size()) - 1, no = static_cast<int>(ao[k].size()) - 1;
         if (ni < no && !allBoundary(ai[k])) needFixed = true;
         if (no < ni && !allBoundary(ao[k])) needFixed = true;
+    }
+    // Next to an interface, the finer arc of a sector may shed its droppable
+    // points instead when it is dS and the coarser one an interface (a plate
+    // round an inclusion: the inclusion's circle is sampled once for both of
+    // its sides, the plate's edges at their own spacing).
+    if (needFixed && R.touchesInterface && opts_.dropBoundary) {
+        std::array<std::vector<int>, 4> ai2 = ai, ao2 = ao;
+        bool ok = true;
+        for (int k = 0; k < 4 && ok; ++k) {
+            const int ni = static_cast<int>(ai[k].size()) - 1, no = static_cast<int>(ao[k].size()) - 1;
+            if (ni == no) continue;
+            std::vector<int> &fine = ni < no ? ao2[k] : ai2[k];
+            std::vector<int> &coarse = ni < no ? ai2[k] : ao2[k];
+            const int d = std::abs(no - ni);
+            if (allBoundary(coarse)) {
+                coarse = splitArc(P, coarse, d);
+                A.splits += d;
+            } else if (allBoundary(fine)) {
+                std::vector<char> may(fine.size(), 0);
+                for (size_t j = 1; j + 1 < fine.size(); ++j) may[j] = CavityFill::droppable(C_, fine[j], R.set);
+                fine = CavityFill::dropFromBoundary(C_, P, fine, may, d);
+            } else {
+                ok = false;
+            }
+            if (fine.empty() || coarse.empty()) ok = false;
+        }
+        if (ok) {
+            ai = ai2;
+            ao = ao2;
+            needFixed = false;
+        }
+    }
+    if (!needFixed) {
+        // Handled above, or nothing to handle: each arc pair is equal now or
+        // settles below by subdividing the coarser dS arc.
     }
     if (needFixed) {
         if (Ni != No) return fail("sector counts differ and the coarser arc is an interface");
@@ -1637,5 +1881,328 @@ bool ExplicitTemplates::tryAnnulus(const Region &R, Patch &P, Attempt &A) {
     P.blocks = 4;
     P.kind = "annulus";
     A.maps = "4 polar";
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// General sections (see the class comment): SectionArrangement's faces on
+// this region, their counts, and a grid or a star in each.
+// ---------------------------------------------------------------------------
+bool ExplicitTemplates::trySectionsGeneral(const Region &R, Patch &P, Attempt &A) {
+    typedef SectionArrangement SA;
+    auto fail = [&](const std::string &why) { A.reason = why; return false; };
+    if (R.outer < 0) return fail("the region has no single outer loop");
+
+    // ---- the loops, outer first ----------------------------------------------
+    std::vector<SA::Loop> Ls;
+    std::vector<std::vector<int>> ids, edges;
+    std::vector<int> loopOrder{R.outer};
+    for (int h : R.holes) loopOrder.push_back(h);
+    for (int b : loopOrder) {
+        SA::Loop D;
+        const std::vector<int> &L = R.B.loops[b];
+        if (L.size() < 3) return fail("a loop has fewer than three vertices");
+        D.angle = R.B.angle[b];
+        for (int i = 0; i < static_cast<int>(L.size()); ++i) {
+            D.X.push_back(C_.vertices[L[i]]);
+            D.node.push_back(isNode(L[i]) ? 1 : 0);
+            D.corner.push_back(isCorner(R, b, i) ? 1 : 0);
+            const int sv = C_.sourceVertex[L[i]];
+            D.preferred.push_back(opts_.preferredEnds && sv >= 0 && sv < static_cast<int>(opts_.preferredEnds->size()) &&
+                                  (*opts_.preferredEnds)[sv] ? 1 : 0);
+        }
+        Ls.push_back(std::move(D));
+        ids.push_back(L);
+        edges.push_back(R.B.loopEdges[b]);
+    }
+    SA::Options so;
+    so.flatSections = opts_.flatSections;
+    so.nodeSnap = opts_.nodeSnap;
+    so.cornerTolerance = opts_.cornerTolerance * M_PI / 180.0;
+    if (opts_.field) {
+        const ReferenceField *F = opts_.field;
+        so.cross = [F](const Point &p, double *w) { return F->crossAt(p, w); };
+    }
+    std::vector<SA::Section> secs;
+    std::string why;
+    if (!SA::cast(Ls, so, secs, why)) return fail(why);
+    if (secs.empty()) return fail("no corner or flat node to cut at");
+
+    // ---- one arrangement and its counts ----------------------------------------
+    struct Plan {
+        SA::Result r;
+        std::vector<int> count, minCount;   // loop arcs: carrier edges now, and with droppable points gone
+        std::vector<char> splittable;
+        std::vector<int> target;
+        std::string why;
+        int mismatch = 0;                   // sum of the fixed counts that disagree
+        bool ok = false;
+    };
+    auto evaluate = [&](const std::vector<SA::Section> &S, Plan &pl) {
+        pl = Plan();
+        auto no = [&](const std::string &w, int mismatch = 0) {
+            pl.why = w;
+            pl.mismatch = mismatch;
+            return false;
+        };
+        if (!SA::arrange(Ls, S, so, pl.r)) return no(pl.r.why);
+        const std::vector<SA::Arc> &arcs = pl.r.arcs;
+        const int NA = static_cast<int>(arcs.size());
+        pl.count.assign(NA, 0);
+        pl.minCount.assign(NA, 0);
+        pl.splittable.assign(NA, 0);
+        for (int k = 0; k < NA; ++k) {
+            const SA::Arc &arc = arcs[k];
+            if (arc.loop < 0) continue;
+            bool allBoundary = true;
+            for (size_t j = 0; j + 1 < arc.pos.size(); ++j) {
+                if (!C_.boundaryEdge[edges[arc.loop][arc.pos[j]]]) allBoundary = false;
+            }
+            pl.count[k] = static_cast<int>(arc.pos.size()) - 1;
+            pl.splittable[k] = allBoundary && opts_.splitBoundary;
+            pl.minCount[k] = pl.count[k];
+            if (pl.splittable[k] && opts_.dropBoundary) {
+                for (size_t j = 1; j + 1 < arc.pos.size(); ++j) {
+                    if (CavityFill::droppable(C_, ids[arc.loop][arc.pos[j]], R.set)) --pl.minCount[k];
+                }
+            }
+        }
+        // Grids: Sec. 11.2's union-find, opposite sides equal.
+        UF uf(NA);
+        for (const SA::Face &f : pl.r.faces) {
+            if (f.corners.size() != 4) continue;
+            uf.unite(pl.r.half[f.halves[f.corners[0]]].arc, pl.r.half[f.halves[f.corners[2]]].arc);
+            uf.unite(pl.r.half[f.halves[f.corners[1]]].arc, pl.r.half[f.halves[f.corners[3]]].arc);
+        }
+        struct Class { int lb = 1, pref = 1; bool adjustable = true; };
+        std::map<int, Class> cls;
+        std::map<int, std::vector<int>> members;
+        for (int k = 0; k < NA; ++k) members[uf.find(k)].push_back(k);
+        int mismatch = 0;
+        for (const auto &kv : members) {
+            Class c;
+            int curMax = 0, fixedMin = 1 << 30, fixedMax = -1, nIdeal = 0;
+            double idealSum = 0.0;
+            bool anyLoop = false;
+            for (int k : kv.second) {
+                if (arcs[k].loop >= 0) {
+                    anyLoop = true;
+                    curMax = std::max(curMax, pl.count[k]);
+                    if (!pl.splittable[k]) {
+                        fixedMin = std::min(fixedMin, pl.count[k]);
+                        fixedMax = std::max(fixedMax, pl.count[k]);
+                    } else {
+                        c.lb = std::max(c.lb, pl.minCount[k]);
+                    }
+                } else {
+                    idealSum += std::max(1.0, arcs[k].length / std::max(1e-300, R.h));
+                    ++nIdeal;
+                }
+            }
+            if (fixedMax >= 0) {
+                mismatch += fixedMax - fixedMin + std::max(0, c.lb - fixedMax);
+                c.adjustable = false;
+                c.pref = fixedMax;
+            } else if (anyLoop) {
+                c.pref = std::max(curMax, c.lb);
+            } else {
+                c.pref = std::max(1, static_cast<int>(std::lround(idealSum / std::max(1, nIdeal))));
+            }
+            cls[kv.first] = c;
+        }
+        if (mismatch > 0) return no("two interface arcs that must match have different counts", mismatch);
+
+        // Stars: the counts no arc fixes, chosen so that every star face has
+        // positive integer spokes, nearest their preferred values first.
+        std::map<int, int> val;
+        for (const auto &kv : cls) val[kv.first] = kv.second.pref;
+        std::vector<std::vector<int>> starClasses;
+        std::vector<int> vars;
+        for (const SA::Face &f : pl.r.faces) {
+            if (f.corners.size() == 4) continue;
+            std::vector<int> sc;
+            for (int c : f.corners) sc.push_back(uf.find(pl.r.half[f.halves[c]].arc));
+            starClasses.push_back(sc);
+            for (int c : sc) {
+                if (cls[c].adjustable && std::find(vars.begin(), vars.end(), c) == vars.end()) vars.push_back(c);
+            }
+        }
+        std::map<int, char> assigned;
+        auto starsOk = [&](bool partial) {
+            std::vector<int> n, s;
+            for (const auto &sc : starClasses) {
+                bool all = true;
+                n.clear();
+                for (int c : sc) {
+                    if (partial && cls[c].adjustable && !assigned.count(c)) { all = false; break; }
+                    n.push_back(val[c]);
+                }
+                if (!all) continue;
+                if (!CavityFill::solveStar(n, s)) return false;
+            }
+            return true;
+        };
+        if (!starClasses.empty()) {
+            if (!starsOk(true)) return no("a star face's fixed sides admit no spoke counts");
+            int maxN = 1;
+            for (int x : pl.count) maxN = std::max(maxN, x);
+            for (const auto &kv : cls) maxN = std::max(maxN, kv.second.pref);
+            maxN = 3 * maxN + 4;
+            long long budget = 200000;
+            std::function<bool(size_t)> search = [&](size_t k) {
+                if (k == vars.size()) return starsOk(false);
+                const int c = vars[k];
+                const int p = cls[c].pref, lb = cls[c].lb;
+                for (int d = 0; d <= maxN; ++d) {
+                    for (int sgn : {1, -1}) {
+                        if (d == 0 && sgn < 0) continue;
+                        const int v = p + sgn * d;
+                        if (v < lb || v < 1 || v > maxN) continue;
+                        if (--budget < 0) return false;
+                        val[c] = v;
+                        assigned[c] = 1;
+                        if (starsOk(true) && search(k + 1)) return true;
+                        assigned.erase(c);
+                    }
+                }
+                val[c] = cls[c].pref;
+                return false;
+            };
+            if (!search(0)) return no("no counts give every star face positive spokes");
+        }
+        pl.target.assign(NA, 0);
+        for (int k = 0; k < NA; ++k) pl.target[k] = val[uf.find(k)];
+        pl.ok = true;
+        return true;
+    };
+
+    // ---- the sections' far ends, moved where two fixed counts disagree -------
+    Plan plan;
+    evaluate(secs, plan);
+    if (!plan.ok && plan.mismatch > 0 && opts_.sectionShift > 0) {
+        int best = plan.mismatch;
+        for (int iter = 0; iter < 4 * static_cast<int>(secs.size()) && !plan.ok; ++iter) {
+            bool improved = false;
+            for (size_t s = 0; s < secs.size() && !improved; ++s) {
+                if (!secs[s].shiftable) continue;
+                for (int d = 1; d <= opts_.sectionShift && !improved; ++d) {
+                    for (int sgn : {-1, 1}) {
+                        std::vector<SA::Section> trial = secs;
+                        SA::End &e = trial[s].b;
+                        const int N = static_cast<int>(Ls[e.l].X.size());
+                        e.i = ((e.i + sgn * d) % N + N) % N;
+                        // Never onto or past a node or another section's end.
+                        bool blocked = false;
+                        for (int k = 1; k <= d; ++k) {
+                            const int j = ((secs[s].b.i + sgn * k) % N + N) % N;
+                            if (Ls[e.l].node[j]) blocked = true;
+                            for (const SA::Section &o : secs) {
+                                if ((o.a.l == e.l && o.a.i == j) || (o.b.l == e.l && o.b.i == j)) blocked = true;
+                            }
+                        }
+                        if (blocked || !SA::clear(Ls, trial[s].a, e)) continue;
+                        Plan p2;
+                        evaluate(trial, p2);
+                        if (p2.ok || (p2.mismatch > 0 && p2.mismatch < best)) {
+                            secs = trial;
+                            plan = p2;
+                            best = p2.ok ? 0 : p2.mismatch;
+                            improved = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!improved) break;
+        }
+    }
+    if (!plan.ok) return fail(plan.why);
+
+    // ---- the patch ----------------------------------------------------------
+    const SA::Result &ar = plan.r;
+    std::vector<int> gid(ar.nodes.size());
+    for (size_t g = 0; g < ar.nodes.size(); ++g) {
+        const SA::Node &n = ar.nodes[g];
+        gid[g] = n.l >= 0 ? ids[n.l][n.i] : P.addVertex(n.x, Origin::Template);
+    }
+    std::vector<std::vector<int>> arcIds(ar.arcs.size());
+    for (size_t k = 0; k < ar.arcs.size(); ++k) {
+        const SA::Arc &arc = ar.arcs[k];
+        const int t = plan.target[k];
+        if (arc.loop >= 0) {
+            std::vector<int> v;
+            for (int p : arc.pos) v.push_back(ids[arc.loop][p]);
+            const int n = plan.count[k];
+            if (t > n) {
+                v = splitArc(P, v, t - n);
+                if (v.empty()) return fail("an arc would need subdividing and cannot be");
+                A.splits += t - n;
+            } else if (t < n) {
+                std::vector<char> may(v.size(), 0);
+                for (size_t j = 1; j + 1 < v.size(); ++j) may[j] = CavityFill::droppable(C_, v[j], R.set);
+                v = CavityFill::dropFromBoundary(C_, P, v, may, n - t);
+                if (v.empty()) return fail("an arc would need to shed points and cannot");
+            }
+            arcIds[k] = std::move(v);
+        } else {
+            arcIds[k] = CavityFill::segment(C_, P, gid[arc.a], gid[arc.b], t, Origin::Template);
+        }
+    }
+    int grids = 0, stars = 0;
+    for (const SA::Face &f : ar.faces) {
+        const int K = static_cast<int>(f.corners.size());
+        std::vector<std::vector<int>> sides(K);
+        for (int c = 0; c < K; ++c) {
+            const SA::Half &h = ar.half[f.halves[f.corners[c]]];
+            sides[c] = arcIds[h.arc];
+            if (h.rev) std::reverse(sides[c].begin(), sides[c].end());
+        }
+        if (K == 4) {
+            std::array<std::vector<int>, 4> s4{sides[0], sides[1], sides[2], sides[3]};
+            if (!CavityFill::grid(C_, P, s4, Origin::Template)) return fail("a face's sides do not close");
+            propagateNodes(R, P, s4);
+            ++grids;
+            continue;
+        }
+        std::vector<int> n(K), sigma;
+        for (int c = 0; c < K; ++c) n[c] = static_cast<int>(sides[c].size()) - 1;
+        if (!CavityFill::solveStar(n, sigma)) return fail("a star face's spokes do not solve");
+        std::vector<Point> poly;
+        for (const auto &sd : sides) for (size_t j = 0; j + 1 < sd.size(); ++j) poly.push_back(P.at(C_, sd[j]));
+        Point c = CavityFill::kernelCenter(poly, CavityFill::areaCentroid(poly));
+        const double depth = CavityFill::kernelDepth(poly, c);
+        if (!(depth > 1e-6 * R.h)) return fail("a star face is not star-shaped about any point found");
+        // A cone of the centre's sign well inside the face's kernel is where
+        // the centre belongs (as tryStar).
+        if (opts_.field && opts_.conePlacement) {
+            const int sign = K == 3 ? 1 : -1;
+            const ReferenceField::Singularity *only = nullptr;
+            int count = 0;
+            for (const ReferenceField::Singularity &sg : regionCones_) {
+                if (sg.sign != sign || !(CavityFill::kernelDepth(poly, sg.x) > 0.25 * depth)) continue;
+                ++count;
+                only = &sg;
+            }
+            if (count == 1) {
+                c = only->x;
+                A.conePlaced = true;
+            }
+        }
+        std::vector<int> mid;
+        int centre = 0;
+        if (!CavityFill::star(C_, P, sides, sigma, c, Origin::Template, &mid, &centre)) {
+            return fail("a star face's blocks do not close");
+        }
+        for (int m : mid) P.designated.push_back(m);
+        P.designated.push_back(centre);
+        ++stars;
+        P.blocks += K;
+    }
+    for (size_t g = 0; g < ar.nodes.size(); ++g) P.designated.push_back(gid[g]);
+    P.blocks += grids;
+    P.kind = "general sections";
+    std::ostringstream os;
+    os << secs.size() << " section(s), " << grids << " grid face(s), " << stars << " star face(s)";
+    A.maps = os.str();
     return true;
 }

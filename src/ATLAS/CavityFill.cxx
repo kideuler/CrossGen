@@ -104,6 +104,7 @@ struct ValidateScratch {
     StampSet run;
     StampSet hasNextOf;                               // nextOf's keys
     std::vector<int> nextOf;                          // by vertex key
+    StampSet kept;                                    // interior vertices the patch may reuse
     StampSet hasAngleSum;                             // angleSum's keys
     std::vector<double> angleSum;                     // by vertex key
     std::vector<int> angleKeys;                       // ... in first-seen order
@@ -272,6 +273,78 @@ std::vector<int> CavityFill::insertOnBoundary(const SquareCarrier &C, Patch &P, 
     return out;
 }
 
+std::vector<int> CavityFill::dropFromBoundary(const SquareCarrier &C, const Patch &P, const std::vector<int> &ids,
+                                              const std::vector<char> &mayDrop, int count) {
+    std::vector<int> out = ids;
+    std::vector<char> may = mayDrop;
+    for (int x = 0; x < count; ++x) {
+        int best = -1;
+        double bestL = 1e300;
+        for (size_t k = 1; k + 1 < out.size(); ++k) {
+            if (!may[k]) continue;
+            const double L = normP(P.at(C, out[k]) - P.at(C, out[k - 1])) +
+                             normP(P.at(C, out[k + 1]) - P.at(C, out[k]));
+            if (L < bestL) { bestL = L; best = static_cast<int>(k); }
+        }
+        if (best < 0) return {};
+        out.erase(out.begin() + best);
+        may.erase(may.begin() + best);
+    }
+    return out;
+}
+
+int CavityFill::interfaceSourceEdge(const SquareCarrier &C, int a, int b) {
+    const PlanarDomain &D = C.getDomain();
+    for (int v : {a, b}) {
+        if (v < 0) continue;
+        const int e = C.sourceEdge[v];
+        if (e >= 0 && D.interfaceEdge[e] && C.vertexOrigin[v] != Origin::MeshVertex) return e;
+    }
+    if (a < 0 || b < 0) return -1;
+    const int u = C.sourceVertex[a], w = C.sourceVertex[b];
+    if (u < 0 || w < 0) return -1;
+    const Mesh &M = D.getMesh();
+    const auto range = M.vertexTriangles.trianglesForVertex(u);
+    for (const int *t = range.first; t != range.second; ++t) {
+        for (int k = 0; k < 3; ++k) {
+            const int e = M.triangleEdges[*t][k];
+            const auto &ev = M.edges[e];
+            if ((ev[0] == u && ev[1] == w) || (ev[0] == w && ev[1] == u)) return D.interfaceEdge[e] ? e : -1;
+        }
+    }
+    return -1;
+}
+
+std::vector<int> CavityFill::insertOnSegments(const SquareCarrier &C, Patch &P, const std::vector<int> &ids,
+                                              const std::vector<int> &segEdge, const std::vector<char> &segIface,
+                                              int extra) {
+    if (extra <= 0) return ids;
+    struct Seg { int a, b, meshEdge; bool iface; };
+    std::vector<Seg> segs;
+    for (size_t k = 0; k + 1 < ids.size(); ++k) {
+        segs.push_back({ids[k], ids[k + 1], k < segEdge.size() ? segEdge[k] : -1,
+                        k < segIface.size() && segIface[k] != 0});
+    }
+    for (int x = 0; x < extra; ++x) {
+        int best = -1;
+        double bestL = -1.0;
+        for (size_t k = 0; k < segs.size(); ++k) {
+            if (segs[k].meshEdge < 0) continue;
+            const double L = normP(P.at(C, segs[k].b) - P.at(C, segs[k].a));
+            if (L > bestL) { bestL = L; best = static_cast<int>(k); }
+        }
+        if (best < 0) return {};
+        const Seg s = segs[best];
+        const int m = P.addVertex((P.at(C, s.a) + P.at(C, s.b)) * 0.5,
+                                  s.iface ? Origin::InterfaceSplit : Origin::BoundarySplit, s.meshEdge);
+        segs[best] = Seg{s.a, m, s.meshEdge, s.iface};
+        segs.insert(segs.begin() + best + 1, Seg{m, s.b, s.meshEdge, s.iface});
+    }
+    std::vector<int> out{segs.front().a};
+    for (const Seg &s : segs) out.push_back(s.b);
+    return out;
+}
+
 std::vector<int> CavityFill::dropFromBoundary(const SquareCarrier &C, const std::vector<int> &ids,
                                               const std::vector<char> &mayDrop, int count) {
     std::vector<int> out = ids;
@@ -418,7 +491,7 @@ bool CavityFill::solveStar(const std::vector<int> &n, std::vector<int> &s) {
 }
 
 bool CavityFill::repairStar(const std::vector<int> &n, const std::vector<char> &splittable,
-                            std::vector<int> &s) {
+                            std::vector<int> &s, const std::vector<int> *prescribed) {
     const int K = static_cast<int>(n.size());
     if (K != 3 && K != 5) return false;
     // The real solution, as the tie-break target.
@@ -455,6 +528,7 @@ bool CavityFill::repairStar(const std::vector<int> &n, const std::vector<char> &
         double dev = 0.0;
         for (int i = 0; i < K; ++i) {
             if (cur[i] < 1) return;
+            if (prescribed && (*prescribed)[i] >= 0 && cur[(i + K - 1) % K] != (*prescribed)[i]) return;
             const int have = cur[(i + K - 1) % K] + cur[(i + 1) % K];
             if (have < n[i] || (!splittable[i] && have != n[i])) return;
             D += have - n[i];
@@ -539,7 +613,8 @@ bool bestSpoke(long long L, long long H, long long a, long long b, double c, lon
 } // namespace
 
 bool CavityFill::rangeStar(const std::vector<int> &n, const std::vector<int> &lo, const std::vector<int> &hi,
-                           std::vector<int> &s, std::vector<int> &have, int window) {
+                           std::vector<int> &s, std::vector<int> &have, int window,
+                           const std::vector<int> *prescribed) {
     const int K = static_cast<int>(n.size());
     if (K != 3 && K != 5) return false;
     // Fixed arrays rather than vectors: K is 3 or 5, and this runs for every
@@ -574,6 +649,7 @@ bool CavityFill::rangeStar(const std::vector<int> &n, const std::vector<int> &lo
         double dev = 0.0;
         for (int i = 0; i < K; ++i) {
             if (cur[i] < 1) return;
+            if (prescribed && (*prescribed)[i] >= 0 && cur[(i + K - 1) % K] != (*prescribed)[i]) return;
             const long long h = cur[(i + K - 1) % K] + cur[(i + 1) % K];
             if (h < lo[i] || h > hi[i]) return;
             D += std::llabs(h - n[i]);
@@ -604,6 +680,13 @@ bool CavityFill::rangeStar(const std::vector<int> &n, const std::vector<int> &lo
         const long long c = std::llround(ideal[k]);
         a[k] = std::max(1LL, c - window);
         b[k] = std::min(static_cast<long long>(maxH), c + window);
+    }
+    // A prescribed spoke among the enumerated ones takes just its value.
+    if (prescribed) {
+        for (int i = 0; i < K; ++i) {
+            const int j = (i + K - 1) % K;
+            if ((*prescribed)[i] >= 0 && j < 3) a[j] = b[j] = (*prescribed)[i];
+        }
     }
     if (K == 3) {
         for (cur[0] = a[0]; cur[0] <= b[0]; ++cur[0]) {
@@ -644,7 +727,10 @@ void CavityFill::smooth(const SquareCarrier &C, Patch &P, int iterations) {
     for (int it = 0; it < iterations; ++it) {
         for (int k = 0; k < K; ++k) {
             next[k] = P.newVertices[k];
-            if (P.newOrigin[k] == Origin::BoundarySplit || nbr[k].empty()) continue;
+            if (P.newOrigin[k] == Origin::BoundarySplit || P.newOrigin[k] == Origin::InterfaceSplit ||
+                nbr[k].empty()) {
+                continue;
+            }
             Point s{0.0, 0.0};
             for (int id : nbr[k]) s = s + P.at(C, id);
             next[k] = s / static_cast<double>(nbr[k].size());
@@ -654,8 +740,9 @@ void CavityFill::smooth(const SquareCarrier &C, Patch &P, int iterations) {
 }
 
 CavityFill::Verdict CavityFill::settle(const SquareCarrier &C, const std::vector<int> &cavity, Patch &P,
-                                       double minScaledJacobian, int smoothingIterations) {
-    Verdict best = validate(C, cavity, P, minScaledJacobian);
+                                       double minScaledJacobian, int smoothingIterations,
+                                       const std::vector<int> *keep) {
+    Verdict best = validate(C, cavity, P, minScaledJacobian, keep);
     // Good enough already: an explicit map that certifies does not get
     // smoothed away from itself.
     if (smoothingIterations <= 0 || (best.valid && best.minScaledJacobian >= 0.5)) return best;
@@ -664,7 +751,7 @@ CavityFill::Verdict CavityFill::settle(const SquareCarrier &C, const std::vector
     const int chunk = 5;
     for (int done = 0; done < smoothingIterations; done += chunk) {
         smooth(C, work, chunk);
-        const Verdict v = validate(C, cavity, work, minScaledJacobian);
+        const Verdict v = validate(C, cavity, work, minScaledJacobian, keep);
         if (v.valid && (!best.valid || v.minScaledJacobian > best.minScaledJacobian + 1e-12)) {
             best = v;
             bestPatch = work;
@@ -687,7 +774,7 @@ CavityFill::Verdict CavityFill::settle(const SquareCarrier &C, const std::vector
 // gives the same verdict whichever vertex it looks at first.
 // ---------------------------------------------------------------------------
 CavityFill::Verdict CavityFill::validate(const SquareCarrier &C, const std::vector<int> &cavity,
-                                         const Patch &P, double minScaledJacobian) {
+                                         const Patch &P, double minScaledJacobian, const std::vector<int> *keep) {
     Verdict V;
     auto fail = [&](const std::string &why) { V.valid = false; V.reason = why; return V; };
     if (P.cells.empty()) return fail("the patch has no cells");
@@ -841,10 +928,16 @@ CavityFill::Verdict CavityFill::validate(const SquareCarrier &C, const std::vect
     }
     if (consumed != patchBoundary) return fail("the patch has boundary edges the cavity does not");
 
-    // Only boundary vertices of the cavity may be reused; its interior
-    // vertices are deleted with it.
+    // Only boundary vertices of the cavity may be reused, and the interior
+    // ones the caller keeps; the rest are deleted with it.
+    S.kept.reset(NV);
+    if (keep) for (int v : *keep) if (v >= 0 && v < NV && !S.onBoundary.contains(v)) S.kept.insert(v);
     for (const auto &q : P.cells) {
-        for (int v : q) if (v >= 0 && !S.onBoundary.contains(v)) return fail("the patch uses a vertex outside the cavity boundary");
+        for (int v : q) {
+            if (v >= 0 && !S.onBoundary.contains(v) && !S.kept.contains(v)) {
+                return fail("the patch uses a vertex outside the cavity boundary");
+            }
+        }
     }
 
     // Cells: Sec. 9.1's four corners, plus the requested quality floor.
@@ -886,7 +979,7 @@ CavityFill::Verdict CavityFill::validate(const SquareCarrier &C, const std::vect
     for (int k : S.angleKeys) {
         double want;
         if (k < NV) {
-            want = S.oldAngle[k];
+            want = S.onBoundary.contains(k) ? S.oldAngle[k] : 2.0 * M_PI;   // a kept interior vertex
         } else {
             const int idx = k - NV;
             want = P.newOrigin[idx] == Origin::BoundarySplit ? M_PI : 2.0 * M_PI;
@@ -895,6 +988,13 @@ CavityFill::Verdict CavityFill::validate(const SquareCarrier &C, const std::vect
     }
     for (int k = 0; k < static_cast<int>(P.newVertices.size()); ++k) {
         if (!S.hasAngleSum.contains(NV + k)) return fail("a new vertex is used by no cell");
+    }
+    if (keep) {
+        for (int v : *keep) {
+            if (v >= 0 && v < NV && !S.onBoundary.contains(v) && !S.hasAngleSum.contains(v)) {
+                return fail("a kept interface vertex is used by no cell");
+            }
+        }
     }
     if (std::fabs(newArea - oldArea) > 1e-9 * std::max(1e-300, std::fabs(oldArea))) {
         return fail("the patch does not have the cavity's area");

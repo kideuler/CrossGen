@@ -87,6 +87,9 @@ bool ATLAS::run() {
         for (double h : opts_.coarseSpacings) {
             CoarseDomain::Options co = opts_.coarseDomain;
             co.maxSpacing = h;
+            if (const ReferenceField *F = getField()) {
+                if (opts_.field.templates) co.cross = [F](const Point &p, double *w) { return F->crossAt(p, w); };
+            }
             auto domain = std::make_shared<CoarseDomain>(*domain_, co);
             for (int k = 0; k < std::max(1, opts_.coarseSeeds); ++k) {
                 auto sp = std::make_unique<Search>();
@@ -94,9 +97,33 @@ bool ATLAS::run() {
                 sp->spacing = h;
                 sp->seed = opts_.anneal.seed + 7919u * static_cast<unsigned>(k);
                 sp->coarseDomain = domain;
+                sp->smallestFirst = opts_.multimatOrders && k % 2 == 1 && domain_->getReport().interfaceEdges > 0;
                 std::ostringstream os;
                 os << "coarse h=" << h;
                 if (opts_.coarseSeeds > 1) os << " seed " << k + 1;
+                if (sp->smallestFirst) os << " small-first";
+                sp->name = os.str();
+                searches_.push_back(std::move(sp));
+            }
+            if (opts_.coarseWithoutTemplates && opts_.runTemplates && domain_->getReport().interfaceEdges > 0) {
+                auto sp = std::make_unique<Search>();
+                sp->coarse = true;
+                sp->spacing = h;
+                sp->seed = opts_.anneal.seed;
+                // The counts CoarseDomain reconciles across interfaces are
+                // there for Stage 3's templates; without them this search
+                // gets the domain as sampled (geom012: 15 blocks on the
+                // reconciled domain, 9 on its own).
+                if (co.harmoniseCounts && domain->valid() && domain->getReport().harmonisedChains > 0) {
+                    CoarseDomain::Options plain = co;
+                    plain.harmoniseCounts = false;
+                    sp->coarseDomain = std::make_shared<CoarseDomain>(*domain_, plain);
+                } else {
+                    sp->coarseDomain = domain;
+                }
+                sp->useTemplates = false;
+                std::ostringstream os;
+                os << "coarse h=" << h << " no templates";
                 sp->name = os.str();
                 searches_.push_back(std::move(sp));
             }
@@ -189,9 +216,27 @@ bool ATLAS::run() {
         const double obj = s.finalCover()->getReport().objective;
         s.finalScore = obj + arbiterTerms(*s.finalCarrier(), &s.finalDir, &s.finalSing, &s.finalShape);
     }
+    // The quality gate (Options::multimatQualityGate), among the coarse
+    // searches only: the fine carrier is the input's own three-quad split, a
+    // fallback of thousands of blocks whose cells are as good as the input's
+    // triangles, and measured against it every coarse answer could fail.
+    double gate = -1.0;
+    if (opts_.multimatQualityGate > 0.0 && domain_->getReport().interfaceEdges > 0) {
+        double bestCell = -1.0;
+        for (int i = 0; i < nSearches; ++i) {
+            const Search &s = *searches_[i];
+            if (s.coarse && s.succeeded()) bestCell = std::max(bestCell, s.finalCarrier()->getReport().minScaledJacobian);
+        }
+        if (bestCell > 0.0) gate = opts_.multimatQualityGate * bestCell;
+    }
     for (int i = 0; i < nSearches; ++i) {
         Search &s = *searches_[i];
         if (!s.succeeded()) continue;
+        if (s.coarse && s.finalCarrier()->getReport().minScaledJacobian < gate) {
+            status_.messages.push_back("Arbiter: " + s.name + " passed over, its worst cell is under " +
+                                       std::to_string(opts_.multimatQualityGate) + " of the best search's");
+            continue;
+        }
         const double obj = s.finalCover()->getReport().objective;
         if (status_.chosen < 0 || s.finalScore < status_.bestScore - 1e-9) {
             status_.chosen = i;
@@ -324,8 +369,14 @@ void ATLAS::search(Search &s, bool rewrite, int rounds, int passes, int maxRings
     const ReferenceField *field = getField();
 
     // ---- Stage 3 ------------------------------------------------------------
-    if (opts_.runTemplates) {
+    if (opts_.runTemplates && s.useTemplates) {
         ExplicitTemplates::Options to = opts_.templates;
+        if (s.smallestFirst) to.smallestFirst = true;
+        // On a coarse carrier, the samples CoarseDomain placed where the
+        // input's own sections landed are where this carrier's should end.
+        if (s.coarse && s.coarseDomain && !s.coarseDomain->sectionEnds().empty()) {
+            to.preferredEnds = &s.coarseDomain->sectionEnds();
+        }
         if (field && opts_.field.templates) {
             to.field = field;
             to.wDir = opts_.field.wDir;
@@ -355,6 +406,18 @@ void ATLAS::search(Search &s, bool rewrite, int rounds, int passes, int maxRings
         ro.fieldWeight = opts_.field.wDir / std::max(1e-9, opts_.anneal.wDefect);
     }
     if (rewrite) s.rewrite = std::make_unique<CavityRewrite>(work, ro);
+    // The template groups Stage 6 leaves alone: Stage 3 numbers them in the
+    // order it commits, which is the order of its accepted attempts.
+    if (s.rewrite && s.templates && opts_.lockInclusionOGrids && domain_->getReport().interfaceEdges > 0) {
+        std::vector<int> locked;
+        int group = 0;
+        for (const ExplicitTemplates::Attempt &a : s.templates->getReport().attempts) {
+            if (!a.accepted) continue;
+            if (a.family == "O-grid" && a.corners == 0 && a.holes == 0) locked.push_back(group);
+            ++group;
+        }
+        s.rewrite->lockGroups(locked);
+    }
     double bestScore = 0.0;
     // Stages 4 and 5 on a snapshot of the working carrier, recorded as round
     // r; returns Stage 4's witnesses as vertices of the working carrier.
@@ -453,6 +516,7 @@ void ATLAS::search(Search &s, bool rewrite, int rounds, int passes, int maxRings
         if (s.best) work = *s.best;
         CavityRewrite::AnnealOptions ao = opts_.anneal;
         ao.seed = s.seed;
+        if (opts_.freeTemplatesMultimat && domain_->getReport().interfaceEdges > 0) ao.freeTemplates = true;
         if (opts_.field.reference == Options::Field::Reference::Harmonic && s.coarse && s.coarseDomain &&
             opts_.alignToField) {
             const CoarseDomain *cd = s.coarseDomain.get();
@@ -497,7 +561,9 @@ double ATLAS::arbiterTerms(const SquareCarrier &C, double *eDir, double *eSing, 
     if (field && opts_.field.arbiter) {
         *eDir = field->directionEnergy(C);
         *eSing = field->singularityEnergy(C, opts_.field.singularity);
-        add += opts_.field.wDir * *eDir + *eSing;
+        const bool multimat = domain_ && domain_->getReport().interfaceEdges > 0;
+        const double wDir = multimat && opts_.multimatArbiterWDir > 0.0 ? opts_.multimatArbiterWDir : opts_.field.wDir;
+        add += wDir * *eDir + *eSing;
     }
     if (opts_.arbiterShape > 0.0 && opts_.arbiterShapeFloor > 0.0) {
         double worst = 1.0;

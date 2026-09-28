@@ -489,9 +489,10 @@ void SquareCarrier::apply(const std::vector<Edit> &edits) {
             designatedVertex.push_back(0);
         }
         auto decode = [&](int id) { return id >= 0 ? id : base + (-1 - id); };
-        for (const auto &q : ed.cells) {
+        for (size_t i = 0; i < ed.cells.size(); ++i) {
+            const auto &q = ed.cells[i];
             cells.push_back({decode(q[0]), decode(q[1]), decode(q[2]), decode(q[3])});
-            cellMaterial.push_back(ed.material);
+            cellMaterial.push_back(i < ed.cellMaterials.size() ? ed.cellMaterials[i] : ed.material);
             cellTriangle.push_back(-1);
             cellOrigin.push_back(ed.cellOrigin);
             cellGroup.push_back(ed.group);

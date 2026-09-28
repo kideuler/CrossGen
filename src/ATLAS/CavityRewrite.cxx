@@ -68,6 +68,15 @@ thread_local CornerSetSeen cornerSetSeen;
 
 } // namespace
 
+void CavityRewrite::lockGroups(const std::vector<int> &groups) {
+    lockedGroup_.clear();
+    for (int g : groups) {
+        if (g < 0) continue;
+        if (g >= static_cast<int>(lockedGroup_.size())) lockedGroup_.resize(g + 1, 0);
+        lockedGroup_[g] = 1;
+    }
+}
+
 CavityRewrite::CavityRewrite(SquareCarrier &carrier, const Options &opts) : C_(carrier), opts_(opts) {
     report_.defectBefore = report_.defectAfter = totalDefect();
     report_.irregularBefore = report_.irregularAfter = irregularCount();
@@ -115,7 +124,7 @@ void CavityRewrite::propose(const Loop &L, std::vector<Proposal> &out) {
     double geoBase = 0.0;
     std::vector<char> okCorner(N);
     for (int u = 0; u < N; ++u) {
-        const int t = C_.targetValence(L.ids[u]);
+        const int t = L.target.empty() ? C_.targetValence(L.ids[u]) : L.target[u];
         const int f1 = std::abs(L.outside[u] + 1 - t);
         const int f2 = std::abs(L.outside[u] + 2 - t);
         base += f2;
@@ -246,7 +255,7 @@ void CavityRewrite::propose(const Loop &L, std::vector<Proposal> &out) {
     report_.proposals += static_cast<int>(out.size());
 }
 
-bool CavityRewrite::realise(const Loop &L, const Proposal &p, Patch &P) const {
+bool CavityRewrite::realise(const Loop &L, const Proposal &p, Patch &P, std::vector<int> *loopOut) const {
     const int N = static_cast<int>(L.ids.size());
     const int K = static_cast<int>(p.corners.size());
     std::vector<std::vector<int>> arcs(K);
@@ -255,17 +264,32 @@ bool CavityRewrite::realise(const Loop &L, const Proposal &p, Patch &P) const {
         const int e = p.corners[(k + 1) % K];
         std::vector<int> ids{L.ids[i]};
         std::vector<char> may{0};
+        // A straddling side says per loop edge where points may go.
+        std::vector<int> segEdge;
+        std::vector<char> segIface;
         do {
+            if (!L.flexEdge.empty()) {
+                segEdge.push_back(L.flexEdge[i]);
+                segIface.push_back(L.flexIface[i]);
+            }
             i = (i + 1) % N;
             ids.push_back(L.ids[i]);
             may.push_back(L.droppable[i]);
         } while (i != e);
         may.back() = 0;
         const int n = static_cast<int>(ids.size()) - 1;
-        if (p.counts[k] < n) ids = CavityFill::dropFromBoundary(C_, ids, may, n - p.counts[k]);
-        else if (p.counts[k] > n) ids = CavityFill::insertOnBoundary(C_, P, ids, p.counts[k] - n);
+        if (p.counts[k] < n) {
+            ids = CavityFill::dropFromBoundary(C_, P, ids, may, n - p.counts[k]);
+        } else if (p.counts[k] > n) {
+            ids = L.flexEdge.empty() ? CavityFill::insertOnBoundary(C_, P, ids, p.counts[k] - n)
+                                     : CavityFill::insertOnSegments(C_, P, ids, segEdge, segIface, p.counts[k] - n);
+        }
         if (ids.empty()) return false;
         arcs[k] = std::move(ids);
+    }
+    if (loopOut) {
+        loopOut->clear();
+        for (const auto &a : arcs) loopOut->insert(loopOut->end(), a.begin(), a.end() - 1);
     }
     if (p.kind == 0) {
         std::array<std::vector<int>, 4> sides{arcs[0], arcs[1], arcs[2], arcs[3]};
@@ -337,12 +361,78 @@ int CavityRewrite::round(const std::vector<int> &priority) {
         Proposal p;
     };
 
+    // Across an interface: a straddling cavity round the interface vertex
+    // nearest witness v, ring by ring, committed when its exact defect change
+    // pays for its cells like any other rewrite.
+    bool hasInterfaces = false;
+    for (char f : C_.interfaceEdge) hasInterfaces = hasInterfaces || f;
+    std::vector<Proposal> sprops;
+    auto tryStraddle = [&](int v) {
+        if (!opts_.straddle || !hasInterfaces) return false;
+        const int seed = straddleSeed(v, opts_.straddleReach, nullptr);
+        if (seed < 0 || lockedV[seed]) return false;
+        for (int k = 1; k <= opts_.maxRings; ++k) {
+            Straddle S;
+            if (!growStraddle(seed, k, S)) continue;
+            bool free = true;
+            for (int q : S.cav) {
+                if (lockedQ[q]) { free = false; break; }
+                for (int w : C_.cells[q]) if (lockedV[w]) free = false;
+            }
+            if (!free) { reject("touches a committed cavity"); continue; }
+            ++report_.straddleCavities;
+            propose(S.LA, sprops);
+            std::vector<int> ord(sprops.size());
+            for (size_t j = 0; j < sprops.size(); ++j) ord[j] = static_cast<int>(j);
+            std::stable_sort(ord.begin(), ord.end(), [&](int a, int b) {
+                const double da = sprops[a].weighted + opts_.lambdaQ * sprops[a].cells;
+                const double db = sprops[b].weighted + opts_.lambdaQ * sprops[b].cells;
+                if (std::fabs(da - db) > 1e-9) return da < db;
+                return sprops[a].geo < sprops[b].geo;
+            });
+            double oldMin = 1.0;
+            for (int q : S.cav) oldMin = std::min(oldMin, C_.minScaledJacobian(q));
+            const double floor = std::min(opts_.minScaledJacobian, oldMin);
+            for (int t = 0; t < static_cast<int>(ord.size()) && t < opts_.realisationsPerWitness; ++t) {
+                Patch P;
+                int nA = 0;
+                std::vector<int> keep;
+                if (!fillStraddle(S, sprops[ord[t]], floor, P, nA, keep)) continue;
+                ++report_.straddleCertified;
+                const double dE = opts_.lambdaS * straddleDefectDelta(S, P, signedBoundary) +
+                                  opts_.lambdaQ * (static_cast<int>(P.cells.size()) - static_cast<int>(S.cav.size()));
+                if (!(dE < -1e-9)) continue;
+                SquareCarrier::Edit ed;
+                ed.removeCells = S.cav;
+                ed.newVertices = P.newVertices;
+                ed.newOrigin = P.newOrigin;
+                ed.newSourceEdge = P.newSourceEdge;
+                ed.cells = P.cells;
+                ed.material = S.matA;
+                ed.cellMaterials.assign(P.cells.size(), S.matB);
+                for (int c = 0; c < nA; ++c) ed.cellMaterials[c] = S.matA;
+                ed.cellOrigin = SquareCarrier::CellOrigin::Rewrite;
+                edits.push_back(std::move(ed));
+                for (int q : S.cav) {
+                    lockedQ[q] = 1;
+                    for (int w : C_.cells[q]) lockedV[w] = 1;
+                }
+                ++report_.committed;
+                ++report_.straddleCommitted;
+                if (sprops[ord[t]].kind == 0) ++report_.gridFills; else ++report_.starFills;
+                return true;
+            }
+        }
+        return false;
+    };
+
     for (int v : order) {
         const double elapsed =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         if (elapsed > opts_.timeBudget) { report_.timedOut = true; break; }
         if (lockedV[v] || C_.valence[v] == 0) continue;
         ++report_.witnesses;
+        const int committedBefore = report_.committed;
 
         // The material of the cavity: the first non-template cell at v.
         int material = -1;
@@ -435,7 +525,10 @@ int CavityRewrite::round(const std::vector<int> &priority) {
             cavities.push_back(cav);
             loops.push_back(std::move(L));
         }
-        if (options.empty()) continue;
+        if (options.empty()) {
+            tryStraddle(v);
+            continue;
+        }
         std::stable_sort(options.begin(), options.end(), [](const Option &a, const Option &b) {
             if (std::fabs(a.dE - b.dE) > 1e-9) return a.dE < b.dE;
             return a.geo < b.geo;
@@ -500,6 +593,7 @@ int CavityRewrite::round(const std::vector<int> &priority) {
             if (certified[best].option != 0) ++report_.fieldChoices;
             commit(options[certified[best].option], certified[best].P);
         }
+        if (report_.committed == committedBefore) tryStraddle(v);
     }
 
     starTargets_ = nullptr;
@@ -519,11 +613,14 @@ bool CavityRewrite::growCavity(const std::vector<int> &seeds, int rings, const s
     cav.clear();
     inCav.clear();
     material = -1;
+    const auto locked = [&](int q) {
+        return (!freeTemplates_ && C_.cellOrigin[q] == SquareCarrier::CellOrigin::Template) || lockedCell(q);
+    };
     for (int v : seeds) {
         for (int r = C_.ringPtr[v]; r < C_.ringPtr[v + 1] && material < 0; ++r) {
             const int q = C_.ringCell[r];
             if (exclude.count(q)) continue;
-            if (C_.cellOrigin[q] != SquareCarrier::CellOrigin::Template) material = C_.cellMaterial[q];
+            if (!locked(q)) material = C_.cellMaterial[q];
         }
     }
     if (material < 0) return false;
@@ -535,7 +632,7 @@ bool CavityRewrite::growCavity(const std::vector<int> &seeds, int rings, const s
             for (int r = C_.ringPtr[u]; r < C_.ringPtr[u + 1]; ++r) {
                 const int q = C_.ringCell[r];
                 if (inCav.count(q) || exclude.count(q) || C_.cellMaterial[q] != material) continue;
-                if (C_.cellOrigin[q] == SquareCarrier::CellOrigin::Template) continue;
+                if (locked(q)) continue;
                 inCav.insert(q);
                 cav.push_back(q);
                 for (int w : C_.cells[q]) if (seenV.insert(w).second) next.push_back(w);
@@ -547,7 +644,7 @@ bool CavityRewrite::growCavity(const std::vector<int> &seeds, int rings, const s
     const CavityFill::Boundary B = CavityFill::boundaryOf(C_, cav, inCav);
     if (!B.manifold || B.loops.size() != 1) return false;
     for (int w : B.interior) {
-        if (C_.protectedVertex[w] || C_.designatedVertex[w]) return false;
+        if (C_.protectedVertex[w] || (C_.designatedVertex[w] && !freeTemplates_)) return false;
     }
     L.ids = B.loops[0];
     L.angle = B.angle[0];
@@ -561,6 +658,316 @@ bool CavityRewrite::growCavity(const std::vector<int> &seeds, int rings, const s
         L.onBoundary[u] = C_.boundaryEdge[B.loopEdges[0][u]] ? 1 : 0;
     }
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Straddling cavities (see "Across an interface" in the header).
+// ---------------------------------------------------------------------------
+namespace {
+
+// A vertex a straddling cavity may be seeded at: on exactly one run of
+// interface, inside the domain, not a node of the layout.
+bool straddleEligible(const SquareCarrier &C, int v, bool freeDesignated) {
+    return v >= 0 && C.valence[v] > 0 && !C.boundaryVertex[v] && C.interfaceDegree[v] == 2 &&
+           !C.protectedVertex[v] && (freeDesignated || !C.designatedVertex[v]);
+}
+
+} // namespace
+
+int CavityRewrite::straddleSeed(int v, int reach, std::mt19937 *rng) const {
+    if (straddleEligible(C_, v, freeTemplates_)) return v;
+    // Breadth first over the cells' corners; the first ring holding an
+    // eligible vertex supplies the seed (one of them at random with an rng).
+    std::vector<int> frontier{v};
+    std::unordered_set<int> seen{v};
+    for (int k = 1; k <= reach && !frontier.empty(); ++k) {
+        std::vector<int> next, found;
+        for (int u : frontier) {
+            for (int r = C_.ringPtr[u]; r < C_.ringPtr[u + 1]; ++r) {
+                for (int w : C_.cells[C_.ringCell[r]]) {
+                    if (!seen.insert(w).second) continue;
+                    next.push_back(w);
+                    if (straddleEligible(C_, w, freeTemplates_)) found.push_back(w);
+                }
+            }
+        }
+        if (!found.empty()) {
+            if (!rng) return found.front();
+            return found[std::uniform_int_distribution<int>(0, static_cast<int>(found.size()) - 1)(*rng)];
+        }
+        frontier.swap(next);
+    }
+    return -1;
+}
+
+bool CavityRewrite::growStraddle(int seed, int rings, Straddle &S) {
+    S = Straddle();
+    if (!straddleEligible(C_, seed, freeTemplates_)) return false;
+    for (int r = C_.ringPtr[seed]; r < C_.ringPtr[seed + 1]; ++r) {
+        const int q = C_.ringCell[r];
+        if ((!opts_.straddleTemplates && !freeTemplates_ && C_.cellOrigin[q] == SquareCarrier::CellOrigin::Template) ||
+            lockedCell(q)) {
+            return false;
+        }
+        const int m = C_.cellMaterial[q];
+        if (S.matA < 0) S.matA = m;
+        else if (m != S.matA && S.matB < 0) S.matB = m;
+        else if (m != S.matA && m != S.matB) return false;
+    }
+    if (S.matB < 0) return false;
+    std::vector<int> frontier{seed};
+    std::unordered_set<int> seenV{seed};
+    for (int k = 1; k <= rings; ++k) {
+        std::vector<int> next;
+        for (int u : frontier) {
+            for (int r = C_.ringPtr[u]; r < C_.ringPtr[u + 1]; ++r) {
+                const int q = C_.ringCell[r];
+                if (S.inD.count(q)) continue;
+                if ((!opts_.straddleTemplates && !freeTemplates_ &&
+                     C_.cellOrigin[q] == SquareCarrier::CellOrigin::Template) ||
+                    lockedCell(q)) {
+                    continue;
+                }
+                const int m = C_.cellMaterial[q];
+                if (m != S.matA && m != S.matB) continue;
+                S.inD.insert(q);
+                S.cav.push_back(q);
+                (m == S.matA ? S.cavA : S.cavB).push_back(q);
+                for (int w : C_.cells[q]) if (seenV.insert(w).second) next.push_back(w);
+            }
+        }
+        frontier.swap(next);
+    }
+    if (S.cavA.empty() || S.cavB.empty() || static_cast<int>(S.cav.size()) > opts_.maxCavityCells) return false;
+    S.inA.insert(S.cavA.begin(), S.cavA.end());
+    S.inB.insert(S.cavB.begin(), S.cavB.end());
+
+    const CavityFill::Boundary BD = CavityFill::boundaryOf(C_, S.cav, S.inD);
+    if (!BD.manifold || BD.loops.size() != 1) return false;
+    const CavityFill::Boundary BA = CavityFill::boundaryOf(C_, S.cavA, S.inA);
+    if (!BA.manifold || BA.loops.size() != 1 || BA.loops[0].size() < 3) return false;
+    S.BB = CavityFill::boundaryOf(C_, S.cavB, S.inB);
+    if (!S.BB.manifold || S.BB.loops.size() != 1 || S.BB.loops[0].size() < 3) return false;
+    for (int w : BD.interior) {
+        if (C_.protectedVertex[w] || (C_.designatedVertex[w] && !freeTemplates_) || C_.boundaryVertex[w]) {
+            return false;
+        }
+    }
+
+    // The chain: the edges between the two sides. It must be one simple path
+    // whose interior is inside the cavity and whose ends are on its loop, and
+    // the two sides may touch nowhere else.
+    std::unordered_map<int, int> degree;
+    std::unordered_set<int> chainEdges;
+    for (int q : S.cavA) {
+        for (int i = 0; i < 4; ++i) {
+            const int r = C_.neighbor[q][i];
+            if (r < 0 || !S.inB.count(r)) continue;
+            const int e = C_.cellEdges[q][i];
+            if (!C_.interfaceEdge[e] || !chainEdges.insert(e).second) continue;
+            ++degree[C_.edges[e][0]];
+            ++degree[C_.edges[e][1]];
+        }
+    }
+    if (chainEdges.empty()) return false;
+    std::unordered_set<int> onLoopD(BD.loops[0].begin(), BD.loops[0].end());
+    int ends = 0;
+    for (const auto &kv : degree) {
+        if (kv.second == 1) {
+            if (!onLoopD.count(kv.first)) return false;
+            ++ends;
+        } else if (kv.second == 2) {
+            if (onLoopD.count(kv.first)) return false;
+        } else {
+            return false;
+        }
+    }
+    if (ends != 2) return false;
+    for (int q : S.cavA) {
+        for (int w : C_.cells[q]) {
+            if (degree.count(w)) continue;
+            for (int r = C_.ringPtr[w]; r < C_.ringPtr[w + 1]; ++r) {
+                if (S.inB.count(C_.ringCell[r])) return false;
+            }
+        }
+    }
+
+    // Side A's loop, the chain in it free like dS.
+    Loop &L = S.LA;
+    L.ids = BA.loops[0];
+    L.angle = BA.angle[0];
+    L.outside = BA.outside[0];
+    const int N = static_cast<int>(L.ids.size());
+    L.droppable.assign(N, 0);
+    L.onBoundary.assign(N, 0);
+    L.target.assign(N, 4);
+    L.flexEdge.assign(N, -1);
+    L.flexIface.assign(N, 0);
+    int chainStart = -1;
+    for (int u = 0; u < N; ++u) {
+        const int w = L.ids[u], x = L.ids[(u + 1) % N];
+        const int e = BA.loopEdges[0][u];
+        L.target[u] = C_.targetValence(w);
+        const auto dw = degree.find(w);
+        if (dw != degree.end() && dw->second == 2) {
+            // Inside the chain: droppable where it is not an input vertex.
+            const int se = C_.sourceEdge[w];
+            L.droppable[u] = (C_.vertexOrigin[w] == SquareCarrier::Origin::EdgeMidpoint ||
+                              C_.vertexOrigin[w] == SquareCarrier::Origin::InterfaceSplit) &&
+                             se >= 0 && C_.getDomain().interfaceEdge[se];
+        } else {
+            L.droppable[u] = CavityFill::droppable(C_, w, S.inA) ? 1 : 0;
+        }
+        if (chainEdges.count(e)) {
+            L.flexEdge[u] = CavityFill::interfaceSourceEdge(C_, w, x);
+            L.flexIface[u] = 1;
+            L.onBoundary[u] = L.flexEdge[u] >= 0;
+            if (chainStart < 0 || !chainEdges.count(BA.loopEdges[0][(u + N - 1) % N])) chainStart = u;
+        } else if (C_.boundaryEdge[e]) {
+            L.flexEdge[u] = CavityFill::domainEdge(C_, w, x);
+            L.onBoundary[u] = L.flexEdge[u] >= 0;
+        }
+    }
+    if (chainStart < 0) return false;
+    S.p = L.ids[chainStart];
+    int u = chainStart;
+    while (chainEdges.count(BA.loopEdges[0][u])) u = (u + 1) % N;
+    S.q = L.ids[u];
+    return S.p != S.q;
+}
+
+double CavityRewrite::straddleDefectDelta(const Straddle &S, const Patch &P, bool signedBoundary) const {
+    auto cost = [&](bool onBoundary, int val, int target) {
+        if (onBoundary && signedBoundary) {
+            return opts_.boundaryPlusWeight * std::max(0, target - val) +
+                   opts_.boundaryMinusWeight * std::max(0, val - target);
+        }
+        return static_cast<double>(std::abs(val - target));
+    };
+    // Before: every vertex of the cavity's cells.
+    std::unordered_set<int> old;
+    for (int q : S.cav) for (int w : C_.cells[q]) old.insert(w);
+    double before = 0.0;
+    for (int w : old) before += cost(C_.boundaryVertex[w] != 0, C_.valence[w], C_.targetValence(w));
+    // After: the patch's cells at each vertex, plus the old ones outside the
+    // cavity at a vertex of its loop.
+    std::unordered_map<int, int> val;
+    for (const auto &c : P.cells) for (int id : c) ++val[id];
+    double after = 0.0;
+    for (const auto &kv : val) {
+        const int id = kv.first;
+        if (id >= 0) {
+            int outside = 0;
+            for (int r = C_.ringPtr[id]; r < C_.ringPtr[id + 1]; ++r) outside += S.inD.count(C_.ringCell[r]) ? 0 : 1;
+            after += cost(C_.boundaryVertex[id] != 0, outside + kv.second, C_.targetValence(id));
+        } else {
+            const bool split = P.newOrigin[-1 - id] == Origin::BoundarySplit;
+            after += cost(split, kv.second, split ? 2 : 4);
+        }
+    }
+    return after - before;
+}
+
+bool CavityRewrite::fillStraddle(const Straddle &S, const Proposal &pA, double floor, Patch &P, int &nA,
+                                 std::vector<int> &keep) {
+    std::vector<int> loopA;
+    if (!realise(S.LA, pA, P, &loopA)) return false;
+    nA = static_cast<int>(P.cells.size());
+    // A's chain, p -> q in A's loop order.
+    const int MA = static_cast<int>(loopA.size());
+    int ip = -1;
+    for (int i = 0; i < MA; ++i) if (loopA[i] == S.p) ip = i;
+    if (ip < 0) return false;
+    std::vector<int> chain{S.p};
+    for (int i = (ip + 1) % MA; loopA[i] != S.q; i = (i + 1) % MA) {
+        chain.push_back(loopA[i]);
+        if (static_cast<int>(chain.size()) > MA) return false;
+    }
+    chain.push_back(S.q);
+    // A's new cells at each vertex.
+    std::unordered_map<int, int> cellsA;
+    for (int c = 0; c < nA; ++c) for (int id : P.cells[c]) ++cellsA[id];
+    auto countA = [&](int id) {
+        const auto it = cellsA.find(id);
+        return it == cellsA.end() ? 0 : it->second;
+    };
+
+    // Side B's loop, walking q -> p along the chain, with A's chain in it.
+    const std::vector<int> &LB0 = S.BB.loops[0];
+    const int NB0 = static_cast<int>(LB0.size());
+    int iq = -1;
+    for (int i = 0; i < NB0; ++i) if (LB0[i] == S.q) iq = i;
+    if (iq < 0) return false;
+    Loop L;
+    auto pushOld = [&](int i, bool chainEdgeNext) {
+        const int w = LB0[i];
+        int oldA = 0;
+        for (int r = C_.ringPtr[w]; r < C_.ringPtr[w + 1]; ++r) oldA += S.inA.count(C_.ringCell[r]) ? 1 : 0;
+        L.ids.push_back(w);
+        L.angle.push_back(S.BB.angle[0][i]);
+        L.outside.push_back(S.BB.outside[0][i] - oldA + countA(w));
+        L.target.push_back(C_.targetValence(w));
+        L.droppable.push_back(oldA == 0 && CavityFill::droppable(C_, w, S.inB) ? 1 : 0);
+        const int e = S.BB.loopEdges[0][i];
+        const int x = LB0[(i + 1) % NB0];
+        int fe = -1;
+        if (!chainEdgeNext && C_.boundaryEdge[e]) fe = CavityFill::domainEdge(C_, w, x);
+        L.flexEdge.push_back(fe);
+        L.flexIface.push_back(0);
+        L.onBoundary.push_back(fe >= 0);
+    };
+    // q first, then A's chain backwards to p (fixed), then B's own loop on
+    // from p back round to q.
+    pushOld(iq, true);
+    for (int k = static_cast<int>(chain.size()) - 2; k >= 1; --k) {
+        const int id = chain[k];
+        L.ids.push_back(id);
+        double ang = M_PI;
+        if (id >= 0) {
+            for (int i = 0; i < NB0; ++i) if (LB0[i] == id) ang = S.BB.angle[0][i];
+        }
+        L.angle.push_back(ang);
+        L.outside.push_back(countA(id));
+        L.target.push_back(4);
+        L.droppable.push_back(0);
+        L.flexEdge.push_back(-1);
+        L.flexIface.push_back(0);
+        L.onBoundary.push_back(0);
+    }
+    int ipB = -1;
+    for (int i = 0; i < NB0; ++i) if (LB0[i] == S.p) ipB = i;
+    if (ipB < 0) return false;
+    for (int i = ipB; i != iq; i = (i + 1) % NB0) pushOld(i, false);
+    const int NB = static_cast<int>(L.ids.size());
+    if (NB < 3) return false;
+    L.weight.assign(NB, 1.0);
+    for (int w = 0; w < NB; ++w) {
+        if (L.ids[w] >= 0 && C_.boundaryVertex[L.ids[w]]) L.weight[w] = 1.5;
+    }
+
+    keep.clear();
+    for (size_t k = 1; k + 1 < chain.size(); ++k) if (chain[k] >= 0) keep.push_back(chain[k]);
+
+    std::vector<Proposal> props;
+    propose(L, props);
+    if (props.empty()) return false;
+    std::vector<int> order(props.size());
+    for (size_t k = 0; k < props.size(); ++k) order[k] = static_cast<int>(k);
+    std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+        const double da = props[a].weighted + opts_.lambdaQ * props[a].cells;
+        const double db = props[b].weighted + opts_.lambdaQ * props[b].cells;
+        if (std::fabs(da - db) > 1e-9) return da < db;
+        return props[a].geo < props[b].geo;
+    });
+    const Patch base = P;
+    for (int t = 0; t < static_cast<int>(order.size()) && t < 3; ++t) {
+        P = base;
+        if (!realise(L, props[order[t]], P)) continue;
+        const CavityFill::Verdict V = CavityFill::settle(C_, S.cav, P, floor, opts_.smoothingIterations, &keep);
+        if (V.valid) return true;
+    }
+    P = base;
+    return false;
 }
 
 size_t CavityRewrite::CornerBitsHash::operator()(const CornerBits &k) const {
@@ -696,6 +1103,9 @@ const CavityRewrite::AnnealReport &CavityRewrite::anneal(const AnnealOptions &ao
     };
     if (directed) starTargets_ = &ao.reference->cones();
     conePlacedStars_ = 0;
+    freeTemplates_ = ao.freeTemplates;
+    bool hasInterfaces = false;
+    for (char f : C_.interfaceEdge) hasInterfaces = hasInterfaces || f;
 
     for (int move = 0; move < ao.maxMoves; ++move) {
         // The best state at each quarter of the schedule, kept for a caller
@@ -734,6 +1144,77 @@ const CavityRewrite::AnnealReport &CavityRewrite::anneal(const AnnealOptions &ao
         }
         const double pr = U(rng);
         int rings = pr < 0.35 ? 1 : (pr < 0.75 ? 2 : std::min(3, ao.maxRings));
+
+        // A cavity straddling the interface nearest the witness.
+        if (hasInterfaces && ao.straddleFraction > 0.0 && U(rng) < ao.straddleFraction) {
+            const int seed = straddleSeed(v, 2, &rng);
+            if (seed < 0) continue;
+            ++R.straddleMoves;
+            Straddle S;
+            if (!growStraddle(seed, rings, S)) continue;
+            ++R.cavities;
+            propose(S.LA, props);
+            if (props.empty()) continue;
+            R.proposals += static_cast<int>(props.size());
+            // Side A's proposals by their own defect; the chain's defect only
+            // settles once side B is filled, so the energy decides.
+            struct CandS { double d; int k; };
+            std::vector<CandS> cand;
+            for (int k = 0; k < static_cast<int>(props.size()); ++k) {
+                cand.push_back({ao.wDefect * props[k].weighted + ao.wCells * props[k].cells, k});
+            }
+            std::sort(cand.begin(), cand.end(), [](const CandS &a, const CandS &b) { return a.d < b.d; });
+            if (cand.size() > 12) cand.resize(12);
+            const double Tloc = std::max(0.5, T);
+            double Z = 0.0;
+            for (const CandS &c : cand) Z += std::exp(-(c.d - cand[0].d) / Tloc);
+            for (int attempt = 0; attempt < ao.realisations; ++attempt) {
+                double x = U(rng) * Z;
+                int pick = 0;
+                for (int j = 0; j < static_cast<int>(cand.size()); ++j) {
+                    x -= std::exp(-(cand[j].d - cand[0].d) / Tloc);
+                    if (x <= 0.0) { pick = j; break; }
+                    pick = j;
+                }
+                Patch P;
+                int nA = 0;
+                std::vector<int> keep;
+                if (!fillStraddle(S, props[cand[pick].k], ao.minScaledJacobian, P, nA, keep)) continue;
+                ++R.certified;
+                ++R.straddleCertified;
+                trial = C_;
+                SquareCarrier::Edit ed;
+                ed.removeCells = S.cav;
+                ed.newVertices = P.newVertices;
+                ed.newOrigin = P.newOrigin;
+                ed.newSourceEdge = P.newSourceEdge;
+                ed.cells = P.cells;
+                ed.material = S.matA;
+                ed.cellMaterials.assign(P.cells.size(), S.matB);
+                for (int c = 0; c < nA; ++c) ed.cellMaterials[c] = S.matA;
+                ed.cellOrigin = SquareCarrier::CellOrigin::Rewrite;
+                trial.apply({ed});
+                int nb = 0;
+                const double E2 = energy(trial, ao, &nb, this);
+                const double dE = E2 - E;
+                if (dE <= 0.0 || U(rng) < std::exp(-dE / T)) {
+                    if (dE > 0.0) ++R.uphill;
+                    ++R.accepted;
+                    ++R.straddleAccepted;
+                    std::swap(C_, trial);
+                    E = E2;
+                    directedStale = true;
+                    if (E < Ebest - 1e-9) {
+                        best = C_;
+                        Ebest = E;
+                        blocksBest = nb;
+                        ++R.improvements;
+                    }
+                }
+                break;
+            }
+            continue;
+        }
         // The cavity's shape: rings round the witness, round one of its edges,
         // or -- on dS or at a protected vertex -- round part of its fan only.
         // A ring always takes every cell at the witness, so a fill can leave
@@ -870,6 +1351,7 @@ const CavityRewrite::AnnealReport &CavityRewrite::anneal(const AnnealOptions &ao
         }
     }
     starTargets_ = nullptr;
+    freeTemplates_ = false;
     R.conePlacedStars = conePlacedStars_;
     C_ = std::move(best);
     R.energyAfter = Ebest;

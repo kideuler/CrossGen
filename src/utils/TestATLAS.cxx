@@ -23,9 +23,11 @@
 //                without ever leaving it invalid; a plate with two holes,
 //                which no template covers, blocked by a coarse search and
 //                realised on the input; Sec. 13.3's last row, two meshes of
-//                one boundary giving blockings of about the same size; and the
+//                one boundary giving blockings of about the same size; the
 //                TFI mesh on the blocks (BlockMesh), whose counts and
-//                boundary are known on a rectangle and two materials.
+//                boundary are known on a rectangle and two materials; a disk
+//                in a square (the O-grid in a square, 9 blocks); and a square
+//                inclusion in a plate (a 3 x 3 grid, by general sections).
 //
 // --mesh <h> then meshes the chosen blocking at target edge length h, as the
 // viewer's ATLAS mode does (Sec. 11.2's counts, transfinite interpolation per
@@ -188,8 +190,13 @@ void summary(const ATLAS &pipe) {
     for (int i = 0; i < pipe.numSearches(); ++i) {
         const ATLAS::Search &s = pipe.getSearch(i);
         std::cout << "     " << s.name << ": ";
-        if (s.succeeded()) std::cout << s.finalCover()->getReport().blocks << " block(s)";
-        else std::cout << "no valid cover";
+        if (s.succeeded()) {
+            std::cout << s.finalCover()->getReport().blocks << " block(s), score " << std::fixed << std::setprecision(2)
+                      << s.finalScore << ", worst cell " << std::setprecision(3)
+                      << s.finalCarrier()->getReport().minScaledJacobian << std::defaultfloat;
+        } else {
+            std::cout << "no valid cover";
+        }
         if (s.templates) {
             for (const ExplicitTemplates::Attempt &a : s.templates->getReport().attempts) {
                 std::cout << "; region of " << a.cells << " cell(s), " << a.corners << " corner(s), " << a.holes
@@ -678,7 +685,12 @@ int selfTest() {
                   "the carrier's interface is the input's, segment for segment");
             const BlockCover::Report &br = pipe.getCover().getReport();
             std::cout << "  " << br.blocks << " block(s), " << cr.interfaceEdges << " interface edge(s)\n";
-            check(br.blocks <= 40, "a coarse blocking: at most 40 blocks, not thousands");
+            // The O-grid in a square: four sectors whose rays run through the
+            // plate's corners, the disk's O-grid split where they arrive -- 9
+            // blocks. 32 until 2026-09-28, when the circle's sampling could
+            // not match the plate's sides and the two templates' split
+            // points missed each other (docs/atlas_multimaterial_blocks.md).
+            check(br.blocks <= 12, "a coarse blocking: the O-grid in a square, at most 12 blocks");
             check(br.interfaceInside == 0, "no block straddles the interface");
 
             // The same cover, as the class MERIDIAN's and TORSION's own
@@ -862,6 +874,49 @@ int selfTest() {
         }
     }
 
+    // -----------------------------------------------------------------
+    heading("Case 16  A square inclusion in a plate: general sections");
+    // -----------------------------------------------------------------
+    {
+        // The plate is a region with a hole whose four corners are reflex
+        // (270 degrees from the plate's side). No single-hole template fits
+        // it -- the annulus wants a radial hole and four corners on one loop
+        // -- so until the general sections of docs/atlas_multimaterial_
+        // blocks.md it was Stage 6's (10 blocks, TMOP-free worst cell 0.6).
+        // Sections continue the square's sides to the plate's edges: eight
+        // four-cornered faces round the square, a 3 x 3 grid of blocks.
+        auto mesh = meshLoops({{{0.0, 0.0}, {3.0, 0.0}, {3.0, 2.0}, {0.0, 2.0}},
+                               {{1.1, 0.6}, {1.9, 0.6}, {1.9, 1.4}, {1.1, 1.4}}},
+                              {0, 0}, 0.05);
+        {
+            std::vector<int> mat(mesh->triangles.size(), 2);
+            for (size_t t = 0; t < mesh->triangles.size(); ++t) {
+                const Triangle &tr = mesh->triangles[t];
+                const Point c = (mesh->vertices[tr[0]] + mesh->vertices[tr[1]] + mesh->vertices[tr[2]]) / 3.0;
+                if (c[0] > 1.1 && c[0] < 1.9 && c[1] > 0.6 && c[1] < 1.4) mat[t] = 1;
+            }
+            mesh = std::make_shared<Mesh>(mesh->vertices, mesh->triangles, mat);
+        }
+        ATLAS pipe(mesh, quietOptions());
+        const bool ok = pipe.run();
+        summary(pipe);
+        check(ok && pipe.hasCover(), "the pipeline returns a valid blocking");
+        bool general = false;
+        for (int i = 0; i < pipe.numSearches(); ++i) {
+            const ATLAS::Search &sx = pipe.getSearch(i);
+            if (!sx.templates) continue;
+            for (const ExplicitTemplates::Attempt &a : sx.templates->getReport().attempts) {
+                if (a.accepted && a.family == "general sections" && a.holes == 1 && a.blocks == 8) general = true;
+            }
+        }
+        check(general, "the plate is templated by general sections: eight grid faces round the square");
+        if (pipe.hasCover()) {
+            const BlockCover::Report &br = pipe.getCover().getReport();
+            check(br.blocks == 9, "the blocking is the 3 x 3 grid: 9 blocks");
+            check(pipe.getCarrier().getReport().minScaledJacobian > 0.9, "every carrier cell is nearly square");
+        }
+    }
+
     heading("Self-test result");
     if (failures == 0) {
         std::cout << "  " << kPass << " Every check held.\n";
@@ -897,6 +952,11 @@ void printSearch(const ATLAS::Search &s, bool chosen) {
                   << cr.triangles << " triangle(s), spacing " << std::setprecision(3) << cr.spacingMin << " to "
                   << cr.spacingMax << std::setprecision(6) << ", " << std::fixed << std::setprecision(3)
                   << cr.seconds << " s" << std::defaultfloat << "\n";
+        if (cr.harmonisedRegions > 0) {
+            std::cout << "  Counts across interfaces: " << cr.harmonisedRegions << " region(s) constrained, "
+                      << cr.harmonisedChains << " interface chain(s) raised by " << cr.harmonisedSegments
+                      << " segment(s)\n";
+        }
         if (!cr.valid) {
             warn("no coarse domain: " + cr.reason);
             return;
@@ -972,6 +1032,11 @@ void printSearch(const ATLAS::Search &s, bool chosen) {
             std::cout << "  Field in the greedy rounds: " << wr.fieldChoices << " fill(s) chosen over the first "
                       << "certified, " << wr.conePlacedStars << " star(s) centred on a cone\n";
         }
+        if (wr.straddleCavities > 0) {
+            std::cout << "  Across interfaces in the greedy rounds: " << wr.straddleCavities
+                      << " straddling cavit(ies), " << wr.straddleCertified << " certified, "
+                      << wr.straddleCommitted << " committed\n";
+        }
         if (!wr.rejections.empty()) {
             std::cout << "  Rejected:";
             for (const auto &kv : wr.rejections) std::cout << " " << kv.second << " " << kv.first << ";";
@@ -988,6 +1053,10 @@ void printSearch(const ATLAS::Search &s, bool chosen) {
             if (ar.directed > 0 || ar.conePlacedStars > 0) {
                 std::cout << "  Field-directed: " << ar.directed << " witness(es) where the field disagrees, "
                           << ar.conePlacedStars << " star fill(s) centred on a cone\n";
+            }
+            if (ar.straddleMoves > 0) {
+                std::cout << "  Across interfaces: " << ar.straddleMoves << " straddling move(s), "
+                          << ar.straddleCertified << " certified, " << ar.straddleAccepted << " accepted\n";
             }
         }
         verdict(s.rewritesValid, "The carrier validated after every round of rewrites");
@@ -1099,6 +1168,16 @@ void usage(const char *prog) {
               << "  --coarse-spacing <h>  a coarse search at this fraction of the diagonal; repeatable\n"
               << "                        (default: 0.125 and 0.07)\n"
               << "  --coarse-rounds <n>   rounds of Stages 4-6 on a coarse carrier       (default 30)\n"
+              << "Multi-material (docs/atlas_multimaterial_blocks.md)\n"
+              << "  --no-harmonise        sample interfaces chain by chain (no count reconciliation)\n"
+              << "  --no-flat-nodes       every node on a region's boundary is a template corner\n"
+              << "  --no-template-drops   templates may not shed dS points next to an interface\n"
+              << "  --no-general-sections no sectioned template with holes or star faces\n"
+              << "  --no-flat-sections    general sections only from reflex corners\n"
+              << "  --template-free-search  one more coarse search per spacing without Stage 3\n"
+              << "  --lock-inclusion-ogrids  Stage 6 keeps the O-grids of smooth inclusions whole\n"
+              << "  --no-free-templates   the annealer may not rewrite template cells\n"
+              << "  --no-straddle         no cavities across an interface\n"
               << "  --anneal <n>          moves of annealed search per coarse carrier, 0 = off (default 15000)\n"
               << "  --seed <n>            the annealer's random seed\n"
               << "  --realise-size <h>    fine edge length of the realisation (default: the input's mean)\n"
@@ -1219,6 +1298,19 @@ int main(int argc, char **argv) {
         else if (a == "--time" && i + 1 < argc)           opts.timeBudget = std::stod(argv[++i]);
         else if (a == "--fine-rewrite")                   opts.fineRewrite = true;
         else if (a == "--no-coarse")                      opts.coarse = false;
+        else if (a == "--no-harmonise")                   opts.coarseDomain.harmoniseCounts = false;
+        else if (a == "--no-flat-nodes")                  opts.templates.flatNodes = false;
+        else if (a == "--no-template-drops")              opts.templates.dropBoundary = false;
+        else if (a == "--no-general-sections")            opts.templates.generalSections = false;
+        else if (a == "--no-flat-sections")               opts.templates.flatSections = false;
+        else if (a == "--section-shift" && i + 1 < argc)  opts.templates.sectionShift = std::stoi(argv[++i]);
+        else if (a == "--template-free-search")           opts.coarseWithoutTemplates = true;
+        else if (a == "--lock-inclusion-ogrids")          opts.lockInclusionOGrids = true;
+        else if (a == "--no-free-templates")              opts.freeTemplatesMultimat = false;
+        else if (a == "--no-straddle") {
+            opts.rewrite.straddle = false;
+            opts.anneal.straddleFraction = 0.0;
+        }
         else if (a == "--coarse-spacing" && i + 1 < argc) spacings.push_back(std::stod(argv[++i]));
         else if (a == "--coarse-rounds" && i + 1 < argc)  opts.coarseRewriteRounds = std::stoi(argv[++i]);
         else if (a == "--anneal" && i + 1 < argc)         opts.anneal.maxMoves = std::stoi(argv[++i]);
@@ -1520,7 +1612,8 @@ int main(int argc, char **argv) {
             std::cout << "  " << sx.name << ": " << sx.finalCover()->getReport().blocks << " block(s), objective "
                       << std::fixed << std::setprecision(2) << sx.finalCover()->getReport().objective << ", score "
                       << sx.finalScore << " (E_dir " << std::setprecision(3) << sx.finalDir << ", E_sing "
-                      << std::setprecision(2) << sx.finalSing << ", shape " << sx.finalShape << ")"
+                      << std::setprecision(2) << sx.finalSing << ", shape " << sx.finalShape << "; worst cell "
+                      << std::setprecision(3) << sx.finalCarrier()->getReport().minScaledJacobian << ")"
                       << std::defaultfloat << (i == st.chosen ? "  <- chosen" : "") << "\n";
         }
         summary << std::fixed << std::setprecision(4) << " eDir=" << eDir << " eSing=" << eSing

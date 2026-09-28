@@ -79,6 +79,22 @@
 // sets template parameters; every state is still certified exactly as before,
 // so Sec. 14's guarantees do not depend on it.
 //
+// ### Multi-material domains
+//
+// An interface cannot be re-subdivided by a cavity on one side of it (Sec.
+// 8.4), so on a multi-material domain its sample count is fixed when
+// CoarseDomain samples it, and Stage 3 and Stage 6 have to live with it. What
+// makes that work (docs/atlas_multimaterial_blocks.md): CoarseDomain
+// reconciles the counts before sampling, against the section arrangements
+// Stage 3 will cast; Stage 3's templates treat a neighbour's split points as
+// flat nodes to meet, not corners, may shed dS midpoints next to an
+// interface, and cut regions with holes and awkward corners by general
+// sections with star faces; Stage 6's cavities may straddle an interface and
+// re-subdivide it on both sides at once, and the annealer may rewrite
+// templates. Here, the second seed's searches template smallest region first,
+// and the arbiter passes over a coarse search whose worst cell is under half
+// the best one's and weighs the field's direction term double.
+//
 // The contrast with MERIDIAN and TORSION is the spec's central idea: nothing
 // here is a cross field to be integrated and quantised afterwards. The carrier
 // already is a set of valid charts with integer transitions (Sec. 2.3), every
@@ -124,6 +140,38 @@ public:
         // the best realised one wins. They and the fine search run in
         // parallel threads.
         int coarseSeeds = 2;
+        // On a domain with material interfaces, one more coarse search per
+        // spacing with Stage 3 off, on the domain as sampled (without the
+        // counts reconciled for templates). It was added when a certified
+        // template could still wreck the regions round it -- multimat/
+        // geom012's five-block star in one grain turned a 9-block answer into
+        // 17 -- and Stage 6 alone did better. Flat nodes, prescribed spokes
+        // and general sections now give the templated searches geom012's 9
+        // themselves, and over the corpus this search then won only on
+        // bubbles, by cutting its disks into D-shaped halves (346 blocks,
+        // TMOP worst 0.33, against the templated 369 at 0.36). Off, so a
+        // multi-material domain runs the same five searches as any other.
+        bool coarseWithoutTemplates = false;
+        // On a domain with material interfaces, the annealer may rewrite
+        // template cells and give up designated vertices
+        // (CavityRewrite::AnnealOptions::freeTemplates).
+        bool freeTemplatesMultimat = true;
+        // On a domain with material interfaces, the second seed's coarse
+        // searches template their regions smallest first
+        // (ExplicitTemplates::Options::smallestFirst): which order lets the
+        // templates' split points line up depends on the model, and the
+        // annealer seeds that differ on a single-material domain barely do
+        // on a multi-material one.
+        bool multimatOrders = true;
+        // On a domain with material interfaces, Stage 6 may not rewrite the
+        // O-grid Stage 3 put in a smooth inclusion (a region of no corners),
+        // however free AnnealOptions::freeTemplates leaves the other templates
+        // (CavityRewrite::lockGroups). Off by default: it is what lets the
+        // annealer merge an inclusion's blocks into the layout round it, and
+        // on multimat/bubbles that is 369 blocks (TMOP worst 0.36) against
+        // 551 with every disk kept a five-block O-grid (0.51, the quality
+        // ATLAS had before). On, for the second.
+        bool lockInclusionOGrids = false;
         // Score the annealer's layouts against the coarse domain's harmonic
         // reference cross field (CoarseDomain::crossAngle) as well; only with
         // field.reference = Harmonic below.
@@ -198,6 +246,30 @@ public:
         // Apply rewrite.boundaryPlusWeight / boundaryMinusWeight in the fine
         // search's greedy rounds too, not only the coarse searches'.
         bool signedDefectsOnFine = false;
+        // On a domain with material interfaces, the arbiter passes over a
+        // search whose realised carrier's worst cell is below this fraction
+        // of the best worst cell any search reached (0 = off). The score is
+        // blocks first and nearly blind to geometry (Stage 5's distortion
+        // weighs 0.05 a block), and on multi-material domains the searches
+        // differ in shape far more than on single-material ones: the search
+        // without templates found geom002 in 7 blocks round a 0.04 cell, where
+        // a templated one had 12 round a 0.38, and bubbles in 324 blocks whose
+        // mesh folded, where one of 346 did not. Measured on the multimat
+        // corpus, a worst cell under half the best is always the one whose
+        // mesh is visibly worse, and every such search had a sound one within
+        // a few blocks of it.
+        double multimatQualityGate = 0.5;
+        // The arbiter's weight on E_dir on a domain with material interfaces,
+        // in place of field.wDir there (0 = field.wDir). Stage 3 now offers a
+        // multi-material domain several templated layouts of close block
+        // counts that differ in how they sit in the field -- multimat/geom001
+        // in 5 blocks with a diagonal splitting a corner of the box (E_dir
+        // 0.19), or in TORSION's 8 (0.02) -- and at 10 blocks per unit the
+        // arbiter took the 5, whose mesh was worse (TMOP worst 0.67 against
+        // 0.83). Replayed over the corpus, 15 or 20 changes that model's
+        // choice and no other; 30 starts to trade a worse worst cell on
+        // rocket for alignment.
+        double multimatArbiterWDir = 20.0;
     };
 
     struct Round {
@@ -226,6 +298,8 @@ public:
         bool coarse = false;
         double spacing = 0.0;                 // coarse: maxSpacing used
         unsigned seed = 0;                    // coarse: the annealer's seed
+        bool useTemplates = true;             // Stage 3 runs (Options::runTemplates too)
+        bool smallestFirst = false;           // Stage 3's region order
         std::shared_ptr<CoarseDomain> coarseDomain;
 
         // The searched carrier (fine, or over coarseDomain->getDomain()).

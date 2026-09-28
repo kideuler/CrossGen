@@ -4,6 +4,7 @@
 #include <array>
 #include <functional>
 #include <map>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -72,6 +73,31 @@
 // round() is the greedy half of the stage: fast, local, and blind to how many
 // blocks the singularities it leaves will cut the domain into. anneal() is the
 // other half, for a coarse carrier, and is described with its options.
+//
+// ### Across an interface
+//
+// A cavity of one material may not re-subdivide the interfaces on its loop,
+// because the region across has cells on them (Sec. 8.4), and it cannot hold
+// an interface inside it. On a multi-material domain that makes every
+// interface a wall with its subdivision fixed for good: a singularity can
+// never cross one, and a count mismatch between two interfaces -- the two
+// sides of a thin layer -- can only be absorbed by singularities inside the
+// layer, whose lines then cut every layer round it. That, not the templates,
+// was most of the blocks ATLAS put on multimat/det_rocket, icf and rocket.
+//
+// Sec. 8.4's own remedy is "enlarge the cavity", and a *straddling* cavity
+// does: cells of two materials either side of one run of interface, the
+// chain, whose ends are on the cavity's loop and whose interior is inside it.
+// Side A is filled first with the chain free to be re-subdivided as dS is --
+// its input vertices kept, its midpoints droppable, new InterfaceSplit points
+// inserted on its input segments -- and side B is then filled on its own loop
+// with A's version of the chain fixed, so both sides meet on the same points.
+// The two fills are one patch over the whole cavity, certified by
+// CavityFill::settle with the chain's kept input vertices as interior anchors,
+// and committed as one Edit with a material per cell. Everything validate()
+// asks of a single-material fill holds of it, and the interface is the chain
+// again by construction; SquareCarrier::validate() audits that it still lies
+// on the input's interface segments.
 class CavityRewrite {
 public:
     struct Options {
@@ -118,6 +144,18 @@ public:
         double fieldWeight = 5.0;
         bool coneStars = true;
         double timeBudget = 60.0;   // seconds per round
+        // Cavities that straddle an interface ("Across an interface" above):
+        // round() tries them at witnesses within straddleReach rings of an
+        // interface, once the single-material cavities there found nothing.
+        bool straddle = true;
+        int straddleReach = 2;
+        // A straddling cavity may take Stage 3 template cells (never a
+        // designated vertex inside it). A single-material cavity never does:
+        // there the greedy would pick templates apart for defect alone. Across
+        // an interface it is the only way to change the counts a template
+        // fixed on its sides, and on det_rocket every interface of the one
+        // region no template covers is a template's side.
+        bool straddleTemplates = true;
     };
 
     struct Report {
@@ -131,6 +169,7 @@ public:
         int gridFills = 0, starFills = 0;
         int fieldChoices = 0;       // commits the field preferred over the first certified fill
         int conePlacedStars = 0;    // star fills centred on a cone
+        int straddleCavities = 0, straddleCertified = 0, straddleCommitted = 0;
         int defectBefore = 0, defectAfter = 0;
         int irregularBefore = 0, irregularAfter = 0;
         int cellsBefore = 0, cellsAfter = 0;
@@ -230,6 +269,20 @@ public:
         int maxRings = 3;
         // Proposals realised per move, the locally best first.
         int realisations = 2;
+        // On a carrier with interfaces, this fraction of the moves is a
+        // cavity straddling one ("Across an interface"), grown round the
+        // interface vertex nearest the witness.
+        double straddleFraction = 0.35;
+        // The annealer's cavities may take Stage 3 template cells and hold
+        // designated vertices, which the greedy rounds' never may. Stage 3
+        // commits one region at a time, and two templates that each
+        // certified can still disagree about where their split points sit on
+        // the interface between them, each then cutting the other's blocks
+        // (multimat/geom004: three templates of 10 blocks, a cover of 31).
+        // A designated vertex is a soft macrovertex; only the energy, which
+        // counts the cuts it makes, can say which to give up. ATLAS turns
+        // this on for domains with interfaces.
+        bool freeTemplates = false;
         unsigned seed = 12345;
     };
 
@@ -238,6 +291,7 @@ public:
         int accepted = 0, uphill = 0, improvements = 0;
         int directed = 0;             // moves whose witness the field chose
         int conePlacedStars = 0;      // star fills centred on a cone
+        int straddleMoves = 0, straddleCertified = 0, straddleAccepted = 0;
         bool timedOut = false;
         double energyBefore = 0.0, energyAfter = 0.0;
         int blocksBefore = 0, blocksAfter = 0;
@@ -260,6 +314,14 @@ public:
     // first (the final best is the carrier itself): fallbacks for a caller
     // that cannot use the final one.
     const std::vector<SquareCarrier> &getCheckpoints() const { return checkpoints_; }
+
+    // Stage 3 template groups (SquareCarrier::cellGroup) no cavity may take,
+    // even where AnnealOptions::freeTemplates or Options::straddleTemplates
+    // free the rest: ATLAS locks the O-grids of smooth inclusions, which are
+    // already what such a region should be (five blocks, no corner lying flat
+    // on the circle), and which the annealer otherwise pared down to fewer
+    // blocks and worse ones (multimat/bubbles: TMOP worst 0.41 -> 0.36).
+    void lockGroups(const std::vector<int> &groups);
 
     // The cavity radius, in rings round a witness. ATLAS widens it when a
     // round stalls: singular vertices that survive a small radius are the
@@ -292,6 +354,13 @@ private:
         // Sign-aware weights, when set: of a unit of defect with too few
         // cells, and with too many (AnnealOptions::wBoundaryDefectPlus).
         std::vector<double> weightPlus, weightMinus;
+        // Only for the two sides of a straddling cavity, empty otherwise: the
+        // target valence at each position (a new point of the chain has none
+        // in the carrier yet), and the input feature edge each loop edge may
+        // take inserted points on (-1: none), an interface one or dS.
+        std::vector<int> target;
+        std::vector<int> flexEdge;
+        std::vector<char> flexIface;
         // Weighted defect of vertex u at valence `val`.
         double cost(int u, int val, int target) const {
             if (!weightPlus.empty()) {
@@ -307,7 +376,37 @@ private:
                     std::vector<int> &cav, Loop &L, int &material, std::unordered_set<int> &inCav);
 
     void propose(const Loop &L, std::vector<Proposal> &out);
-    bool realise(const Loop &L, const Proposal &p, CavityFill::Patch &P) const;
+    // `loopOut`: the realised loop, corner 0 first, after drops and insertions.
+    bool realise(const Loop &L, const Proposal &p, CavityFill::Patch &P, std::vector<int> *loopOut = nullptr) const;
+
+    // A cavity straddling one run of interface: side A (one material) and
+    // side B (the other) whose only contact is the chain p ... q, inside the
+    // cavity but for its two ends. LA is side A's loop with the chain free to
+    // be re-subdivided like dS; side B is filled afterwards against whatever
+    // A made of the chain.
+    struct Straddle {
+        std::vector<int> cav, cavA, cavB;
+        std::unordered_set<int> inD, inA, inB;
+        int matA = -1, matB = -1;
+        int p = -1, q = -1;
+        Loop LA;
+        CavityFill::Boundary BB;
+    };
+    // Grow `rings` rings round interface vertex `seed` over both materials
+    // there; false when the result is not a straddling cavity as above.
+    bool growStraddle(int seed, int rings, Straddle &S);
+    // Fill side A with pA and then side B with the best of its proposals
+    // against A's chain, in one patch (A's cells first, nA of them), and
+    // certify it; `keep` gets the chain's reused interior vertices.
+    bool fillStraddle(const Straddle &S, const Proposal &pA, double floor, CavityFill::Patch &P, int &nA,
+                      std::vector<int> &keep);
+    // An interface vertex eligible to seed a straddling cavity within
+    // `reach` rings of v, nearest first, -1 if none.
+    int straddleSeed(int v, int reach, std::mt19937 *rng) const;
+    // The change in defect a certified straddling fill makes, weighted as
+    // round()'s score (dS vertices by boundaryPlus/MinusWeight when signed),
+    // over every vertex of the cavity and the patch.
+    double straddleDefectDelta(const Straddle &S, const CavityFill::Patch &P, bool signedBoundary) const;
     // Side k of a corner set: its edge count now and the range drops and
     // insertions allow.
     void sideRange(const Loop &L, int from, int to, int &n, int &lo, int &hi) const;
@@ -342,6 +441,14 @@ private:
     Report report_;
     AnnealReport annealReport_;
     std::vector<SquareCarrier> checkpoints_;
+    // During anneal() with AnnealOptions::freeTemplates.
+    bool freeTemplates_ = false;
+    std::vector<char> lockedGroup_;
+    bool lockedCell(int q) const {
+        const int g = C_.cellGroup[q];
+        return C_.cellOrigin[q] == SquareCarrier::CellOrigin::Template && g >= 0 &&
+               g < static_cast<int>(lockedGroup_.size()) && lockedGroup_[g];
+    }
     // During anneal() with directed moves: the cones a star fill may centre
     // on (realise()).
     const std::vector<ReferenceField::Singularity> *starTargets_ = nullptr;

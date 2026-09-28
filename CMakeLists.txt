@@ -201,6 +201,8 @@ add_library(PolyVector SHARED
     src/ATLAS/CavityFill.cxx
     src/ATLAS/ExplicitTemplates.hxx
     src/ATLAS/ExplicitTemplates.cxx
+    src/ATLAS/SectionArrangement.hxx
+    src/ATLAS/SectionArrangement.cxx
     src/ATLAS/RectangleCertifier.hxx
     src/ATLAS/RectangleCertifier.cxx
     src/ATLAS/BlockCover.hxx
@@ -638,10 +640,14 @@ endforeach()
 # interface network these had no coarse search at all and fell back on the
 # fine carrier, where Stage 6 stalls (geom001 29054 blocks against the 8 its
 # layout wants, geom012 43406, the corpus 225617). With it, each is a handful
-# to a few dozen. The ceilings are about three times what they reach now
-# (12, 12, 9, 30 on 2026-09-19), so annealer seed noise cannot trip them but a
-# lost coarse search will.
-foreach(ATLAS_CASE "multimat/geom001 40" "multimat/geom003 40" "multimat/geom012 40" "multimat/geom013 90")
+# to a few dozen. Since 2026-09-28 (docs/atlas_multimaterial_blocks.md: counts
+# reconciled across interfaces, flat nodes, general sections, straddling
+# cavities) they reach 8, 12, 9, 16, 13, 37, 59 -- TORSION's own counts on the
+# first five -- where they reached 12, 12, 9, 30, 119, 138, 237. The ceilings
+# are about three times the new counts and below the old ones, so seed noise
+# cannot trip them but losing any of the multi-material machinery will.
+foreach(ATLAS_CASE "multimat/geom001 24" "multimat/geom003 36" "multimat/geom012 30" "multimat/geom013 48"
+                   "multimat/geom010 40" "multimat/det_rocket 110" "multimat/icf 180")
     string(REPLACE " " ";" ATLAS_ARGS ${ATLAS_CASE})
     list(GET ATLAS_ARGS 0 ATLAS_MODEL)
     list(GET ATLAS_ARGS 1 ATLAS_MAX)

@@ -127,6 +127,33 @@ public:
     // whose two edges are shortest together first; `mayDrop` says which may go.
     static std::vector<int> dropFromBoundary(const SquareCarrier &C, const std::vector<int> &ids,
                                              const std::vector<char> &mayDrop, int count);
+    // The same over ids that may include the patch's new vertices.
+    static std::vector<int> dropFromBoundary(const SquareCarrier &C, const Patch &P, const std::vector<int> &ids,
+                                             const std::vector<char> &mayDrop, int count);
+
+    // ---- Cavities that straddle an interface (CavityRewrite) ---------------
+    //
+    // An interface edge has a neighbour on its other side, so a cavity that
+    // stops at one may not re-subdivide it (Sec. 8.4). A cavity that holds
+    // cells on both sides of a run of interface -- the chain -- may: the run
+    // is then inside the cavity, both sides are refilled in one patch, and
+    // the chain's new points are the same vertices for both. Its points obey
+    // dS's rule: every input vertex stays, a midpoint or inserted point may
+    // go, and new points go on the input interface segments (InterfaceSplit,
+    // held fixed like a BoundarySplit). The input vertices it keeps are
+    // interior vertices of the cavity that the patch reuses, and validate()
+    // is told which (`keep`).
+    //
+    // The input interface edge that the carrier segment a-b lies on, or -1;
+    // as domainEdge() for dS.
+    static int interfaceSourceEdge(const SquareCarrier &C, int a, int b);
+    // ids with `extra` points inserted on the segments whose segEdge (the
+    // input feature edge segment k of ids lies on) is set, longest first:
+    // BoundarySplit on a dS edge, InterfaceSplit on an interface one
+    // (segIface). Empty when no segment may take one.
+    static std::vector<int> insertOnSegments(const SquareCarrier &C, Patch &P, const std::vector<int> &ids,
+                                             const std::vector<int> &segEdge, const std::vector<char> &segIface,
+                                             int extra);
 
     // A structured n x m grid over a four-sided region. sides[0..3] are the
     // bottom (corner 0 -> 1, n edges), right (1 -> 2, m edges), top (2 -> 3,
@@ -164,28 +191,38 @@ public:
     // (two of them for K = 3, three in a window round the real solution for
     // K = 5), so a long side opposite two short ones -- the case a fixed
     // budget of increments misses -- is still found. False when no such s.
+    // With `prescribed`, prescribed[k] >= 0 also fixes where the split point
+    // of side k goes: m_k exactly that many edges along it, i.e. s_{k-1} =
+    // prescribed[k] (a node already there that the star's spoke has to meet).
     static bool repairStar(const std::vector<int> &n, const std::vector<char> &splittable,
-                           std::vector<int> &s);
+                           std::vector<int> &s, const std::vector<int> *prescribed = nullptr);
     // The same with a range [lo_k, hi_k] for each side's edge count: spoke
     // counts s whose sides s_{k-1} + s_{k+1} all fall in their ranges,
     // minimising the total change from n and then the distance from the real
     // solution. `have` returns the side counts the solution gives. The first
     // two (K = 3) or three (K = 5) spokes are searched within `window` of the
     // real solution, the others settle exactly.
+    // `prescribed` as in repairStar.
     static bool rangeStar(const std::vector<int> &n, const std::vector<int> &lo, const std::vector<int> &hi,
-                          std::vector<int> &s, std::vector<int> &have, int window = 40);
+                          std::vector<int> &s, std::vector<int> &have, int window = 40,
+                          const std::vector<int> *prescribed = nullptr);
 
     // Jacobi-Laplacian smoothing of the patch's free vertices: every new vertex
-    // except a point inserted on dS. The cavity boundary does not move.
+    // except a point inserted on dS or on an interface. The cavity boundary
+    // does not move.
     static void smooth(const SquareCarrier &C, Patch &P, int iterations);
 
     // Place the patch, then smooth it only if the placement is not already
     // certified, keeping the best certified state seen.
+    // `keep`: interior vertices of the cavity the patch reuses where they are
+    // -- the input vertices on an interface chain inside a straddling cavity
+    // -- each of which must end up with a one-ring of 2 pi.
     static Verdict settle(const SquareCarrier &C, const std::vector<int> &cavity, Patch &P,
-                          double minScaledJacobian, int smoothingIterations);
+                          double minScaledJacobian, int smoothingIterations,
+                          const std::vector<int> *keep = nullptr);
 
     static Verdict validate(const SquareCarrier &C, const std::vector<int> &cavity, const Patch &P,
-                            double minScaledJacobian);
+                            double minScaledJacobian, const std::vector<int> *keep = nullptr);
 
     // Min over the loop's edges of the signed distance from c to the edge's
     // line, positive on the left. Positive iff c is strictly inside the

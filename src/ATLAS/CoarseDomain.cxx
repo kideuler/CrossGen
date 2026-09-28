@@ -5,6 +5,7 @@
 #include <cmath>
 #include <functional>
 #include <limits>
+#include <map>
 #include <queue>
 #include <unordered_map>
 #include <unordered_set>
@@ -429,6 +430,16 @@ bool CoarseDomain::sample(std::vector<std::vector<int>> &samples) {
     samples.assign(arcs_.size(), {});
     report_.spacingMin = std::numeric_limits<double>::infinity();
     report_.spacingMax = 0.0;
+    // The input's own section arrangements first: where their sections end,
+    // the chains are cut, so that each face side is a whole number of chains
+    // whose counts harmonise() can set.
+    breakpoint_.assign(M.vertices.size(), 0);
+    const bool reconcile = opts_.harmoniseCounts && fine_.getReport().interfaceEdges > 0;
+    if (reconcile) planSections();
+    // The chains of every arc and their counts, so that the counts can be
+    // reconciled across the interfaces (harmonise()) before any sample is
+    // placed.
+    std::vector<std::vector<SampleChain>> arcChains(arcs_.size());
     for (int l = 0; l < static_cast<int>(arcs_.size()); ++l) {
         const Arc &A = arcs_[l];
         const int n = static_cast<int>(A.vertices.size());
@@ -449,9 +460,18 @@ bool CoarseDomain::sample(std::vector<std::vector<int>> &samples) {
         };
 
         std::vector<int> corners;
-        for (int i = 0; i < n; ++i) if (fine_.protectedVertex[A.vertices[i]]) corners.push_back(i);
-        struct Chain { int a, len; bool closed; std::vector<double> dens; int segs; };
-        std::vector<Chain> chains;
+        for (int i = 0; i < n; ++i) {
+            const int v = A.vertices[i];
+            if (fine_.protectedVertex[v] || breakpoint_[v]) corners.push_back(i);
+        }
+        std::vector<SampleChain> &chains = arcChains[l];
+        auto add = [&](int a, int len, bool closed) {
+            SampleChain c;
+            c.a = a;
+            c.len = len;
+            c.closed = closed;
+            chains.push_back(std::move(c));
+        };
         if (!A.closed) {
             // An open chain runs between two nodes of the interface network,
             // both protected, and any protected vertex between them (a kink)
@@ -461,21 +481,19 @@ bool CoarseDomain::sample(std::vector<std::vector<int>> &samples) {
                 corners.push_back(0);
                 corners.push_back(n - 1);
             }
-            for (size_t k = 0; k + 1 < corners.size(); ++k) {
-                chains.push_back({corners[k], corners[k + 1] - corners[k], false, {}, 0});
-            }
+            for (size_t k = 0; k + 1 < corners.size(); ++k) add(corners[k], corners[k + 1] - corners[k], false);
         } else if (corners.empty()) {
-            chains.push_back({0, n, true, {}, 0});
+            add(0, n, true);
         } else {
             for (size_t k = 0; k < corners.size(); ++k) {
                 const int a = corners[k];
                 const int b = corners[(k + 1) % corners.size()];
                 const int len = corners.size() == 1 ? n : ((b - a) % n + n) % n;
-                chains.push_back({a, len, corners.size() == 1, {}, 0});
+                add(a, len, corners.size() == 1);
             }
         }
         int total = 0;
-        for (Chain &c : chains) {
+        for (SampleChain &c : chains) {
             c.dens.assign(c.len + 1, 0.0);
             for (int k = 0; k < c.len; ++k) {
                 const int i = (c.a + k) % n;
@@ -489,8 +507,8 @@ bool CoarseDomain::sample(std::vector<std::vector<int>> &samples) {
         // A closed curve needs three samples to be a polygon at all; an open
         // chain is already one with its two ends.
         while (A.closed && total < 3) {
-            Chain *best = nullptr;
-            for (Chain &c : chains) {
+            SampleChain *best = nullptr;
+            for (SampleChain &c : chains) {
                 if (c.segs >= c.len) continue;
                 if (!best || c.dens[c.len] / c.segs > best->dens[best->len] / best->segs) best = &c;
             }
@@ -501,7 +519,15 @@ bool CoarseDomain::sample(std::vector<std::vector<int>> &samples) {
             ++best->segs;
             ++total;
         }
-        for (const Chain &c : chains) {
+    }
+
+    if (reconcile) harmonise(arcChains);
+
+    for (int l = 0; l < static_cast<int>(arcs_.size()); ++l) {
+        const Arc &A = arcs_[l];
+        const int n = static_cast<int>(A.vertices.size());
+        const std::vector<SampleChain> &chains = arcChains[l];
+        for (const SampleChain &c : chains) {
             samples[l].push_back(A.vertices[c.a]);
             int prev = 0;
             const double D = c.dens[c.len];
@@ -525,6 +551,401 @@ bool CoarseDomain::sample(std::vector<std::vector<int>> &samples) {
         report_.samples += static_cast<int>(samples[l].size());
     }
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Counts across an interface (see the class comment), part one: the input's
+// material regions, each one's loops, and the arrangement of the sections its
+// corners and flat nodes cast (SectionArrangement), built on the input's own
+// curves. Where a section ends, the sampling cuts its chain (breakpoint_), so
+// that each side of each face is a whole number of chains.
+// ---------------------------------------------------------------------------
+void CoarseDomain::planSections() {
+    const Mesh &M = fine_.getMesh();
+    const int NT = static_cast<int>(M.triangles.size());
+    const int NV = static_cast<int>(M.vertices.size());
+    region_.assign(NT, -1);
+    regions_ = 0;
+    for (int s = 0; s < NT; ++s) {
+        if (region_[s] >= 0) continue;
+        std::vector<int> stack{s};
+        region_[s] = regions_;
+        while (!stack.empty()) {
+            const int t = stack.back();
+            stack.pop_back();
+            for (int k = 0; k < 3; ++k) {
+                const int e = M.triangleEdges[t][k];
+                if (fine_.interfaceEdge[e] || fine_.boundaryEdge[e]) continue;
+                const int u = M.edgeTriangles[e][0] == t ? M.edgeTriangles[e][1] : M.edgeTriangles[e][0];
+                if (u < 0 || region_[u] >= 0) continue;
+                region_[u] = regions_;
+                stack.push_back(u);
+            }
+        }
+        ++regions_;
+    }
+    std::vector<std::vector<int>> tris(regions_);
+    for (int t = 0; t < NT; ++t) tris[region_[t]].push_back(t);
+    plans_.assign(regions_, RegionPlan());
+    const double flatTol = 25.0 * M_PI / 180.0;
+    std::vector<int> next(NV, -1);
+    std::vector<double> angle(NV, 0.0);
+    for (int r = 0; r < regions_; ++r) {
+        // The boundary half-edges with the region on their left: a triangle's
+        // own edge (triangles are counter-clockwise) whose other side is not
+        // the region.
+        std::vector<int> starts;
+        bool pinched = false;
+        for (int t : tris[r]) {
+            for (int k = 0; k < 3; ++k) {
+                const int e = M.triangleEdges[t][k];
+                const int u = M.edgeTriangles[e][0] == t ? M.edgeTriangles[e][1] : M.edgeTriangles[e][0];
+                if (u >= 0 && region_[u] == r) continue;
+                const int a = M.triangles[t][k], b = M.triangles[t][(k + 1) % 3];
+                if (next[a] >= 0) pinched = true;
+                next[a] = b;
+                starts.push_back(a);
+            }
+        }
+        RegionPlan &plan = plans_[r];
+        if (!pinched) {
+            std::vector<char> seen;
+            for (int a : starts) {
+                if (next[a] < 0) continue;
+                std::vector<int> loop;
+                int v = a;
+                while (next[v] >= 0) {
+                    loop.push_back(v);
+                    const int w = next[v];
+                    next[v] = -1;
+                    v = w;
+                }
+                if (v != a) { pinched = true; break; }
+                plan.loops.push_back(std::move(loop));
+            }
+        }
+        for (int a : starts) next[a] = -1;
+        if (pinched || plan.loops.empty()) {
+            plan.loops.clear();
+            continue;
+        }
+        // The region's own interior angle at each loop vertex.
+        for (int t : tris[r]) {
+            for (int k = 0; k < 3; ++k) {
+                const int v = M.triangles[t][k];
+                const Point p = M.vertices[v];
+                const Point u = M.vertices[M.triangles[t][(k + 1) % 3]] - p;
+                const Point w = M.vertices[M.triangles[t][(k + 2) % 3]] - p;
+                angle[v] += std::fabs(std::atan2(cross2(u, w), dotP(u, w)));
+            }
+        }
+        // Outer loop first: the one of positive area.
+        std::vector<SectionArrangement::Loop> L;
+        std::vector<std::vector<int>> ordered;
+        int outer = -1;
+        for (size_t k = 0; k < plan.loops.size(); ++k) {
+            double a2 = 0.0;
+            const auto &lp = plan.loops[k];
+            for (size_t i = 0; i < lp.size(); ++i) a2 += cross2(M.vertices[lp[i]], M.vertices[lp[(i + 1) % lp.size()]]);
+            if (a2 > 0.0) {
+                if (outer >= 0) { outer = -2; break; }
+                outer = static_cast<int>(k);
+            }
+        }
+        if (outer >= 0) {
+            ordered.push_back(plan.loops[outer]);
+            for (size_t k = 0; k < plan.loops.size(); ++k) if (static_cast<int>(k) != outer) ordered.push_back(plan.loops[k]);
+            for (const auto &lp : ordered) {
+                SectionArrangement::Loop D;
+                for (int v : lp) {
+                    D.X.push_back(M.vertices[v]);
+                    D.angle.push_back(angle[v]);
+                    const bool node = fine_.protectedVertex[v];
+                    D.node.push_back(node ? 1 : 0);
+                    D.corner.push_back(node && std::fabs(angle[v] - M_PI) >= flatTol ? 1 : 0);
+                }
+                L.push_back(std::move(D));
+            }
+            plan.loops = ordered;
+            SectionArrangement::Options so;
+            so.cross = opts_.cross;
+            std::vector<SectionArrangement::Section> S;
+            std::string why;
+            bool ok = SectionArrangement::cast(L, so, S, why) && SectionArrangement::arrange(L, S, so, plan.arrangement);
+            // A plate round one inclusion, the plate four-cornered and the
+            // inclusion smooth, casts nothing that reaches the hole; Stage 3
+            // gives it an annulus whose four sector rays run through the
+            // plate's corners, so those are the sections to plan: from each
+            // corner towards the hole's centre, to where they meet it.
+            if (!ok && L.size() == 2) {
+                std::vector<int> outerCorners;
+                bool holeCorner = false;
+                for (size_t i = 0; i < L[0].X.size(); ++i) if (L[0].corner[i]) outerCorners.push_back(static_cast<int>(i));
+                for (size_t i = 0; i < L[1].X.size(); ++i) holeCorner = holeCorner || L[1].corner[i];
+                if (outerCorners.size() == 4 && !holeCorner) {
+                    Point c{0.0, 0.0};
+                    for (const Point &p : L[1].X) c = c + p;
+                    c = c / static_cast<double>(L[1].X.size());
+                    S.clear();
+                    bool all = true;
+                    for (int i : outerCorners) {
+                        const Point O = L[0].X[i];
+                        const Point d = c - O;
+                        // The first hole edge the ray from the corner to c
+                        // crosses, and the nearer end of it.
+                        int best = -1;
+                        double bestT = 1e300;
+                        const int NH = static_cast<int>(L[1].X.size());
+                        for (int j = 0; j < NH; ++j) {
+                            const Point a = L[1].X[j], e = L[1].X[(j + 1) % NH] - a;
+                            const double den = cross2(d, e);
+                            if (std::fabs(den) < 1e-300) continue;
+                            const Point w = a - O;
+                            const double t = cross2(w, e) / den, u = cross2(w, d) / den;
+                            if (t <= 0.0 || u < 0.0 || u > 1.0 || t >= bestT) continue;
+                            bestT = t;
+                            best = u < 0.5 ? j : (j + 1) % NH;
+                        }
+                        SectionArrangement::End a{0, i}, b{1, best};
+                        if (best < 0 || !SectionArrangement::clear(L, a, b)) { all = false; break; }
+                        S.push_back({a, b, false});
+                    }
+                    ok = all && SectionArrangement::arrange(L, S, so, plan.arrangement);
+                }
+            }
+            if (ok) {
+                for (const SectionArrangement::Section &sc : S) {
+                    breakpoint_[plan.loops[sc.b.l][sc.b.i]] = 1;
+                    breakpoint_[plan.loops[sc.a.l][sc.a.i]] = 1;
+                }
+            }
+        }
+        for (int t : tris[r]) for (int k = 0; k < 3; ++k) angle[M.triangles[t][k]] = 0.0;
+    }
+    // A breakpoint only matters on a feature curve; the protected ones cut
+    // chains anyway.
+    for (int v = 0; v < NV; ++v) {
+        if (breakpoint_[v] && (arcsAt_[v].empty() || fine_.protectedVertex[v])) breakpoint_[v] = 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Counts across an interface, part two: every face of every region's
+// arrangement asks for its opposite sides equal (a grid) or its sides to
+// satisfy a star's triangle inequalities, and through the union-find of the
+// grids those become classes of sides that must share one count. Only
+// interface chains are raised -- a boundary chain is a floor Stage 3 can lift
+// -- to a fixpoint, and a constraint the caps leave unmet is dropped and the
+// whole thing redone without it, so that no partial raise is left behind.
+// ---------------------------------------------------------------------------
+void CoarseDomain::harmonise(std::vector<std::vector<SampleChain>> &chains) {
+    const Mesh &M = fine_.getMesh();
+    struct Ref {
+        int arc = -1, k = -1;
+        bool iface = false;
+        int cap = 0;
+        double length = 0.0;
+    };
+    std::vector<Ref> G;
+    std::vector<int> edgeChain(M.edges.size(), -1);
+    for (int l = 0; l < static_cast<int>(arcs_.size()); ++l) {
+        const Arc &A = arcs_[l];
+        const int n = static_cast<int>(A.vertices.size());
+        for (int k = 0; k < static_cast<int>(chains[l].size()); ++k) {
+            const SampleChain &c = chains[l][k];
+            Ref r;
+            r.arc = l;
+            r.k = k;
+            r.iface = A.onInterface;
+            const int gid = static_cast<int>(G.size());
+            for (int j = 0; j < c.len; ++j) {
+                const int e = A.edges[(c.a + j) % n];
+                edgeChain[e] = gid;
+                r.length += normP(M.vertices[M.edges[e][1]] - M.vertices[M.edges[e][0]]);
+            }
+            r.cap = std::min(c.len, std::max(c.segs, static_cast<int>(std::floor(opts_.maxHarmoniseFactor * c.segs))));
+            G.push_back(r);
+        }
+    }
+    auto segs = [&](int g) -> int & { return chains[G[g].arc][G[g].k].segs; };
+
+    // A side: the chains along one arc of an arrangement, in order.
+    struct Side {
+        std::vector<int> chains;
+        bool loop = false;       // a loop arc (else a section: free)
+        double length = 0.0;
+    };
+    auto edgeBetween = [&](int a, int b) {
+        const auto range = M.vertexTriangles.trianglesForVertex(a);
+        for (const int *t = range.first; t != range.second; ++t) {
+            for (int k = 0; k < 3; ++k) {
+                const int e = M.triangleEdges[*t][k];
+                if ((M.edges[e][0] == a && M.edges[e][1] == b) || (M.edges[e][0] == b && M.edges[e][1] == a)) return e;
+            }
+        }
+        return -1;
+    };
+    // Constraints: classes of sides that must share a count, and stars.
+    std::vector<std::vector<Side>> classes;
+    std::vector<std::array<Side, 3>> stars;
+    int constrainedRegions = 0;
+    for (const RegionPlan &plan : plans_) {
+        const SectionArrangement::Result &ar = plan.arrangement;
+        if (!ar.ok) continue;
+        const int NA = static_cast<int>(ar.arcs.size());
+        std::vector<Side> sides(NA);
+        bool broken = false;
+        for (int k = 0; k < NA && !broken; ++k) {
+            const SectionArrangement::Arc &arc = ar.arcs[k];
+            sides[k].length = arc.length;
+            if (arc.loop < 0) continue;
+            sides[k].loop = true;
+            const std::vector<int> &lp = plan.loops[arc.loop];
+            for (size_t j = 0; j + 1 < arc.pos.size(); ++j) {
+                const int e = edgeBetween(lp[arc.pos[j]], lp[arc.pos[j + 1]]);
+                const int g = e >= 0 ? edgeChain[e] : -1;
+                if (g < 0) { broken = true; break; }
+                if (sides[k].chains.empty() || sides[k].chains.back() != g) sides[k].chains.push_back(g);
+            }
+        }
+        if (broken) continue;
+        struct UFs {
+            std::vector<int> p;
+            explicit UFs(int n) : p(n) { for (int i = 0; i < n; ++i) p[i] = i; }
+            int find(int x) { while (p[x] != x) { p[x] = p[p[x]]; x = p[x]; } return x; }
+            void unite(int a, int b) { a = find(a); b = find(b); if (a != b) p[a] = b; }
+        } uf(NA);
+        bool any = false;
+        for (const SectionArrangement::Face &f : ar.faces) {
+            if (f.corners.size() == 4) {
+                uf.unite(ar.half[f.halves[f.corners[0]]].arc, ar.half[f.halves[f.corners[2]]].arc);
+                uf.unite(ar.half[f.halves[f.corners[1]]].arc, ar.half[f.halves[f.corners[3]]].arc);
+            } else if (f.corners.size() == 3) {
+                std::array<Side, 3> st;
+                for (int c = 0; c < 3; ++c) st[c] = sides[ar.half[f.halves[f.corners[c]]].arc];
+                stars.push_back(st);
+                any = true;
+            }
+        }
+        std::map<int, std::vector<int>> members;
+        for (int k = 0; k < NA; ++k) members[uf.find(k)].push_back(k);
+        for (const auto &kv : members) {
+            std::vector<Side> cls;
+            double lo = 1e300, hi = 0.0;
+            bool fixed = false;
+            for (int k : kv.second) {
+                if (!sides[k].loop) continue;
+                cls.push_back(sides[k]);
+                lo = std::min(lo, sides[k].length);
+                hi = std::max(hi, sides[k].length);
+                for (int g : sides[k].chains) fixed = fixed || G[g].iface;
+            }
+            // Only a class of two or more loop sides, one an interface, and
+            // none much longer than another: one grid between a 0.65 arc and a
+            // 2.9 side (multimat/icf's big region) is not a layout anyone
+            // wants, whatever the counts, and equating them raised the thin
+            // shells behind it out of step with each other.
+            if (cls.size() < 2 || !fixed || hi > opts_.maxHarmoniseAspect * lo) continue;
+            classes.push_back(cls);
+            any = true;
+        }
+        if (any) ++constrainedRegions;
+    }
+    report_.harmonisedRegions = constrainedRegions;
+    if (classes.empty() && stars.empty()) return;
+
+    std::vector<int> before(G.size());
+    for (int g = 0; g < static_cast<int>(G.size()); ++g) before[g] = segs(g);
+    auto count = [&](const Side &sd) {
+        int n = 0;
+        for (int g : sd.chains) n += segs(g);
+        return n;
+    };
+    auto fixedSide = [&](const Side &sd) {
+        for (int g : sd.chains) if (G[g].iface) return true;
+        return false;
+    };
+    // Raise a side's count by `d`, shared among its interface chains by
+    // length so that they keep their spacing, each within its cap.
+    auto raiseSide = [&](const Side &sd, int d) {
+        if (d <= 0) return false;
+        double L = 0.0;
+        for (int g : sd.chains) if (G[g].iface) L += G[g].length;
+        if (!(L > 0.0)) return false;
+        bool changed = false;
+        int left = d;
+        for (size_t k = 0; k < sd.chains.size() && left > 0; ++k) {
+            const int g = sd.chains[k];
+            if (!G[g].iface) continue;
+            bool last = true;
+            for (size_t j = k + 1; j < sd.chains.size(); ++j) last = last && !G[sd.chains[j]].iface;
+            const int want = last ? left : std::min(left, static_cast<int>(std::lround(d * G[g].length / L)));
+            const int add = std::min(want, std::max(0, G[g].cap - segs(g)));
+            if (add > 0) {
+                segs(g) += add;
+                left -= add;
+                changed = true;
+            }
+        }
+        return changed;
+    };
+    // What constraint q still asks: raises of the sides that fall short.
+    // Classes are q < classes.size(), stars after.
+    const int NQ = static_cast<int>(classes.size() + stars.size());
+    auto apply = [&](int q, bool dryRun) {
+        bool unmet = false, changed = false;
+        if (q < static_cast<int>(classes.size())) {
+            const std::vector<Side> &cls = classes[q];
+            // Every interface side up to the largest count in the class; a
+            // boundary side only sets the floor.
+            int target = 0;
+            for (const Side &sd : cls) target = std::max(target, count(sd));
+            for (const Side &sd : cls) {
+                if (!fixedSide(sd)) continue;
+                const int d = target - count(sd);
+                if (d <= 0) continue;
+                unmet = true;
+                if (!dryRun) changed = raiseSide(sd, d) || changed;
+            }
+        } else {
+            // Carrier counts are 2 segs; s_i = (n_j + n_k - n_i) / 2 >= 1
+            // binds when j and k are both fixed.
+            const std::array<Side, 3> &st = stars[q - classes.size()];
+            for (int i = 0; i < 3; ++i) {
+                const Side &sj = st[(i + 1) % 3], &sk = st[(i + 2) % 3];
+                if (!sj.loop || !sk.loop || !st[i].loop || !fixedSide(sj) || !fixedSide(sk)) continue;
+                const int deficit = count(st[i]) + 1 - count(sj) - count(sk);
+                if (deficit <= 0) continue;
+                unmet = true;
+                if (dryRun) continue;
+                double lj = 0.0, lk = 0.0;
+                for (int g : sj.chains) if (G[g].iface) lj += G[g].length;
+                for (int g : sk.chains) if (G[g].iface) lk += G[g].length;
+                const int dj = static_cast<int>(std::lround(deficit * lj / std::max(1e-300, lj + lk)));
+                changed = raiseSide(sj, dj) || changed;
+                changed = raiseSide(sk, deficit - dj) || changed;
+            }
+        }
+        return dryRun ? unmet : changed;
+    };
+    std::vector<char> active(NQ, 1);
+    for (int attempt = 0; attempt <= NQ; ++attempt) {
+        for (int g = 0; g < static_cast<int>(G.size()); ++g) segs(g) = before[g];
+        for (int pass = 0; pass < 100; ++pass) {
+            bool changed = false;
+            for (int q = 0; q < NQ; ++q) if (active[q]) changed = apply(q, false) || changed;
+            if (!changed) break;
+        }
+        int unmet = -1;
+        for (int q = 0; q < NQ && unmet < 0; ++q) if (active[q] && apply(q, true)) unmet = q;
+        if (unmet < 0) break;
+        active[unmet] = 0;
+    }
+    for (int g = 0; g < static_cast<int>(G.size()); ++g) {
+        if (segs(g) == before[g]) continue;
+        ++report_.harmonisedChains;
+        report_.harmonisedSegments += segs(g) - before[g];
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -743,6 +1164,19 @@ bool CoarseDomain::triangulate(const std::vector<std::vector<int>> &samples) {
     fineVertex_.assign(NV, -1);
     // Triangle keeps the input points first and in order (switch z).
     for (size_t k = 0; k < fineOf.size() && static_cast<int>(k) < NV; ++k) fineVertex_[k] = fineOf[k];
+    coarseBreakpoint_.clear();
+    bool anyBreakpoint = false;
+    for (int k = 0; k < NV; ++k) {
+        const int f = fineVertex_[k];
+        if (f >= 0 && f < static_cast<int>(breakpoint_.size()) && breakpoint_[f]) anyBreakpoint = true;
+    }
+    if (anyBreakpoint) {
+        coarseBreakpoint_.assign(NV, 0);
+        for (int k = 0; k < NV; ++k) {
+            const int f = fineVertex_[k];
+            if (f >= 0 && breakpoint_[f]) coarseBreakpoint_[k] = 1;
+        }
+    }
 
     PlanarDomain::Options po = fine_.getOptions();
     po.angleOverride.assign(NV, std::numeric_limits<double>::quiet_NaN());

@@ -116,6 +116,9 @@ public:
         std::vector<int> newSourceEdge;           // mesh edge a BoundarySplit lies on
         std::vector<std::array<int, 4>> cells;    // counter-clockwise
         int material = 1;
+        // Per cell when not empty, in place of `material`: a Stage 6 cavity
+        // that straddles an interface refills both materials at once.
+        std::vector<int> cellMaterials;
         std::vector<int> designate;               // macrovertices the replacement made
         CellOrigin cellOrigin = CellOrigin::Template;
         int group = -1;                           // which replacement, for reporting

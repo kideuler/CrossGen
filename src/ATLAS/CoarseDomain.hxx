@@ -1,12 +1,14 @@
 #ifndef __COARSE_DOMAIN_HXX__
 #define __COARSE_DOMAIN_HXX__
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include "ATLAS/PlanarDomain.hxx"
+#include "ATLAS/SectionArrangement.hxx"
 #include "ATLAS/SquareCarrier.hxx"
 #include "mesh/Mesh.hxx"
 
@@ -101,6 +103,33 @@
 // or interface: those are all input vertices) and a quality bound, which
 // grades the interior to the feature spacing on its own.
 //
+// ### Counts across an interface
+//
+// On dS a sample count is only a floor: Stage 3 may insert points on a
+// boundary segment and Stage 6 may drop midpoints, so a boundary chain takes
+// whatever count its region's layout asks for. An interface chain cannot
+// (Sec. 8.4): the region across it would be left with hanging nodes, so its
+// carrier count is fixed at twice its samples for good. Sampled chain by
+// chain, those fixed counts rarely agree with each other -- the two arcs of a
+// thin shell are sampled at one spacing but have different lengths -- and a
+// four-sided region whose opposite sides differ can never be one structured
+// grid. Stage 3 then keeps the region ("two interface arcs that must match
+// have different counts") and Stage 6 has to absorb the difference with
+// singularities it can never move out through an interface, whose lines then
+// cut every layer they cross: multimat/geom010, four nested shells, came to
+// 119 blocks where 13 is its layout.
+//
+// So before placing samples the chains of each material region are given
+// counts its template can close. For a region bounded by one loop of four
+// chains, opposite chains get equal counts where both are interfaces, and an
+// interface chain at least the count of a boundary chain opposite it (which
+// Stage 3 can raise, never lower). For a loop of three, a star's spoke counts
+// s_k = (n_{k-1} + n_{k+1} - n_k) / 2 must be positive, which only binds when
+// both sides that must outweigh a third are interfaces. Counts are only ever
+// raised, to a fixpoint, and only on interface chains: raising adds samples
+// (a finer proxy, never a coarser one), and a single-material domain is
+// sampled exactly as before.
+//
 // ### Corners
 //
 // In the three-quad split a boundary vertex's valence is its number of
@@ -124,6 +153,23 @@ public:
         // Edge flips that give each boundary sample the number of triangles
         // its layout angle asks for may not make an angle smaller than this.
         double minFlipAngle = 12.0;
+        // Give the chains of each material region counts its Stage 3
+        // template can close (see "Counts across an interface" above):
+        // opposite sides of a four-sided region equal, the sides of a
+        // three-sided one a star's triangle inequalities. Only interface
+        // chains are raised, so a single-material domain is untouched.
+        bool harmoniseCounts = true;
+        // A chain is never raised past this multiple of its own count (nor
+        // past its own fine edges).
+        double maxHarmoniseFactor = 16.0;
+        // Opposite sides of a four-sided region are equated only when the
+        // longer is at most this multiple of the shorter: past it one block
+        // between them is not a layout anyone wants, whatever the counts.
+        double maxHarmoniseAspect = 2.5;
+        // The reference cross field the input's section arrangements follow
+        // (SectionArrangement::Options::cross), the same one Stage 3's are
+        // cast along; unset, the sections follow their angle rule.
+        std::function<double(const Point &, double *)> cross;
     };
 
     // A point on a fine feature curve: which arc, and the arc-length position
@@ -160,6 +206,11 @@ public:
         int interfaceArcs = 0;           // chains of the interface network
         int interfaceSegments = 0;       // coarse interface edges they became
         int materialRegions = 0;         // regions the flood fill separated
+        // harmoniseCounts: the regions whose chains it constrained, the
+        // interface chains it raised, and the coarse segments it added.
+        int harmonisedRegions = 0;
+        int harmonisedChains = 0;
+        int harmonisedSegments = 0;
         double spacingMin = 0.0, spacingMax = 0.0;
         double seconds = 0.0;
     };
@@ -176,6 +227,11 @@ public:
     // Coarse mesh vertex -> the fine vertex it samples, -1 for an interior
     // Steiner point.
     const std::vector<int> &fineVertexOf() const { return fineVertex_; }
+    // Coarse mesh vertex -> it samples a point where a section of the
+    // input's own arrangement ends ("Counts across an interface"): where
+    // Stage 3's sections on the coarse carrier should end too
+    // (ExplicitTemplates::Options::preferredEnds). Empty when there are none.
+    const std::vector<char> &sectionEnds() const { return coarseBreakpoint_; }
 
     const std::vector<Arc> &arcs() const { return arcs_; }
     // A fine vertex's index in one arc, -1 if it is not on that arc.
@@ -215,12 +271,29 @@ public:
     Point pointAt(int loop, double s, int *edge = nullptr, int *index = nullptr) const;
 
 private:
+    // One run of an arc between two of its protected vertices, as sample()
+    // cuts it: `len` fine edges from arc position `a`, the integrated density
+    // along it, and the number of coarse segments it gets.
+    struct SampleChain {
+        int a = 0, len = 0;
+        bool closed = false;
+        std::vector<double> dens;
+        int segs = 0;
+    };
+
     void buildArcs();
     void buildInterfaceArcs();
     void indexArc(int arc);
     void geodesic(int source, double cap, std::vector<double> &dist, std::vector<int> &touched) const;
     std::vector<double> spacing(int loop) const;
     bool sample(std::vector<std::vector<int>> &samples);
+    // "Counts across an interface": the input's material regions and, for
+    // each, the arrangement of the sections its corners and flat nodes cast
+    // (SectionArrangement), whose section ends become breakpoints of the
+    // sampling; then the interface chains' segs raised until every face of
+    // every arrangement can close its grid or star.
+    void planSections();
+    void harmonise(std::vector<std::vector<SampleChain>> &chains);
     bool triangulate(const std::vector<std::vector<int>> &samples);
     // Materials of the coarse triangles, flooded out from the sampled chains.
     // Each segment is a consecutive pair of samples in its arc's own
@@ -233,6 +306,18 @@ private:
     const PlanarDomain &fine_;
     Options opts_;
     Report report_;
+    // planSections(): the input's material regions (per triangle), and each
+    // one's loops and arrangement; the fine vertices sections end on, and the
+    // coarse vertices that sample them.
+    struct RegionPlan {
+        std::vector<std::vector<int>> loops;   // fine vertices, the region on the left
+        SectionArrangement::Result arrangement;
+    };
+    std::vector<int> region_;
+    int regions_ = 0;
+    std::vector<RegionPlan> plans_;
+    std::vector<char> breakpoint_;
+    std::vector<char> coarseBreakpoint_;
     std::vector<Arc> arcs_;
     // (arc, fine vertex) -> index in that arc, as arc * numVertices + vertex.
     std::unordered_map<long long, int> arcIndex_;

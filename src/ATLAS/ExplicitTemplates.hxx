@@ -86,10 +86,47 @@
 //     hole: four sectors, no centre, the hole kept exactly. When one loop
 //     has exactly four protected corners -- a plate with a hole -- the
 //     sector rays go through them.
+//   * General sections, Sec. 7.5's "graph of corridor patches ... junction
+//     cavities" made explicit, for regions that touch an interface. Sections
+//     run from the reflex corners of *every* loop, a hole's included, and
+//     from each flat node (the macro edge a neighbour's template ends there
+//     continues into this region), to the far boundary; the faces they cut
+//     are grids when they have four corners and stars when they have three
+//     or five, the star's centre being the singularity the region needs.
+//     multimat/det_rocket's fuel region, a stadium round a square inclusion,
+//     is eight faces this way -- six grids beside the square's sides and
+//     corners, two three-cornered stars in the rounded end -- which is the
+//     layout TORSION's field finds, singularities where its cones are. The
+//     counts are Sec. 11.2's union-find over the grids plus the stars' own
+//     equations n_k = s_{k-1} + s_{k+1}, solved by a small search over the
+//     counts nothing fixes. Interface sides are fixed on both sides of a
+//     face (Sec. 8.4), so where two of them must match and do not, the
+//     sections' far ends are moved along the boundary a few vertices until
+//     they do.
 //
 // Each accepted template's corners become *designated* macrovertices of the
 // carrier, so the rest of the pipeline can see the layout the template meant
 // even where the carrier is regular across it (an annulus is all valence-4).
+//
+// ### Corners and flat nodes
+//
+// Every protected or designated vertex on a region's boundary is a *node*: a
+// macrovertex the layout must have. Not every node is a *corner* of the
+// region's template. Where the boundary runs straight through a node -- a
+// star's split point that a template across a smooth interface designated, or
+// a T-junction of the interface network seen from its flat side -- the
+// region's blocks meet there side by side, and making it a block corner puts
+// a corner of nearly pi into a block (multimat/geom001's quarter disk, whose
+// neighbour's five-block star had designated a point on their arc, was read as
+// a four-cornered region, and multimat/geom012's mat 1 as a five-cornered one
+// that no family took). So a node within cornerTolerance of pi, and any
+// designated vertex that is not protected (it lies on a smooth feature curve,
+// whatever the coarse polygon's own angle there), is not counted as a
+// corner. It stays a boundary vertex of the template, where every family
+// runs a grid line from it into the region, so Stage 5 still finds the
+// macrovertex it needs; a star does better and puts its spoke there
+// (tryStar), so that the two sides' layouts meet at one point instead of
+// each cutting the other's blocks.
 // A rejected template leaves the carrier untouched and records why (Sec. 13.2:
 // "the reason each attempted coarse constructor was rejected").
 class ExplicitTemplates {
@@ -124,6 +161,43 @@ public:
         int smoothingIterations = 60;
         // Sec. 8.4: may subdivide domain-boundary segments to reconcile counts.
         bool splitBoundary = true;
+        // A node the region's boundary runs straight through is not one of
+        // its corners (see "Corners and flat nodes" above): a neighbouring
+        // template's split point on a smooth interface, or a T-junction seen
+        // from its flat side, within cornerTolerance of pi. Off: every
+        // protected or designated vertex is a corner, as before 2026-09-28.
+        bool flatNodes = true;
+        // Next to an interface, a domain-boundary side may also shed its
+        // droppable points (the coarse carrier's midpoints) when that is what
+        // closes a section's or a star's counts against the interface sides.
+        bool dropBoundary = true;
+        // "General sections" (see the class comment), for a region that
+        // touches an interface: sections from the reflex corners of every
+        // loop -- holes included -- and from flat nodes, faces of three and
+        // five corners filled as stars, and section ends moved up to
+        // sectionShift loop vertices when that is what closes two interface
+        // counts that must match.
+        bool generalSections = true;
+        bool flatSections = true;
+        int sectionShift = 3;
+        // Vertices of the domain a section passing close should end on, as on
+        // a node, indexed by domain vertex: CoarseDomain's samples at the
+        // points where the input's own sections landed (see its "Counts
+        // across an interface"). Null: none.
+        const std::vector<char> *preferredEnds = nullptr;
+        // Next to an interface, a grid face designates the point facing each
+        // node on its sides: the separatrix from the node runs straight
+        // across the grid and Stage 5 cuts there anyway, and marking where it
+        // leaves lets the template across the next interface see it as a
+        // flat node (multimat/icf: the capsule's O-grid split points, carried
+        // out through two one-block shells to the region round them).
+        bool propagateNodes = true;
+        // The order regions are tried in after those bounded by dS alone:
+        // largest first (the default), or smallest first, so that small
+        // inner templates -- a capsule's O-grid -- set the split points the
+        // large regions round them follow. ATLAS runs both on
+        // multi-material domains.
+        bool smallestFirst = false;
 
         // The reference cross field (docs/atlas_crossfield_guidance.md, Sec.
         // 4.2), or null for none. With it every attempt records the region's
@@ -208,6 +282,7 @@ private:
     std::vector<Region> extractRegions() const;
     bool attempt(const Region &R, Attempt &A);
     bool trySections(const Region &R, CavityFill::Patch &P, Attempt &A);
+    bool trySectionsGeneral(const Region &R, CavityFill::Patch &P, Attempt &A);
     bool tryStar(const Region &R, CavityFill::Patch &P, Attempt &A);
     bool tryOGrid(const Region &R, CavityFill::Patch &P, Attempt &A);
     bool tryHalfOGrid(const Region &R, CavityFill::Patch &P, Attempt &A);
@@ -218,6 +293,11 @@ private:
     void score(const Region &R, const CavityFill::Patch &P, Attempt &A) const;
 
     bool isNode(int v) const;
+    // Node i of R's loop `loop` is one of the template's corners (see
+    // "Corners and flat nodes").
+    bool isCorner(const Region &R, int loop, int i) const;
+    // Options::propagateNodes, for one grid face of R's template.
+    void propagateNodes(const Region &R, CavityFill::Patch &P, const std::array<std::vector<int>, 4> &sides) const;
     // The arc's ids with `extra` collinear points inserted on its domain
     // boundary segments, longest first; empty when that is not allowed.
     std::vector<int> splitArc(CavityFill::Patch &P, const std::vector<int> &ids, int extra) const;
