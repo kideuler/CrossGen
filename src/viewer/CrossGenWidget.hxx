@@ -508,11 +508,6 @@ private:
     // ends at. Blocking, and announced a frame ahead.
     void runTORSIONIntegration();
 
-    // Stage 4R alone. Returns the untangled map, or an empty vector when there
-    // was nothing locally injective to start from -- in which case psi_0 stands
-    // as the solve left it and Stage 4's gate is what stops the pipeline.
-    std::vector<Point> runTORSIONUntangle();
-
     // Stage 3: the Newton solve on Eq. (10), then the two things drawn from it
     // -- the conformal factor as a scalar field and the unfolded cone fans.
     // Blocking, like runUMBER, and announced a frame ahead for the same reason.

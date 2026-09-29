@@ -124,6 +124,13 @@ public:
         // singularity of the field that Stage 2 did not cut to, and the branch
         // over Omega is then not single valued at all.
         bool reconcileIndices = true;
+        // Transport to and from *sectors* rather than vertices wherever the
+        // vertex is on dS or on an interface, route every path clear of both,
+        // and hold the pinned faces through the re-smoothing. See
+        // reconcileSectors() in FieldFrames.cxx for why the vertex-level
+        // transport cannot be trusted there. Off is the vertex-level transport,
+        // with dS absorbing anything, kept so the difference stays measurable.
+        bool reconcileSectors = true;
 
         // Read the axis of every chain of dS - G and of every interface branch
         // off the frame, so that Stage 4F can hold it exactly. See
@@ -135,6 +142,13 @@ public:
         // so an edge whose reading is a coin toss abstains rather than being
         // rounded.
         double alignmentVoteTolerance = M_PI / 8.0;
+        // Read an interface branch the cutting graph crosses in the chart each
+        // of its pieces is combed in, and vote on it in one. Off votes the
+        // branch as though it lay in one chart, which is what this class did
+        // before and what folds the far side of every crossing through a right
+        // angle; kept so the difference stays a measurement. See
+        // buildAlignment().
+        bool alignAcrossSeams = true;
     };
 
     struct Report {
@@ -159,6 +173,14 @@ public:
         int reconciledUnits = 0;        // index units moved
         int reconciledEdges = 0;        // matchings changed to move them
         int reconcileFailures = 0;      // units with nowhere to go
+        // reconcileSectors(): sectors of dS and of the interface network where
+        // the frame's quarter count and the layout's differed, how many of
+        // those were left because no route could reach a sector wanting the
+        // opposite, and how many interior units had to be absorbed by a sector
+        // that did not want them (the vertex-level transport's only option).
+        int reconciledSectors = 0;
+        int unresolvedSectorUnits = 0;
+        int absorbedUnits = 0;
         bool branchResmoothed = false;
         double maxBranchCorrection = 0.0;   // the largest |c_f|, radians
 
@@ -225,6 +247,10 @@ public:
         // of a curve that Stage 1 says runs straight, and holding the chain to
         // one axis is what takes it out.
         int alignmentOverrides = 0;
+        // Places where an interface branch crosses the cutting graph and its
+        // reading changes chart by a non-zero quarter turn, each taken back
+        // before the vote rather than counted as a step of the staircase.
+        int alignmentSeamCrossings = 0;
         // Chains left unaligned because they close on themselves with no cone
         // on them. Holding a closed curve to one coordinate line collapses it,
         // so they are reported and left to E2.
@@ -315,6 +341,12 @@ public:
     // before giving up on the alignment altogether. See FieldFrames.cxx.
     const std::vector<int>& strictAlignmentAxis() const { return strictAxis; }
 
+    // Which chain each held edge of Omega belongs to, numbered in the order
+    // they were given an axis, and -1 for an edge held by none. A chain is the
+    // unit the alignment is decided in, so it is also the unit it is let go
+    // in: Stage 4F releases the chains a tangle touches and keeps the rest.
+    const std::vector<int>& alignmentChain() const { return alignChain; }
+
     // One length per edge of S, from the field metric. Sec. 6.3: g_t is
     // isotropic here, so this is the Euclidean length divided by h, averaged
     // over the two incident triangles.
@@ -331,6 +363,8 @@ private:
     void indexRing(std::vector<int> &out) const;
     int ringSign(int v, int e) const;
     void reconcile(const ConeCut &cut, const ConeSingularities &cones);
+    void reconcileSectors(const ConeCut &cut, const ConeSingularities &cones,
+                          const Interfaces *interfaces);
     void smoothBranch(const ConeCut &cut);
     void audit(const ConeCut &cut, const ConeSingularities &cones);
     void buildAlignment(const ConeCut &cut, const ConeSingularities &cones,
@@ -349,8 +383,10 @@ private:
     std::vector<double> metricLen;
     std::vector<int> indexFromMatchings;
     std::vector<int> frameBoundaryIndex;
+    std::vector<char> pinned;      // per face: the field's Dirichlet data
     std::vector<int> alignAxis;    // per edge of Omega
     std::vector<int> strictAxis;   // ... the chains with nothing overridden
+    std::vector<int> alignChain;   // per edge of Omega: its chain, or -1
 
     Report report;
 };

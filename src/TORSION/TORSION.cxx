@@ -48,8 +48,52 @@ std::vector<std::array<double, 4>> TORSION::jacobianOf(const Mesh &om,
     return J;
 }
 
+// The signed angle a map on Omega puts at each vertex of S, summed over the
+// vertex's children in Omega. A seam vertex's star is split between two
+// children, and a repair that wraps one child's share a whole turn further
+// round leaves every triangle positive and the vertex 2 pi out -- which is a
+// cone changing valence as far as Q2 is concerned, and nothing downstream
+// undoes it. Comparing these sums before and after a repair is the check that
+// catches it; winding tests on the stars of Omega cannot, since a seam child's
+// star is not a loop.
+static std::vector<double> angleSumsOnS(const Mesh &om, const std::vector<int> &c2o,
+                                        const std::vector<Point> &m, int nOrig) {
+    std::vector<double> sum(static_cast<size_t>(std::max(nOrig, 0)), 0.0);
+    if (m.size() != om.vertices.size() || c2o.size() != om.vertices.size()) return sum;
+    for (const Triangle &tri : om.triangles) {
+        for (int i = 0; i < 3; ++i) {
+            const int w = tri[i];
+            const int o = c2o[w];
+            if (o < 0 || o >= nOrig) continue;
+            const Point p = m[tri[(i + 1) % 3]] - m[w], q = m[tri[(i + 2) % 3]] - m[w];
+            sum[o] += std::atan2(cross2(p, q), dotP(p, q));
+        }
+    }
+    return sum;
+}
+
 // What one vertex of Omega may do while Sec. 7.2a untangles around it.
 enum : unsigned char { kFixed = 0, kFreeInU = 1, kFreeInV = 2, kFree = 3 };
+
+// What Sec. 6.4's alignment alone lets each vertex of Omega do, the seam left
+// out of it: vertexFreedom() at rung 0 holds every seam child outright, and a
+// paired move needs to know which of them the alignment would have held too.
+static std::vector<unsigned char> alignmentFreedom(const ConeCut &cut,
+                                                   const std::vector<int> &usedAxis) {
+    const Mesh &om = cut.getCutMesh();
+    std::vector<unsigned char> freedom(om.vertices.size(), kFree);
+    if (usedAxis.size() != om.edges.size()) return freedom;
+    for (size_t e = 0; e < om.edges.size(); ++e) {
+        const int hold = usedAxis[e];
+        if (hold != 0 && hold != 1) continue;
+        const unsigned char keep = (hold == 0) ? kFreeInV : kFreeInU;
+        for (int i = 0; i < 2; ++i) {
+            unsigned char &f = freedom[om.edges[e][i]];
+            f = static_cast<unsigned char>(f & keep);
+        }
+    }
+    return freedom;
+}
 
 // ---------------------------------------------------------------------------
 // relaxToKernel()  --  Sec. 7.2a, the local untangling
@@ -368,6 +412,435 @@ int TORSION::relaxToKernel(const Mesh &om, std::vector<Point> &uv,
     return countInverted();
 }
 
+// ---------------------------------------------------------------------------
+// untangleRegularised()  --  Sec. 7.2c, the fold relaxToKernel() cannot open
+//
+// relaxToKernel() moves one vertex at a time and only ever to a position where
+// its own star is better than it was, which clears a tangle one vertex deep and
+// cannot clear a fold: a run of triangles turned over together, where every
+// vertex that would have to move is pinned by a neighbour that is itself
+// inverted. The fold that matters here is at a cone. A -1 cone opens its fan
+// to 5 pi / 2 and a +1 closes it to 3 pi / 2; the frame asks every triangle of
+// the fan for the angle it has on the model, the least-squares fit takes up
+// the quarter turn it is owed in whichever triangles it can, and on tunnel that
+// is fifteen triangles turned over round one -1 cone, of which the kernel pass
+// clears two.
+//
+// What opens a fold is an energy that is finite on an inverted triangle, so
+// that the optimisation can pass through one, and that becomes a barrier as it
+// converges, so that it cannot stop there. That is Garanzha et al. (2021), and
+// the same regularised energy mesh::TMOP's UntangleRegular runs on quads:
+//
+//     f(J) = [ (1 - g) |J|^2 / 2 + g (det J^2 + 1) / 2 ] / chi(det J, eps)
+//     chi(d, eps) = (d + sqrt(eps^2 + d^2)) / 2
+//
+// with J the map's Jacobian against the frame's own scale, so that |J|^2 / 2
+// det J is the conformal distortion and (det^2 + 1) / 2 det the size, g = 1/128
+// between them, and eps shrinking with the worst det. Minimised over the
+// vertices within a few rings of the tangle, node by node, by Newton with a
+// backtracking line search on the node's star; the rest of the map does not
+// move, and `freedom` holds Sec. 7.2a's rungs exactly as relaxToKernel() does.
+//
+// Every triangle positive is not quite enough, for the reason relaxToKernel()
+// checks winding: a ring can wind twice with every triangle in it positive. The
+// result is kept only if no interior ring of Omega in the region does.
+//
+// Returns the number of faces still inverted; the map is left as it was if the
+// pass did not reduce it.
+// ---------------------------------------------------------------------------
+int TORSION::untangleRegularised(const Mesh &om, std::vector<Point> &uv,
+                                 const std::vector<unsigned char> &freedom,
+                                 const std::vector<int> &partner,
+                                 const std::vector<int> &partnerK,
+                                 const std::vector<std::array<double, 4>> &target,
+                                 const std::vector<int> &cutToOriginal,
+                                 const std::vector<double> &prescribedAngle, int rings,
+                                 int maxIterations) {
+    const int nV = static_cast<int>(om.vertices.size());
+    const int nT = static_cast<int>(om.triangles.size());
+    if (uv.size() != static_cast<size_t>(nV) || freedom.size() != static_cast<size_t>(nV)) return -1;
+
+    auto signedArea = [&](const std::vector<Point> &m, int t) {
+        const Triangle &tri = om.triangles[t];
+        return 0.5 * cross2(m[tri[1]] - m[tri[0]], m[tri[2]] - m[tri[0]]);
+    };
+    auto countInverted = [&](const std::vector<Point> &m) {
+        int n = 0;
+        for (int t = 0; t < nT; ++t) if (!(signedArea(m, t) > 0.0)) ++n;
+        return n;
+    };
+    const int before = countInverted(uv);
+    if (before == 0) return 0;
+
+    // Per face: G = M^-1 / s, with M the model's edge matrix and s the frame's
+    // scale, so that J = D G for D the image's edge matrix; and the model area.
+    std::vector<std::array<double, 4>> G(nT, {0.0, 0.0, 0.0, 0.0});
+    std::vector<double> weight(nT, 0.0);
+    for (int t = 0; t < nT; ++t) {
+        const Triangle &tri = om.triangles[t];
+        const Point a = om.vertices[tri[1]] - om.vertices[tri[0]];
+        const Point b = om.vertices[tri[2]] - om.vertices[tri[0]];
+        const double det = a[0] * b[1] - a[1] * b[0];
+        if (!(std::fabs(det) > 0.0)) continue;
+        double s = 1.0;
+        if (target.size() == static_cast<size_t>(nT)) {
+            const std::array<double, 4> &J = target[t];
+            const double d = J[0] * J[3] - J[1] * J[2];
+            if (d > 0.0 && std::isfinite(d)) s = std::sqrt(d);
+        }
+        // M = [a b] (columns); M^-1 = [[b1, -b0], [-a1, a0]] / det. Rows of G:
+        // g0 = row 0 of M^-1 / s, g1 = row 1.
+        G[t] = {b[1] / (det * s), -b[0] / (det * s), -a[1] / (det * s), a[0] / (det * s)};
+        weight[t] = 0.5 * std::fabs(det);
+    }
+
+    const double g = 1.0 / 128.0;
+    const auto &vt = om.vertexTriangles;
+    const bool paired = partner.size() == static_cast<size_t>(nV) &&
+                        partnerK.size() == static_cast<size_t>(nV);
+    auto sharesTriangle = [&](int a, int b) {
+        for (int k = vt.rowPtr[a]; k < vt.rowPtr[a + 1]; ++k) {
+            const Triangle &tri = om.triangles[vt.colIdx[k]];
+            if (tri[0] == b || tri[1] == b || tri[2] == b) return true;
+        }
+        return false;
+    };
+    std::vector<char> onBoundary(nV, 0);
+    for (int e : om.boundaryEdges) {
+        onBoundary[om.edges[e][0]] = 1;
+        onBoundary[om.edges[e][1]] = 1;
+    }
+
+    // J on face t with the current map.
+    auto jacobian = [&](const std::vector<Point> &m, int t, double J[4]) {
+        const Triangle &tri = om.triangles[t];
+        const Point d1 = m[tri[1]] - m[tri[0]], d2 = m[tri[2]] - m[tri[0]];
+        const std::array<double, 4> &Gt = G[t];
+        // J = d1 g0^T + d2 g1^T
+        J[0] = d1[0] * Gt[0] + d2[0] * Gt[2];
+        J[1] = d1[0] * Gt[1] + d2[0] * Gt[3];
+        J[2] = d1[1] * Gt[0] + d2[1] * Gt[2];
+        J[3] = d1[1] * Gt[1] + d2[1] * Gt[3];
+    };
+    auto chi = [](double d, double eps) { return 0.5 * (d + std::sqrt(eps * eps + d * d)); };
+    auto faceEnergy = [&](const std::vector<Point> &m, int t, double eps) {
+        double J[4];
+        jacobian(m, t, J);
+        const double f2 = J[0] * J[0] + J[1] * J[1] + J[2] * J[2] + J[3] * J[3];
+        const double d = J[0] * J[3] - J[1] * J[2];
+        return weight[t] * ((1.0 - g) * 0.5 * f2 + g * 0.5 * (d * d + 1.0)) / chi(d, eps);
+    };
+    auto starEnergy = [&](const std::vector<Point> &m, int v, double eps) {
+        double e = 0.0;
+        for (int k = vt.rowPtr[v]; k < vt.rowPtr[v + 1]; ++k) e += faceEnergy(m, vt.colIdx[k], eps);
+        return e;
+    };
+    auto minDet = [&](const std::vector<Point> &m, const std::vector<int> &faces) {
+        double worst = std::numeric_limits<double>::infinity();
+        for (int t : faces) {
+            double J[4];
+            jacobian(m, t, J);
+            worst = std::min(worst, J[0] * J[3] - J[1] * J[2]);
+        }
+        return worst;
+    };
+    // The signed angle the map puts at Omega vertex w, over its own star. A
+    // vertex of S with several children in Omega -- a seam vertex -- has its
+    // angle sum split between them, and a fold can be opened by wrapping one
+    // child's share a whole turn further round with every triangle positive.
+    // So the check is on the sum over the children, per vertex of S, against
+    // the sum Q2 prescribes there -- not against the map the pass started
+    // from, whose sums are a turn out wherever a triangle was turned over.
+    // Without the prescription, an interior vertex of Omega is held to one
+    // turn and nothing else is checked.
+    auto starAngle = [&](const std::vector<Point> &m, int w) {
+        double sum = 0.0;
+        for (int k = vt.rowPtr[w]; k < vt.rowPtr[w + 1]; ++k) {
+            const Triangle &tri = om.triangles[vt.colIdx[k]];
+            int a = -1, b = -1;
+            for (int i = 0; i < 3; ++i) if (tri[i] == w) { a = tri[(i + 1) % 3]; b = tri[(i + 2) % 3]; }
+            if (a < 0) continue;
+            const Point p = m[a] - m[w], q = m[b] - m[w];
+            sum += std::atan2(cross2(p, q), dotP(p, q));
+        }
+        return sum;
+    };
+    const bool haveParents = cutToOriginal.size() == static_cast<size_t>(nV) &&
+                             !prescribedAngle.empty();
+    std::unordered_map<int, std::vector<int>> childrenOf;
+    if (haveParents) {
+        for (int w = 0; w < nV; ++w) childrenOf[cutToOriginal[w]].push_back(w);
+    }
+    auto sumsHold = [&](const std::vector<Point> &after, const std::vector<int> &touched) {
+        std::vector<int> parents;
+        for (int w : touched) {
+            if (haveParents) parents.push_back(cutToOriginal[w]);
+            for (int k = vt.rowPtr[w]; k < vt.rowPtr[w + 1]; ++k) {
+                const Triangle &tri = om.triangles[vt.colIdx[k]];
+                for (int i = 0; i < 3; ++i) {
+                    if (haveParents) parents.push_back(cutToOriginal[tri[i]]);
+                    else if (!onBoundary[tri[i]] &&
+                             std::fabs(starAngle(after, tri[i]) - 2.0 * M_PI) > M_PI)
+                        return false;
+                }
+            }
+        }
+        if (!haveParents) return true;
+        std::sort(parents.begin(), parents.end());
+        parents.erase(std::unique(parents.begin(), parents.end()), parents.end());
+        for (int o : parents) {
+            auto it = childrenOf.find(o);
+            if (it == childrenOf.end() || o < 0 || o >= static_cast<int>(prescribedAngle.size())) continue;
+            double now = 0.0;
+            for (int w : it->second) now += starAngle(after, w);
+            if (std::fabs(now - prescribedAngle[o]) > M_PI) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    std::vector<char> inRegion(nV, 0);
+    for (int t = 0; t < nT; ++t) {
+        if (signedArea(uv, t) > 0.0) continue;
+        for (int i = 0; i < 3; ++i) inRegion[om.triangles[t][i]] = 1;
+    }
+    auto grow = [&]() {
+        std::vector<char> grown = inRegion;
+        for (const Triangle &tri : om.triangles) {
+            if (!inRegion[tri[0]] && !inRegion[tri[1]] && !inRegion[tri[2]]) continue;
+            for (int i = 0; i < 3; ++i) grown[tri[i]] = 1;
+        }
+        inRegion.swap(grown);
+    };
+    for (int r = 0; r < rings; ++r) grow();
+
+    std::vector<Point> best = uv;
+    int bestLeft = before;
+    // Three widening neighbourhoods, and then the whole map: a tangle of
+    // hundreds of faces is not local to anything, and started from the
+    // integration's own map the energy keeps every star's winding, so a pass
+    // over everything is still a repair of that map and not a new one -- which
+    // is the difference from Sec. 7.2's Tutte pass, whose circle flattens every
+    // cone at the tip of a slit to a half turn and lets the fit settle it a
+    // whole turn from its index.
+    for (int attempt = 0; attempt < 4 && bestLeft > 0; ++attempt) {
+        if (attempt > 0 && attempt < 3) for (int r = 0; r < rings; ++r) grow();
+        if (attempt == 3) std::fill(inRegion.begin(), inRegion.end(), 1);
+        std::vector<int> movers, faces;
+        std::vector<char> faceIn(nT, 0);
+        for (int v = 0; v < nV; ++v) {
+            if (!inRegion[v] || freedom[v] == kFixed) continue;
+            const int mate = paired ? partner[v] : -1;
+            // A seam child moves with its partner, handled at the smaller index
+            // of the two; a pair whose stars share a triangle -- the tip of a
+            // one-edge slit -- is left where it is.
+            if (mate >= 0 && (mate < v || freedom[mate] != kFree || freedom[v] != kFree ||
+                              sharesTriangle(v, mate))) continue;
+            movers.push_back(v);
+            for (int k = vt.rowPtr[v]; k < vt.rowPtr[v + 1]; ++k) faceIn[vt.colIdx[k]] = 1;
+            if (mate >= 0) {
+                movers.push_back(-1 - mate);   // its partner, marked, for the checks
+                for (int k = vt.rowPtr[mate]; k < vt.rowPtr[mate + 1]; ++k) faceIn[vt.colIdx[k]] = 1;
+            }
+        }
+        for (int t = 0; t < nT; ++t) if (faceIn[t]) faces.push_back(t);
+        if (movers.empty()) continue;
+
+        std::vector<Point> m = best;
+        // A region whose inverted count has not come down for a while is not
+        // going to clear at this size; the next, wider one is tried instead.
+        int leastInverted = std::numeric_limits<int>::max(), sinceProgress = 0;
+        for (int it = 0; it < maxIterations; ++it) {
+            const double worst = minDet(m, faces);
+            const int invertedNow = countInverted(m);
+            if (worst > 0.0 && invertedNow == 0) break;
+            if (invertedNow < leastInverted) { leastInverted = invertedNow; sinceProgress = 0; }
+            else if (++sinceProgress >= 15) break;
+            const double eps = std::sqrt(1e-10 + 0.04 * std::min(worst, 0.0) * std::min(worst, 0.0)) +
+                               (worst > 0.0 ? 1e-6 : 0.0);
+            // Gradient and Hessian of w's star energy in w's own position: on
+            // each face J = x w^T + C, affine in x.
+            auto starDerivatives = [&](int v, double eps, double &gx, double &gy, double &hxx,
+                                       double &hxy, double &hyy) {
+                gx = gy = hxx = hxy = hyy = 0.0;
+                for (int k = vt.rowPtr[v]; k < vt.rowPtr[v + 1]; ++k) {
+                    const int t = vt.colIdx[k];
+                    if (!(weight[t] > 0.0)) continue;
+                    const Triangle &tri = om.triangles[t];
+                    const std::array<double, 4> &Gt = G[t];
+                    double w[2];
+                    if (tri[1] == v) { w[0] = Gt[0]; w[1] = Gt[1]; }
+                    else if (tri[2] == v) { w[0] = Gt[2]; w[1] = Gt[3]; }
+                    else { w[0] = -(Gt[0] + Gt[2]); w[1] = -(Gt[1] + Gt[3]); }
+                    double J[4];
+                    jacobian(m, t, J);
+                    const double x0 = m[v][0], x1 = m[v][1];
+                    // C = J - x w^T
+                    const double c00 = J[0] - x0 * w[0], c01 = J[1] - x0 * w[1];
+                    const double c10 = J[2] - x1 * w[0], c11 = J[3] - x1 * w[1];
+                    const double ww = w[0] * w[0] + w[1] * w[1];
+                    // q = adj(C)^T w, so that det J = det C + q . x
+                    const double q0 = c11 * w[0] - c10 * w[1];
+                    const double q1 = -c01 * w[0] + c00 * w[1];
+                    const double f2 = J[0] * J[0] + J[1] * J[1] + J[2] * J[2] + J[3] * J[3];
+                    const double d = J[0] * J[3] - J[1] * J[2];
+                    const double root = std::sqrt(eps * eps + d * d);
+                    const double c = 0.5 * (d + root);
+                    const double c1 = 0.5 * (1.0 + d / root);
+                    const double c2 = 0.5 * eps * eps / (root * root * root);
+                    const double N = (1.0 - g) * 0.5 * f2 + g * 0.5 * (d * d + 1.0);
+                    // grad N = (1-g)(|w|^2 x + C w) + g d q
+                    const double Cw0 = c00 * w[0] + c01 * w[1], Cw1 = c10 * w[0] + c11 * w[1];
+                    const double n0 = (1.0 - g) * (ww * x0 + Cw0) + g * d * q0;
+                    const double n1 = (1.0 - g) * (ww * x1 + Cw1) + g * d * q1;
+                    const double A = weight[t];
+                    gx += A * (n0 / c - N * c1 * q0 / (c * c));
+                    gy += A * (n1 / c - N * c1 * q1 / (c * c));
+                    const double k2 = N * (2.0 * c1 * c1 / (c * c * c) - c2 / (c * c));
+                    const double hN00 = (1.0 - g) * ww + g * q0 * q0;
+                    const double hN01 = g * q0 * q1;
+                    const double hN11 = (1.0 - g) * ww + g * q1 * q1;
+                    hxx += A * (hN00 / c - 2.0 * c1 * n0 * q0 / (c * c) + k2 * q0 * q0);
+                    hxy += A * (hN01 / c - c1 * (n0 * q1 + n1 * q0) / (c * c) + k2 * q0 * q1);
+                    hyy += A * (hN11 / c - 2.0 * c1 * n1 * q1 / (c * c) + k2 * q1 * q1);
+                }
+            };
+            for (int sweep = 0; sweep < 4; ++sweep) {
+                for (int v : movers) {
+                    if (v < 0) continue;   // a partner, moved with its pair
+                    const int mate = paired ? partner[v] : -1;
+                    double gx, gy, hxx, hxy, hyy;
+                    starDerivatives(v, eps, gx, gy, hxx, hxy, hyy);
+                    Point e1{1.0, 0.0}, e2{0.0, 1.0};
+                    if (mate >= 0) {
+                        // phi_mate moves by R_k d, so its star enters through
+                        // R^T grad and R^T H R.
+                        double mgx, mgy, mhxx, mhxy, mhyy;
+                        starDerivatives(mate, eps, mgx, mgy, mhxx, mhxy, mhyy);
+                        e1 = Immersion::rotateQuarter(Point{1.0, 0.0}, partnerK[v]);
+                        e2 = Immersion::rotateQuarter(Point{0.0, 1.0}, partnerK[v]);
+                        auto Hq = [&](const Point &a, const Point &b) {
+                            return a[0] * (mhxx * b[0] + mhxy * b[1]) +
+                                   a[1] * (mhxy * b[0] + mhyy * b[1]);
+                        };
+                        gx += e1[0] * mgx + e1[1] * mgy;
+                        gy += e2[0] * mgx + e2[1] * mgy;
+                        hxx += Hq(e1, e1);
+                        hxy += Hq(e1, e2);
+                        hyy += Hq(e2, e2);
+                    }
+                    Point step{0.0, 0.0};
+                    if (freedom[v] == kFreeInU) {
+                        if (hxx > 1e-300) step = Point{-gx / hxx, 0.0};
+                        else step = Point{-gx, 0.0};
+                    } else if (freedom[v] == kFreeInV) {
+                        if (hyy > 1e-300) step = Point{0.0, -gy / hyy};
+                        else step = Point{0.0, -gy};
+                    } else {
+                        // Make the 2x2 positive definite before solving.
+                        const double tr = hxx + hyy;
+                        const double disc = std::sqrt(std::max(0.0, 0.25 * (hxx - hyy) * (hxx - hyy) + hxy * hxy));
+                        const double lmin = 0.5 * tr - disc;
+                        const double shift = (lmin < 1e-8 * std::max(1.0, std::fabs(tr)))
+                                                 ? (1e-8 * std::max(1.0, std::fabs(tr)) - lmin)
+                                                 : 0.0;
+                        const double a = hxx + shift, b = hxy, dd = hyy + shift;
+                        const double det = a * dd - b * b;
+                        if (!(det > 0.0)) continue;
+                        step = Point{-(dd * gx - b * gy) / det, -(a * gy - b * gx) / det};
+                    }
+                    if (!std::isfinite(step[0]) || !std::isfinite(step[1])) continue;
+                    const Point was = m[v];
+                    const Point wasM = (mate >= 0) ? m[mate] : Point{0.0, 0.0};
+                    auto energyNow = [&]() {
+                        return starEnergy(m, v, eps) + (mate >= 0 ? starEnergy(m, mate, eps) : 0.0);
+                    };
+                    // The stars a move can re-wind: the moved vertices' own and
+                    // every neighbour's. A step is refused if any of them turns
+                    // by a whole turn -- which happens when a triangle passes
+                    // through the degenerate position with its angle there near
+                    // a half turn, and is how an energy that may cross inverted
+                    // states reopens a -1 cone's fan the short way, a quarter
+                    // turn instead of five. With every step winding-preserving,
+                    // the pass keeps the angle sums the integration's seam put
+                    // at every vertex it started from.
+                    std::vector<int> watch;
+                    for (int c : {v, mate}) {
+                        if (c < 0) continue;
+                        for (int k = vt.rowPtr[c]; k < vt.rowPtr[c + 1]; ++k) {
+                            const Triangle &tri = om.triangles[vt.colIdx[k]];
+                            for (int i = 0; i < 3; ++i) watch.push_back(tri[i]);
+                        }
+                    }
+                    std::sort(watch.begin(), watch.end());
+                    watch.erase(std::unique(watch.begin(), watch.end()), watch.end());
+                    // With Q2's prescription to hand the test is directional: a
+                    // vertex of S may be wound a turn *towards* its prescribed
+                    // sum -- a cone the integration left wound the short way,
+                    // opened the right way once its tip is free to move -- and
+                    // never away from it. Without one, a turn either way is
+                    // refused.
+                    std::vector<int> parents;
+                    if (haveParents) {
+                        for (int w : watch) parents.push_back(cutToOriginal[w]);
+                        std::sort(parents.begin(), parents.end());
+                        parents.erase(std::unique(parents.begin(), parents.end()), parents.end());
+                    }
+                    auto gapOf = [&](int o) {
+                        auto it = childrenOf.find(o);
+                        if (it == childrenOf.end() || o < 0 ||
+                            o >= static_cast<int>(prescribedAngle.size())) return 0.0;
+                        double sum = 0.0;
+                        for (int w : it->second) sum += starAngle(m, w);
+                        return std::fabs(sum - prescribedAngle[o]);
+                    };
+                    std::vector<double> gap0(parents.size());
+                    for (size_t i = 0; i < parents.size(); ++i) gap0[i] = gapOf(parents[i]);
+                    std::vector<double> wound0(watch.size());
+                    for (size_t i = 0; i < watch.size(); ++i) wound0[i] = starAngle(m, watch[i]);
+                    auto windingKept = [&]() {
+                        if (haveParents) {
+                            for (size_t i = 0; i < parents.size(); ++i) {
+                                if (gapOf(parents[i]) > gap0[i] + 0.5) return false;
+                            }
+                            return true;
+                        }
+                        for (size_t i = 0; i < watch.size(); ++i) {
+                            if (std::fabs(starAngle(m, watch[i]) - wound0[i]) > M_PI) return false;
+                        }
+                        return true;
+                    };
+                    const double e0 = energyNow();
+                    double alpha = 1.0;
+                    bool accepted = false;
+                    for (int bt = 0; bt < 30; ++bt, alpha *= 0.5) {
+                        const Point d = step * alpha;
+                        m[v] = was + d;
+                        if (mate >= 0) m[mate] = wasM + Immersion::rotateQuarter(d, partnerK[v]);
+                        if (energyNow() < e0 && windingKept()) { accepted = true; break; }
+                    }
+                    if (!accepted) {
+                        m[v] = was;
+                        if (mate >= 0) m[mate] = wasM;
+                    }
+                }
+            }
+        }
+        const int left = countInverted(m);
+        std::vector<int> touched;
+        touched.reserve(movers.size());
+        for (int v : movers) touched.push_back(v < 0 ? -1 - v : v);
+        const bool wound = sumsHold(m, touched);
+        if (wound && left < bestLeft) {
+            bestLeft = left;
+            best.swap(m);
+        }
+    }
+    if (bestLeft < before) uv.swap(best);
+    return bestLeft;
+}
+
 TORSION::TORSION(std::shared_ptr<Mesh> m) : TORSION(std::move(m), Options()) {}
 
 TORSION::TORSION(std::shared_ptr<Mesh> m, const Options &opts)
@@ -495,7 +968,7 @@ void TORSION::runField() {
 }
 
 // ---------------------------------------------------------------------------
-// runFront()  --  Stages 0b, 0, 1 and 2
+// runFieldFront() and runConeFront()  --  Stages 0b, 0, 1 and 2
 //
 // Identical to MERIDIAN's, deliberately and line for line: the interface
 // network, the field, the cone indices with their prescriptions and dipole
@@ -541,9 +1014,7 @@ void TORSION::exciseDisks() {
     status.messages.push_back("Stage 0c: " + oss.str());
 }
 
-bool TORSION::runFront() {
-    size_t balanceMessagesSeen = 0;
-
+void TORSION::runFieldFront() {
     if (options.diskTemplates) exciseDisks();
 
     if (options.materialInterfaces) {
@@ -559,10 +1030,20 @@ bool TORSION::runFront() {
         status.interfaceIllPosedNodes = fr.illPosedNodes;
         status.interfaceWorstSector = fr.worstSectorResidual;
         for (const std::string &m : fr.messages) status.messages.push_back("Stage 0b: " + m);
-        balanceMessagesSeen = fr.messages.size();
     }
 
     runField();
+}
+
+// ---------------------------------------------------------------------------
+// runConeFront()  --  Stages 1 and 2, on the field runFieldFront() solved
+//
+// Separate from Stage 0 because TORSION may run it twice on one field: once as
+// MERIDIAN does, cancelling the same-region dipoles, and -- when that cost the
+// alignment -- once keeping them. See run().
+// ---------------------------------------------------------------------------
+bool TORSION::runConeFront(bool cancelDipoles) {
+    const size_t balanceMessagesSeen = interfaces ? interfaces->getReport().messages.size() : 0;
 
     cones = std::make_unique<ConeSingularities>(*field);
     cones->setBoundaryIndexRange(options.minBoundaryIndex, options.maxBoundaryIndex);
@@ -586,7 +1067,7 @@ bool TORSION::runFront() {
     }
 
     if (interfaces && interfaces->multiMaterial() && options.alignFieldToInterfaces &&
-        options.cancelInterfaceDipoles) {
+        cancelDipoles) {
         const int nV = static_cast<int>(mesh->vertices.size());
         std::vector<int> region(nV, -1);
         for (int v = 0; v < nV; ++v) region[v] = interfaces->regionAt(v);
@@ -753,12 +1234,15 @@ std::vector<unsigned char> TORSION::vertexFreedom(const ConeCut &cut,
         origEdge.emplace(MeshEdgeKey(orig.edges[e][0], orig.edges[e][1]), e);
     }
     if (level < 2) {
-        // A seam vertex is not fixed but *paired*: it moves under
-        // phi_+ = R_k phi_- + t together with its partner, which keeps Q4
-        // exact. seamPairing() builds the table, and anything it could not pair
-        // -- a cone tip, where the two chains are one vertex and the rotation
-        // has only its fixed point to offer, or a landing, where dS has the
-        // vertex as well -- comes back unpaired and is held here.
+        // Every seam vertex is held here. A seam vertex *can* move, paired: it
+        // moves under phi_+ = R_k phi_- + t together with its partner, which
+        // keeps Q4 exact -- but only a caller that moves the pair together may
+        // let it, and that caller frees the pairs itself (buildPsi0's
+        // pairedFreedom). A caller moving vertices one at a time would break
+        // the seam. seamPairing() says which can be paired; a cone tip, where
+        // the two chains are one vertex and the rotation has only its fixed
+        // point to offer, and a landing, where dS has the vertex as well, never
+        // can.
         for (int e : om.boundaryEdges) {
             auto it = origEdge.find(MeshEdgeKey(c2o[om.edges[e][0]], c2o[om.edges[e][1]]));
             const bool fromBoundary = it != origEdge.end() && orig.isBoundaryEdge[it->second];
@@ -808,16 +1292,16 @@ std::vector<unsigned char> TORSION::vertexFreedom(const ConeCut &cut,
 // unpaired: with conesToBoundary the seam is a forest of disjoint slits and
 // that does not arise, but --cut-to-graph makes junctions and it does.
 // ---------------------------------------------------------------------------
-void TORSION::seamPairing(std::vector<int> &mate, std::vector<int> &turn) const {
-    const Mesh &om = cutter->getCutMesh();
+void TORSION::seamPairing(const ConeCut &cut, const Immersion &scaffold,
+                          std::vector<int> &mate, std::vector<int> &turn) {
+    const Mesh &om = cut.getCutMesh();
     const int nV = static_cast<int>(om.vertices.size());
     mate.assign(nV, -1);
     turn.assign(nV, 0);
-    if (!scaffold) return;
 
-    const auto &pairs = scaffold->getSeamPairs();
-    const auto &pairArc = scaffold->getSeamPairArc();
-    const auto &arcs = scaffold->getArcs();
+    const auto &pairs = scaffold.getSeamPairs();
+    const auto &pairArc = scaffold.getSeamPairArc();
+    const auto &arcs = scaffold.getArcs();
     std::vector<char> conflicted(nV, 0);
 
     auto link = [&](int minus, int plus, int k) {
@@ -842,8 +1326,8 @@ void TORSION::seamPairing(std::vector<int> &mate, std::vector<int> &turn) const 
     // A child that is also on dS: Sec. 6.4 has it, and one displacement cannot
     // answer to both.
     {
-        const Mesh &orig = cutter->getOriginalMesh();
-        const auto &c2o = cutter->getCutVertexToOriginal();
+        const Mesh &orig = cut.getOriginalMesh();
+        const auto &c2o = cut.getCutVertexToOriginal();
         std::unordered_map<MeshEdgeKey, int, MeshEdgeKeyHash> origEdge;
         origEdge.reserve(orig.edges.size() * 2);
         for (int e = 0; e < static_cast<int>(orig.edges.size()); ++e) {
@@ -911,13 +1395,14 @@ void TORSION::seamPairing(std::vector<int> &mate, std::vector<int> &turn) const 
 //
 // Returns an empty vector when there was nothing to start from.
 // ---------------------------------------------------------------------------
-std::vector<Point> TORSION::untangle() {
-    const Mesh &omega = cutter->getCutMesh();
+std::vector<Point> TORSION::untangle(const MapStage &in, const Options &options,
+                                     Status &status, Psi0 &out) {
+    const Mesh &omega = in.cut.getCutMesh();
 
     TutteEmbedding::Options topts;
     topts.targetEdge = options.targetEdge;
-    tutte = std::make_unique<TutteEmbedding>(omega, topts);
-    const TutteEmbedding::Report &tr = tutte->getReport();
+    out.tutte = std::make_unique<TutteEmbedding>(omega, topts);
+    const TutteEmbedding::Report &tr = out.tutte->getReport();
     status.tutteValid = tr.valid;
     for (const std::string &m : tr.messages) status.messages.push_back("Stage 4R: " + m);
     if (!tr.valid) {
@@ -933,9 +1418,9 @@ std::vector<Point> TORSION::untangle() {
     // meaningless.
     std::unique_ptr<Immersion> start;
     try {
-        start = std::make_unique<Immersion>(*cutter, *cones, tutte->getUV(),
-                                            frames->fieldEdgeLengths(),
-                                            frames->combedAngle());
+        start = std::make_unique<Immersion>(in.cut, in.cones, out.tutte->getUV(),
+                                            in.frames.fieldEdgeLengths(),
+                                            in.frames.combedAngle());
     } catch (const std::exception &e) {
         status.messages.push_back(std::string("Stage 4R: could not wrap the Tutte map: ") + e.what());
         return {};
@@ -958,12 +1443,12 @@ std::vector<Point> TORSION::untangle() {
     lopts.interfaceCorners = false;
     lopts.propagateInterfaceLabels = options.propagateInterfaceLabels;
     lopts.seamTurnInterfaceLabels = options.seamTurnInterfaceLabels;
-    SubdomainLabels startLabels(*start, lopts, interfaces.get());
-    if (options.untangleAlignWeight > 0.0) startLabels.relabel(integratedMap);
+    SubdomainLabels startLabels(*start, lopts, in.interfaces);
+    if (options.untangleAlignWeight > 0.0) startLabels.relabel(out.integratedMap);
 
     LayoutEnergy::Options eopts;
     eopts.reference = LayoutEnergy::Reference::Induced;
-    eopts.referenceLengths = inducedLengths(*mesh, *cutter, integratedMap);
+    eopts.referenceLengths = inducedLengths(in.mesh, in.cut, out.integratedMap);
     // mu is E4's penalty and nothing else is switched on, so it is set through
     // lambdaFactor rather than through lambdaInit: run() floors lambda_4 at
     // lambda_1 (Q4 is not free to trade away in the main continuation), and
@@ -1018,6 +1503,95 @@ std::vector<Point> TORSION::untangle() {
 }
 
 // ---------------------------------------------------------------------------
+// pullOntoAlignment()  --  Sec. 7.2b
+//
+// When Stage 4F could not keep the alignment -- no solve that held it came out
+// of Sec. 7.2a's ladder -- what it hands on is an injective map that is only as
+// aligned as the field is integrable. Stage 6 would get it aligned in the end:
+// Q3 and the features reach 1e-6 on tunnel from exactly such a start. That is
+// not where the damage is. Stage 5 seeds Gamma_topo from the separatrices of
+// psi_0 *before* Stage 6 runs, pairing the cones psi_0's traced curves nearly
+// join, and on an unaligned psi_0 those curves run wherever the misaligned
+// boundary sends them. Every constraint seeded from them is one Stage 6 is then
+// bound to satisfy, and Gamma_topo can be added to and never taken back. So an
+// unaligned psi_0 is not a slower start to the same layout; it is a different
+// and worse layout.
+//
+// The remedy is the one the continuation already is, run for a different
+// purpose. The map is injective and the barrier of Sec. 3.3 keeps it so; E2
+// and E3, on labels read off the solve that held the whole alignment, pull
+// dS and the interfaces onto their axes; E4 keeps the seam; E1 against the flat
+// cone metric keeps the rest in shape. No E5 and no E6: this is psi_0, not a
+// layout. What comes out is aligned to the continuation's tolerance, and Sec.
+// 6.5's projection then makes it exact where that inverts nothing.
+// ---------------------------------------------------------------------------
+std::vector<Point> TORSION::pullOntoAlignment(const MapStage &in, const Options &options,
+                                              Status &status, const std::vector<Point> &start,
+                                              const std::vector<Point> &labelMap,
+                                              const std::vector<int> &axis) {
+    const Mesh &omega = in.cut.getCutMesh();
+    if (start.size() != omega.vertices.size() || labelMap.size() != omega.vertices.size()) return {};
+
+    std::unique_ptr<Immersion> from;
+    try {
+        from = std::make_unique<Immersion>(in.cut, in.cones, start, in.frames.fieldEdgeLengths(),
+                                           in.frames.combedAngle());
+    } catch (const std::exception &e) {
+        status.messages.push_back(std::string("Stage 4R: could not wrap the map to pull: ") + e.what());
+        return {};
+    }
+    if (from->getReport().flippedFaces > 0) return {};
+
+    SubdomainLabels::Options lopts;
+    lopts.seedTopoConstraints = false;
+    lopts.interfaceCorners = false;
+    lopts.propagateInterfaceLabels = options.propagateInterfaceLabels;
+    lopts.seamTurnInterfaceLabels = options.seamTurnInterfaceLabels;
+    SubdomainLabels labels(*from, lopts, in.interfaces);
+    labels.relabel(labelMap);
+
+    LayoutEnergy::Options eopts;
+    eopts.reference = LayoutEnergy::Reference::Induced;
+    eopts.referenceLengths = in.coneMetric ? in.coneMetric->edgeLengths()
+                                        : inducedLengths(in.mesh, in.cut, start);
+    eopts.lambdaInit = options.lambdaInit;
+    eopts.lambdaGrowth = options.lambdaGrowth;
+    eopts.outerSteps = options.pullOuterSteps;
+    eopts.innerIterations = options.innerIterations;
+    eopts.alternateReference = false;
+    eopts.relabel = false;
+    eopts.lambdaFactor[2] = 1.0;
+    eopts.lambdaFactor[3] = 1.0;
+    eopts.lambdaFactor[4] = options.lambdaSeamFactor;
+    eopts.lambdaFactor[5] = 0.0;
+    eopts.lambdaFactor[6] = 0.0;
+
+    LayoutEnergy fit(*from, labels, eopts);
+    fit.run();
+    const LayoutEnergy::Report &fr = fit.getReport();
+    status.pullRan = true;
+    status.pullBoundaryResidual = fr.maxBoundaryResidual;
+    status.pullFeatureResidual = fr.maxFeatureResidual;
+    if (fr.invertedTriangles > 0) return {};
+    status.pullKept = true;
+    std::vector<Point> pulled = fit.getUV();
+
+    // Sec. 6.5 onto the exact alignment, kept only if it inverts nothing.
+    if (!axis.empty()) {
+        FieldIntegration::Options po;
+        po.regularisation = options.integrationRegularisation;
+        po.alignAxis = axis;
+        po.targetJacobian = jacobianOf(omega, pulled);
+        FieldIntegration proj(in.cut, in.frames, in.scaffold, po);
+        if (proj.getReport().solved && proj.getReport().flippedFaces == 0) {
+            status.pullProjected = true;
+            return proj.getUV();
+        }
+    }
+    return pulled;
+}
+
+// ---------------------------------------------------------------------------
 // runLayoutStages()  --  Stages 5 to 8 at one Gamma_topo seeding tolerance
 //
 // MERIDIAN::runLayoutStages with this pipeline's Stage 6 in the middle of it.
@@ -1027,10 +1601,10 @@ std::vector<Point> TORSION::untangle() {
 // Returns false when a stage stopped the pipeline, in which case run() is done
 // and there is nothing to retry.
 // ---------------------------------------------------------------------------
-bool TORSION::runLayoutStages(double nearMiss) {
+bool TORSION::runLayoutStages(double nearMiss, bool seed) {
     // --- Stage 5: the subdomain labelling, MERIDIAN's unchanged -----------
     SubdomainLabels::Options lopts;
-    lopts.seedTopoConstraints = options.seedTopoConstraints;
+    lopts.seedTopoConstraints = seed;
     lopts.nearMissTolerance = nearMiss;
     lopts.seedSelfReturns = options.seedSelfReturns;
     lopts.seedAllConnections = options.seedAllConnections;
@@ -1276,11 +1850,584 @@ bool TORSION::runLayoutStages(double nearMiss) {
 }
 
 // ---------------------------------------------------------------------------
-bool TORSION::run() {
-    status = Status();
+// ---------------------------------------------------------------------------
+// buildPsi0()  --  Stages 4F and 4R, from the frames to psi_0
+//
+// Everything between the combed frames and the map the Immersion is built on:
+// Sec. 6.4's attempts at the alignment, Sec. 7.2a-c's ladder, Sec. 7.2's Tutte
+// pass behind it, and Sec. 7.2b's pull back onto the alignment. Static, and
+// taking what it reads as arguments, because the viewer drives Stage 4 itself
+// and has to take the same decisions in the same order -- a second copy of this
+// is a second thing to keep in step with it, and the copy it had did not keep
+// up. Returns false where no psi_0 can be handed on; out.integration is then
+// still whatever was solved, for the report.
+// ---------------------------------------------------------------------------
+bool TORSION::buildPsi0(const MapStage &in, const Options &options, Status &status, Psi0 &out) {
+    // Sec. 6.4's three attempts. Holding the boundary and the interfaces
+    // exactly is a constraint on the fit, and a constraint on a fit can invert
+    // a triangle the free fit would not have -- the place it happens is a chain
+    // whose staircase was overridden, because a step is a right angle the map
+    // is being asked to unbend. So the alignment is tried in full, then on the
+    // chains that needed no overriding, then not at all.
+    //
+    // **What decides between them is what Sec. 7.2a leaves, not the raw flip
+    // count.** A handful of inverted faces in a cone's one ring is what a
+    // least-squares fit of a non-integrable field produces with or without the
+    // alignment, and the local pass clears it with the alignment held; the free
+    // solve may invert nothing and still be the worse psi_0 by far, because
+    // everything it did not hold Stage 6 has to find from an unaligned start.
+    // Choosing on the raw count threw the alignment away on 20 of the 31
+    // multi-material models for tangles of 2 to 30 faces, and on concrete the
+    // difference is the whole layout: dropped, Stage 8 came back with 8590
+    // patches of which 3203 were not quadrilaterals; kept and cleared at rung
+    // 0, 5485 quadrilaterals and nothing else. So each attempt is handed to
+    // the ladder in turn, and the first one that comes out of it as a legal
+    // psi_0 is kept; only when none does is the one with the fewest flips
+    // handed on to Sec. 7.2's Tutte pass, as before.
+    auto solveWith = [&](const std::vector<int> &axis) {
+        FieldIntegration::Options io;
+        io.regularisation = options.integrationRegularisation;
+        io.alignAxis = axis;
+        return std::make_unique<FieldIntegration>(in.cut, in.frames, in.scaffold, io);
+    };
+    auto flipsOf = [](const FieldIntegration &fi) {
+        return fi.getReport().solved ? fi.getReport().flippedFaces
+                                     : std::numeric_limits<int>::max();
+    };
 
-    if (!runFront()) return false;
+    // Sec. 6.5's projection, as a step rather than as a stage: fit a map's own
+    // Jacobian back under the seam and alignment equalities. Used after any
+    // repair that was allowed to break one of them. Returns an empty map when
+    // it did not solve or inverted something, with the count in `flips`.
+    auto reproject = [&](const std::vector<Point> &m, const std::vector<int> &axis,
+                         int &flips, std::vector<Point> *raw = nullptr) -> std::vector<Point> {
+        FieldIntegration::Options po;
+        po.regularisation = options.integrationRegularisation;
+        po.alignAxis = axis;
+        po.targetJacobian = jacobianOf(in.cut.getCutMesh(), m);
+        FieldIntegration proj(in.cut, in.frames, in.scaffold, po);
+        flips = proj.getReport().flippedFaces;
+        if (raw && proj.getReport().solved) *raw = proj.getUV();
+        if (!proj.getReport().solved || proj.getReport().flippedFaces > 0) return {};
+        return proj.getUV();
+    };
 
+    // Sec. 7.2a, on a ladder. Each rung frees one more of the things the
+    // integration fixed, and every rung above the first hands what it produced
+    // to the projection to put them back:
+    //
+    //   0   the seam and Sec. 6.4's alignment both held. Nothing to restore, so
+    //       nothing can go wrong restoring it.
+    //   1   the alignment let go, the seam still held. Q3 comes back from the
+    //       projection, or -- if the projection inverts -- Stage 6 has it to
+    //       reach, which is where it started.
+    //   2   both let go. Q4 is not recoverable by anything downstream, so this
+    //       rung is kept only if the projection takes.
+    //
+    // The ladder exists because the tangles that survive rung 0 are the ones
+    // at a cone, and a cone is exactly the vertex the alignment pins in both
+    // coordinates. Rung 1 is what unpins it.
+    struct Ladder {
+        std::vector<Point> map;        // empty: the ladder did not clear it
+        int level = -1;
+        int leastLeft = 0;             // the fewest inverted faces any rung left
+        std::string how;
+        bool reprojectionRan = false;
+        bool reprojectionKept = false;
+        int reprojectionFlips = 0;
+        int windingRejects = 0;        // rungs that cleared it by wrapping a star
+    };
+    // Q2's angle sum at every vertex of S: 2 pi - (pi/2) I inside, seam
+    // vertices included, and pi - (pi/2) I on dS. A repair is checked against
+    // these and not against the map it started from, whose signed angle sums
+    // are a whole turn out wherever it had a triangle turned over.
+    const std::vector<double> prescribedAngle = [&]() {
+        std::vector<double> want(in.mesh.vertices.size(), 0.0);
+        const std::vector<int> &I = in.cones.getIndices();
+        for (size_t o = 0; o < want.size(); ++o) {
+            const double full = in.mesh.isBoundaryVertex[o] ? M_PI : 2.0 * M_PI;
+            want[o] = full - M_PI_2 * (o < I.size() ? I[o] : 0);
+        }
+        return want;
+    }();
+    auto angleSumsHold = [&](const std::vector<Point> &m) {
+        const std::vector<double> now =
+            angleSumsOnS(in.cut.getCutMesh(), in.cut.getCutVertexToOriginal(), m,
+                         static_cast<int>(in.mesh.vertices.size()));
+        for (size_t o = 0; o < now.size(); ++o) {
+            if (std::fabs(now[o] - prescribedAngle[o]) > M_PI) return false;
+        }
+        return true;
+    };
+    // The seam pairing, and the freedom it gives: at rungs 0 and 1 each child of
+    // a slit that seamPairing() can pair is freed to move with its partner,
+    // unless at rung 0 the alignment would have held either of them too. At
+    // rung 2 the seam is let go outright and nothing needs pairing.
+    auto pairSeam = [&](const std::vector<int> &axis, int level,
+                        std::vector<unsigned char> &freedom, std::vector<int> &pmate,
+                        std::vector<int> &pturn) {
+        pmate.clear();
+        pturn.clear();
+        if (level >= 2) return;
+        seamPairing(in.cut, in.scaffold, pmate, pturn);
+        const std::vector<unsigned char> alignOnly =
+            (level == 0) ? alignmentFreedom(in.cut, axis)
+                         : std::vector<unsigned char>(pmate.size(), kFree);
+        for (size_t v = 0; v < pmate.size(); ++v) {
+            const int w = pmate[v];
+            if (w < 0) continue;
+            if (alignOnly[v] == kFree && alignOnly[w] == kFree) {
+                freedom[v] = kFree;
+            } else {
+                pmate[v] = -1;   // held to an axis as well: leave it held
+            }
+        }
+    };
+    // What the kernel pass leaves is a fold, and Sec. 7.2c is what opens a fold
+    // -- within the same freedom, but with the seam paired rather than held: a
+    // child of a slit moves with its partner under R_k, which is Q4 kept
+    // exactly and the one freedom a fold round the tip of a slit needs. The tip
+    // itself, and a landing, stay put. Returns what is left inverted.
+    auto openFold = [&](std::vector<Point> &m, const std::vector<int> &axis, int level,
+                        const std::vector<unsigned char> &freedom) -> int {
+        if (options.regularisedUntangleRings <= 0) {
+            int n = 0;
+            const Mesh &cm = in.cut.getCutMesh();
+            for (const Triangle &t : cm.triangles) {
+                if (!(cross2(m[t[1]] - m[t[0]], m[t[2]] - m[t[0]]) > 0.0)) ++n;
+            }
+            return n;
+        }
+        std::vector<unsigned char> pairedFreedom = freedom;
+        std::vector<int> pmate, pturn;
+        pairSeam(axis, level, pairedFreedom, pmate, pturn);
+        return untangleRegularised(in.cut.getCutMesh(), m, pairedFreedom, pmate, pturn,
+                                   in.frames.frames(), in.cut.getCutVertexToOriginal(),
+                                   prescribedAngle, options.regularisedUntangleRings,
+                                   options.regularisedUntangleIterations);
+    };
+    // A projection that inverted a few faces is not the end of its rung: it put
+    // the seam and the alignment back, and what it left is a tangle of exactly
+    // the kind rungs 0 and 1 are for -- on a map whose cones are now wound the
+    // way the rung above put them, which is what the integration's own map could
+    // not offer. Rung 1 hands its result to the projection once more.
+    auto settle = [&](const std::vector<Point> &projected,
+                      const std::vector<int> &axis) -> std::vector<Point> {
+        for (int lv = 0; lv < 2; ++lv) {
+            if (lv == 1 && axis.empty()) continue;
+            std::vector<Point> trial = projected;
+            const std::vector<unsigned char> fz = vertexFreedom(in.cut, axis, lv);
+            int left = relaxToKernel(in.cut.getCutMesh(), trial, fz, {}, {},
+                                     options.localUntangleSweeps);
+            if (left > 0) left = openFold(trial, axis, lv, fz);
+            if (left != 0 || !angleSumsHold(trial)) continue;
+            if (lv == 0) return trial;
+            int f = 0;
+            std::vector<Point> again = reproject(trial, axis, f);
+            if (!again.empty()) return again;
+        }
+        return {};
+    };
+    auto climb = [&](const std::vector<Point> &start, const std::vector<int> &axis,
+                     int flips) -> Ladder {
+        Ladder out;
+        out.leastLeft = flips;
+        // A tangle of thousands of faces is not local to anything: the full
+        // alignment on a model it contradicts, or a field that is not integrable
+        // over whole regions. No rung clears one, and Sec. 7.2c would spend its
+        // whole schedule over the whole map three times finding that out -- 2.5
+        // minutes on singlemat/geom024's 6749. Such an attempt goes straight to
+        // the chain releases, whose smaller tangles are where the ladder works.
+        const int nFaces = static_cast<int>(in.cut.getCutMesh().triangles.size());
+        const int limit = std::max(options.localUntangleFaceFloor,
+                                   static_cast<int>(options.localUntangleFaceFraction * nFaces));
+        if (flips > limit) return out;
+        const std::vector<int> seamOnly;
+        auto project = [&](const std::vector<Point> &m, const std::vector<int> &ax) {
+            int f = 0;
+            std::vector<Point> raw;
+            std::vector<Point> put = reproject(m, ax, f, &raw);
+            out.reprojectionRan = true;
+            out.reprojectionFlips = f;
+            if (put.empty() && !raw.empty() && f > 0) put = settle(raw, ax);
+            if (!put.empty()) out.reprojectionKept = true;
+            return put;
+        };
+        for (int level = 0; level < 3; ++level) {
+            // Rung 1 frees the alignment, so with no alignment to free it is
+            // rung 0 again -- the same freedom, the same pairing and the same
+            // answer. Skipping it keeps the rung the message names honest about
+            // what was actually tried.
+            if (level == 1 && axis.empty()) continue;
+            std::vector<Point> local = start;
+            const std::vector<unsigned char> freedom = vertexFreedom(in.cut, axis, level);
+            std::vector<unsigned char> kernelFreedom = freedom;
+            std::vector<int> mate, turn;
+            if (options.pairSeamInUntangle) pairSeam(axis, level, kernelFreedom, mate, turn);
+            int left = relaxToKernel(in.cut.getCutMesh(), local, kernelFreedom, mate, turn,
+                                     options.localUntangleSweeps);
+            if (left > 0) left = openFold(local, axis, level, freedom);
+            // Whatever cleared it, every vertex of S has to have the angle
+            // sum Q2 prescribes, to within less than a turn, or a cone has
+            // changed valence under the repair.
+            if (left == 0 && !angleSumsHold(local)) {
+                ++out.windingRejects;
+                continue;
+            }
+            out.leastLeft = std::min(out.leastLeft, left);
+            if (left != 0) continue;
+
+            if (level == 0) {
+                out.map = std::move(local);
+                out.level = 0;
+                out.how = "with the seam and the alignment held throughout";
+                return out;
+            }
+            std::vector<Point> put = project(local, axis);
+            if (!put.empty()) {
+                out.map = std::move(put);
+                out.level = level;
+                out.how = "and Sec. 6.5's projection put the seam and the alignment back";
+                return out;
+            }
+            if (level == 1) {
+                // The seam was held throughout this rung, so the map is legal
+                // as it stands; only Q3 is left for Stage 6.
+                out.map = std::move(local);
+                out.level = 1;
+                out.how = "with Q3 left for Stage 6, the projection onto it having inverted";
+                return out;
+            }
+            if (!axis.empty()) {
+                // Both were let go, so Q4 has to come back or the map is not one
+                // Stage 6 can be handed. The alignment is what made the
+                // projection a large displacement; ask for the seam alone. With
+                // no alignment in play the two projections are the same solve
+                // and the first one has already failed.
+                put = project(local, seamOnly);
+                if (!put.empty()) {
+                    out.map = std::move(put);
+                    out.level = 2;
+                    out.how = "and Sec. 6.5's projection put the seam back, Q3 with the "
+                              "alignment having been too far to reach";
+                    return out;
+                }
+            }
+        }
+        return out;
+    };
+
+    const std::vector<int> noAxis;
+    out.usedAxis = options.alignInIntegration ? in.frames.alignmentAxis() : noAxis;
+    out.integration = solveWith(out.usedAxis);
+
+    Ladder ladder;
+    bool ladderRan = false;
+    // The solve that held the whole alignment, for Sec. 7.2b to read its
+    // labels off if the one kept here does not.
+    std::vector<Point> fullAlignedMap;
+    std::vector<int> fullAxis = out.usedAxis;
+    if (out.integration->getReport().solved) fullAlignedMap = out.integration->getUV();
+    const bool canClimb = options.untangle && options.localUntangle;
+
+    if (options.alignInIntegration && options.alignmentFallback &&
+        out.integration->getReport().alignedEdges > 0 && flipsOf(*out.integration) > 0) {
+        const int firstFlips = flipsOf(*out.integration);
+        const double strain = out.integration->getReport().alignmentStrain;
+
+        struct Attempt {
+            std::unique_ptr<FieldIntegration> fit;
+            std::vector<int> axis;
+            const char *name;
+            Ladder ladder;
+            bool climbed = false;
+        };
+        std::vector<Attempt> attempts;
+        int chosen = -1;
+        auto tryAttempt = [&](size_t i) {
+            Attempt &a = attempts[i];
+            if (!a.fit) a.fit = solveWith(a.axis);
+            const int flips = flipsOf(*a.fit);
+            if (flips == std::numeric_limits<int>::max()) return false;
+            if (flips == 0) return true;
+            if (!canClimb || !options.alignmentChooseByLadder) return false;
+            a.ladder = climb(a.fit->getUV(), a.axis, flips);
+            a.climbed = true;
+            return !a.ladder.map.empty();
+        };
+        attempts.push_back({std::move(out.integration), out.usedAxis, "the full alignment", {}, false});
+        if (tryAttempt(0)) chosen = 0;
+
+        // Letting go of the whole alignment because one corner of it is out of
+        // reach is the answer this used to give, and it is out of all
+        // proportion: on tunnel the one thing wrong is a stratum whose right
+        // side is 0.04 of the model long, 25 times shorter than its left, and
+        // the frame and its neighbours' axes disagree by a factor of eight about
+        // how long its image is. So the chains the tangle actually touches are
+        // released -- every held edge with an end on an inverted face, whole
+        // chain at a time, since a chain is the unit the axis was decided in --
+        // and the rest are solved for again. A few rounds, each releasing only
+        // what the last solve's tangle reached; where a tangle touches no
+        // chain at all, its neighbourhood is widened a ring at a time before
+        // concluding that the alignment is not what inverted it.
+        const std::vector<int> &chainOf = in.frames.alignmentChain();
+        const Mesh &om = in.cut.getCutMesh();
+        int releasedChains = 0;
+        for (int round = 0; chosen < 0 && round < options.alignmentReleaseRounds &&
+                            chainOf.size() == om.edges.size(); ++round) {
+            const Attempt &prev = attempts.back();
+            if (!prev.fit || !prev.fit->getReport().solved) break;
+            const std::vector<int> &axis = prev.axis;
+            if (axis.size() != om.edges.size()) break;
+            const std::vector<double> &ratio = prev.fit->areaRatios();
+            std::vector<char> near(om.vertices.size(), 0);
+            for (size_t t = 0; t < om.triangles.size() && t < ratio.size(); ++t) {
+                if (ratio[t] > 0.0) continue;
+                for (int i = 0; i < 3; ++i) near[om.triangles[t][i]] = 1;
+            }
+            std::vector<char> release;
+            int hit = 0;
+            for (int ring = 0; ring < 4 && hit == 0; ++ring) {
+                if (ring > 0) {
+                    std::vector<char> grown = near;
+                    for (const Triangle &tri : om.triangles) {
+                        if (!near[tri[0]] && !near[tri[1]] && !near[tri[2]]) continue;
+                        for (int i = 0; i < 3; ++i) grown[tri[i]] = 1;
+                    }
+                    near.swap(grown);
+                }
+                release.assign(static_cast<size_t>(in.frames.getReport().alignmentChains), 0);
+                for (size_t e = 0; e < om.edges.size(); ++e) {
+                    if (axis[e] < 0 || chainOf[e] < 0 ||
+                        chainOf[e] >= static_cast<int>(release.size())) continue;
+                    if (!near[om.edges[e][0]] && !near[om.edges[e][1]]) continue;
+                    if (!release[chainOf[e]]) { release[chainOf[e]] = 1; ++hit; }
+                }
+            }
+            if (hit == 0) break;
+            std::vector<int> next = axis;
+            for (size_t e = 0; e < om.edges.size(); ++e) {
+                if (next[e] >= 0 && chainOf[e] >= 0 &&
+                    chainOf[e] < static_cast<int>(release.size()) && release[chainOf[e]]) {
+                    next[e] = -1;
+                }
+            }
+            releasedChains += hit;
+            attempts.push_back({nullptr, std::move(next),
+                                "the alignment less the chains the tangle touched", {}, false});
+            if (tryAttempt(attempts.size() - 1)) chosen = static_cast<int>(attempts.size()) - 1;
+        }
+        status.alignmentChainsReleased = releasedChains;
+
+        if (chosen < 0 && in.frames.getReport().alignmentSteppedChains > 0) {
+            attempts.push_back({nullptr, in.frames.strictAlignmentAxis(),
+                                "the alignment without the overridden chains", {}, false});
+            if (tryAttempt(attempts.size() - 1)) chosen = static_cast<int>(attempts.size()) - 1;
+        }
+        if (chosen < 0) {
+            attempts.push_back({nullptr, noAxis, "no alignment at all", {}, false});
+            if (tryAttempt(attempts.size() - 1)) chosen = static_cast<int>(attempts.size()) - 1;
+        }
+        // None of them came out of the ladder: the old rule, fewest flips and
+        // the earliest on a tie, and Sec. 7.2's Tutte pass behind it.
+        if (chosen < 0) {
+            int best = std::numeric_limits<int>::max();
+            for (size_t i = 0; i < attempts.size(); ++i) {
+                if (attempts[i].fit && flipsOf(*attempts[i].fit) < best) {
+                    best = flipsOf(*attempts[i].fit);
+                    chosen = static_cast<int>(i);
+                }
+            }
+            if (chosen < 0) chosen = 0;
+        }
+        ladderRan = attempts[chosen].climbed;
+        ladder = std::move(attempts[chosen].ladder);
+
+        if (chosen > 0) {
+            std::ostringstream oss;
+            oss << "The full alignment inverted " << firstFlips << " face(s) at a strain of "
+                << strain << " relative"
+                << (canClimb && options.alignmentChooseByLadder
+                        ? ", more than Sec. 7.2a could clear with it held,"
+                        : ",")
+                << " so Sec. 6.4 fell back to " << attempts[chosen].name;
+            if (releasedChains > 0) {
+                oss << " (" << releasedChains << " of " << in.frames.getReport().alignmentChains
+                    << " chain(s) released over " << (attempts.size() - 1) << " round(s))";
+            }
+            oss << ", which inverts " << flipsOf(*attempts[chosen].fit) << ". The strain is the "
+                << "field disagreeing with the cone set about where the boundary turns; where it "
+                << "is large the remedy is in Stage 1 and not here.";
+            status.messages.push_back("Stage 4F: " + oss.str());
+            status.alignmentWasDropped = true;
+        } else if (ladderRan && !ladder.map.empty()) {
+            std::ostringstream oss;
+            oss << "The full alignment inverted " << firstFlips << " face(s) at a strain of "
+                << strain << " relative, and was kept: Sec. 7.2a clears them at rung "
+                << ladder.level << ", which is a better psi_0 than any solve that lets the "
+                << "alignment go and leaves Stage 6 to find it again.";
+            status.messages.push_back("Stage 4F: " + oss.str());
+        }
+        out.integration = std::move(attempts[chosen].fit);
+        out.usedAxis = std::move(attempts[chosen].axis);
+    }
+
+    const FieldIntegration::Report &ir = out.integration->getReport();
+    status.integrationRan = true;
+    status.integrationAlignedEdges = ir.alignedEdges;
+    status.integrationAlignResidual = ir.maxAlignResidual;
+    status.integrationAlignStrain = ir.alignmentStrain;
+    status.integrationSolved = ir.solved;
+    status.integrationSeamResidual = ir.maxSeamResidual;
+    status.integrationFlippedFaces = ir.flippedFaces;
+    status.integrationFlippedAreaFraction =
+        (ir.totalArea > 0.0) ? ir.flippedArea / ir.totalArea : 0.0;
+    status.integrationMinAreaRatio = ir.minAreaRatio;
+    status.integrationMaxFitResidual = ir.maxFitResidual;
+    status.integrationMeanFitResidual = ir.meanFitResidual;
+    status.integrationFlipsAtCones = ir.flipsAdjacentToCone;
+    status.integrationNearestFlipToCone = ir.nearestFlipToCone;
+    for (const std::string &m : ir.messages) status.messages.push_back("Stage 4F: " + m);
+
+    if (!ir.solved) {
+        status.messages.push_back("Stopping: the field could not be integrated on Omega.");
+        return false;
+    }
+    out.integratedMap = out.integration->getUV();
+
+    // --- Stage 4R: the untangling (Sec. 7.2) ------------------------------
+    std::vector<Point> psi0 = out.integratedMap;
+    if (ir.flippedFaces > 0 && options.untangle) {
+        bool untangled = false;
+        if (options.localUntangle) {
+            // The fallback above may already have climbed it on this solve.
+            if (!ladderRan) ladder = climb(out.integratedMap, out.usedAxis, ir.flippedFaces);
+            status.localUntangleRan = true;
+            status.localUntangleFlippedFaces = ladder.leastLeft;
+            status.reprojectionRan = ladder.reprojectionRan;
+            status.reprojectionKept = ladder.reprojectionKept;
+            status.reprojectionFlippedFaces = ladder.reprojectionFlips;
+            if (!ladder.map.empty()) {
+                psi0 = ladder.map;
+                untangled = true;
+                status.localUntangleLevel = ladder.level;
+                std::ostringstream oss;
+                oss << "Sec. 7.2a: the " << ir.flippedFaces
+                    << " inverted face(s) were a local tangle, cleared at rung "
+                    << status.localUntangleLevel << " of the ladder " << ladder.how
+                    << ". psi_0 keeps the cone angles and the shape the integration gave it, "
+                    << "and Sec. 7.2's Tutte pass was not needed.";
+                status.messages.push_back("Stage 4R: " + oss.str());
+            } else {
+                std::ostringstream oss;
+                oss << "Sec. 7.2a took the tangle from " << ir.flippedFaces << " face(s) to "
+                    << status.localUntangleFlippedFaces << " at best";
+                if (status.localUntangleFlippedFaces == 0) {
+                    oss << ", and cleared it only on the rung that lets the seam go, where "
+                        << "Sec. 6.5's projection could not put it back";
+                }
+                oss << ", so Sec. 7.2's Tutte pass runs on the whole map -- and psi_0 loses "
+                    << "the cone angles, the boundary and the shape the integration gave it.";
+                status.messages.push_back("Stage 4R: " + oss.str());
+            }
+        }
+
+        if (!untangled) {
+            std::vector<Point> repaired = untangle(in, options, status, out);
+            if (!repaired.empty()) {
+                psi0 = std::move(repaired);
+                if (options.reprojectAfterUntangle && !out.usedAxis.empty()) {
+                    int f = 0;
+                    std::vector<Point> put = reproject(psi0, out.usedAxis, f);
+                    status.reprojectionRan = true;
+                    status.reprojectionFlippedFaces = f;
+                    if (!put.empty()) {
+                        status.reprojectionKept = true;
+                        psi0 = std::move(put);
+                        status.messages.push_back(
+                            "Stage 4R: Sec. 6.5 put the seam and the alignment back on the "
+                            "untangled map as equalities, and nothing inverted doing it.");
+                    } else {
+                        std::ostringstream oss;
+                        oss << "Sec. 6.5's projection onto the alignment inverted "
+                            << status.reprojectionFlippedFaces
+                            << " face(s), so the untangled map stands as it is and Stage 6 has "
+                            << "Q3 to reach rather than to hold. A Tutte map is a long way from "
+                            << "the constraint set, which is the argument for making Sec. 7.2a "
+                            << "succeed rather than for making the projection cleverer.";
+                        status.messages.push_back("Stage 4R: " + oss.str());
+                    }
+                }
+            }
+        }
+    } else if (ir.flippedFaces == 0) {
+        status.messages.push_back(
+            "Stage 4F: the integration inverted nothing, so Sec. 7.2's untangling was not "
+            "needed. That happens on gently curved, well-aligned models and is not to be "
+            "assumed.");
+    }
+
+    // --- Stage 4R, Sec. 7.2b: back onto the alignment -----------------------
+    // Whether psi_0 holds the whole alignment as it stands: every held edge's
+    // held coordinate difference at rounding, relative to the image. It does
+    // after a clean solve or Sec. 7.2a at rung 0; it does not after a fallback
+    // that dropped chains, the Tutte pass, or rung 1 with its projection
+    // refused -- and that, not which of those paths was taken, is what decides
+    // whether Stage 5 is handed an unaligned map.
+    auto alignmentGap = [&](const std::vector<Point> &m, const std::vector<int> &axis) {
+        const Mesh &cm = in.cut.getCutMesh();
+        if (m.size() != cm.vertices.size() || axis.size() != cm.edges.size()) return 0.0;
+        Point lo = m.front(), hi = m.front();
+        for (const Point &p : m) {
+            lo[0] = std::min(lo[0], p[0]); lo[1] = std::min(lo[1], p[1]);
+            hi[0] = std::max(hi[0], p[0]); hi[1] = std::max(hi[1], p[1]);
+        }
+        const double extent = std::max(std::hypot(hi[0] - lo[0], hi[1] - lo[1]), 1e-300);
+        double worst = 0.0;
+        for (size_t e = 0; e < cm.edges.size(); ++e) {
+            const int hold = axis[e];
+            if (hold != 0 && hold != 1) continue;
+            worst = std::max(worst, std::fabs(m[cm.edges[e][1]][hold] - m[cm.edges[e][0]][hold]));
+        }
+        return worst / extent;
+    };
+    status.alignmentHeld = fullAxis.empty() || fullAlignedMap.size() != psi0.size() ||
+                           alignmentGap(psi0, fullAxis) <= 1e-8;
+    if (options.pullOntoAlignment && !status.alignmentHeld) {
+        std::vector<Point> pulled = pullOntoAlignment(in, options, status, psi0, fullAlignedMap, fullAxis);
+        if (!pulled.empty()) {
+            psi0 = std::move(pulled);
+            if (status.pullProjected) out.usedAxis = fullAxis;
+        }
+        std::ostringstream oss;
+        if (status.pullKept) {
+            oss << "Sec. 7.2b: psi_0 had lost some of Sec. 6.4's alignment, and was pulled back "
+                << "onto it under the barrier -- Q3 " << status.pullBoundaryResidual
+                << ", features " << status.pullFeatureResidual << " -- "
+                << (status.pullProjected
+                        ? "and Sec. 6.5's projection then made it exact without inverting anything."
+                        : "the projection onto the exact alignment inverting, so it stands at "
+                          "that.")
+                << " Stage 5 seeds Gamma_topo from this map, and an unaligned one seeds it "
+                << "from separatrices the misaligned boundary sent astray.";
+        } else {
+            oss << "Sec. 7.2b could not pull psi_0 back onto the alignment, so Stage 5 seeds "
+                << "from it as Stage 4R left it.";
+        }
+        status.messages.push_back("Stage 4R: " + oss.str());
+    }
+
+    out.psi0 = std::move(psi0);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// runMapStages()  --  Stages 4C, 3F, 4F and 4R: from the cone set to psi_0
+//
+// Everything between the cut and the Immersion, on the cone set runConeFront()
+// left. Leaves psi_0 in psi0Map; false at the stops no later stage survives.
+// ---------------------------------------------------------------------------
+bool TORSION::runMapStages() {
     // --- Sec. 4: the flat cone metric of the cone set ----------------------
     //
     // Built here, before the frames, because it is two things at once: the
@@ -1332,6 +2479,8 @@ bool TORSION::run() {
     }
     fopts.referenceIndex = fieldIndex;
     fopts.buildAlignment = options.alignInIntegration;
+    fopts.alignAcrossSeams = options.alignAcrossSeams;
+    fopts.reconcileSectors = options.reconcileSectors;
     try {
         frames = std::make_unique<FieldFrames>(*field, *cutter, *cones, fopts,
                                                interfaces.get());
@@ -1355,6 +2504,7 @@ bool TORSION::run() {
     status.alignedBoundaryEdges = ffr.alignedBoundaryEdges;
     status.alignedInterfaceEdges = ffr.alignedInterfaceEdges;
     status.alignmentOverrides = ffr.alignmentOverrides;
+    status.alignmentSeamCrossings = ffr.alignmentSeamCrossings;
     status.alignmentClosedChains = ffr.alignmentClosedChains;
     status.maxAlignmentResidual = ffr.maxAlignmentResidual;
     for (const std::string &m : ffr.messages) status.messages.push_back("Stage 3F: " + m);
@@ -1414,239 +2564,142 @@ bool TORSION::run() {
     status.seamArcs = scaffold->getReport().arcs;
     status.frameKConflicts = scaffold->getReport().frameKConflicts;
 
-    // Sec. 6.4's three attempts. Holding the boundary and the interfaces
-    // exactly is a constraint on the fit, and a constraint on a fit can invert
-    // a triangle the free fit would not have -- the place it happens is a chain
-    // whose staircase was overridden, because a step is a right angle the map
-    // is being asked to unbend. So the alignment is tried in full, then on the
-    // chains that needed no overriding, then not at all, and the first solve
-    // that inverts nothing is the one that is kept. On the models where the
-    // first attempt already inverts nothing, which is most of them, the second
-    // and third are never built.
-    auto solveWith = [&](const std::vector<int> &axis) {
-        FieldIntegration::Options io;
-        io.regularisation = options.integrationRegularisation;
-        io.alignAxis = axis;
-        return std::make_unique<FieldIntegration>(*cutter, *frames, *scaffold, io);
-    };
-    const std::vector<int> noAxis;
-    usedAxis = options.alignInIntegration ? frames->alignmentAxis() : noAxis;
-    integration = solveWith(usedAxis);
+    Psi0 built;
+    const bool built0 = buildPsi0(MapStage{*mesh, *cutter, *cones, *frames, *scaffold,
+                                           interfaces.get(), coneMetric.get()},
+                                  options, status, built);
+    integration = std::move(built.integration);
+    tutte = std::move(built.tutte);
+    usedAxis = std::move(built.usedAxis);
+    integratedMap = std::move(built.integratedMap);
+    if (!built0) return false;
+    std::vector<Point> psi0 = std::move(built.psi0);
+    psi0Map = std::move(psi0);
+    return true;
+}
 
-    if (options.alignInIntegration && options.alignmentFallback &&
-        integration->getReport().alignedEdges > 0 &&
-        (!integration->getReport().solved || integration->getReport().flippedFaces > 0)) {
-        const int firstFlips = integration->getReport().solved
-                                   ? integration->getReport().flippedFaces
-                                   : std::numeric_limits<int>::max();
-        const double strain = integration->getReport().alignmentStrain;
+bool TORSION::run() {
+    status = Status();
 
-        std::unique_ptr<FieldIntegration> best;
-        int bestFlips = firstFlips;
-        const char *bestName = "the full alignment";
+    runFieldFront();
 
-        std::vector<int> bestAxis;
-        if (frames->getReport().alignmentSteppedChains > 0) {
-            auto strict = solveWith(frames->strictAlignmentAxis());
-            if (strict->getReport().solved && strict->getReport().flippedFaces < bestFlips) {
-                bestFlips = strict->getReport().flippedFaces;
-                bestName = "the alignment without the overridden chains";
-                bestAxis = frames->strictAlignmentAxis();
-                best = std::move(strict);
-            }
-        }
-        if (bestFlips > 0) {
-            auto free = solveWith(noAxis);
-            if (free->getReport().solved && free->getReport().flippedFaces < bestFlips) {
-                bestFlips = free->getReport().flippedFaces;
-                bestName = "no alignment at all";
-                bestAxis = noAxis;
-                best = std::move(free);
-            }
-        }
-        if (best) {
-            std::ostringstream oss;
-            oss << "The full alignment inverted " << firstFlips << " face(s) at a strain of "
-                << strain << " relative, so Sec. 6.4 fell back to " << bestName << ", which "
-                << "inverts " << bestFlips << ". The strain is the field disagreeing with the "
-                << "cone set about where the boundary turns; where it is large the remedy is "
-                << "in Stage 1 and not here.";
-            status.messages.push_back("Stage 4F: " + oss.str());
-            integration = std::move(best);
-            usedAxis = std::move(bestAxis);
-            status.alignmentWasDropped = true;
-        }
-    }
+    // --- Stages 1 to 4R, once or twice ------------------------------------
+    //
+    // Stage 1 cancels every +1/-1 pair it finds inside one material region,
+    // MERIDIAN's rule: the pair is in no region's count, so no layout needs it,
+    // and a layout without it is simpler. For Pipeline A that is the whole
+    // story, because the flow is driven by the cone set and never looks at the
+    // field again. This pipeline integrates the field, and a pair the field
+    // put there is how the field turned through the curvature between them:
+    // cancelled, the smoothest field left has to make the same turn with no
+    // singularity to make it at, and on a strongly curved interface that is
+    // not a field any map follows. On rt_mushroom, whose interface rolls up
+    // through more than a full turn, cancelling its ten units takes the full
+    // alignment from 2 inverted faces to 675 and the layout from 210 clean
+    // quadrilaterals to a failure; on turbine_blade, 2 to 129. On cruciform,
+    // icf and concrete the same cancellation costs nothing and the layout is
+    // simpler for it (62 patches against 318 on cruciform).
+    //
+    // What separates the two is not the distance between the pair -- icf's are
+    // forty edges apart and cancel harmlessly, rt_mushroom's include pairs one
+    // edge apart that do not -- but whether the alignment survives. So the
+    // cancellation is tried first, and if it cancelled anything and Stage 4F
+    // could not keep the whole alignment with it, Stages 1 to 4R run again on
+    // the same field keeping the pairs, and the second is kept only if it keeps
+    // the alignment the first lost. Stage 0 is not repeated; the interface
+    // network is restored to what it was before the first run's balance().
+    const Status afterField = status;
+    std::unique_ptr<Interfaces> pristine =
+        interfaces ? std::make_unique<Interfaces>(*interfaces) : nullptr;
+    const bool cancel = options.cancelInterfaceDipoles;
+    bool ok = runConeFront(cancel) && runMapStages();
 
-    const FieldIntegration::Report &ir = integration->getReport();
-    status.integrationRan = true;
-    status.integrationAlignedEdges = ir.alignedEdges;
-    status.integrationAlignResidual = ir.maxAlignResidual;
-    status.integrationAlignStrain = ir.alignmentStrain;
-    status.integrationSolved = ir.solved;
-    status.integrationSeamResidual = ir.maxSeamResidual;
-    status.integrationFlippedFaces = ir.flippedFaces;
-    status.integrationFlippedAreaFraction =
-        (ir.totalArea > 0.0) ? ir.flippedArea / ir.totalArea : 0.0;
-    status.integrationMinAreaRatio = ir.minAreaRatio;
-    status.integrationMaxFitResidual = ir.maxFitResidual;
-    status.integrationMeanFitResidual = ir.meanFitResidual;
-    status.integrationFlipsAtCones = ir.flipsAdjacentToCone;
-    status.integrationNearestFlipToCone = ir.nearestFlipToCone;
-    for (const std::string &m : ir.messages) status.messages.push_back("Stage 4F: " + m);
-
-    if (!ir.solved) {
-        status.messages.push_back("Stopping: the field could not be integrated on Omega.");
-        return false;
-    }
-    integratedMap = integration->getUV();
-
-    // --- Stage 4R: the untangling (Sec. 7.2) ------------------------------
-    std::vector<Point> psi0 = integratedMap;
-    if (ir.flippedFaces > 0 && options.untangle) {
-        // Sec. 6.5's projection, as a step rather than as a stage: fit a map's
-        // own Jacobian back under the seam and alignment equalities. Used after
-        // any repair that was allowed to break one of them.
-        auto reproject = [&](const std::vector<Point> &m,
-                             const std::vector<int> &axis) -> std::vector<Point> {
-            FieldIntegration::Options po;
-            po.regularisation = options.integrationRegularisation;
-            po.alignAxis = axis;
-            po.targetJacobian = jacobianOf(cutter->getCutMesh(), m);
-            FieldIntegration proj(*cutter, *frames, *scaffold, po);
-            status.reprojectionRan = true;
-            status.reprojectionFlippedFaces = proj.getReport().flippedFaces;
-            if (!proj.getReport().solved || proj.getReport().flippedFaces > 0) return {};
-            status.reprojectionKept = true;
-            return proj.getUV();
+    // Lost, here, means what Stage 4R handed on does not hold the whole of Sec.
+    // 6.4's alignment exactly -- a fallback that dropped chains, a rung above
+    // the first whose projection was refused, the Tutte pass -- whether or not
+    // Sec. 7.2b then pulled it most of the way back.
+    const bool lostAlignment = !ok || !status.alignmentHeld;
+    if (options.retryKeepingDipoles && cancel && status.coneDipoleUnits > 0 && lostAlignment) {
+        struct Variant {
+            std::unique_ptr<Interfaces> interfaces;
+            std::unique_ptr<ConeSingularities> cones;
+            std::unique_ptr<ConeCut> cutter;
+            std::unique_ptr<FieldFrames> frames;
+            std::unique_ptr<ConeMetric> coneMetric;
+            std::unique_ptr<Immersion> scaffold;
+            std::unique_ptr<FieldIntegration> integration;
+            std::unique_ptr<TutteEmbedding> tutte;
+            std::vector<int> fieldIndex, usedAxis;
+            std::vector<Point> integratedMap, psi0;
+            Status status;
+            bool ok = false;
+        };
+        auto stash = [&](bool okNow) {
+            Variant v;
+            v.interfaces = std::move(interfaces);
+            v.cones = std::move(cones);
+            v.cutter = std::move(cutter);
+            v.frames = std::move(frames);
+            v.coneMetric = std::move(coneMetric);
+            v.scaffold = std::move(scaffold);
+            v.integration = std::move(integration);
+            v.tutte = std::move(tutte);
+            v.fieldIndex = std::move(fieldIndex);
+            v.usedAxis = std::move(usedAxis);
+            v.integratedMap = std::move(integratedMap);
+            v.psi0 = std::move(psi0Map);
+            v.status = status;
+            v.ok = okNow;
+            return v;
+        };
+        auto restore = [&](Variant &v) {
+            interfaces = std::move(v.interfaces);
+            cones = std::move(v.cones);
+            cutter = std::move(v.cutter);
+            frames = std::move(v.frames);
+            coneMetric = std::move(v.coneMetric);
+            scaffold = std::move(v.scaffold);
+            integration = std::move(v.integration);
+            tutte = std::move(v.tutte);
+            fieldIndex = std::move(v.fieldIndex);
+            usedAxis = std::move(v.usedAxis);
+            integratedMap = std::move(v.integratedMap);
+            psi0Map = std::move(v.psi0);
+            status = v.status;
         };
 
-        // Sec. 7.2a, on a ladder. Each rung frees one more of the things the
-        // integration fixed, and every rung above the first hands what it
-        // produced to the projection to put them back:
-        //
-        //   0   the seam and Sec. 6.4's alignment both held. Nothing to
-        //       restore, so nothing can go wrong restoring it.
-        //   1   the alignment let go, the seam still held. Q3 comes back from
-        //       the projection, or -- if the projection inverts -- Stage 6 has
-        //       it to reach, which is where it started.
-        //   2   both let go. Q4 is not recoverable by anything downstream, so
-        //       this rung is kept only if the projection takes.
-        //
-        // The ladder exists because the tangles that survive rung 0 are the
-        // ones at a cone, and a cone is exactly the vertex the alignment pins
-        // in both coordinates. Rung 1 is what unpins it.
-        bool untangled = false;
-        const std::vector<int> seamOnly;
-        std::string howKept;
-        if (options.localUntangle) {
-            status.localUntangleRan = true;
-            status.localUntangleFlippedFaces = ir.flippedFaces;
-            for (int level = 0; level < 3 && !untangled; ++level) {
-                // Rung 1 frees the alignment, so with no alignment to free it
-                // is rung 0 again -- the same freedom, the same pairing and the
-                // same answer. Skipping it keeps the rung the message names
-                // honest about what was actually tried.
-                if (level == 1 && usedAxis.empty()) continue;
-                std::vector<Point> local = integratedMap;
-                std::vector<int> mate, turn;
-                if (options.pairSeamInUntangle && level < 2) seamPairing(mate, turn);
-                const int left = relaxToKernel(cutter->getCutMesh(), local,
-                                               vertexFreedom(*cutter, usedAxis, level),
-                                               mate, turn, options.localUntangleSweeps);
-                status.localUntangleFlippedFaces =
-                    std::min(status.localUntangleFlippedFaces, left);
-                if (left != 0) continue;
+        Variant first = stash(ok);
+        const int cancelled = first.status.coneDipoleUnits;
+        status = afterField;
+        interfaces = pristine ? std::make_unique<Interfaces>(*pristine) : nullptr;
+        const bool okKeep = runConeFront(false) && runMapStages();
+        const bool keepSecond = okKeep && status.alignmentHeld;
 
-                status.localUntangleLevel = level;
-                if (level == 0) {
-                    psi0 = std::move(local);
-                    untangled = true;
-                    howKept = "with the seam and the alignment held throughout";
-                    break;
-                }
-                std::vector<Point> put = reproject(local, usedAxis);
-                if (!put.empty()) {
-                    psi0 = std::move(put);
-                    untangled = true;
-                    howKept = "and Sec. 6.5's projection put the seam and the alignment back";
-                } else if (level == 1) {
-                    // The seam was held throughout this rung, so the map is
-                    // legal as it stands; only Q3 is left for Stage 6.
-                    psi0 = std::move(local);
-                    untangled = true;
-                    howKept = "with Q3 left for Stage 6, the projection onto it having inverted";
-                } else if (!usedAxis.empty()) {
-                    // Both were let go, so Q4 has to come back or the map is not
-                    // one Stage 6 can be handed. The alignment is what made the
-                    // projection a large displacement; ask for the seam alone.
-                    // With no alignment in play the two projections are the same
-                    // solve and the first one has already failed.
-                    put = reproject(local, seamOnly);
-                    if (!put.empty()) {
-                        psi0 = std::move(put);
-                        untangled = true;
-                        howKept = "and Sec. 6.5's projection put the seam back, Q3 with the "
-                                  "alignment having been too far to reach";
-                    }
-                }
-            }
-            if (untangled) {
-                std::ostringstream oss;
-                oss << "Sec. 7.2a: the " << ir.flippedFaces
-                    << " inverted face(s) were a local tangle, cleared at rung "
-                    << status.localUntangleLevel << " of the ladder " << howKept
-                    << ". psi_0 keeps the cone angles and the shape the integration gave it, "
-                    << "and Sec. 7.2's Tutte pass was not needed.";
-                status.messages.push_back("Stage 4R: " + oss.str());
-            } else {
-                std::ostringstream oss;
-                oss << "Sec. 7.2a took the tangle from " << ir.flippedFaces << " face(s) to "
-                    << status.localUntangleFlippedFaces << " at best";
-                if (status.localUntangleFlippedFaces == 0) {
-                    oss << ", and cleared it only on the rung that lets the seam go, where "
-                        << "Sec. 6.5's projection could not put it back";
-                }
-                oss << ", so Sec. 7.2's Tutte pass runs on the whole map -- and psi_0 loses "
-                    << "the cone angles, the boundary and the shape the integration gave it.";
-                status.messages.push_back("Stage 4R: " + oss.str());
-            }
+        std::ostringstream oss;
+        oss << "Stage 1 cancelled " << cancelled << " +1/-1 unit(s) inside single regions and "
+            << "Stage 4F could not then keep the whole alignment, so Stages 1 to 4R were run "
+            << "again keeping them: ";
+        if (keepSecond) {
+            oss << "with the pairs, the alignment holds, and that run is the one kept -- the "
+                << "field turns through its curved interfaces at the pairs, and without them "
+                << "no map it integrates to follows the curve.";
+            status.dipolesKept = true;
+            status.dipoleRetryRan = true;
+            status.messages.push_back("Stage 1: " + oss.str());
+        } else {
+            restore(first);
+            ok = first.ok;
+            oss << "that lost the alignment too, so the cancelled cone set stands.";
+            status.dipoleRetryRan = true;
+            status.messages.push_back("Stage 1: " + oss.str());
         }
-
-        if (!untangled) {
-            std::vector<Point> repaired = untangle();
-            if (!repaired.empty()) {
-                psi0 = std::move(repaired);
-                if (options.reprojectAfterUntangle && !usedAxis.empty()) {
-                    std::vector<Point> put = reproject(psi0, usedAxis);
-                    if (!put.empty()) {
-                        psi0 = std::move(put);
-                        status.messages.push_back(
-                            "Stage 4R: Sec. 6.5 put the seam and the alignment back on the "
-                            "untangled map as equalities, and nothing inverted doing it.");
-                    } else {
-                        std::ostringstream oss;
-                        oss << "Sec. 6.5's projection onto the alignment inverted "
-                            << status.reprojectionFlippedFaces
-                            << " face(s), so the untangled map stands as it is and Stage 6 has "
-                            << "Q3 to reach rather than to hold. A Tutte map is a long way from "
-                            << "the constraint set, which is the argument for making Sec. 7.2a "
-                            << "succeed rather than for making the projection cleverer.";
-                        status.messages.push_back("Stage 4R: " + oss.str());
-                    }
-                }
-            }
-        }
-    } else if (ir.flippedFaces == 0) {
-        status.messages.push_back(
-            "Stage 4F: the integration inverted nothing, so Sec. 7.2's untangling was not "
-            "needed. That happens on gently curved, well-aligned models and is not to be "
-            "assumed.");
+        if (keepSecond) ok = okKeep;
     }
+    if (!ok) return false;
 
     // --- Stage 4: psi_0 ---------------------------------------------------
     try {
-        immersion = std::make_unique<Immersion>(*cutter, *cones, psi0,
+        immersion = std::make_unique<Immersion>(*cutter, *cones, psi0Map,
                                                 frames->fieldEdgeLengths(),
                                                 frames->combedAngle());
     } catch (const std::exception &e) {
@@ -1676,61 +2729,102 @@ bool TORSION::run() {
 
     // --- Stages 5 to 8, at the Gamma_topo tolerance that works ------------
     //
-    // MERIDIAN::run's retry, unchanged, on this pipeline's stages. See
-    // Options::topoNearMissRetry.
+    // MERIDIAN::run's retry, run further down the same ladder. Gamma_topo can
+    // be added to and never taken back, so a tolerance that over-seeds is not
+    // recoverable by the repair loop and a tighter one is -- that asymmetry is
+    // why the retries only ever tighten. MERIDIAN stops at the second rung; this
+    // pipeline goes on to a third and then to none at all, because its psi_0
+    // is a field's and not a flow's. Where Sec. 7.2b has pulled an unaligned map
+    // back onto the alignment, more of its separatrices pass within a given
+    // tolerance of a cone than a Ricci map's would, and on tooth that is the
+    // difference between 13 seeded paths -- three of them back to their own cone
+    // -- and a layout 26 faces short of four-sided, against 187 clean
+    // quadrilaterals at a tolerance of 0.01. Each rung runs only while the best
+    // layout so far still leaves part of S without a grid, and the best is what
+    // is kept.
     const Status statusBeforeLayout = status;
-    if (!runLayoutStages(options.topoNearMiss)) return status.layoutValid;
-
-    if (options.topoNearMissRetry > 0.0 &&
-        options.topoNearMissRetry != options.topoNearMiss && arrangement &&
-        MERIDIAN::unmeshableFraction(*arrangement) > 0.0) {
-        const double firstUnmeshable = MERIDIAN::unmeshableFraction(*arrangement);
-        const int firstUnresolved = status.separatricesUnresolved;
-
-        Status firstStatus = status;
-        std::unique_ptr<SubdomainLabels> firstLabels = std::move(labels);
-        std::unique_ptr<LayoutEnergy> firstLayout = std::move(layout);
-        std::unique_ptr<Separatrices> firstSeparatrices = std::move(separatrices);
-        std::unique_ptr<Arrangement> firstArrangement = std::move(arrangement);
-
-        status = statusBeforeLayout;
-        const bool reached = runLayoutStages(options.topoNearMissRetry);
-        const double secondUnmeshable =
-            (reached && arrangement) ? MERIDIAN::unmeshableFraction(*arrangement) : 1.0;
-        const int secondUnresolved = status.separatricesUnresolved;
-
-        const bool keepSecond =
-            reached && arrangement &&
-            (secondUnmeshable < firstUnmeshable - 1e-12 ||
-             (secondUnmeshable <= firstUnmeshable + 1e-12 &&
-              secondUnresolved < firstUnresolved));
-
-        std::ostringstream retryMsg;
-        retryMsg << "Stage 5: the layout at a near-miss tolerance of " << options.topoNearMiss
-                 << " left " << std::fixed << std::setprecision(2) << 100.0 * firstUnmeshable
-                 << "% of S in faces Stage 10 has no grid for, so it was seeded again at "
-                 << std::defaultfloat << options.topoNearMissRetry << ", which left "
-                 << std::fixed << std::setprecision(2) << 100.0 * secondUnmeshable << "%"
-                 << std::defaultfloat << ". Kept the "
-                 << (keepSecond ? "second" : "first")
-                 << ". Gamma_topo can only be added to, never taken back, so a tolerance "
-                    "that over-seeds is not recoverable by the repair loop and a tighter "
-                    "one is; that asymmetry is the whole reason this retry runs in this "
-                    "direction and not the other.";
-
-        if (!keepSecond) {
-            status = std::move(firstStatus);
-            labels = std::move(firstLabels);
-            layout = std::move(firstLayout);
-            separatrices = std::move(firstSeparatrices);
-            arrangement = std::move(firstArrangement);
+    if (!runLayoutStages(options.topoNearMiss, options.seedTopoConstraints)) {
+        return status.layoutValid;
+    }
+    status.topoNearMissUsed = options.topoNearMiss;
+    {
+        struct Rung { double nearMiss; bool seed; };
+        std::vector<Rung> rungs;
+        auto addRung = [&](double nm, bool seed) {
+            if (seed && !(nm > 0.0)) return;
+            if (seed && nm == options.topoNearMiss) return;
+            for (const Rung &r : rungs) if (r.seed == seed && r.nearMiss == nm) return;
+            rungs.push_back({nm, seed});
+        };
+        if (options.seedTopoConstraints) {
+            addRung(options.topoNearMissRetry, true);
+            addRung(options.topoNearMissLastRetry, true);
+            if (options.topoRetryUnseeded) addRung(0.0, false);
         }
-        status.topoNearMissUsed = keepSecond ? options.topoNearMissRetry
-                                             : options.topoNearMiss;
-        status.topoNearMissRetried = true;
-        status.messages.push_back(retryMsg.str());
-    } else {
-        status.topoNearMissUsed = options.topoNearMiss;
+
+        double bestUnmeshable = arrangement ? MERIDIAN::unmeshableFraction(*arrangement) : 1.0;
+        int bestUnresolved = status.separatricesUnresolved;
+        double bestNearMiss = options.topoNearMiss;
+        bool bestSeeded = options.seedTopoConstraints;
+        std::ostringstream retryMsg;
+        retryMsg << std::fixed << std::setprecision(2);
+        int tried = 0;
+        for (const Rung &rung : rungs) {
+            if (!arrangement || !(bestUnmeshable > 0.0)) break;
+            if (tried == 0) {
+                retryMsg << "Stage 5: the layout at a near-miss tolerance of " << std::defaultfloat
+                         << options.topoNearMiss << std::fixed << " left "
+                         << 100.0 * bestUnmeshable << "% of S in faces Stage 10 has no grid for";
+            }
+            ++tried;
+
+            Status keptStatus = status;
+            std::unique_ptr<SubdomainLabels> keptLabels = std::move(labels);
+            std::unique_ptr<LayoutEnergy> keptLayout = std::move(layout);
+            std::unique_ptr<Separatrices> keptSeparatrices = std::move(separatrices);
+            std::unique_ptr<Arrangement> keptArrangement = std::move(arrangement);
+
+            status = statusBeforeLayout;
+            const bool reached = runLayoutStages(rung.nearMiss, rung.seed);
+            const double unmeshable =
+                (reached && arrangement) ? MERIDIAN::unmeshableFraction(*arrangement) : 1.0;
+            const int unresolved = status.separatricesUnresolved;
+            const bool better = reached && arrangement &&
+                                (unmeshable < bestUnmeshable - 1e-12 ||
+                                 (unmeshable <= bestUnmeshable + 1e-12 &&
+                                  unresolved < bestUnresolved));
+            if (rung.seed) {
+                retryMsg << "; seeded again at " << std::defaultfloat << rung.nearMiss
+                         << std::fixed << ", " << 100.0 * unmeshable << "%";
+            } else {
+                retryMsg << "; with no seeding at all, the repair loop alone, "
+                         << 100.0 * unmeshable << "%";
+            }
+            if (better) {
+                bestUnmeshable = unmeshable;
+                bestUnresolved = unresolved;
+                bestNearMiss = rung.nearMiss;
+                bestSeeded = rung.seed;
+            } else {
+                status = std::move(keptStatus);
+                labels = std::move(keptLabels);
+                layout = std::move(keptLayout);
+                separatrices = std::move(keptSeparatrices);
+                arrangement = std::move(keptArrangement);
+            }
+        }
+        if (tried > 0) {
+            retryMsg << ". Kept ";
+            if (!bestSeeded) retryMsg << "the unseeded layout";
+            else retryMsg << "the one at " << std::defaultfloat << bestNearMiss;
+            retryMsg << ". Gamma_topo can only be added to, never taken back, so a tolerance "
+                        "that over-seeds is not recoverable by the repair loop and a tighter "
+                        "one is; that asymmetry is the whole reason this retry runs in this "
+                        "direction and not the other.";
+            status.topoNearMissUsed = bestSeeded ? bestNearMiss : 0.0;
+            status.topoNearMissRetried = true;
+            status.messages.push_back(retryMsg.str());
+        }
     }
 
     // --- Stage 9 ----------------------------------------------------------

@@ -651,6 +651,16 @@ void usage(const char *prog) {
               << "  --no-seed-check    skip the second-seed spot check\n"
               << "  --no-align         leave Q3 and E3 entirely to Stage 6 (Sec. 6.4 off)\n"
               << "  --no-align-fallback  keep the aligned solve even when it inverts more\n"
+              << "  --no-seam-align    vote an interface branch the cut crosses as one chart\n"
+              << "  --choose-by-flips  pick among the alignment attempts by raw flip count,\n"
+              << "                     not by what Sec. 7.2a's ladder leaves of each\n"
+              << "  --no-regularised-untangle  Sec. 7.2a's kernel pass alone, no Sec. 7.2c\n"
+              << "  --no-pull          hand Stage 5 psi_0 unaligned when Stage 4F dropped the\n"
+              << "                     alignment, instead of pulling it back on (Sec. 7.2b)\n"
+              << "  --release-rounds <n>  rounds of releasing only the chains a tangle touches\n"
+              << "                     before dropping the alignment              (default 4)\n"
+              << "  --no-sector-reconcile  move the field's indices vertex by vertex, dS\n"
+              << "                     absorbing anything, and re-smooth holding one face\n"
               << "  --no-conformal-sizing  leave the frame unscaled: J* = (1/h) R(-theta)\n"
               << "  --ref <r>          E1's reference metric, C4:                (default cone)\n"
               << "                       cone      the flat cone metric of the cone set, from\n"
@@ -680,6 +690,8 @@ void usage(const char *prog) {
               << "  --no-interfaces    ignore the material tags\n"
               << "  --no-field-interfaces  do not align the field to the interfaces\n"
               << "  --no-cancel-dipoles    keep the +1/-1 pairs on curved interfaces\n"
+              << "  --no-dipole-retry  do not rerun Stages 1-4R keeping the pairs when\n"
+              << "                     cancelling them cost Stage 4F the alignment\n"
               << "  --no-e6            leave the interfaces to E3 alone\n"
               << "  --no-seam-turns    give every chain of an interface branch the branch's\n"
               << "                     label, ignoring the quarter turns of the cuts it crosses\n"
@@ -693,6 +705,9 @@ void usage(const char *prog) {
               << "  --near-miss <f>    Gamma_topo seeding tolerance          (default 0.15)\n"
               << "  --retry <f>        tolerance to re-seed from when the first layout\n"
               << "                     leaves a piece of S no grid covers      (default 0.04)\n"
+              << "  --last-retry <f>   a third, tighter rung of that retry           (default 0.01)\n"
+              << "  --no-unseeded-retry  stop the retry before its last rung: no Gamma_topo\n"
+              << "                     seeding at all, the repair loop alone\n"
               << "  --no-retry         one attempt only, at --near-miss\n"
               << "  --no-layout        stop after Stage 4\n"
               << "  --no-trace         skip Stage 7\n"
@@ -751,6 +766,12 @@ int main(int argc, char **argv) {
         else if (a == "--no-align")                     opts.alignInIntegration = false;
         else if (a == "--no-conformal-sizing")          opts.conformalSizing = false;
         else if (a == "--no-align-fallback")            opts.alignmentFallback = false;
+        else if (a == "--no-seam-align")                opts.alignAcrossSeams = false;
+        else if (a == "--choose-by-flips")              opts.alignmentChooseByLadder = false;
+        else if (a == "--no-regularised-untangle")      opts.regularisedUntangleRings = 0;
+        else if (a == "--no-sector-reconcile")          opts.reconcileSectors = false;
+        else if (a == "--release-rounds" && i + 1 < argc) opts.alignmentReleaseRounds = std::stoi(argv[++i]);
+        else if (a == "--no-pull")                      opts.pullOntoAlignment = false;
         else if (a == "--ref" && i + 1 < argc) {
             const std::string r = argv[++i];
             if (r == "cone")           opts.reference = TORSION::Options::Reference::Cone;
@@ -776,6 +797,7 @@ int main(int argc, char **argv) {
         else if (a == "--no-interfaces")                opts.materialInterfaces = false;
         else if (a == "--no-field-interfaces")          opts.alignFieldToInterfaces = false;
         else if (a == "--no-cancel-dipoles")            opts.cancelInterfaceDipoles = false;
+        else if (a == "--no-dipole-retry")              opts.retryKeepingDipoles = false;
         else if (a == "--no-e6")                        opts.interfaceCorners = false;
         else if (a == "--no-seam-turns")                opts.seamTurnInterfaceLabels = false;
         else if (a == "--outer" && i + 1 < argc)        opts.outerSteps = std::stoi(argv[++i]);
@@ -785,8 +807,14 @@ int main(int argc, char **argv) {
         else if (a == "--align-factor" && i + 1 < argc) opts.lambdaAlignmentFactor = std::stod(argv[++i]);
         else if (a == "--seam-factor" && i + 1 < argc)  opts.lambdaSeamFactor = std::stod(argv[++i]);
         else if (a == "--no-topo")                      opts.seedTopoConstraints = false;
-        else if (a == "--no-retry")                    opts.topoNearMissRetry = 0.0;
+        else if (a == "--no-retry") {
+            opts.topoNearMissRetry = 0.0;
+            opts.topoNearMissLastRetry = 0.0;
+            opts.topoRetryUnseeded = false;
+        }
         else if (a == "--retry" && i + 1 < argc)       opts.topoNearMissRetry = std::stod(argv[++i]);
+        else if (a == "--last-retry" && i + 1 < argc)  opts.topoNearMissLastRetry = std::stod(argv[++i]);
+        else if (a == "--no-unseeded-retry")           opts.topoRetryUnseeded = false;
         else if (a == "--near-miss" && i + 1 < argc)    opts.topoNearMiss = std::stod(argv[++i]);
         else if (a == "--no-layout")                    opts.runLayout = false;
         else if (a == "--no-trace")                     opts.runSeparatrices = false;
@@ -867,8 +895,14 @@ int main(int argc, char **argv) {
     std::cout << "  " << st.interiorCones << " interior + " << st.boundaryCones
               << " boundary cone(s)";
     if (st.coneDipoleUnits > 0) std::cout << "; " << st.coneDipoleUnits << " dipole unit(s) cancelled";
+    if (st.dipolesKept) std::cout << "; the same-region pairs kept (see below)";
     std::cout << "\n";
     verdict(st.conesAdmissible, "sum I(v) = 4 chi(S), Eq. (4)");
+    if (st.dipoleRetryRan) {
+        for (const std::string &m : st.messages) {
+            if (m.rfind("Stage 1: Stage 1 cancelled", 0) == 0) warn(m.substr(9));
+        }
+    }
     if (!st.conesAdmissible) {
         stageMessages("Stage 1: ");
         heading("Result");
@@ -992,7 +1026,8 @@ int main(int argc, char **argv) {
               << "interface network -> " << fr.alignedBoundaryEdges << " boundary + "
               << fr.alignedInterfaceEdges << " interface edge(s) held; "
               << fr.alignmentOverrides << " staircase step(s) removed over "
-              << fr.alignmentSteppedChains << " chain(s)\n";
+              << fr.alignmentSteppedChains << " chain(s); " << fr.alignmentSeamCrossings
+              << " crossing(s) of G read across in the branch's own chart\n";
     std::cout << "  Left free: " << fr.alignmentClosedChains << " closed, "
               << fr.alignmentReversedChains << " that turn back on themselves, "
               << fr.alignmentAbstained << " the field is not on an axis of\n";
@@ -1064,7 +1099,7 @@ int main(int argc, char **argv) {
     }
 
     // ---------------------------------------------------------------------
-    if (st.untangleRan || pipeline.hasTutte() || st.localUntangleRan) {
+    if (st.untangleRan || pipeline.hasTutte() || st.localUntangleRan || st.pullRan) {
         heading("Stage 4R  Untangling: the local kernel pass, then Tutte (Secs. 7.2a, 7.2)");
         if (st.localUntangleRan) {
             std::cout << "  Sec. 7.2a: " << st.localUntangleFlippedFaces
@@ -1099,6 +1134,13 @@ int main(int argc, char **argv) {
                       << " of the extent" << std::defaultfloat << "\n";
             verdict(st.untangleFlippedFaces == 0,
                     "The barrier's flip cap kept every triangle positively oriented");
+        }
+        if (st.pullRan) {
+            std::cout << "  Sec. 7.2b: pulled back onto the alignment to Q3 " << std::scientific
+                      << std::setprecision(3) << st.pullBoundaryResidual << ", features "
+                      << st.pullFeatureResidual << std::defaultfloat
+                      << (st.pullProjected ? ", then projected onto it exactly\n" : "\n");
+            verdict(st.pullKept, "Sec. 7.2b: the pull kept every triangle positively oriented");
         }
         stageMessages("Stage 4R: ");
     }

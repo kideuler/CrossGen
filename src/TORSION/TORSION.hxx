@@ -187,6 +187,59 @@ class DualMBO;
 // Status::referenceConeResidual is the reference's own cone angles, read before
 // the continuation is allowed to use it. Options::reference selects among the
 // five so that the paragraphs above stay measurements rather than claims.
+//
+// ### What a multi-material model asks of Stages 3F to 4R
+//
+// On a single material the cut touches dS and nothing else. On the multi-
+// material corpus a cone inside an enclosed region has no route to dS that does
+// not cross the interface around it, concrete's 74 interior cones cross 43
+// interface vertices between them, and every place the pipeline had assumed
+// one chart, one vertex or one attempt was wrong somewhere. In the order the
+// data flows, and each behind an option so the difference stays a measurement:
+//
+//   Stage 3F  FieldFrames reads an interface branch the cut crosses in the
+//             chart each piece of it is combed in (alignAcrossSeams). Voting
+//             such a branch as one chart held the far side of every crossing on
+//             the perpendicular axis: on concrete, 29 of 58 branches, 109 edges
+//             overridden, a strain of 1.83, and the whole alignment dropped.
+//
+//   Stage 3F  It moves the field's singularities onto the cone set sector by
+//             sector and holds every pinned face through the re-smoothing
+//             (reconcileSectors). The vertex-level transport let dS absorb
+//             anything, walked paths through interface vertices, and rotated
+//             the faces the alignment reads its axes off by up to a half turn;
+//             every model that needed a transport failed but one.
+//
+//   Stage 4F  The full alignment is kept whenever Sec. 7.2a can clear what it
+//             inverted, and otherwise only the chains the tangle touches are
+//             released, a few rounds at most (alignmentReleaseRounds), before
+//             anything wholesale. Choosing on the raw flip count dropped the
+//             alignment on 20 of the 31 models for tangles of 2 to 30 faces.
+//
+//   Stage 4R  Sec. 7.2c opens the folds a one-vertex-at-a-time pass cannot: a
+//             regularised barrier untangler on every rung of the ladder, kept
+//             only if no vertex of S ends a whole turn off the angle sum Q2
+//             prescribes (regularisedUntangleRings).
+//
+//   Stage 4R  Sec. 7.2b pulls a psi_0 that lost any of the alignment back onto
+//             it under the barrier before Stage 5 seeds Gamma_topo from it
+//             (pullOntoAlignment): an unaligned psi_0 seeds constraints from
+//             separatrices the misaligned boundary sent astray, and those
+//             cannot be taken back.
+//
+//   Stage 1   Cancelling the same-region dipoles is retried the other way when
+//             it cost the alignment (retryKeepingDipoles): the pair is how the
+//             field turns through a strongly curved interface, and without it
+//             no map the field integrates to follows the curve.
+//
+//   Stage 5   The Gamma_topo retry goes one rung tighter and then to no seeding
+//             at all when the layout still leaves S partly ungridded
+//             (topoNearMissLastRetry, topoRetryUnseeded).
+//
+// Over data/meshes/multimat at defaults: layouts reaching Definition 2.1 with
+// every face four-sided went from 14 of 31 to 23, against 14 for
+// Pipeline A on the same corpus; single-material, 33 of 35 to 34.
+// docs/cf_flow_pipeline.md Sec. 14 has the model-by-model record.
 class TORSION {
 public:
     struct Options {
@@ -254,6 +307,10 @@ public:
         int diskSmoothingPasses = 300;
         bool alignFieldToInterfaces = true;
         bool cancelInterfaceDipoles = true;
+        // If cancelling cost Stage 4F the alignment, run Stages 1 to 4R again
+        // on the same field keeping the pairs, and keep that run if it keeps
+        // the alignment. See run().
+        bool retryKeepingDipoles = true;
         bool prescribeInterfaceCones = true;
         bool interfaceCorners = true;
         bool propagateInterfaceLabels = true;
@@ -296,12 +353,40 @@ public:
         // as equalities, and it takes the staircase out at the same time: the
         // axis is decided per chain and the chains end at the cones.
         bool alignInIntegration = true;
-        // If the aligned solve inverts more faces than the free one would, keep
-        // the free one. One extra factorisation, taken only when the aligned
-        // solve inverted something, and it is what makes the alignment a
-        // strictly-better-or-equal change on the flip census rather than a
-        // trade.
+        // If the aligned solve inverts something Sec. 7.2a's ladder cannot clear
+        // with the alignment held, try it on fewer chains -- the ones the
+        // tangle touches released first, then the unstepped ones, then none --
+        // and keep the first that comes out of the ladder; only if none does,
+        // the one with the fewest flips. Off keeps the full alignment whatever
+        // it inverts. See TORSION::buildPsi0() for why the choice is made on
+        // what the ladder leaves rather than on the raw flip count, which is
+        // what this did first.
         bool alignmentFallback = true;
+        // Decide among those attempts by what the ladder leaves of each, the
+        // first it clears winning. Off is the rule this had first, the fewest
+        // raw flips, which dropped the alignment on 20 of the 31 multi-material
+        // models for tangles of 2 to 30 faces.
+        bool alignmentChooseByLadder = true;
+        // Before falling back to the alignment on fewer chains or on none, let
+        // go of only the chains the tangle touches and solve again, this many
+        // times. Zero is the old three-way fallback. See TORSION::run().
+        int alignmentReleaseRounds = 4;
+        // Sec. 7.2b: when the psi_0 Stage 4R hands on has lost any of the
+        // alignment, pull it back on under the barrier before Stage 5 seeds
+        // from it. See pullOntoAlignment() in TORSION.cxx for why this is
+        // Stage 5's problem and not Stage 6's.
+        bool pullOntoAlignment = true;
+        int pullOuterSteps = 6;
+        // Read an interface branch the cutting graph crosses in the chart each
+        // piece of it is combed in. See FieldFrames::Options::alignAcrossSeams:
+        // off votes such a branch as one chart and holds the far side of every
+        // crossing on the wrong axis.
+        bool alignAcrossSeams = true;
+        // Move the field's singularities onto Stage 1's cone set sector by
+        // sector on dS and on the interface network, by paths that keep off
+        // both, and hold the pinned faces through the re-smoothing. See
+        // FieldFrames::Options::reconcileSectors.
+        bool reconcileSectors = true;
 
         // --- Stage 4F: the integration -------------------------------------
         double integrationRegularisation = 1e-10;
@@ -319,20 +404,27 @@ public:
         // then has to rebuild. See relaxToKernel() in TORSION.cxx.
         bool localUntangle = true;
         int localUntangleSweeps = 32;
+        // Sec. 7.2c after Sec. 7.2a on every rung: the regularised untangler,
+        // over this many rings round the tangle and at most this many
+        // iterations of its eps schedule. Zero rings switches it off.
+        int regularisedUntangleRings = 3;
+        int regularisedUntangleIterations = 60;
+        // The ladder is not climbed for a tangle of more than this fraction of
+        // the faces, or this many, whichever is larger: such a tangle is not
+        // local, and the attempt goes straight to Sec. 6.4's chain releases.
+        double localUntangleFaceFraction = 0.02;
+        int localUntangleFaceFloor = 200;
         // Let a seam vertex move at rungs 0 and 1 of that ladder, with its
         // partner moving under R_k so that Q4 is unchanged. See
         // TORSION::seamPairing().
         //
-        // **Off, and measured.** The construction is right and the extra
-        // freedom is real, and on this corpus it buys nothing: the tangles that
-        // survive rung 0 are not tangles one paired displacement can undo --
-        // rungs 0 and 1 clear the same one model with it as without -- and the
-        // trajectory it takes at rung 2 leaves the seam far enough out that
-        // Sec. 6.5's projection stops being able to put it back, which costs
-        // multimat/geom002 its layout. Kept behind a flag because the argument
-        // for it does not go away with the measurement: on a model whose tangle
-        // straddles the cut rather than sitting beside it, this is the freedom
-        // that pass needs.
+        // Off. It was measured once as buying nothing, and that measurement
+        // was of a no-op: vertexFreedom() held every seam child at rungs 0 and
+        // 1 whatever the pairing said, so relaxToKernel() never moved a pair.
+        // It now frees the paired children the way Sec. 7.2c's regularised
+        // pass does (which pairs the seam unconditionally, and is where the
+        // freedom mattered: a fold round the tip of a slit). For the kernel pass
+        // it is unmeasured since, and left off.
         bool pairSeamInUntangle = false;
         // Outer steps of the target-fitting continuation, and the weight on E4
         // relative to E1 at the first of them. mu grows by lambdaGrowth per
@@ -422,6 +514,12 @@ public:
         // pipeline seeds Gamma_topo with the same code and inherits the same
         // asymmetry, that a constraint can be added and never taken back.
         double topoNearMissRetry = 0.04;
+        // Two more rungs of the same retry, each run only while the best
+        // layout so far still leaves part of S without a grid: a tighter
+        // tolerance still, and then no seeding at all, the repair loop alone.
+        // See TORSION::run(). Zero, and false, stop at MERIDIAN's two rungs.
+        double topoNearMissLastRetry = 0.01;
+        bool topoRetryUnseeded = true;
         bool seedSelfReturns = true;
         bool seedAllConnections = true;
 
@@ -484,6 +582,10 @@ public:
         bool externalFieldUsed = false;
         bool fieldAlignedToInterfaces = false;
         int coneDipoleUnits = 0;
+        // run()'s second attempt without the cancellation: whether it ran, and
+        // whether its cone set -- the pairs kept -- is the one that stands.
+        bool dipoleRetryRan = false;
+        bool dipolesKept = false;
 
         int materials = 1;
         int interfaceEdges = 0;
@@ -531,6 +633,7 @@ public:
         int alignedBoundaryEdges = 0;
         int alignedInterfaceEdges = 0;
         int alignmentOverrides = 0;
+        int alignmentSeamCrossings = 0;
         int alignmentClosedChains = 0;
         double maxAlignmentResidual = 0.0;
 
@@ -541,6 +644,10 @@ public:
         double integrationAlignResidual = 0.0;
         double integrationAlignStrain = 0.0;
         bool alignmentWasDropped = false;
+        int alignmentChainsReleased = 0;
+        // Whether the map Stage 4R handed on held the whole of Sec. 6.4's
+        // alignment exactly, before Sec. 7.2b had anything to pull back.
+        bool alignmentHeld = true;
         double integrationSeamResidual = 0.0;
         int integrationFlippedFaces = 0;
         double integrationFlippedAreaFraction = 0.0;
@@ -565,6 +672,13 @@ public:
         bool reprojectionRan = false;
         bool reprojectionKept = false;
         int reprojectionFlippedFaces = 0;
+        // Sec. 7.2b: whether the pull ran, came back injective, and ended on
+        // the exact alignment (projected) or only near it (penalised).
+        bool pullRan = false;
+        bool pullKept = false;
+        bool pullProjected = false;
+        double pullBoundaryResidual = 0.0;
+        double pullFeatureResidual = 0.0;
 
         // --- Stage 4: psi_0 ------------------------------------------------
         bool immersionValid = false;
@@ -790,6 +904,61 @@ public:
                              const std::vector<int> &partner,
                              const std::vector<int> &partnerK, int sweeps);
 
+    // Sec. 7.2c: the fold relaxToKernel() cannot open -- a run of triangles
+    // turned over together, typically round a cone whose fan the frame asked
+    // for the wrong total angle -- opened by minimising Garanzha et al.'s
+    // regularised barrier energy over the vertices within `rings` rings of it,
+    // within `freedom`. `target` is the frame, read for its scale only. Returns
+    // the number of faces still inverted; the map is changed only if that
+    // number went down. See TORSION.cxx.
+    // `cutToOriginal` is ConeCut::getCutVertexToOriginal() and
+    // `prescribedAngle` Q2's angle sum per vertex of S (2 pi - (pi/2) I inside,
+    // pi - (pi/2) I on dS), for the one check the result has to pass: that no
+    // vertex of S -- a seam vertex included, whose star is split between two
+    // children -- is a whole turn off it. Either may be empty, and then only
+    // the interior vertices of Omega are held to one turn.
+    //
+    // `partner`/`partnerK` pair the two children of each seam vertex the way
+    // relaxToKernel() reads them: the pair moves together, one child by d and
+    // the other by R_k d, which keeps Q4 exact while the fold round a slit's
+    // tip opens. Either may be empty.
+    static int untangleRegularised(const Mesh &om, std::vector<Point> &uv,
+                                   const std::vector<unsigned char> &freedom,
+                                   const std::vector<int> &partner,
+                                   const std::vector<int> &partnerK,
+                                   const std::vector<std::array<double, 4>> &target,
+                                   const std::vector<int> &cutToOriginal,
+                                   const std::vector<double> &prescribedAngle,
+                                   int rings, int maxIterations);
+
+    // --- Stages 4F and 4R as one step, public for the same reason ---------
+    //
+    // What buildPsi0() reads, and what it hands back. The references are the
+    // caller's and must outlive the call; interfaces and coneMetric may be null
+    // (a single material; no cone metric was built).
+    struct MapStage {
+        const Mesh &mesh;                     // S
+        const ConeCut &cut;
+        const ConeSingularities &cones;
+        const FieldFrames &frames;
+        const Immersion &scaffold;            // the seam pairing, as run() builds it
+        const Interfaces *interfaces;
+        const ConeMetric *coneMetric;
+    };
+    struct Psi0 {
+        std::unique_ptr<FieldIntegration> integration;   // the solve that was kept
+        std::unique_ptr<TutteEmbedding> tutte;           // only if Sec. 7.2 ran
+        std::vector<int> usedAxis;                       // the alignment it holds
+        std::vector<Point> integratedMap;                // as the solve left it
+        std::vector<Point> psi0;                         // what Stage 4 is handed
+    };
+    // Sec. 6.4's attempts, Sec. 7.2a-c's ladder, Sec. 7.2's Tutte pass and Sec.
+    // 7.2b's pull, in run()'s order and under `options`; the Stage 4F and 4R
+    // fields of `status` and its messages are written as run() writes them.
+    // False when there is no psi_0 to hand on.
+    static bool buildPsi0(const MapStage &in, const Options &options, Status &status,
+                          Psi0 &out);
+
     // The mesh the layout was computed on. With Options::diskTemplates this is
     // the *excised* mesh; getInputMesh() is what came in. See MERIDIAN.
     const Mesh& getMesh() const { return *mesh; }
@@ -803,18 +972,38 @@ private:
     void exciseDisks();
     // Stages 5 to 8 at one Gamma_topo seeding tolerance. False when a stage
     // stopped the pipeline, in which case there is nothing to retry.
-    bool runLayoutStages(double nearMiss);
-    // Stages 0b, 0, 1 and 2, which are MERIDIAN's unchanged. Returns false when
-    // the cone set is inadmissible or the cut is not a disk, which are the two
-    // things every route downstream depends on.
-    bool runFront();
+    // `seed` is whether Gamma_topo is seeded from psi_0 at all; the repair
+    // loop runs whenever Options::seedTopoConstraints is on, seeded or not.
+    bool runLayoutStages(double nearMiss, bool seed);
+    // Stages 0c, 0b and 0, which are MERIDIAN's unchanged and run once.
+    void runFieldFront();
+    // Stages 1 and 2 on that field, MERIDIAN's unchanged but for whether the
+    // same-region dipoles are cancelled. Returns false when the cone set is
+    // inadmissible or the cut is not a disk, which are the two things every
+    // route downstream depends on.
+    bool runConeFront(bool cancelDipoles);
+    // Stages 4C, 3F, 4F and 4R, from the cone set to psi0Map. False at the
+    // stops no later stage survives.
+    bool runMapStages();
     // The two children of each seam vertex of Omega and the quarter turn
     // between their displacements, so that Sec. 7.2a can move a tangle sitting
     // on the seam without letting go of Q4. See TORSION.cxx.
-    void seamPairing(std::vector<int> &mate, std::vector<int> &turn) const;
-    // Stage 4R. Takes the frames and returns an untangled map, or an empty
-    // vector when it could not.
-    std::vector<Point> untangle();
+    static void seamPairing(const ConeCut &cut, const Immersion &scaffold,
+                            std::vector<int> &mate, std::vector<int> &turn);
+    // Sec. 7.2, the Tutte pass. Takes out.integratedMap for its reference and
+    // returns an untangled map, or an empty vector when it could not; leaves the
+    // embedding in out.tutte.
+    static std::vector<Point> untangle(const MapStage &in, const Options &options,
+                                       Status &status, Psi0 &out);
+    // Sec. 7.2b. Pull an injective map that lost some of Sec. 6.4's alignment
+    // back onto it -- labels read off `labelMap`, the solve that held all of
+    // it -- under the barrier, and project onto the exact alignment `axis`
+    // when that inverts nothing. Empty when there was nothing to pull.
+    static std::vector<Point> pullOntoAlignment(const MapStage &in, const Options &options,
+                                                Status &status,
+                                                const std::vector<Point> &start,
+                                                const std::vector<Point> &labelMap,
+                                                const std::vector<int> &axis);
 
     std::shared_ptr<Mesh> mesh;
     // What run() was handed, kept only when Stage 0c replaced it.
@@ -849,6 +1038,8 @@ private:
     // set Sec. 5.1's audit is run against.
     std::vector<int> fieldIndex;
     std::vector<Point> integratedMap;
+    // psi_0 as Stage 4R hands it to the Immersion.
+    std::vector<Point> psi0Map;
     // The alignment Stage 4F actually used, after its fallback chose among the
     // three. Sec. 6.5's re-projection has to hold the same one.
     std::vector<int> usedAxis;

@@ -12,3 +12,7 @@ pkg/*
 .claude/*
 *.vtu
 docs/*
+*.png
+*.csv
+*.pt
+*.jsonl

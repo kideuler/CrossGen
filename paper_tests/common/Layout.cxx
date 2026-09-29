@@ -43,6 +43,15 @@ void applyOverrides(TORSION::Options &t, const std::vector<std::pair<std::string
         if      (key == "targetEdge")               t.targetEdge = val;
         else if (key == "conformalSizing")          t.conformalSizing = bv;
         else if (key == "alignInIntegration")       t.alignInIntegration = bv;
+        else if (key == "alignAcrossSeams")         t.alignAcrossSeams = bv;
+        else if (key == "alignmentChooseByLadder")  t.alignmentChooseByLadder = bv;
+        else if (key == "reconcileSectors")         t.reconcileSectors = bv;
+        else if (key == "alignmentReleaseRounds")   t.alignmentReleaseRounds = iv;
+        else if (key == "pullOntoAlignment")        t.pullOntoAlignment = bv;
+        else if (key == "regularisedUntangleRings") t.regularisedUntangleRings = iv;
+        else if (key == "retryKeepingDipoles")      t.retryKeepingDipoles = bv;
+        else if (key == "topoNearMissLastRetry")    t.topoNearMissLastRetry = val;
+        else if (key == "topoRetryUnseeded")        t.topoRetryUnseeded = bv;
         else if (key == "untangle")                 t.untangle = bv;
         else if (key == "localUntangle")            t.localUntangle = bv;
         else if (key == "lambdaInit")               t.lambdaInit = val;

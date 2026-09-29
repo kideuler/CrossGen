@@ -6,7 +6,35 @@ supplement can be built from; each exits non-zero if a check it makes fails, so
 they double as regression tests. E6 (the Laghos bubble run) lives outside this
 repository and is not here.
 
-## 2026-09-03 (latest): the mechanism set, `data/meshes/mechanism/`
+## 2026-09-28 (latest): E4 and E5 layouts go through a changed TORSION
+
+`paper::runLayout` hands every field to `TORSION`, and Stages 1 to 5 of it
+changed for the multi-material corpus (`docs/cf_flow_pipeline.md` Sec. 14):
+the Sec. 6.4 alignment is read across the cut in each chart, the field's
+singularities are moved onto the cone set by sector with the pinned faces held,
+Stage 4F keeps the alignment whenever the local untangling can clear what it
+inverted and otherwise releases only the chains the tangle touches, a
+regularised untangler opens folds the kernel pass cannot, an unaligned psi_0 is
+pulled back onto the alignment before Stage 5 seeds from it, dipole
+cancellation is retried the other way when it costs the alignment, and the
+Gamma_topo retry goes on to 0.01 and then to no seeding. Over the 31 multi-
+material models, pipeline-own fields, the count of layouts reaching Definition
+2.1 with every face four-sided went from 14 to 23 (MERIDIAN: 14);
+single-material, 33 of 35 to 34.
+
+**Nothing in `results/` was re-run.** E4 and E5 numbers from before this date
+were produced without these changes, and the next run of either will differ.
+Every change has a switch, so the earlier behaviour is one set of overrides:
+
+```
+--layout-opt alignAcrossSeams=0 --layout-opt reconcileSectors=0 \
+--layout-opt alignmentChooseByLadder=0 --layout-opt alignmentReleaseRounds=0 \
+--layout-opt regularisedUntangleRings=0 --layout-opt pullOntoAlignment=0 \
+--layout-opt retryKeepingDipoles=0 --layout-opt topoNearMissLastRetry=0 \
+--layout-opt topoRetryUnseeded=0
+```
+
+## 2026-09-03: the mechanism set, `data/meshes/mechanism/`
 
 Eleven domains built to test *where the two discretisations must differ*, built
 by `MakeDomains` from `paper::mechanismDomains` and written as `.obj` so every
