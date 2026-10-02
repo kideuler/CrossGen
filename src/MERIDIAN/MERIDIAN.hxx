@@ -274,6 +274,17 @@ public:
         bool autoRebalance = true;   // restore Eq. (4) by moving boundary cones
         int minBoundaryIndex = -3;
         int maxBoundaryIndex = 1;
+        // Move every +1 cone off dS where dS runs straight (more than
+        // flatConeAngle across the vertex, in radians): to the convex corner at
+        // the end of its side when that one has room, otherwise inside. Off,
+        // such a cone is a patch corner of pi on the model, which Stage 10
+        // meshes as one element with a node in the middle of a side. See
+        // ConeSingularities::relocateFlatCones.
+        bool relocateFlatCones = true;
+        double flatConeAngle = 5.0 * M_PI / 6.0;
+        // When the layout that came of that move is not valid, run Stages 1 to
+        // 11 again with the cones left where they were and keep the better.
+        bool keepFlatConesOnFailure = true;
 
         // Stage 2. Where a cone's arc of the cutting graph is allowed to
         // stop: dS itself, or (false) the nearest thing already cut, which is
@@ -404,6 +415,12 @@ public:
         bool quadUseSplines = true;
         // See QuadMesh::Options::featuresOnTracedArcs.
         bool quadFeaturesOnTracedArcs = true;
+        // QuadMesh::Options::materialsFromFaces and contractOntoFeatures: an
+        // element's material from its layout face, and a contracted run of
+        // nodes placed on dS or the interface. Off restores Stage 10 as it was
+        // before 2026-10-01.
+        bool quadMaterialsFromFaces = true;
+        bool quadContractOntoFeatures = true;
         // Winslow sweeps over the interior of each block, the boundary held.
         // Zero leaves the transfinite grid alone. See QuadMesh::smooth().
         int quadSmoothingPasses = 500;
@@ -456,6 +473,13 @@ public:
         bool fieldAlignedToInterfaces = false;
         // Index units cancelDipoles() annihilated, Stage 1.
         int coneDipoleUnits = 0;
+        // Stage 1's +1 cones taken off straight dS (Options::relocateFlatCones):
+        // to a corner further along the side, and inside.
+        int flatConesToCorners = 0;
+        int flatConesInside = 0;
+        // Whether that move's layout was not valid and the one with the +1s left
+        // in place is what stands (Options::keepFlatConesOnFailure).
+        bool flatConesKept = false;
         // Stage 0c: circular inclusions found, and the triangles they took out
         // of the layout problem with them.
         int diskInclusions = 0;
@@ -718,6 +742,10 @@ private:
     // Stages 5 to 8 at one Gamma_topo seeding tolerance. False when a stage
     // stopped the pipeline, in which case there is nothing to retry.
     bool runLayoutStages(double nearMiss);
+    // Stages 1 to 11, on the field and the interface network run() built;
+    // what run() returns. run() calls it a second time with Stage 1's flat +1s
+    // left in place when the first moved some and did not come out valid.
+    bool runFromCones(size_t balanceMessagesSeen);
 
     std::shared_ptr<Mesh> mesh;
     // What run() was handed, kept only when Stage 0c replaced it.

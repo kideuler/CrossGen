@@ -96,6 +96,28 @@ Arrangement::Arrangement(const Separatrices &separatrices, const SubdomainLabels
 }
 
 // ---------------------------------------------------------------------------
+// The assembling constructor. See the header: the pieces arrive glued and
+// classified, so what is left is what every arrangement ends with -- the
+// patches, their areas, and check().
+// ---------------------------------------------------------------------------
+Arrangement::Arrangement(const Mesh &mesh, Assembly parts, const Options &opts)
+    : orig(&mesh), options(opts) {
+    measureDomain();
+    nodes = std::move(parts.nodes);
+    arcs = std::move(parts.arcs);
+    halves = std::move(parts.halves);
+    faces = std::move(parts.faces);
+    if (halves.size() != 2 * arcs.size()) {
+        throw std::runtime_error("Arrangement: an assembly needs exactly two half-edges per arc");
+    }
+    collectPatches();
+    for (int f : patches) {
+        if (faces[f].mixed) ++report.mixedPatches;
+    }
+    check();
+}
+
+// ---------------------------------------------------------------------------
 // buildDomain()
 //
 // The parts of S the arrangement is built against: how big it is, how its
@@ -103,8 +125,7 @@ Arrangement::Arrangement(const Separatrices &separatrices, const SubdomainLabels
 // left. That last one is what separates a patch from a hole later on without
 // any point-in-polygon test -- see the class comment.
 // ---------------------------------------------------------------------------
-void Arrangement::buildDomain() {
-    const int nV = static_cast<int>(orig->vertices.size());
+void Arrangement::measureDomain() {
     const int nF = static_cast<int>(orig->triangles.size());
 
     Point lo{std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity()};
@@ -124,6 +145,11 @@ void Arrangement::buildDomain() {
         report.domainArea += std::fabs(0.5 * cross2(orig->vertices[t[1]] - orig->vertices[t[0]],
                                                     orig->vertices[t[2]] - orig->vertices[t[0]]));
     }
+}
+
+void Arrangement::buildDomain() {
+    const int nV = static_cast<int>(orig->vertices.size());
+    measureDomain();
 
     vertexNode.assign(nV, -1);
     fanBuilt.assign(nV, 0);
@@ -1476,7 +1502,11 @@ void Arrangement::classifyFaces() {
                     fc.sides[0].size() == 1 && fc.sides[1].size() == 1 &&
                     fc.sides[2].size() == 1 && fc.sides[3].size() == 1;
     }
+    collectPatches();
+}
 
+void Arrangement::collectPatches() {
+    patches.clear();
     report.minPatchArea = std::numeric_limits<double>::infinity();
     for (size_t f = 0; f < faces.size(); ++f) {
         const Face &fc = faces[f];

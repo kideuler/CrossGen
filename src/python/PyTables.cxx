@@ -63,6 +63,20 @@ const Table<mesh::TMOP::Report> &tmopReportTable() {
     return t;
 }
 
+const Table<mesh::Pillow::Report> &pillowReportTable() {
+    using O = mesh::Pillow::Report;
+    static const Table<O> t{
+        REP(ran),                     REP(defectsBefore),           REP(defectsAfter),
+        REP(flattestBefore),          REP(flattestAfter),           REP(layers),
+        REP(closedLayers),            REP(skipped),                 REP(layerQuads),
+        REP(splitQuads),              REP(featureSplits),           REP(quadsBefore),
+        REP(quadsAfter),              REP(verticesBefore),          REP(verticesAfter),
+        REP(minScaledJacobianBefore), REP(minScaledJacobianAfter),  REP(invertedBefore),
+        REP(invertedAfter),           REP(messages),
+    };
+    return t;
+}
+
 const Table<BlockQuadMesh::Options> &blockQuadMeshOptionsTable() {
     using O = BlockQuadMesh::Options;
     static const Table<O> t{
@@ -171,9 +185,14 @@ PyObject *meshingDefaults(double h, std::initializer_list<Source> sources) {
     return keyedDict("h", PyFloat_FromDouble(h), sources);
 }
 
-PyObject *smoothingDefaults(const mesh::TMOP::Options &defaults) {
-    return keyedDict("niters", PyLong_FromLong(defaults.maxSweeps),
-                     {source(tmopOptionsTable(), defaults)});
+PyObject *smoothingDefaults(const mesh::TMOP::Options &defaults, bool pillow) {
+    PyObject *d = keyedDict("niters", PyLong_FromLong(defaults.maxSweeps),
+                            {source(tmopOptionsTable(), defaults)});
+    if (d && PyDict_SetItemString(d, "pillow", pillow ? Py_True : Py_False) < 0) {
+        Py_DECREF(d);
+        return nullptr;
+    }
+    return d;
 }
 
 void buildSharedTables() {
@@ -181,6 +200,7 @@ void buildSharedTables() {
     qualityTable();
     tmopOptionsTable();
     tmopReportTable();
+    pillowReportTable();
     blockQuadMeshOptionsTable();
     blockQuadMeshReportTable();
     shapeDNAOptionsTable();

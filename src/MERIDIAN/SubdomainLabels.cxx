@@ -909,6 +909,8 @@ Separatrices::Options SubdomainLabels::seedTracerOptions(const std::vector<Point
     // difference shows up two stages later as a separatrix with no constraint
     // behind it.
     if (itf) so.extraEmitters = itf->emitterNodes();
+    so.extraEmitters.insert(so.extraEmitters.end(), options.extraEmitters.begin(),
+                            options.extraEmitters.end());
     so.coneSnapTolerance = tol / extent;
     so.coneSnapRings = (meanEdge > 0.0)
         ? std::max(2, std::min(32, static_cast<int>(std::ceil(tol / meanEdge)) + 1))

@@ -29,6 +29,7 @@
 #include "dualmbo/DualMBO.hxx"
 #include "mesh/QuadMesh.hxx"
 #include "mesh/TMOP.hxx"
+#include "mesh/Pillow.hxx"
 #include "TestHelper.hxx"
 
 namespace {
@@ -285,6 +286,8 @@ void usage(const char *argv0) {
               << "  --newton <n>       max Newton iterations         (default 100)\n"
               << "  --no-flips         disable weighted-Delaunay flipping\n"
               << "  --no-rebalance     do not repair Eq. (4) automatically\n"
+              << "  --keep-flat-cones  leave a +1 cone where Stage 1 put it on straight dS\n"
+              << "                     (a patch corner of pi; Stage 1 before 2026-10-02)\n"
               << "  --cut-to-graph     cone cuts may stop on an earlier cut, not only dS\n"
               << "  --cut-through-interfaces  route the cutting graph as if the material\n"
               << "                     interfaces were not there (Stage 2 before it knew)\n"
@@ -368,6 +371,10 @@ void usage(const char *argv0) {
               << "  --collapse-span <f>  contract a chord whose every patch is thinner\n"
               << "                     than this times the target             (default 0.5)\n"
               << "  --no-collapse      keep every chord, however thin its patches\n"
+              << "  --sample-materials give each element the material its samples find, not\n"
+              << "                     its layout face's (Stage 10 before 2026-10-01)\n"
+              << "  --contract-at-root place a contracted run of nodes where the union-find\n"
+              << "                     left its root, on dS or an interface or not\n"
               << "  --min-edges <n>    fewest edges per chord               (default 1)\n"
               << "  --max-edges <n>    most edges per chord, 0 = no cap     (default 0)\n"
               << "  --polyline-mesh    mesh the traced arcs, not the spline fits\n"
@@ -377,6 +384,10 @@ void usage(const char *argv0) {
               << "  --tmop <n>         smooth the final mesh with n TMOP sweeps, 0 = off\n"
               << "  --tmop-power <p>   TMOP exponent: 1 optimises the average, 2 (default)\n"
               << "                     and up chase the worst element\n"
+              << "  --tmop-gauss       sample TMOP at the 2x2 Gauss points, not the element\n"
+              << "                     corners (Stage 12 before 2026-10-02)\n"
+              << "  --no-pillow        TMOP straight away, without first pillowing the feature\n"
+              << "                     corners an element spans flat (Stage 12 before 2026-10-02)\n"
               << "  --pin-features     TMOP pins every feature node instead of sliding\n"
               << "  --mesh <file.obj>  write the quadrilateral mesh\n"
               << "  --mesh-vtu <f.vtu> write it as a VTK unstructured grid\n"
@@ -395,6 +406,8 @@ int main(int argc, char **argv) {
     std::string arcsOut, facesOut, fitOut, netOut, surfOut, meshOut, meshVTUOut, mfemOut;
     std::string stepOut, brepOut;
     int tmopSweeps = 0;
+    bool tmopGauss = false;
+    bool tmopPillow = true;
     double tmopPower = 2.0;
     bool tmopPinFeatures = false;
     int coneListLimit = 20;
@@ -411,6 +424,7 @@ int main(int argc, char **argv) {
         else if (a == "--newton" && i + 1 < argc)  opts.ricciMaxIterations = std::stoi(argv[++i]);
         else if (a == "--no-flips")                opts.delaunayFlips = false;
         else if (a == "--no-rebalance")            opts.autoRebalance = false;
+        else if (a == "--keep-flat-cones")         opts.relocateFlatCones = false;
         else if (a == "--cut-to-graph")            opts.coneCutsToBoundary = false;
         else if (a == "--cut-through-interfaces")  opts.coneCutInterfaceAvoidance = 0.0;
         else if (a == "--cut" && i + 1 < argc)     cutOut = argv[++i];
@@ -486,6 +500,8 @@ int main(int argc, char **argv) {
         else if (a == "--target" && i + 1 < argc)  opts.quadTargetEdge = std::stod(argv[++i]);
         else if (a == "--collapse-span" && i+1 < argc) opts.quadCollapseSpan = std::stod(argv[++i]);
         else if (a == "--no-collapse")             opts.quadCollapseSpan = 0.0;
+        else if (a == "--sample-materials")        opts.quadMaterialsFromFaces = false;
+        else if (a == "--contract-at-root")        opts.quadContractOntoFeatures = false;
         else if (a == "--min-edges" && i + 1 < argc) opts.quadMinIntervals = std::stoi(argv[++i]);
         else if (a == "--max-edges" && i + 1 < argc) opts.quadMaxIntervals = std::stoi(argv[++i]);
         else if (a == "--polyline-mesh")           opts.quadUseSplines = false;
@@ -493,6 +509,8 @@ int main(int argc, char **argv) {
         else if (a == "--smooth-below" && i + 1 < argc) opts.quadSmoothingThreshold = std::stod(argv[++i]);
         else if (a == "--chords" && i + 1 < argc)  chordListLimit = std::stoi(argv[++i]);
         else if (a == "--tmop" && i + 1 < argc)    tmopSweeps = std::stoi(argv[++i]);
+        else if (a == "--tmop-gauss")              tmopGauss = true;
+        else if (a == "--no-pillow")               tmopPillow = false;
         else if (a == "--tmop-power" && i + 1 < argc) tmopPower = std::stod(argv[++i]);
         else if (a == "--pin-features")            tmopPinFeatures = true;
         else if (a == "--mesh" && i + 1 < argc)    meshOut = argv[++i];
@@ -1633,6 +1651,40 @@ int main(int argc, char **argv) {
     }
 
     // ---------------------------------------------------------------------
+    // Stage 12 starts with a pillow. A block corner the layout put on a
+    // straight stretch of dS or of an interface is one element spanning 180
+    // degrees at a feature node, and no move TMOP is allowed changes that
+    // angle: the node is fixed, or slides along the very line both sides lie
+    // on. One layer of quads along that stretch gives the node two elements
+    // and moves the corner half an element inside, where TMOP can move it in
+    // both directions. src/mesh/Pillow.hxx says why it is a whole layer.
+    if (tmopSweeps > 0 && tmopPillow) {
+        heading("Stage 12  Pillowing flat feature corners (mesh::Pillow)");
+        mesh::Pillow pillow(finalMesh);
+        pillow.run();
+        const mesh::Pillow::Report &pr = pillow.getReport();
+        std::cout << "  " << pr.defectsBefore << " element corner(s) with both sides on a feature, "
+                  << "opening past " << pillow.getOptions().flatAngle << " degrees";
+        if (pr.defectsBefore > 0)
+            std::cout << " (the flattest " << std::fixed << std::setprecision(1)
+                      << pr.flattestBefore << std::defaultfloat << ")";
+        std::cout << "\n";
+        if (pr.layers > 0) {
+            std::cout << "  " << pr.layers << " layer(s)";
+            if (pr.closedLayers > 0) std::cout << ", " << pr.closedLayers << " round a closed loop";
+            std::cout << ": " << pr.layerQuads << " quad(s) along the features, " << pr.splitQuads
+                      << " split carrying the layers' chords on to dS; " << pr.quadsBefore
+                      << " -> " << pr.quadsAfter << " quadrilateral(s)\n";
+            std::cout << "  Scaled Jacobian before smoothing: worst " << std::fixed
+                      << std::setprecision(4) << pr.minScaledJacobianBefore << " -> "
+                      << pr.minScaledJacobianAfter << std::defaultfloat << "\n";
+        }
+        for (const std::string &m : pr.messages) std::cout << "  " << kWarn << " " << m << "\n";
+        verdict(pr.defectsAfter == 0,
+                "No element spans a flat corner with both of its sides on a feature");
+    }
+
+    // ---------------------------------------------------------------------
     // Stage 12 -- TMOP. Node-local Newton on the TMOP energy over the mesh
     // above, with the boundary and the material interfaces free to slide along
     // themselves. Everything written below this point is the smoothed mesh, so
@@ -1644,6 +1696,9 @@ int main(int argc, char **argv) {
         topt.metric = mesh::TMOP::ShapeSize007;
         topt.maxSweeps = tmopSweeps;
         topt.exponent = tmopPower;
+        // Sampled at the corners, as the viewer's Stage 12: at the 2x2 Gauss
+        // points a corner can fold without the barrier seeing it.
+        topt.quadrature = tmopGauss ? mesh::TMOP::Gauss2x2 : mesh::TMOP::Corners;
         mesh::TMOP smoother(finalMesh, topt);
         tmopOK = smoother.run();
         const mesh::TMOP::Report &tr2 = smoother.getReport();

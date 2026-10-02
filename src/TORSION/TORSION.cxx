@@ -1,6 +1,7 @@
 #include "TORSION.hxx"
 
 #include "TORSION/ConeMetric.hxx"
+#include "TORSION/MaterialLayout.hxx"
 
 #include <algorithm>
 #include <array>
@@ -852,34 +853,85 @@ TORSION::TORSION(std::shared_ptr<Mesh> m, const Options &opts)
 TORSION::~TORSION() = default;
 
 // ---------------------------------------------------------------------------
+// prepareFieldLevel(), fieldTauLadder(), fieldLevelCap(), fieldLevelConverged()
+//
+// One level of Stage 0's tau-continuation: a fresh operator at this tau, with
+// the same Dirichlet data, started from the field the previous level left. See
+// the header for why these are static.
+// ---------------------------------------------------------------------------
+bool TORSION::prepareFieldLevel(DualMBO &f, const Interfaces *interfaces, const Options &options,
+                                double tauScale, const Eigen::VectorXcd &carried) {
+    f.setPenaltyWeight(options.dualMBOWeight);
+    f.setTauScale(tauScale);
+    // On a multi-material domain the interfaces are Dirichlet data for the
+    // field in exactly the way dS is, and that matters more here than in
+    // Pipeline A rather than less: this pipeline integrates the field, so an
+    // interface the field ran straight through is an interface the *map*
+    // runs straight through. See DualMBO::setAlignedInteriorEdges for why
+    // the hard pin and not a penalty.
+    const bool aligned =
+        interfaces && interfaces->multiMaterial() && options.alignFieldToInterfaces;
+    if (aligned) f.setAlignedInteriorEdges(interfaces->interfaceEdges());
+    f.initialize();
+    // The constraint does not travel with the field: every level re-imposes
+    // the Dirichlet data its own assembly computed, and only the free
+    // triangles are carried.
+    if (carried.size() == f.u_k_prev.size()) {
+        Eigen::VectorXcd start = carried;
+        for (const auto &[ti, bc] : f.getBoundaryData()) start[ti] = bc;
+        f.u_k_prev = start;
+        f.u_k = start;
+    }
+    return aligned;
+}
+
+// The ladder of tau scales, largest first. The first entry is always 1 -- the
+// heuristic's tau -- so the continuation starts from the field the single-tau
+// scheme would have returned and only ever refines it. Its floor is read off
+// the assembled operator, so it cannot be known until level 0 has been built.
+std::vector<double> TORSION::fieldTauLadder(const Mesh &mesh, const DualMBO &level0,
+                                            const Options &options) {
+    std::vector<double> ladder{1.0};
+    if (options.dualMBOTauContinuation && options.dualMBOTauRatio > 0.0 &&
+        options.dualMBOTauRatio < 1.0) {
+        double mnx = 1e300, mxx = -1e300, mny = 1e300, mxy = -1e300;
+        for (const Point &p : mesh.vertices) {
+            mnx = std::min(mnx, p[0]); mxx = std::max(mxx, p[0]);
+            mny = std::min(mny, p[1]); mxy = std::max(mxy, p[1]);
+        }
+        const double D = std::hypot(mxx - mnx, mxy - mny);
+        const double rate = level0.medianDiffusionRate();
+        if (D > 0.0 && rate > 0.0) {
+            const double tau0 = D * D / 10.0;
+            const double c = options.dualMBOTauFloorEdges;
+            const double tauMin = c * c / rate;
+            double tau = tau0;
+            while (tau * options.dualMBOTauRatio > tauMin && ladder.size() < 40) {
+                tau *= options.dualMBOTauRatio;
+                ladder.push_back(ladder.back() * options.dualMBOTauRatio);
+            }
+        }
+    }
+    return ladder;
+}
+
+int TORSION::fieldLevelCap(const Options &options, std::size_t levels) {
+    return (levels <= 1) ? options.dualMBOMaxSteps
+                         : std::min(options.dualMBOMaxSteps, options.dualMBOTauLevelSteps);
+}
+
+bool TORSION::fieldLevelConverged(const DualMBO &field) {
+    return field.error < 2.0 * static_cast<double>(field.getMesh().triangles.size()) * 1e-5;
+}
+
+// ---------------------------------------------------------------------------
 // runField()  --  Stage 0, MERIDIAN's unchanged
 // ---------------------------------------------------------------------------
 void TORSION::runField() {
-    // One level of the tau-continuation: a fresh operator at this tau, with the
-    // same Dirichlet data, started from the field the previous level left.
     auto buildLevel = [&](double tauScale, const Eigen::VectorXcd &carried) {
         auto f = std::make_unique<DualMBO>(mesh, options.dualMBOMaxSteps, options.dualMBOGamma);
-        f->setPenaltyWeight(options.dualMBOWeight);
-        f->setTauScale(tauScale);
-        // On a multi-material domain the interfaces are Dirichlet data for the
-        // field in exactly the way dS is, and that matters more here than in
-        // Pipeline A rather than less: this pipeline integrates the field, so an
-        // interface the field ran straight through is an interface the *map*
-        // runs straight through. See DualMBO::setAlignedInteriorEdges for why
-        // the hard pin and not a penalty.
-        if (interfaces && interfaces->multiMaterial() && options.alignFieldToInterfaces) {
-            f->setAlignedInteriorEdges(interfaces->interfaceEdges());
+        if (prepareFieldLevel(*f, interfaces.get(), options, tauScale, carried)) {
             status.fieldAlignedToInterfaces = true;
-        }
-        f->initialize();
-        // The constraint does not travel with the field: every level re-imposes
-        // the Dirichlet data its own assembly computed, and only the free
-        // triangles are carried.
-        if (carried.size() == f->u_k_prev.size()) {
-            Eigen::VectorXcd start = carried;
-            for (const auto &[ti, bc] : f->getBoundaryData()) start[ti] = bc;
-            f->u_k_prev = start;
-            f->u_k = start;
         }
         return f;
     };
@@ -908,46 +960,16 @@ void TORSION::runField() {
         status.messages.push_back("Stage 0: " + oss.str());
     }
 
-    const double nTris = static_cast<double>(mesh->triangles.size());
-
-    // The ladder of tau scales, largest first. The first entry is always 1 --
-    // the heuristic's tau -- so the continuation starts from the field the
-    // single-tau scheme would have returned and only ever refines it. Its floor
-    // is read off the assembled operator, so it cannot be known until level 0
-    // has been built.
-    std::vector<double> ladder{1.0};
-    if (options.dualMBOTauContinuation && options.dualMBOTauRatio > 0.0 &&
-        options.dualMBOTauRatio < 1.0) {
-        double mnx = 1e300, mxx = -1e300, mny = 1e300, mxy = -1e300;
-        for (const Point &p : mesh->vertices) {
-            mnx = std::min(mnx, p[0]); mxx = std::max(mxx, p[0]);
-            mny = std::min(mny, p[1]); mxy = std::max(mxy, p[1]);
-        }
-        const double D = std::hypot(mxx - mnx, mxy - mny);
-        const double rate = field->medianDiffusionRate();
-        if (D > 0.0 && rate > 0.0) {
-            const double tau0 = D * D / 10.0;
-            const double c = options.dualMBOTauFloorEdges;
-            const double tauMin = c * c / rate;
-            double tau = tau0;
-            while (tau * options.dualMBOTauRatio > tauMin && ladder.size() < 40) {
-                tau *= options.dualMBOTauRatio;
-                ladder.push_back(ladder.back() * options.dualMBOTauRatio);
-            }
-        }
-    }
-
+    const std::vector<double> ladder = fieldTauLadder(*mesh, *field, options);
     Eigen::VectorXcd carried;
     for (std::size_t level = 0; level < ladder.size(); ++level) {
         if (level > 0) field = buildLevel(ladder[level], carried);
-        const int cap = (ladder.size() == 1)
-                            ? options.dualMBOMaxSteps
-                            : std::min(options.dualMBOMaxSteps, options.dualMBOTauLevelSteps);
+        const int cap = fieldLevelCap(options, ladder.size());
         status.fieldConverged = false;
         for (int i = 0; i < cap; ++i) {
             field->step();
             ++status.mboSteps;
-            if (field->error < 2.0 * nTris * 1e-5) { status.fieldConverged = true; break; }
+            if (fieldLevelConverged(*field)) { status.fieldConverged = true; break; }
         }
         carried = field->u_k_prev;
     }
@@ -1080,6 +1102,21 @@ bool TORSION::runConeFront(bool cancelDipoles) {
         }
     }
 
+    // A material region laid out on its own (the per-material mode) is a
+    // single-material mesh, and the whole-model run would have cancelled the
+    // pairs inside it. The same rule, on the one region there is.
+    if (options.cancelSingleMaterialDipoles && cancelDipoles &&
+        !(interfaces && interfaces->multiMaterial())) {
+        std::vector<int> region(mesh->vertices.size(), 0);
+        status.coneDipoleUnits = cones->cancelDipoles(region);
+        if (status.coneDipoleUnits > 0) {
+            std::ostringstream oss;
+            oss << "Cancelled " << status.coneDipoleUnits
+                << " +1/-1 cone pair(s) the field put inside this single region.";
+            status.messages.push_back("Stage 1: " + oss.str());
+        }
+    }
+
     ConeSingularities::GaussBonnetReport gb = cones->gaussBonnet();
     if (!gb.admissible && options.autoRebalance) {
         const int moved = cones->rebalance();
@@ -1087,6 +1124,32 @@ bool TORSION::runConeFront(bool cancelDipoles) {
             status.messages.push_back(
                 "Stage 1: could not restore Eq. (4): no boundary cone left within the allowed "
                 "index range to take the residual.");
+        }
+        gb = cones->gaussBonnet();
+    }
+
+    // As MERIDIAN's Stage 1: the +1s rebalance() left on straight dS, moved to
+    // where a quadrilateral can hold them. On a region of the per-material mode
+    // dS is the region's whole boundary, its interfaces included, and that is
+    // where most of them are: a layer pinching out between two interfaces.
+    // Stage 3F moves the field's singularities onto wherever they go.
+    status.flatConesToCorners = status.flatConesInside = 0;
+    if (options.relocateFlatCones && gb.admissible) {
+        const int nV = static_cast<int>(mesh->vertices.size());
+        std::vector<int> region;
+        if (interfaces && interfaces->multiMaterial()) {
+            region.assign(nV, -1);
+            for (int v = 0; v < nV; ++v) region[v] = interfaces->regionAt(v);
+        }
+        if (cones->relocateFlatCones(region, options.flatConeAngle) > 0) {
+            for (const ConeSingularities::Relocation &r : cones->getRelocations())
+                (r.inside ? status.flatConesInside : status.flatConesToCorners) += 1;
+            std::ostringstream oss;
+            oss << "Moved " << cones->getRelocations().size()
+                << " +1 cone(s) off straight dS, where each was a patch corner of pi: "
+                << status.flatConesToCorners << " to the corner at the end of its side, "
+                << status.flatConesInside << " inside.";
+            status.messages.push_back("Stage 1: " + oss.str());
         }
         gb = cones->gaussBonnet();
     }
@@ -1612,6 +1675,7 @@ bool TORSION::runLayoutStages(double nearMiss, bool seed) {
     lopts.interfaceCorners = options.interfaceCorners;
     lopts.propagateInterfaceLabels = options.propagateInterfaceLabels;
     lopts.seamTurnInterfaceLabels = options.seamTurnInterfaceLabels;
+    lopts.extraEmitters = options.extraEmitters;
     labels = std::make_unique<SubdomainLabels>(*immersion, lopts, interfaces.get());
     const SubdomainLabels::Report &lr = labels->getReport();
     status.boundaryEdgesU = lr.boundaryEdgesU;
@@ -1779,6 +1843,9 @@ bool TORSION::runLayoutStages(double nearMiss, bool seed) {
     if (interfaces && interfaces->multiMaterial()) {
         sopts.extraEmitters = interfaces->emitterNodes();
     }
+    // The same list Stage 5 seeded with. See Options::extraEmitters.
+    sopts.extraEmitters.insert(sopts.extraEmitters.end(), options.extraEmitters.begin(),
+                               options.extraEmitters.end());
 
     MERIDIAN::RepairOptions ropts;
     ropts.passes = options.seedTopoConstraints ? options.repairPasses : 0;
@@ -2580,8 +2647,224 @@ bool TORSION::runMapStages() {
 
 bool TORSION::run() {
     status = Status();
+    materials.reset();
 
     runFieldFront();
+
+    const bool perMaterialMode = options.perMaterial && interfaces &&
+                                 interfaces->multiMaterial() && options.runLayout &&
+                                 options.runSeparatrices && options.runArrangement;
+    if (!perMaterialMode) {
+        bool proceed = false;
+        const bool verdict = runWholeModel(proceed);
+        return proceed ? runMeshStages() : verdict;
+    }
+
+    // --- The per-material mode (MaterialLayout, Sec. 15) --------------------
+    const Status afterField = status;
+    const bool glued = runPerMaterial();
+    if (glued || !options.perMaterialFallback) {
+        return arrangement ? runMeshStages() : status.layoutValid;
+    }
+
+    // The glued layout is not valid, which in practice means one region whose
+    // own layout has a face that is not a simple quadrilateral, or a matching
+    // that ran out of rounds. The whole model is run as well, from the same
+    // field, and whichever leaves less of S without a grid is the one kept --
+    // the glued one on a tie, being the simpler of the two wherever both work.
+    // Neither route dominates the other on this corpus, and the regions of a
+    // model the whole-model run gets right can still be the ones a region on
+    // its own gets wrong: concrete's matrix, 12606 triangles holding seven
+    // shelled stones, is one.
+    std::unique_ptr<Arrangement> gluedArrangement = std::move(arrangement);
+    const Status gluedStatus = status;
+    const double gluedUnmeshable =
+        gluedArrangement ? MERIDIAN::unmeshableFraction(*gluedArrangement) : 1.0;
+    status = afterField;
+    bool proceed = false;
+    const bool verdict = runWholeModel(proceed);
+    const double wholeUnmeshable =
+        (proceed && arrangement) ? MERIDIAN::unmeshableFraction(*arrangement) : 1.0;
+    const bool wholeWins = proceed && arrangement &&
+                           (wholeUnmeshable < gluedUnmeshable - 1e-12 ||
+                            (wholeUnmeshable <= gluedUnmeshable + 1e-12 && status.layoutValid &&
+                             !gluedStatus.layoutValid));
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(2) << "the glued layout left "
+        << 100.0 * gluedUnmeshable << "% of S in faces Stage 10 has no grid for, so the "
+        << "whole model was run as well: " << 100.0 * wholeUnmeshable << "%. ";
+    if (wholeWins) {
+        oss << "The whole-model layout is kept.";
+        status.perMaterialRan = true;
+        status.perMaterialKept = false;
+        status.perMaterialFallbackRan = true;
+        status.perMaterialRegions = gluedStatus.perMaterialRegions;
+        status.perMaterialRegionsValid = gluedStatus.perMaterialRegionsValid;
+        status.perMaterialRounds = gluedStatus.perMaterialRounds;
+        status.perMaterialConverged = gluedStatus.perMaterialConverged;
+        status.perMaterialEmitters = gluedStatus.perMaterialEmitters;
+        status.perMaterialMatched = gluedStatus.perMaterialMatched;
+        status.perMaterialUnmatched = gluedStatus.perMaterialUnmatched;
+        status.perMaterialDipolesKept = gluedStatus.perMaterialDipolesKept;
+        status.perMaterialSeconds = gluedStatus.perMaterialSeconds;
+        status.messages.push_back("Per material: " + oss.str());
+        return runMeshStages();
+    }
+    (void)verdict;
+    // What the whole-model run built belongs to a layout that is not the one
+    // kept, and a caller reading getCones() or getImmersion() after this would
+    // be reading the wrong route's stages.
+    cones.reset();
+    cutter.reset();
+    frames.reset();
+    referenceFlow.reset();
+    coneMetric.reset();
+    scaffold.reset();
+    integration.reset();
+    tutte.reset();
+    immersion.reset();
+    labels.reset();
+    layout.reset();
+    separatrices.reset();
+    fieldIndex.clear();
+    integratedMap.clear();
+    psi0Map.clear();
+    usedAxis.clear();
+    arrangement = std::move(gluedArrangement);
+    status = gluedStatus;
+    status.perMaterialFallbackRan = true;
+    oss << "The glued layout is kept.";
+    status.messages.push_back("Per material: " + oss.str());
+    return arrangement ? runMeshStages() : status.layoutValid;
+}
+
+// ---------------------------------------------------------------------------
+// runWholeModel()  --  Stages 1 to 8 on S at once
+// ---------------------------------------------------------------------------
+bool TORSION::runWholeModel(bool &proceed) {
+    const Status afterField = status;
+    std::unique_ptr<Interfaces> pristine =
+        interfaces ? std::make_unique<Interfaces>(*interfaces) : nullptr;
+    bool verdict = runWholeModelOnce(proceed);
+
+    // Stage 1 moved a +1 off straight dS (Options::relocateFlatCones), and the
+    // layout that came of it is not valid. The move is right for the mesh -- a
+    // +1 left on straight dS is a patch corner of pi, meshed as an element with
+    // a node in the middle of a side -- but Stage 6 cannot always make a layout
+    // round where it went: a corner sharper than about 45 degrees that the
+    // field reads as two quarters keeps a cusp's worth of frame across its fan,
+    // and whether the map opens it to a right angle with one of the quarters
+    // gone elsewhere is settled only by Stages 4F to 6. Which models it fails
+    // on is not predictable from Stage 1 (multimat/ply_drop's 25 degree corner
+    // opens, tooth's 20 degree one does not, and both are one triangle across),
+    // so the layout is simply tried both ways, and an invalid layout is never
+    // what the move leaves behind where the old cone set gave a valid one.
+    const bool moved = status.flatConesToCorners + status.flatConesInside > 0;
+    const bool firstValid = proceed && arrangement && status.layoutValid;
+    if (!options.relocateFlatCones || !options.keepFlatConesOnFailure || !moved || firstValid)
+        return verdict;
+
+    struct Attempt {
+        std::unique_ptr<Interfaces> interfaces;
+        std::unique_ptr<ConeSingularities> cones;
+        std::unique_ptr<ConeCut> cutter;
+        std::unique_ptr<FieldFrames> frames;
+        std::unique_ptr<RicciFlow> referenceFlow;
+        std::unique_ptr<ConeMetric> coneMetric;
+        std::unique_ptr<Immersion> scaffold;
+        std::unique_ptr<FieldIntegration> integration;
+        std::unique_ptr<TutteEmbedding> tutte;
+        std::unique_ptr<Immersion> immersion;
+        std::unique_ptr<SubdomainLabels> labels;
+        std::unique_ptr<LayoutEnergy> layout;
+        std::unique_ptr<Separatrices> separatrices;
+        std::unique_ptr<Arrangement> arrangement;
+        std::vector<int> fieldIndex, usedAxis;
+        std::vector<Point> integratedMap, psi0;
+        Status status, statusBeforeLayout;
+        bool verdict = false, proceed = false;
+    };
+    auto take = [&](bool v, bool p) {
+        Attempt a;
+        a.interfaces = std::move(interfaces);
+        a.cones = std::move(cones);
+        a.cutter = std::move(cutter);
+        a.frames = std::move(frames);
+        a.referenceFlow = std::move(referenceFlow);
+        a.coneMetric = std::move(coneMetric);
+        a.scaffold = std::move(scaffold);
+        a.integration = std::move(integration);
+        a.tutte = std::move(tutte);
+        a.immersion = std::move(immersion);
+        a.labels = std::move(labels);
+        a.layout = std::move(layout);
+        a.separatrices = std::move(separatrices);
+        a.arrangement = std::move(arrangement);
+        a.fieldIndex = std::move(fieldIndex);
+        a.usedAxis = std::move(usedAxis);
+        a.integratedMap = std::move(integratedMap);
+        a.psi0 = std::move(psi0Map);
+        a.status = status;
+        a.statusBeforeLayout = statusBeforeLayout;
+        a.verdict = v;
+        a.proceed = p;
+        return a;
+    };
+    auto put = [&](Attempt &a) {
+        interfaces = std::move(a.interfaces);
+        cones = std::move(a.cones);
+        cutter = std::move(a.cutter);
+        frames = std::move(a.frames);
+        referenceFlow = std::move(a.referenceFlow);
+        coneMetric = std::move(a.coneMetric);
+        scaffold = std::move(a.scaffold);
+        integration = std::move(a.integration);
+        tutte = std::move(a.tutte);
+        immersion = std::move(a.immersion);
+        labels = std::move(a.labels);
+        layout = std::move(a.layout);
+        separatrices = std::move(a.separatrices);
+        arrangement = std::move(a.arrangement);
+        fieldIndex = std::move(a.fieldIndex);
+        usedAxis = std::move(a.usedAxis);
+        integratedMap = std::move(a.integratedMap);
+        psi0Map = std::move(a.psi0);
+        status = a.status;
+        statusBeforeLayout = a.statusBeforeLayout;
+    };
+    auto unmeshable = [&](const Attempt &a) {
+        return (a.proceed && a.arrangement) ? MERIDIAN::unmeshableFraction(*a.arrangement) : 2.0;
+    };
+
+    Attempt first = take(verdict, proceed);
+    status = afterField;
+    interfaces = pristine ? std::make_unique<Interfaces>(*pristine) : nullptr;
+    options.relocateFlatCones = false;
+    bool proceedKept = false;
+    const bool verdictKept = runWholeModelOnce(proceedKept);
+    options.relocateFlatCones = true;
+    Attempt kept = take(verdictKept, proceedKept);
+
+    // Valid first, then the less of S left without a grid; a tie keeps the move.
+    const bool keptValid = kept.proceed && kept.arrangement && kept.status.layoutValid;
+    const bool useKept = keptValid || unmeshable(kept) < unmeshable(first) - 1e-12;
+    Attempt &chosen = useKept ? kept : first;
+    put(chosen);
+    proceed = chosen.proceed;
+    verdict = chosen.verdict;
+    std::ostringstream oss;
+    oss << "Stage 1 moved " << (first.status.flatConesToCorners + first.status.flatConesInside)
+        << " +1 cone(s) off straight dS and the layout was not valid, so Stages 1 to 8 were "
+        << "run again with them where they were: "
+        << (useKept ? "that one is kept, and its patch corners of pi with it."
+                    : "that was no better, so the move stands.");
+    status.flatConesKept = useKept;
+    status.messages.push_back("Stage 1: " + oss.str());
+    return verdict;
+}
+
+bool TORSION::runWholeModelOnce(bool &proceed) {
+    proceed = false;
 
     // --- Stages 1 to 4R, once or twice ------------------------------------
     //
@@ -2726,7 +3009,20 @@ bool TORSION::run() {
         return false;
     }
     if (!options.runLayout) return true;
+    proceed = true;
 
+    statusBeforeLayout = status;
+    if (!runLayoutLadder()) {
+        proceed = false;
+        return status.layoutValid;
+    }
+    return status.layoutValid;
+}
+
+// ---------------------------------------------------------------------------
+// runLayoutLadder()  --  Stages 5 to 8, at the Gamma_topo tolerance that works
+// ---------------------------------------------------------------------------
+bool TORSION::runLayoutLadder() {
     // --- Stages 5 to 8, at the Gamma_topo tolerance that works ------------
     //
     // MERIDIAN::run's retry, run further down the same ladder. Gamma_topo can
@@ -2742,10 +3038,8 @@ bool TORSION::run() {
     // quadrilaterals at a tolerance of 0.01. Each rung runs only while the best
     // layout so far still leaves part of S without a grid, and the best is what
     // is kept.
-    const Status statusBeforeLayout = status;
-    if (!runLayoutStages(options.topoNearMiss, options.seedTopoConstraints)) {
-        return status.layoutValid;
-    }
+    status = statusBeforeLayout;
+    if (!runLayoutStages(options.topoNearMiss, options.seedTopoConstraints)) return false;
     status.topoNearMissUsed = options.topoNearMiss;
     {
         struct Rung { double nearMiss; bool seed; };
@@ -2826,7 +3120,104 @@ bool TORSION::run() {
             status.messages.push_back(retryMsg.str());
         }
     }
+    return true;
+}
 
+// ---------------------------------------------------------------------------
+// relayout()  --  Stages 5 to 8 again, with other emitters
+// ---------------------------------------------------------------------------
+bool TORSION::relayout(const std::vector<int> &emitters) {
+    if (!immersion || !options.runLayout) return false;
+    options.extraEmitters = emitters;
+    labels.reset();
+    layout.reset();
+    separatrices.reset();
+    arrangement.reset();
+    runLayoutLadder();
+    return status.layoutValid;
+}
+
+const MaterialLayout &TORSION::getMaterialLayout() const { return *materials; }
+
+// ---------------------------------------------------------------------------
+// runPerMaterial()  --  MaterialLayout on Stage 0's field
+// ---------------------------------------------------------------------------
+bool TORSION::runPerMaterial() {
+    status.perMaterialRan = true;
+
+    const MaterialLayout::Options mo = MaterialLayout::optionsFor(options);
+    const Options regionOptions = MaterialLayout::regionOptionsFor(options);
+    materials = std::make_unique<MaterialLayout>(mesh, field->u_k_prev, regionOptions, mo);
+    const bool glued = materials->run();
+    const MaterialLayout::Report &mr = materials->getReport();
+
+    status.perMaterialKept = true;
+    status.perMaterialRegions = mr.regions;
+    status.perMaterialRegionsValid = mr.regionsValid;
+    status.perMaterialRounds = mr.rounds;
+    status.perMaterialConverged = mr.converged;
+    status.perMaterialEmitters = mr.emitters;
+    status.perMaterialMatched = mr.matched;
+    status.perMaterialUnmatched = mr.unmatched;
+    status.perMaterialDipolesKept = mr.dipolesKept;
+    status.perMaterialSeconds = mr.seconds;
+
+    // The stages the regions ran, summed or conjoined over them, so that the
+    // fields a caller reads for Stages 1 to 7 say something about this route.
+    status.regions = mr.regions;
+    status.regionsBalanced = 0;
+    status.conesAdmissible = true;
+    status.layoutRan = true;
+    status.layoutInjective = true;
+    status.layoutConstrained = true;
+    status.separatricesRan = true;
+    status.q5Verified = true;
+    for (const MaterialLayout::Region &r : materials->getRegions()) {
+        if (!r.layout) {
+            status.conesAdmissible = false;
+            status.layoutInjective = status.layoutConstrained = status.q5Verified = false;
+            continue;
+        }
+        const Status &rs = r.layout->getStatus();
+        if (rs.conesAdmissible) ++status.regionsBalanced;
+        status.interiorCones += rs.interiorCones;
+        status.boundaryCones += rs.boundaryCones;
+        status.coneDipoleUnits += rs.coneDipoleUnits;
+        status.conesAdmissible = status.conesAdmissible && rs.conesAdmissible;
+        status.layoutInjective = status.layoutInjective && rs.layoutInjective;
+        status.layoutConstrained = status.layoutConstrained && rs.layoutConstrained;
+        status.q5Verified = status.q5Verified && rs.q5Verified;
+        status.separatrices += rs.separatrices;
+        status.separatricesToCone += rs.separatricesToCone;
+        status.separatricesToBoundary += rs.separatricesToBoundary;
+        status.separatricesUnresolved += rs.separatricesUnresolved;
+        status.separatricesNearMisses += rs.separatricesNearMisses;
+        status.repairPasses += rs.repairPasses;
+        status.repairConstraintsAdded += rs.repairConstraintsAdded;
+        status.topoPaths += rs.topoPaths;
+    }
+    for (const std::string &m : mr.messages) status.messages.push_back("Per material: " + m);
+
+    if (materials->hasArrangement()) {
+        arrangement = materials->takeArrangement();
+        const Arrangement::Report &ar = arrangement->getReport();
+        status.arrangementRan = true;
+        status.layoutNodes = ar.nodes;
+        status.layoutArcs = ar.arcs;
+        status.layoutPatches = ar.patches;
+        status.layoutQuads = ar.simpleQuads;
+        status.layoutCoverage = ar.areaCoverage;
+        status.arrangementValid = ar.valid;
+        for (const std::string &m : ar.messages) status.messages.push_back("Stage 8: " + m);
+    }
+    status.layoutValid = glued;
+    return glued;
+}
+
+// ---------------------------------------------------------------------------
+// runMeshStages()  --  Stages 9 to 11 on whichever arrangement was built
+// ---------------------------------------------------------------------------
+bool TORSION::runMeshStages() {
     // --- Stage 9 ----------------------------------------------------------
     if (!options.runSplines) return status.layoutValid;
     SplineFit::Options sfopts;
@@ -2858,6 +3249,8 @@ bool TORSION::run() {
     qopts.collapseSpan = options.quadCollapseSpan;
     qopts.useSplines = options.quadUseSplines;
     qopts.featuresOnTracedArcs = options.quadFeaturesOnTracedArcs;
+    qopts.materialsFromFaces = options.quadMaterialsFromFaces;
+    qopts.contractOntoFeatures = options.quadContractOntoFeatures;
     qopts.smoothingPasses = options.quadSmoothingPasses;
     qopts.smoothingThreshold = options.quadSmoothingThreshold;
     // Each excised rim has to come out with an even number of edges or Stage 11

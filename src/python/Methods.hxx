@@ -34,9 +34,11 @@
 // meshes through the pipeline's own stage.
 //
 // The same goes for smoothing: each method's meshes carry the TMOP settings its
-// own driver and viewer mode smooth with (metric 7 everywhere; mu at the
-// corners for the three transfinite-grid methods, at the 2x2 Gauss points for
-// MERIDIAN and TORSION, whose Stage 12 has always run that way).
+// own driver and viewer mode smooth with (metric 7 everywhere, mu at the
+// element corners everywhere -- MERIDIAN and TORSION sampled the 2x2 Gauss
+// points until 2026-10-02, when their Stage 12 changed), and MERIDIAN's and
+// TORSION's also pillow the flat feature corners first, as their Stage 12
+// does since the same day (mesh::Pillow).
 namespace pycg {
 
 // What BlockDecomposition.mesh() hands to the module: the quad mesh as the
@@ -45,6 +47,9 @@ struct MeshOutput {
     std::unique_ptr<mesh::QuadMesh> mesh;
     PyObject *report = nullptr;           // owned: a dict
     mesh::TMOP::Options smoothing;
+    // Whether the first smooth() pillows the flat feature corners before it
+    // smooths: Stage 12 of MERIDIAN and TORSION.
+    bool pillow = false;
 };
 
 class Method {

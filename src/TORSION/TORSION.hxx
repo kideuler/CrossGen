@@ -31,6 +31,7 @@
 #include "mesh/Mesh.hxx"
 
 class DualMBO;
+class MaterialLayout;
 
 // Pipeline B of docs/cf_flow_pipeline.md: the quadrilateral layout of Shepherd,
 // Gu and Hughes (2022) with the initial map psi_0 built by **integrating the
@@ -240,6 +241,35 @@ class DualMBO;
 // every face four-sided went from 14 of 31 to 23, against 14 for
 // Pipeline A on the same corpus; single-material, 33 of 35 to 34.
 // docs/cf_flow_pipeline.md Sec. 14 has the model-by-model record.
+//
+// ### One material region at a time (Options::perMaterial, the default)
+//
+// Everything in the section above is the price of laying a multi-material model
+// out as one map: the interfaces are curves inside Omega, the cut crosses them
+// wherever a region is enclosed, and every stage from 3F on has to read a branch
+// in two charts. The per-material mode (MaterialLayout) pays none of it. Each
+// material region is laid out on its own -- this pipeline, Stages 1 to 8, on
+// the region's triangles, with Stage 0's field restricted to them -- so that the
+// interfaces are dS of the regions they bound, held on an axis by Q3 like any
+// other dS, and no cut crosses one. The field is the same on both sides of an
+// interface and tangent to it, so any two regions' layouts can be joined along
+// it; what has to be agreed is only where each puts its layout vertices, and
+// that is settled in rounds. The vertices one region puts on an interface are
+// handed to the region across it as emitters, the neighbour's Stage 5 pairs
+// each with a cone it nearly meets or with a separatrix of its own landing
+// beside it -- Sec. 3.3's near-miss rule, applied across the interface -- and
+// the neighbour's Stages 5 to 8 run again (relayout()) until no region is asked
+// for anything new. The regions' arrangements are then glued into one
+// Arrangement of S, the vertices matched across each interface made one node,
+// and Stages 9 to 11 run on it as on a traced one. What the rounds leave single
+// is carried on through the glued faces to dS; where even that does not close
+// the layout, the whole model is laid out as well and the one that leaves less
+// of S without a grid is kept (perMaterialFallback).
+//
+// Over data/meshes/multimat at defaults, layouts reaching Definition 2.1 with
+// every face four-sided go from the whole-model route's 23 of 31 to 29, 24 of
+// them glued, and those with every element's scaled Jacobian positive from 13
+// to 18. docs/cf_flow_pipeline.md Sec. 15.
 class TORSION {
 public:
     struct Options {
@@ -294,6 +324,55 @@ public:
         // Options::diskTemplates excises the inclusions before Stage 0.
         Eigen::VectorXcd externalField;
 
+        // --- The per-material mode (MaterialLayout, Sec. 15) ----------------
+        //
+        // On a multi-material model, lay out each material region on its own
+        // -- Stages 1 to 8 on the region's triangles alone, with this field
+        // restricted to them -- match the layout vertices neighbouring regions
+        // put on the interfaces they share, extend the ones that find no
+        // partner through the neighbour's own map, and glue the result into
+        // one arrangement of S for Stages 9 to 11. See MaterialLayout for why
+        // and docs/cf_flow_pipeline.md Sec. 15 for the corpus. No effect on a
+        // single-material mesh. Off runs Stages 1 to 8 on the whole model at
+        // once, which is what this pipeline did until 2026-09-29.
+        bool perMaterial = true;
+        // How many rounds of matching at most. A round re-runs Stages 5 to 8 of
+        // every region whose neighbours asked it for a new layout edge.
+        int perMaterialRounds = 10;
+        // Regions laid out at once; 0 is one per hardware thread. The regions
+        // are independent, and the result does not depend on this.
+        int perMaterialThreads = 0;
+        // How far apart, in edges of the interface branch, two layout vertices
+        // on opposite sides of it may be and still be matched into one vertex
+        // of the glued layout (MaterialLayout::Options::matchTolerance).
+        double perMaterialMatchTolerance = 3.0;
+        // Re-run a region keeping its +1/-1 pairs when cancelling them left it
+        // with a face that is not a simple quadrilateral. See MaterialLayout.
+        bool perMaterialKeepDipoles = true;
+        // When the glued layout is not valid, run the whole model as well and
+        // keep whichever leaves less of S without a grid.
+        bool perMaterialFallback = true;
+        // Weigh where the glued nodes land when matching (no two closer than
+        // a quarter of an edge unless a region's own layout already has them
+        // so), and bend a matched curve into its glued node rather than move
+        // only its last point. See MaterialLayout::Options::spacedMatching and
+        // bendMatchedEnds; off, the matching of 2026-09-29.
+        bool perMaterialSpacedMatching = true;
+        bool perMaterialBendEnds = true;
+
+        // Two hooks the per-material mode sets on each region's own run, and
+        // which do nothing at their defaults. extraEmitters: vertices of dS
+        // that emit a layout edge although Stage 1 put no cone there, handed
+        // to Stage 5's seeding and to Stage 7 alike (see SubdomainLabels::
+        // Options::extraEmitters). cancelSingleMaterialDipoles: cancel the
+        // +1/-1 pairs Stage 1 finds on a single-material mesh too. Stage 1
+        // cancels them only where there are interfaces, and a material region
+        // laid out on its own is a single-material mesh: left alone it keeps
+        // pairs the whole-model run would have cancelled inside it -- on
+        // jelly_roll, 29 patches for a strip that is one.
+        std::vector<int> extraEmitters;
+        bool cancelSingleMaterialDipoles = false;
+
         bool materialInterfaces = true;
         double interfaceKinkAngle = M_PI / 4.0;
         int interfaceLoopSplits = 4;
@@ -321,6 +400,14 @@ public:
         bool autoRebalance = true;
         int minBoundaryIndex = -3;
         int maxBoundaryIndex = 1;
+        bool relocateFlatCones = true;
+        double flatConeAngle = 5.0 * M_PI / 6.0;
+        // When Stage 1 moved a +1 off a straight stretch of dS and the layout
+        // that came out of it is not valid, run Stages 1 to 8 again with it
+        // left where it was and keep the better of the two -- on the whole
+        // model here, and per region in the per-material mode
+        // (MaterialLayout::Options::keepFlatConesOnFailure).
+        bool keepFlatConesOnFailure = true;
         bool coneCutsToBoundary = true;
         double coneCutInterfaceAvoidance = 1.0;
 
@@ -557,6 +644,12 @@ public:
         double quadCollapseSpan = 0.5;
         bool quadUseSplines = true;
         bool quadFeaturesOnTracedArcs = true;
+        // QuadMesh::Options::materialsFromFaces and contractOntoFeatures: an
+        // element's material from its layout face, and a contracted run of
+        // nodes placed on dS or the interface. Off restores Stage 10 as it was
+        // before 2026-10-01.
+        bool quadMaterialsFromFaces = true;
+        bool quadContractOntoFeatures = true;
         int quadSmoothingPasses = 500;
         double quadSmoothingThreshold = 0.0;
 
@@ -582,6 +675,11 @@ public:
         bool externalFieldUsed = false;
         bool fieldAlignedToInterfaces = false;
         int coneDipoleUnits = 0;
+        int flatConesToCorners = 0;
+        int flatConesInside = 0;
+        // Whether the moved set's layout was not valid and the one with the +1s
+        // left in place is what stands (Options::keepFlatConesOnFailure).
+        bool flatConesKept = false;
         // run()'s second attempt without the cancellation: whether it ran, and
         // whether its cone set -- the pairs kept -- is the one that stands.
         bool dipoleRetryRan = false;
@@ -793,6 +891,22 @@ public:
         int repairConstraintsAdded = 0;
         bool q5Verified = false;
 
+        // --- The per-material mode (MaterialLayout) -------------------------
+        // Whether it ran, and whether its glued layout is the one Stages 9 to
+        // 11 were run on -- false after a fallback that the whole model won.
+        bool perMaterialRan = false;
+        bool perMaterialKept = false;
+        bool perMaterialFallbackRan = false;
+        int perMaterialRegions = 0;
+        int perMaterialRegionsValid = 0;
+        int perMaterialRounds = 0;
+        bool perMaterialConverged = false;
+        int perMaterialEmitters = 0;
+        int perMaterialMatched = 0;
+        int perMaterialUnmatched = 0;
+        int perMaterialDipolesKept = 0;
+        double perMaterialSeconds = 0.0;
+
         std::vector<std::string> messages;
     };
 
@@ -812,7 +926,20 @@ public:
     // front of it.
     bool run();
 
+    // Stages 5 to 8 again, on the psi_0 run() already built, with `emitters`
+    // as Options::extraEmitters. What the per-material mode's matching rounds
+    // call on each region: a vertex where a neighbour's layout meets the
+    // shared interface is a statement about Psi and not about psi_0 -- it
+    // changes which separatrices Stage 5 pairs and which Stage 7 traces, and
+    // nothing before -- so a round pays for Stages 5 to 8 only. False if
+    // run() never reached Stage 5.
+    bool relayout(const std::vector<int> &emitters);
+
     const DualMBO& getField() const { return *field; }
+    // The per-material mode's regions, their layouts and the matching; only
+    // after a run() on a multi-material mesh with Options::perMaterial.
+    bool hasMaterialLayout() const { return materials != nullptr; }
+    const MaterialLayout& getMaterialLayout() const;
     const Interfaces& getInterfaces() const { return *interfaces; }
     const ConeSingularities& getCones() const { return *cones; }
     const ConeCut& getCut() const { return *cutter; }
@@ -959,6 +1086,35 @@ public:
     static bool buildPsi0(const MapStage &in, const Options &options, Status &status,
                           Psi0 &out);
 
+    // Stage 0's field, one level of its tau-continuation at a time. runField()
+    // builds and steps every level through these, and so does the viewer's
+    // TORSION mode, so that the field it shows -- and lays out, a region at a
+    // time or whole -- is the field this class computes. It was not, for a
+    // while: the viewer stepped MERIDIAN's field, a single tau at DualMBO's
+    // default penalty weight, which on rt_mushroom is two MBO steps from the
+    // linear solve and lays out with folds along the interfaces that the
+    // pipeline's field does not have.
+    //
+    // prepareFieldLevel() takes a DualMBO freshly constructed with
+    // Options::dualMBOMaxSteps and dualMBOGamma and makes it one level:
+    // Options::dualMBOWeight, the interface network as Dirichlet data when
+    // Options::alignFieldToInterfaces and the model has more than one material,
+    // the level's tau scale, the assembly, and -- when `carried` has one value
+    // per triangle -- the previous level's field as the start, with this
+    // level's own Dirichlet data re-imposed on it. True when the interfaces
+    // were imposed.
+    static bool prepareFieldLevel(DualMBO &field, const Interfaces *interfaces,
+                                  const Options &options, double tauScale,
+                                  const Eigen::VectorXcd &carried);
+    // The tau scales the continuation runs through, 1 (the heuristic) first,
+    // read off level 0 once it is assembled; {1} when it is off.
+    static std::vector<double> fieldTauLadder(const Mesh &mesh, const DualMBO &level0,
+                                              const Options &options);
+    // The steps any one level of a ladder `levels` long may take, and the
+    // test each level stops at before that.
+    static int fieldLevelCap(const Options &options, std::size_t levels);
+    static bool fieldLevelConverged(const DualMBO &field);
+
     // The mesh the layout was computed on. With Options::diskTemplates this is
     // the *excised* mesh; getInputMesh() is what came in. See MERIDIAN.
     const Mesh& getMesh() const { return *mesh; }
@@ -975,6 +1131,24 @@ private:
     // `seed` is whether Gamma_topo is seeded from psi_0 at all; the repair
     // loop runs whenever Options::seedTopoConstraints is on, seeded or not.
     bool runLayoutStages(double nearMiss, bool seed);
+    // Stages 5 to 8 with the Gamma_topo retry: runLayoutStages() at
+    // Options::topoNearMiss and then down the ladder while the best layout so
+    // far leaves part of S without a grid. Starts from statusBeforeLayout.
+    bool runLayoutLadder();
+    // Stages 1 to 8 on the whole model at once -- this pipeline as it was
+    // before the per-material mode. `proceed` is set when there is an
+    // arrangement for Stages 9 to 11; otherwise the return value is run()'s.
+    // runWholeModelOnce() is one attempt; runWholeModel() makes a second with
+    // Stage 1's flat +1s left in place when the first moved some and did not
+    // come out valid (Options::keepFlatConesOnFailure).
+    bool runWholeModel(bool &proceed);
+    bool runWholeModelOnce(bool &proceed);
+    // The per-material mode: MaterialLayout on the field Stage 0 solved, its
+    // glued arrangement moved into `arrangement`. True when that layout is
+    // valid.
+    bool runPerMaterial();
+    // Stages 9 to 11 on `arrangement`, whichever route built it.
+    bool runMeshStages();
     // Stages 0c, 0b and 0, which are MERIDIAN's unchanged and run once.
     void runFieldFront();
     // Stages 1 and 2 on that field, MERIDIAN's unchanged but for whether the
@@ -1029,6 +1203,10 @@ private:
     std::unique_ptr<SplineFit> splines;
     std::unique_ptr<QuadMesh> quads;
     std::unique_ptr<DiskTemplate> diskFill;
+    std::unique_ptr<MaterialLayout> materials;
+    // The status Stage 5 starts from, so that relayout() and the retry ladder
+    // can run Stages 5 to 8 again without Stage 5's messages piling up.
+    Status statusBeforeLayout;
 
     // The circular inclusions Stage 0c took out. Empty unless
     // Options::diskTemplates.

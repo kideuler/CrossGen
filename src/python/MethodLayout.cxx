@@ -63,6 +63,7 @@ const Table<::QuadMesh::Options> &stage10OptionsTable() {
         OPT(minLoopEdges),     OPT(arcLengthSamples),     OPT(useSplines),
         OPT(featuresOnTracedArcs), OPT(spanSamples),      OPT(smoothingPasses),
         OPT(smoothingTolerance), OPT(smoothingThreshold), OPT(crackTolerance),
+        OPT(materialsFromFaces), OPT(contractOntoFeatures),
     };
     return t;
 }
@@ -85,6 +86,7 @@ const Table<::QuadMesh::Report> &stage10ReportTable() {
         REP(meshArea),        REP(patchArea),       REP(interiorEdges),
         REP(boundaryEdges),   REP(nonManifoldEdges), REP(cracks),
         REP(materials),       REP(mixedQuads),      REP(unlocatedQuads),
+        REP(relabelledQuads),
         REP(interfaceEdges),  REP(conforming),      REP(materialsPure),
         REP(valid),           REP(messages),
     };
@@ -116,6 +118,8 @@ template <class PO>
     q.collapseSpan = o.quadCollapseSpan;
     q.useSplines = o.quadUseSplines;
     q.featuresOnTracedArcs = o.quadFeaturesOnTracedArcs;
+    q.materialsFromFaces = o.quadMaterialsFromFaces;
+    q.contractOntoFeatures = o.quadContractOntoFeatures;
     q.smoothingPasses = o.quadSmoothingPasses;
     q.smoothingThreshold = o.quadSmoothingThreshold;
     return q;
@@ -132,10 +136,15 @@ DiskTemplate::Options stage11Options(const PO &o) {
 }
 
 // Stage 12 as TestMERIDIAN and TestTORSION run it (and the viewer's pipeline
-// modes): metric 7 at the 2x2 Gauss points, exponent 2.
+// modes): metric 7 sampled at the element corners, exponent 2 -- after the
+// flat feature corners have been pillowed, which MeshOutput::pillow asks of
+// the first smooth(). Corners since 2026-10-02: at the 2x2 Gauss points TMOP
+// turned corners over on these meshes that it could not see (multimat/tooth
+// 0.00 -> -0.96).
 mesh::TMOP::Options stage12Smoothing() {
     mesh::TMOP::Options t;
     t.metric = mesh::TMOP::ShapeSize007;
+    t.quadrature = mesh::TMOP::Corners;
     t.maxSweeps = 1000;
     return t;
 }
@@ -158,7 +167,8 @@ struct Traits<MERIDIAN> {
             OPT(diskSmoothingPasses), OPT(alignFieldToInterfaces), OPT(cancelInterfaceDipoles),
             OPT(prescribeInterfaceCones), OPT(interfaceCorners), OPT(propagateInterfaceLabels),
             OPT(seamTurnInterfaceLabels), OPT(lagInterfaceScales), OPT(autoRebalance),
-            OPT(minBoundaryIndex), OPT(maxBoundaryIndex), OPT(coneCutsToBoundary),
+            OPT(minBoundaryIndex), OPT(maxBoundaryIndex), OPT(relocateFlatCones),
+            OPT(flatConeAngle), OPT(keepFlatConesOnFailure), OPT(coneCutsToBoundary),
             OPT(coneCutInterfaceAvoidance), OPT(ricciTolerance), OPT(ricciMaxIterations),
             OPT(delaunayFlips), OPT(lambdaInit), OPT(lambdaGrowth), OPT(outerSteps),
             OPT(innerIterations), OPT(alternateReference), OPT(relabelBetweenSteps),
@@ -212,18 +222,25 @@ struct Traits<TORSION> {
     static constexpr const char *source = "TORSION";
 
     // Less externalField and sizing too: a complex vector per face and a size
-    // per vertex, neither of which a keyword can sensibly carry.
+    // per vertex, neither of which a keyword can sensibly carry -- and less
+    // extraEmitters, a list of vertices the per-material mode sets on each
+    // region's own run and nothing else has a use for.
     static const Table<TORSION::Options> &options() {
         using O = TORSION::Options;
         static const Table<O> t{
             OPT(dualMBOGamma), OPT(dualMBOMaxSteps), OPT(dualMBOWeight),
             OPT(dualMBOTauContinuation), OPT(dualMBOTauRatio), OPT(dualMBOTauFloorEdges),
-            OPT(dualMBOTauLevelSteps), OPT(materialInterfaces), OPT(interfaceKinkAngle),
+            OPT(dualMBOTauLevelSteps), OPT(perMaterial), OPT(perMaterialRounds),
+            OPT(perMaterialThreads), OPT(perMaterialMatchTolerance), OPT(perMaterialKeepDipoles),
+            OPT(perMaterialFallback), OPT(perMaterialSpacedMatching), OPT(perMaterialBendEnds),
+            OPT(cancelSingleMaterialDipoles),
+            OPT(materialInterfaces), OPT(interfaceKinkAngle),
             OPT(interfaceLoopSplits), OPT(diskTemplates), OPT(diskCoreSquareness),
             OPT(diskRingDepth), OPT(diskSmoothingPasses), OPT(alignFieldToInterfaces),
             OPT(cancelInterfaceDipoles), OPT(prescribeInterfaceCones), OPT(interfaceCorners),
             OPT(propagateInterfaceLabels), OPT(seamTurnInterfaceLabels), OPT(lagInterfaceScales),
             OPT(autoRebalance), OPT(minBoundaryIndex), OPT(maxBoundaryIndex),
+            OPT(relocateFlatCones), OPT(flatConeAngle), OPT(keepFlatConesOnFailure),
             OPT(coneCutsToBoundary), OPT(coneCutInterfaceAvoidance), OPT(targetEdge),
             OPT(checkSecondSeed), OPT(alignInIntegration), OPT(alignmentFallback),
             OPT(alignAcrossSeams), OPT(alignmentChooseByLadder), OPT(reconcileSectors),
@@ -301,7 +318,11 @@ struct Traits<TORSION> {
             REP(splinesRan), REP(splinePatches), REP(splineControlPoints), REP(splineMaxDeviation),
             REP(splinesWatertight), REP(splinesValid), REP(diskInclusions),
             REP(diskTrianglesExcised), REP(repairPasses), REP(repairConstraintsAdded),
-            REP(q5Verified), REP(messages),
+            REP(q5Verified), REP(perMaterialRan), REP(perMaterialKept),
+            REP(perMaterialFallbackRan), REP(perMaterialRegions), REP(perMaterialRegionsValid),
+            REP(perMaterialRounds), REP(perMaterialConverged), REP(perMaterialEmitters),
+            REP(perMaterialMatched), REP(perMaterialUnmatched), REP(perMaterialDipolesKept),
+            REP(perMaterialSeconds), REP(messages),
         };
         return t;
     }
@@ -393,6 +414,7 @@ public:
                                            "disk_templates_")})
                           : toDict({source(stage10ReportTable(), quads->getReport())});
         out.smoothing = stage12Smoothing();
+        out.pillow = true;
         return out.report ? 0 : -1;
     }
 
@@ -429,7 +451,7 @@ PyObject *layoutDefaults(const std::string &stage) {
         return meshingDefaults(qo.targetEdgeLength, {source(stage10OptionsTable(), qo),
                                                      source(nodeOptionsTable(), nodes)});
     }
-    if (stage == "smooth") return smoothingDefaults(stage12Smoothing());
+    if (stage == "smooth") return smoothingDefaults(stage12Smoothing(), true);
     return unknownStage(Traits<P>::name, stage);
 }
 
@@ -467,9 +489,13 @@ const MethodSpec torsionSpec = {
     "TORSION, Pipeline B: MERIDIAN's stages with Stages 3-4 replaced by\n"
     "integrating the DualMBO cross field (ConeMetric, FieldFrames,\n"
     "FieldIntegration, TutteEmbedding); every stage from Immersion on is\n"
-    "shared, meshing included.\n\n"
+    "shared, meshing included. On a multi-material model each material region\n"
+    "is laid out on its own and the layouts are matched across the interfaces\n"
+    "and glued (per_material=True, the default; per_material=False lays the\n"
+    "whole model out at once).\n\n"
     "Keywords are the fields of TORSION::Options in snake_case\n"
-    "(src/TORSION/TORSION.hxx), less quad_*, run_*, external_field and sizing;\n"
+    "(src/TORSION/TORSION.hxx), less quad_*, run_*, external_field, extra_emitters\n"
+    "and sizing;\n"
     "e.g. dual_mbo_weight='orthogonal', reference='cone'.\n"
     "crossgen.options('torsion') lists them.",
     runLayout<TORSION>,

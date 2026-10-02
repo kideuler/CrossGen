@@ -17,6 +17,7 @@
 #include "mesh/Mesh.hxx"
 #include "mesh/QuadMesh.hxx"
 #include "mesh/TMOP.hxx"
+#include "mesh/Pillow.hxx"
 #include "ATLAS/ATLAS.hxx"
 #include "ATLAS/BlockMesh.hxx"
 #include "MERIDIAN/Arrangement.hxx"
@@ -58,6 +59,7 @@
 #include "TORSION/TORSION.hxx"
 #include "TORSION/FieldIntegration.hxx"
 #include "TORSION/TutteEmbedding.hxx"
+#include "TORSION/MaterialLayout.hxx"
 
 // ── Enumerations mirroring the original viewer state machine ──────────────────
 
@@ -488,6 +490,11 @@ private:
     // check Eq. (4), and rebalance the boundary cones if it does not hold.
     // Cheap; unlike the two below it needs no announcement.
     void runMERIDIANCones();
+    // Advance the DualMBO solve by at most `budget` MBO steps, level by level
+    // of TORSION's tau-continuation in TORSION mode, setting dualMBOConverged_
+    // once the last level stops. The stepping phase calls it a few steps a
+    // frame; a stage that needs the finished field calls it with no limit.
+    void stepDualMBOField(int budget);
 
     // Stage 2: HarmonicCut's void arcs plus the Sec. 3.2.2 cone arcs, and the
     // disk they cut S into.
@@ -507,6 +514,26 @@ private:
     // to", and the immersion that wraps it is the same object either route
     // ends at. Blocking, and announced a frame ahead.
     void runTORSIONIntegration();
+
+    // TORSION's per-material mode (MaterialLayout, docs/cf_flow_pipeline.md
+    // Sec. 15), the default on a multi-material model: every material region
+    // laid out by Stages 1 to 8 on its own, matched across the interfaces and
+    // glued. It is one blocking step here, run at the cone phase, and the
+    // phases after it show what it produced -- each region's cones, cuts and
+    // frames on the model, one region's psi_0 and Psi on the right ('[' and ']'
+    // step through them), every region's separatrices with the layout vertices
+    // the matching joined -- until the patch phase, which fits Stage 9 to the
+    // glued arrangement exactly as it fits it to a traced one.
+    void runTORSIONPerMaterial();
+    void runTORSIONGluedPatches();
+    // Whether TORSION is running per material on this model: the mode, the
+    // switch ('w' toggles it before the cone phase), and more than one
+    // material to run it over.
+    bool perMaterialView() const;
+    // Fit the right half to the region shown there, at the phases that have
+    // one to show; and whether this phase shows one.
+    void fitRegionView();
+    bool perMaterialRegionPanel() const;
 
     // Stage 3: the Newton solve on Eq. (10), then the two things drawn from it
     // -- the conformal factor as a scalar field and the unfolded cone fans.
@@ -902,6 +929,12 @@ private:
     // Stage 7, traced on Psi. Holds a reference to the immersion like the three
     // above it, so it is cleared first and never outlives immersion_.
     std::optional<Separatrices>      separatrices_;
+    // The per-material mode's regions, each a TORSION of its own, and the
+    // matching between them. The glued arrangement is moved out of it into
+    // arrangement_ at the patch phase; nothing else holds on to it.
+    std::unique_ptr<MaterialLayout>  materialLayout_;
+    bool                             perMaterial_ = TORSION::Options().perMaterial;
+    int                              regionShown_ = 0;
     // Stages 8 and 9. Arrangement holds a reference to the separatrices and the
     // labels, SplineFit to the arrangement, so they are cleared before either.
     std::optional<Arrangement>       arrangement_;
@@ -985,6 +1018,12 @@ private:
     bool dualMBOSteppingStarted_  = false;
     bool dualMBOConverged_        = false;
     int  dualMBOStepCount_        = 0;
+    // TORSION's tau-continuation (TORSION::fieldTauLadder): the tau scales
+    // still to run, which of them the field is at, and the steps taken at it.
+    // A single level, the heuristic tau, in every other mode.
+    std::vector<double> dualMBOLadder_{1.0};
+    int  dualMBOLevel_            = 0;
+    int  dualMBOLevelSteps_       = 0;
     // The Eq. (1) solve is attempted once per run: a failure leaves umber_
     // empty, and retrying it every frame would only stall the viewer again.
     // It is announced one frame ahead so the notice is on screen while the
@@ -1014,6 +1053,8 @@ private:
     bool framesAttempted_      = false;
     bool integrationAnnounced_ = false;
     bool integrationAttempted_ = false;
+    bool materialAnnounced_    = false;
+    bool materialAttempted_    = false;
     bool layoutAnnounced_      = false;
     bool layoutAttempted_      = false;
     bool separatricesAnnounced_ = false;
@@ -1147,15 +1188,38 @@ private:
         bool   pinFeatures = mesh::QuadMesh::Options().fixAllFeatureNodes;
         double cornerAngle = mesh::QuadMesh::Options().cornerAngle;
         int    curveSource = mesh::QuadMesh::Options().curveSource;
+        // Pillow the flat feature corners before smoothing (mesh::Pillow):
+        // one layer of quads along each stretch of dS or interface on which an
+        // element spans 180 degrees, so that TMOP is handed a corner it can
+        // move. Off here and on for the pipelines' Stage 12 below.
+        bool   pillow      = false;
     };
-    TMOPSettings tmopSettings_;
-    // ATLAS's copy, which differs in one default: mu is sampled at the element
-    // corners. Those are the Jacobians Sec. 9.1 of the square-transport spec
-    // judges an element by, and at the 2x2 Gauss points a corner can turn over
-    // without the barrier seeing it -- measured on ATLAS's TFI meshes, where
-    // six corpus models came out of TMOP with folds they did not go in with,
-    // and none did sampled at the corners. Kept apart so the pipelines' Stage
-    // 12 runs exactly as it always has.
+    // The pipelines' Stage 12 samples mu at the element corners too, since
+    // 2026-10-02. At the 2x2 Gauss points a corner can turn over without the
+    // barrier seeing it, and on the pipelines' own meshes it did: over the
+    // multimat corpus at 0.05, per material, TMOP left 25 elements inverted
+    // that it had made itself or failed to clear (multimat/tooth from a worst
+    // of 0.00 to -0.96, artery 0.06 to -0.58), and sampled at the corners 4;
+    // 16 -> 5 on singlemat through TORSION and 7 -> 0 through MERIDIAN, with no
+    // model's worst element going down by more than 0.03.
+    //
+    // It pillows first, too, since the same day: a block corner the layout put
+    // on a straight feature is an element spanning 180 degrees at a feature
+    // node, which no sampling repairs because no admissible move changes the
+    // angle. Over the multimat corpus at 0.05, per material, that was basin's
+    // worst element going 0.000 -> 0.515 and artery's 0.136 -> 0.256 with the
+    // layer in, and no model worse; docs/cf_flow_pipeline.md Sec. 15.10.
+    TMOPSettings tmopSettings_ = [] {
+        TMOPSettings t;
+        t.corners = true;
+        t.pillow = true;
+        return t;
+    }();
+    // ATLAS's copy, which samples mu at the element corners for the same
+    // reason: those are the Jacobians Sec. 9.1 of the square-transport spec
+    // judges an element by -- measured on ATLAS's TFI meshes, where six corpus
+    // models came out of TMOP with folds they did not go in with, and none did
+    // sampled at the corners.
     TMOPSettings atlasTmopSettings_ = [] { TMOPSettings t; t.corners = true; return t; }();
     // UMBER's copy, which differs the same way and for the same reason: what
     // it smooths is a transfinite grid on a block decomposition, exactly what

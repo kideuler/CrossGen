@@ -193,8 +193,27 @@ const char *umberPhaseName(UMBERPhase p) {
 // The two pipelines differ in exactly two of the eleven rows, so the name is a
 // function of the phase and the mode rather than of the phase alone. Every
 // other row is the same stage of the same paper reached by the same code.
-const char *pipelinePhaseName(PipelinePhase p, Mode m) {
+const char *pipelinePhaseName(PipelinePhase p, Mode m, bool perMaterial = false) {
     const bool field = (m == Mode::TORSION);
+    // TORSION's per-material mode (MaterialLayout) runs Stages 1 to 8 on every
+    // material region at once at the cone phase, and the phases after it show
+    // what that produced, region by region, until the glued arrangement.
+    if (field && perMaterial) {
+        switch (p) {
+            case PipelinePhase::Cones:
+                return "4) cone singularities, one material region at a time (Sec. 15)";
+            case PipelinePhase::Cut:    return "5) cutting graphs, one per region";
+            case PipelinePhase::Flow:   return "6) combed field and matchings, per region";
+            case PipelinePhase::Metric: return "7) psi_0 per region (Stages 4F, 4R)";
+            case PipelinePhase::Layout:
+                return "8) layout Psi per region, matched across the interfaces";
+            case PipelinePhase::Separatrices:
+                return "9) separatrices per region, and where they were matched";
+            case PipelinePhase::Patches:
+                return "10) the glued arrangement and its splines (Secs. 4, 5, 15)";
+            default: break;
+        }
+    }
     switch (p) {
         case PipelinePhase::MeshOnly:   return "1) mesh";
         case PipelinePhase::CrossField: return "2) DualMBO crossfield";
@@ -532,7 +551,69 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
         }
         break;
 
+    case Qt::Key_BracketLeft:
+    case Qt::Key_BracketRight:
+        // The per-material mode's regions, one at a time on the right: each has
+        // its own psi_0 and its own Psi, in a plane of its own, and there is no
+        // one picture of them that is not a gallery of unrelated scales.
+        if (perMaterialView() && materialLayout_ && !materialLayout_->getRegions().empty()) {
+            const std::vector<MaterialLayout::Region> &regions = materialLayout_->getRegions();
+            const int n = static_cast<int>(regions.size());
+            const int step = (event->key() == Qt::Key_BracketRight) ? 1 : n - 1;
+            for (int tries = 0; tries < n; ++tries) {
+                regionShown_ = (regionShown_ + step) % n;
+                if (regions[regionShown_].layout && regions[regionShown_].layout->hasImmersion())
+                    break;
+            }
+            fitRegionView();
+            const MaterialLayout::Region &R = regions[regionShown_];
+            console_.log("[Per material] right panel: region " + std::to_string(regionShown_) +
+                         ", material " + std::to_string(R.material) + ", " +
+                         std::to_string(R.triangles.size()) + " triangle(s)");
+            update();
+        }
+        break;
+
+    case Qt::Key_W:
+        // Per material or the whole model at once. Only before the cone phase:
+        // after it, the two routes have built different things, and switching
+        // would leave the phases after it reading the wrong one.
+        if (mode_ == Mode::TORSION && interfaces_.has_value() && interfaces_->multiMaterial()) {
+            if (pipePhase_ < PipelinePhase::Cones) {
+                perMaterial_ = !perMaterial_;
+                console_.log(perMaterial_
+                                 ? "[TORSION] per material: each region laid out on its own, "
+                                   "matched across the interfaces and glued (Sec. 15)"
+                                 : "[TORSION] the whole model at once, as before the "
+                                   "per-material mode");
+            } else {
+                console_.log("[TORSION] the route is chosen before the cone phase; press 'r' "
+                             "and choose TORSION again to switch");
+            }
+            update();
+        }
+        break;
+
     case Qt::Key_P:
+        // The per-material mode's right panel swaps the same pairs the traced
+        // route's does, for the region shown there.
+        if (perMaterialView() && materialLayout_ &&
+            (pipePhase_ == PipelinePhase::Metric || pipePhase_ == PipelinePhase::Layout)) {
+            if (pipePhase_ == PipelinePhase::Metric) {
+                showIntegrated_ = !showIntegrated_;
+                console_.log(showIntegrated_
+                                 ? "[psi_0] right panel: the region's Stage 4F least-squares map, "
+                                   "red where it inverted"
+                                 : "[psi_0] right panel: the region's psi_0 as Stage 4 accepted it");
+            } else {
+                showPsiR_ = !showPsiR_;
+                console_.log(showPsiR_ ? "[Layout] right panel: the region's psi_0"
+                                       : "[Layout] right panel: the region's Psi");
+            }
+            fitRegionView();
+            update();
+            break;
+        }
         // ATLAS's Search phase is the same kind of pair: the carrier the
         // winning search started from and the one it ended on, and what Stages
         // 3 and 6 did is the difference.
@@ -830,6 +911,8 @@ void CrossGenWidget::doReset() {
     quadMesh_.reset();
     splines_.reset();
     arrangement_.reset();
+    materialLayout_.reset();
+    regionShown_ = 0;
     separatrices_.reset();
     meridianLayout_.reset();
     meridianLabels_.reset();
@@ -875,6 +958,8 @@ void CrossGenWidget::doReset() {
     dualMBOSteppingStarted_  = false;
     dualMBOConverged_        = false;
     dualMBOStepCount_        = 0;
+    dualMBOLadder_.assign(1, 1.0);
+    dualMBOLevel_ = dualMBOLevelSteps_ = 0;
     umberAnnounced_       = false;
     umberAttempted_       = false;
     umberMeshAttempted_   = false;
@@ -890,6 +975,8 @@ void CrossGenWidget::doReset() {
     framesAttempted_      = false;
     integrationAnnounced_ = false;
     integrationAttempted_ = false;
+    materialAnnounced_    = false;
+    materialAttempted_    = false;
     layoutAnnounced_      = false;
     layoutAttempted_      = false;
     separatricesAnnounced_ = false;
@@ -1679,6 +1766,159 @@ void CrossGenWidget::reportBlockQuadMesh(const BlockQuadMesh &bqm, double ms) {
                  "element. Press 'c' to smooth it, 'e' to mesh again at another target");
 }
 
+// ── TORSION per material (MaterialLayout, Sec. 15) ───────────────────────────
+bool CrossGenWidget::perMaterialView() const {
+    return mode_ == Mode::TORSION && perMaterial_ && interfaces_.has_value() &&
+           interfaces_->multiMaterial();
+}
+
+void CrossGenWidget::runTORSIONPerMaterial() {
+    materialAttempted_ = true;
+    if (!dualMBOField_.has_value()) return;
+    // The regions are laid out on the finished field, for the reason
+    // runMERIDIANCones() reads its cones off one: advancing past the stepping
+    // phase early would otherwise hand them a field still in motion.
+    if (!dualMBOConverged_) {
+        stepDualMBOField(std::numeric_limits<int>::max());
+        dualMBOField_->computeSingularities();
+    }
+
+    // The options run() hands MaterialLayout, from the pipeline's defaults, so
+    // what is on screen is what TestTORSION and the Python module compute.
+    const TORSION::Options defaults;
+    auto t0 = Clock::now();
+    materialLayout_ = std::make_unique<MaterialLayout>(
+        mesh_, dualMBOField_->u_k_prev, MaterialLayout::regionOptionsFor(defaults),
+        MaterialLayout::optionsFor(defaults));
+    bool glued = false;
+    try {
+        glued = materialLayout_->run();
+    } catch (const std::exception &e) {
+        blockPipeline("Per-material layout failed", e.what());
+        return;
+    }
+    auto t1 = Clock::now();
+
+    const MaterialLayout::Report &mr = materialLayout_->getReport();
+    {
+        std::ostringstream oss;
+        oss << "[Per material] " << mr.regions << " region(s) laid out on their own, "
+            << mr.rounds << " round(s) of matching; " << mr.emitters
+            << " layout edge(s) asked across the interfaces, " << mr.matched
+            << " vertex/vertices matched, " << mr.unmatched << " left single, "
+            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+        std::cerr << "[Viewer] " << oss.str() << "\n";
+    }
+    const std::vector<MaterialLayout::Region> &regions = materialLayout_->getRegions();
+    for (size_t r = 0; r < regions.size(); ++r) {
+        const MaterialLayout::Region &R = regions[r];
+        std::ostringstream oss;
+        oss << "[Per material] r" << r << ", material " << R.material << ", "
+            << R.triangles.size() << " triangle(s): ";
+        if (!R.laidOut()) {
+            oss << "no layout";
+        } else {
+            const TORSION::Status &rs = R.layout->getStatus();
+            const Arrangement::Report &ar = R.layout->getArrangement().getReport();
+            oss << rs.interiorCones << " + " << rs.boundaryCones << " cone(s), " << ar.patches
+                << " patch(es), " << ar.simpleQuads << " simple, " << R.emitters.size()
+                << " emitter(s)" << (R.dipolesKept ? ", +1/-1 pairs kept" : "")
+                << (rs.layoutValid ? "" : ", Stage 6 short of Definition 2.1");
+        }
+        std::cerr << "[Viewer] " << oss.str() << "\n";
+    }
+    for (const std::string &m : mr.messages) console_.log("[Per material] " + m);
+    console_.log(std::string("[Per material] the glued layout ") +
+                 (glued ? "validates [PASS]" : "does not validate [FAIL]"));
+
+    // The region on the right is the largest one to begin with: it is most of
+    // the model, and usually where the cones are.
+    regionShown_ = 0;
+    for (size_t r = 1; r < regions.size(); ++r) {
+        if (regions[r].triangles.size() > regions[regionShown_].triangles.size())
+            regionShown_ = static_cast<int>(r);
+    }
+    fitRegionView();
+}
+
+void CrossGenWidget::fitRegionView() {
+    if (!materialLayout_) return;
+    const std::vector<MaterialLayout::Region> &regions = materialLayout_->getRegions();
+    if (regionShown_ < 0 || regionShown_ >= static_cast<int>(regions.size())) return;
+    const MaterialLayout::Region &R = regions[regionShown_];
+    if (!R.layout || !R.layout->hasImmersion()) return;
+    const TORSION &T = *R.layout;
+    const std::vector<Point> &uv =
+        (pipePhase_ == PipelinePhase::Metric)
+            ? ((showIntegrated_ && !T.getIntegratedMap().empty()) ? T.getIntegratedMap()
+                                                                  : T.getImmersion().getUV())
+            : ((T.hasLayout() && !showPsiR_) ? T.getLayout().getUV() : T.getImmersion().getUV());
+    viewer::computeLayoutBounds(uv, uvView_.cx, uvView_.cy, uvView_.baseW, uvView_.baseH);
+    uvView_.zoom = 1.0;
+    uvView_.fbw = view_.fbw;
+    uvView_.fbh = view_.fbh;
+}
+
+// Stages 8 and 9 on the glued arrangement. It was built with the regions; here
+// it is moved to where the traced route keeps its own, and Stage 9 is fitted to
+// it the same way, so the mesh and smoothing phases after this one cannot tell
+// which route produced it.
+void CrossGenWidget::runTORSIONGluedPatches() {
+    patchesAttempted_ = true;
+    pipelineBlocked_.clear();
+    if (!materialLayout_ || !materialLayout_->hasArrangement()) {
+        std::string why = "the regions could not be glued";
+        if (materialLayout_) {
+            for (const std::string &m : materialLayout_->getReport().messages) {
+                if (m.rfind("could not glue", 0) == 0) { why = m; break; }
+            }
+        }
+        blockPipeline("Stage 8 not built", why);
+        return;
+    }
+    std::unique_ptr<Arrangement> glued = materialLayout_->takeArrangement();
+    arrangement_.emplace(std::move(*glued));
+
+    const Arrangement::Report &ar = arrangement_->getReport();
+    {
+        std::ostringstream oss;
+        oss << "[Patches] Stage 8, glued: " << ar.nodes << " node(s), " << ar.arcs << " arc(s) ("
+            << ar.separatrixArcs << " traced, " << ar.interfaceArcs << " on an interface, "
+            << ar.boundaryArcs << " of dS); " << ar.patches << " patch(es), " << ar.simpleQuads
+            << " with four corners and one arc per side, covering " << std::fixed
+            << std::setprecision(6) << ar.areaCoverage << " of S";
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Patches] Stage 8 " << (ar.valid ? "validates [PASS]" : "does not validate [FAIL]");
+        console_.log(oss.str());
+        std::cerr << "[Viewer] " << oss.str() << "\n";
+    }
+
+    auto t0 = Clock::now();
+    try {
+        splines_.emplace(*arrangement_);
+    } catch (const std::exception &e) {
+        splines_.reset();
+        blockPipeline("Stage 9 failed", e.what());
+        return;
+    }
+    auto t1 = Clock::now();
+    const SplineFit::Report &sr = splines_->getReport();
+    {
+        std::ostringstream oss;
+        oss << "[Patches] Stage 9: " << sr.curves << " cubic B-spline(s) and " << sr.patches
+            << " bicubic patch(es), "
+            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count()) << "; "
+            << (sr.watertight ? "watertight" : "not watertight") << ", "
+            << (sr.valid ? "validates [PASS]" : "does not validate [FAIL]");
+        console_.log(oss.str());
+        std::cerr << "[Viewer] " << oss.str() << "\n";
+    }
+}
+
 // ── MERIDIAN: Shepherd, Gu and Hughes (2022), Stages 0b-3 ────────────────────
 
 // Stage 0b, the material interface network. Everything it reads is already on
@@ -1783,6 +2023,58 @@ void CrossGenWidget::runMERIDIANInterfaces() {
 // solvability condition of the Newton system in Stage 3 -- the Laplacian's
 // kernel is the constants, so the residual has to be orthogonal to them -- and
 // an inadmissible set does not converge slowly, it has no solution at all.
+// The DualMBO solve, advanced by at most `budget` MBO steps. In TORSION mode a
+// level of the tau-continuation that converges or reaches its cap hands its
+// field on to the next, which is built and started exactly as
+// TORSION::runField() builds it; the solve is finished when the last level
+// stops. Every other mode has the one level, the heuristic tau, capped at the
+// pipeline's step count, which is what the viewer always ran.
+void CrossGenWidget::stepDualMBOField(int budget) {
+    if (!dualMBOField_.has_value() || dualMBOConverged_) return;
+    const TORSION::Options pipe;
+    const std::size_t levels = std::max<std::size_t>(1, dualMBOLadder_.size());
+    const int cap = TORSION::fieldLevelCap(pipe, levels);
+    while (budget > 0 && !dualMBOConverged_) {
+        bool levelDone = dualMBOLevelSteps_ >= cap;
+        if (!levelDone) {
+            dualMBOField_->step();
+            ++dualMBOStepCount_;
+            ++dualMBOLevelSteps_;
+            --budget;
+            levelDone = TORSION::fieldLevelConverged(*dualMBOField_) || dualMBOLevelSteps_ >= cap;
+        }
+        if (!levelDone) continue;
+        if (dualMBOLevel_ + 1 < static_cast<int>(levels)) {
+            const Eigen::VectorXcd carried = dualMBOField_->u_k_prev;
+            ++dualMBOLevel_;
+            dualMBOLevelSteps_ = 0;
+            const Interfaces *network =
+                (interfaces_.has_value() && interfaces_->multiMaterial()) ? &*interfaces_ : nullptr;
+            dualMBOField_.emplace(mesh_, pipe.dualMBOMaxSteps, pipe.dualMBOGamma);
+            TORSION::prepareFieldLevel(*dualMBOField_, network, pipe, dualMBOLadder_[dualMBOLevel_],
+                                       carried);
+            std::ostringstream oss;
+            oss << "[DualMBO] tau level " << dualMBOLevel_ + 1 << " of " << levels
+                << ", tau/tau_0 = " << dualMBOLadder_[dualMBOLevel_] << ", after step "
+                << dualMBOStepCount_;
+            console_.log(oss.str());
+        } else {
+            // The last level stopped. TORSION::runField() moves on from a level
+            // at its cap whether or not it converged; every other mode leaves
+            // such a field unconverged, as it always has, which is what
+            // runUMBER()'s own finishing solve and runMERIDIANCones() read.
+            const bool converged = TORSION::fieldLevelConverged(*dualMBOField_);
+            if (mode_ != Mode::TORSION && !converged) return;
+            dualMBOConverged_ = true;
+            std::ostringstream oss;
+            oss << "[DualMBO] " << (converged ? "Converged" : "Stopped at the cap") << " at step "
+                << dualMBOStepCount_ << " error=" << std::scientific << std::setprecision(3)
+                << dualMBOField_->error;
+            console_.log(oss.str());
+        }
+    }
+}
+
 void CrossGenWidget::runMERIDIANCones() {
     if (!dualMBOField_.has_value()) return;   // called before the field: not an attempt
     conesAttempted_ = true;
@@ -1796,15 +2088,9 @@ void CrossGenWidget::runMERIDIANCones() {
         auto t0 = Clock::now();
         // The pipeline's own loop rather than DualMBO::runMBO(), which stops at
         // a tolerance of its own (1e-7): what this finishes has to be the field
-        // TORSION::runField() would have handed Stage 1, or the cone indices
-        // read off it below are read off a different field.
-        const double ntris = static_cast<double>(mesh_->triangles.size());
-        const int cap = TORSION::Options().dualMBOMaxSteps;
-        for (int i = dualMBOStepCount_; i < cap; ++i) {
-            dualMBOField_->step();
-            ++dualMBOStepCount_;
-            if (dualMBOField_->error < 2.0 * ntris * DUALMBO_TOL) break;
-        }
+        // the pipeline would have handed Stage 1, or the cone indices read off
+        // it below are read off a different field.
+        stepDualMBOField(std::numeric_limits<int>::max());
         dualMBOConverged_ = true;
         auto t1 = Clock::now();
         std::ostringstream oss;
@@ -1879,6 +2165,29 @@ void CrossGenWidget::runMERIDIANCones() {
             console_.log("[Cones] could not restore Eq. (4): no boundary cone left within "
                          "the allowed index range");
         }
+    }
+    // The pipelines' own step after the rebalance (MERIDIAN::Options::
+    // relocateFlatCones, on by default in both): a +1 on a stretch of dS that
+    // runs straight is a patch corner of pi, which Stage 10 meshes as one
+    // element with a node in the middle of a side.
+    if (gb.admissible && MERIDIAN::Options().relocateFlatCones) {
+        const int nV = static_cast<int>(mesh_->vertices.size());
+        std::vector<int> region;
+        if (interfaces_.has_value() && interfaces_->multiMaterial()) {
+            region.assign(nV, -1);
+            for (int v = 0; v < nV; ++v) region[v] = interfaces_->regionAt(v);
+        }
+        const int moved = cones_->relocateFlatCones(region, MERIDIAN::Options().flatConeAngle);
+        if (moved > 0) {
+            int inside = 0;
+            for (const ConeSingularities::Relocation &r : cones_->getRelocations()) inside += r.inside;
+            std::ostringstream oss;
+            oss << "[Cones] moved " << moved << " +1 cone(s) off straight dS: "
+                << (moved - inside) << " to the corner at the end of the side, " << inside
+                << " inside";
+            console_.log(oss.str());
+        }
+        gb = cones_->gaussBonnet();
     }
     auto t1 = Clock::now();
 
@@ -3958,6 +4267,17 @@ bool CrossGenWidget::promptTMOP() {
         "Pinning is the isolation knob — it is what tells an interior defect from\n"
         "a boundary one.");
 
+    auto *pillowBox = new QCheckBox("pillow the flat feature corners first", &dlg);
+    pillowBox->setChecked(ts.pillow);
+    pillowBox->setToolTip(
+        "A block corner on a straight stretch of dS or of an interface is one\n"
+        "element spanning 180 degrees at a feature node. No move the smoother is\n"
+        "allowed changes that angle: the node is fixed, or slides along the line\n"
+        "both sides lie on. This puts one layer of quads along that stretch first\n"
+        "(mesh::Pillow), so the node has two elements and the corner is half an\n"
+        "element inside, where TMOP can move it. The layer runs on to the next\n"
+        "corners and its chord to dS, so the element count goes up a little.");
+
     auto *cornerBox = new QDoubleSpinBox(&dlg);
     cornerBox->setRange(0.0, 90.0);
     cornerBox->setDecimals(1);
@@ -4065,6 +4385,11 @@ bool CrossGenWidget::promptTMOP() {
         if (q.invertedQuads > 0)
             oss << "\n" << q.invertedQuads << " element(s) folded: a barrier metric "
                 << "needs the untangler";
+        const std::size_t flat =
+            mesh::Pillow::findDefects(m, mesh::Pillow::Options().flatAngle).size();
+        if (flat > 0)
+            oss << "\n" << flat << " element(s) spanning a flat feature corner: only "
+                << "a pillow repairs those";
         derived->setText(QString::fromStdString(oss.str()));
     };
     QObject::connect(pinBox, &QCheckBox::toggled, &dlg, updateDerived);
@@ -4082,6 +4407,7 @@ bool CrossGenWidget::promptTMOP() {
     form->addRow("size weight gamma (metric 100)", gammaBox);
     form->addRow("exponent p", powerBox);
     form->addRow("sweeps at most", sweepBox);
+    form->addRow(pillowBox);
     form->addRow(pinBox);
     form->addRow("corner if the feature turns by", cornerBox);
     form->addRow("a feature node slides on", curveBox);
@@ -4103,6 +4429,7 @@ bool CrossGenWidget::promptTMOP() {
     ts.gamma       = gammaBox->value();
     ts.exponent    = powerBox->value();
     ts.sweeps      = sweepBox->value();
+    ts.pillow      = pillowBox->isChecked();
     ts.pinFeatures = pinBox->isChecked();
     ts.cornerAngle = cornerBox->value();
     ts.curveSource = curveBox->currentData().toInt();
@@ -4149,12 +4476,34 @@ void CrossGenWidget::runTMOP() {
     mopts.curveSource = static_cast<mesh::QuadMesh::Options::CurveSource>(ts.curveSource);
 
     auto t0 = Clock::now();
+    mesh::Pillow::Report pillowReport;
     try {
         smoothMesh_.emplace(finishedMesh(mopts));
+        // The pillow comes first, on the mesh the smoother is about to be
+        // handed: an element spanning 180 degrees at a feature node is a
+        // corner no admissible move changes, so it has to be given a second
+        // element before TMOP starts rather than after. New nodes are appended
+        // and old ones keep their indices, so the block walls drawn off the
+        // Stage 10 vertex lists still land where they did.
+        if (ts.pillow) {
+            mesh::Pillow pillow(*smoothMesh_);
+            pillow.run();
+            pillowReport = pillow.getReport();
+        }
     } catch (const std::exception &e) {
         smoothMesh_.reset();
         blockPipeline(stage + " failed", e.what());
         return;
+    }
+    if (pillowReport.ran) {
+        std::ostringstream oss;
+        oss << "[TMOP] pillow: " << pillowReport.defectsBefore
+            << " element(s) spanning a flat feature corner, " << pillowReport.layers
+            << " layer(s), " << pillowReport.quadsBefore << " -> " << pillowReport.quadsAfter
+            << " element(s)";
+        if (pillowReport.defectsAfter > 0) oss << ", " << pillowReport.defectsAfter << " left";
+        console_.log(oss.str());
+        for (const std::string &m : pillowReport.messages) console_.log("[TMOP] pillow: " + m);
     }
 
     mesh::TMOP::Options topt;
@@ -4882,6 +5231,8 @@ void CrossGenWidget::runDiskExcision() {
     quadMesh_.reset();
     splines_.reset();
     arrangement_.reset();
+    materialLayout_.reset();
+    regionShown_ = 0;
     separatrices_.reset();
     meridianLayout_.reset();
     meridianLabels_.reset();
@@ -4912,6 +5263,8 @@ void CrossGenWidget::runDiskExcision() {
     meshAttempted_ = tmopAttempted_ = false;
     dualMBOSteppingStarted_ = dualMBOConverged_ = false;
     dualMBOStepCount_ = 0;
+    dualMBOLadder_.assign(1, 1.0);
+    dualMBOLevel_ = dualMBOLevelSteps_ = 0;
 
     {
         std::ostringstream oss;
@@ -5186,7 +5539,7 @@ void CrossGenWidget::advancePhase() {
         pipePhase_ = nextPipelinePhase(pipePhase_);
         if (pipePhase_ != old)
             std::cerr << "[Viewer] " << modeName(mode_) << " Phase "
-                      << pipelinePhaseName(pipePhase_, mode_) << "\n";
+                      << pipelinePhaseName(pipePhase_, mode_, perMaterialView()) << "\n";
 
         // Mesh is the last phase and it stays that way: 'c' at it re-opens the
         // Stage 10 dialog, so a target edge length can be tried, looked at, and
@@ -5200,7 +5553,10 @@ void CrossGenWidget::advancePhase() {
             // for them, so they may not be there yet on the frame that
             // advanced. Build them now rather than opening a dialog on a
             // pipeline that has not run.
-            if (!patchesAttempted_) runMERIDIANPatches();
+            if (!patchesAttempted_) {
+                if (perMaterialView()) runTORSIONGluedPatches();
+                else runMERIDIANPatches();
+            }
         }
         if (pipePhase_ == PipelinePhase::Mesh && splines_.has_value()) {
             // Marked as asked before the dialog opens, for the same reason the
@@ -5758,22 +6114,43 @@ void CrossGenWidget::runComputations() {
         // if the stepping phase were walked past before the field converged.
         const TORSION::Options pipe;
         dualMBOField_.emplace(mesh_, pipe.dualMBOMaxSteps, pipe.dualMBOGamma);
-        // On a multi-material domain the interfaces are Dirichlet data for the
-        // field in exactly the way dS is: a curve the layout has to keep needs
-        // the field tangent to it, or neither region either side gets the
-        // interior cones its own Gauss-Bonnet count demands. Must be set before
-        // initialize(), which does the first assembly.
-        // TORSION needs this more than MERIDIAN does rather than less: it
-        // integrates the field, so an interface the field ran straight through
-        // is an interface the *map* runs straight through.
-        if ((inPipeline() || mode_ == Mode::UMBER) && interfaces_.has_value() &&
-            interfaces_->multiMaterial()) {
-            dualMBOField_->setAlignedInteriorEdges(interfaces_->interfaceEdges());
+        dualMBOLadder_.assign(1, 1.0);
+        dualMBOLevel_ = dualMBOLevelSteps_ = 0;
+        if (mode_ == Mode::TORSION) {
+            // TORSION's own Stage 0, level by level through the same calls
+            // TORSION::runField() makes: the two-point weight, the interfaces
+            // as Dirichlet data, and the tau-continuation, whose ladder is read
+            // off this first level. MERIDIAN's single tau at the default
+            // weight is a different field, and the per-material layout and the
+            // traced route laid it out until this was put right -- with folds
+            // along the interfaces of rt_mushroom that TestTORSION's do not
+            // have.
+            const Interfaces *network =
+                (interfaces_.has_value() && interfaces_->multiMaterial()) ? &*interfaces_ : nullptr;
+            TORSION::prepareFieldLevel(*dualMBOField_, network, pipe, 1.0, Eigen::VectorXcd());
+            dualMBOLadder_ = TORSION::fieldTauLadder(*mesh_, *dualMBOField_, pipe);
+        } else {
+            // On a multi-material domain the interfaces are Dirichlet data for
+            // the field in exactly the way dS is: a curve the layout has to
+            // keep needs the field tangent to it, or neither region either side
+            // gets the interior cones its own Gauss-Bonnet count demands. Must
+            // be set before initialize(), which does the first assembly.
+            if ((inPipeline() || mode_ == Mode::UMBER) && interfaces_.has_value() &&
+                interfaces_->multiMaterial()) {
+                dualMBOField_->setAlignedInteriorEdges(interfaces_->interfaceEdges());
+            }
+            dualMBOField_->initialize();
         }
-        dualMBOField_->initialize();
         auto t1 = Clock::now();
+        std::string ladder;
+        if (dualMBOLadder_.size() > 1) {
+            std::ostringstream oss;
+            oss << "; tau-continuation over " << dualMBOLadder_.size() << " level(s) down to "
+                << "tau/tau_0 = " << dualMBOLadder_.back();
+            ladder = oss.str();
+        }
         console_.log("[DualMBO] Initialized: " +
-                     formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count()));
+                     formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count()) + ladder);
     }
 
     // ── DualMBO: Kick off stepping ───────────────────────────────────────────────
@@ -5786,23 +6163,14 @@ void CrossGenWidget::runComputations() {
 
     // ── DualMBO: Run 2 stepping iterations per frame ─────────────────────────────
     if (dualMBOStageIsStepping() && dualMBOSteppingStarted_ && !dualMBOConverged_) {
-        double ntris = static_cast<double>(mesh_->triangles.size());
-        const int cap = TORSION::Options().dualMBOMaxSteps;
-        for (int i = 0; i < 2 && dualMBOStepCount_ < cap; ++i) {
-            dualMBOField_->step();
-            ++dualMBOStepCount_;
-            if (dualMBOField_->error < 2.0 * ntris * DUALMBO_TOL) {
-                console_.log("[DualMBO] Converged at step " + std::to_string(dualMBOStepCount_) +
-                             " error=" + std::to_string(dualMBOField_->error));
-                dualMBOConverged_ = true;
-                break;
-            }
-        }
+        stepDualMBOField(2);
         dualMBOField_->computeSingularities();
 
         std::ostringstream stepMsg;
-        stepMsg << "[DualMBO] Step " << dualMBOStepCount_ << "  error=" << std::scientific
-                << std::setprecision(3) << dualMBOField_->error;
+        stepMsg << "[DualMBO] Step " << dualMBOStepCount_;
+        if (dualMBOLadder_.size() > 1)
+            stepMsg << " (tau level " << dualMBOLevel_ + 1 << " of " << dualMBOLadder_.size() << ")";
+        stepMsg << "  error=" << std::scientific << std::setprecision(3) << dualMBOField_->error;
         console_.log(stepMsg.str());
     }
 
@@ -5875,8 +6243,30 @@ void CrossGenWidget::runComputations() {
 
     // ── Both pipelines: Stage 1, the cones and Eq. (4) ───────────────────────
     if (inPipeline() && pipePhase_ >= PipelinePhase::Cones &&
-        dualMBOField_.has_value() && !conesAttempted_) {
+        dualMBOField_.has_value() && !conesAttempted_ && !perMaterialView()) {
         runMERIDIANCones();
+    }
+
+    // ── TORSION per material: Stages 1 to 8 of every region, and the matching ─
+    //
+    // One blocking step, where Stage 1 would otherwise run: the regions are
+    // independent problems solved side by side, and the rounds of matching
+    // between them are what make them one layout, so there is no picture of
+    // one stage of it that is not already the picture of all of them. The
+    // phases after this one read what it left.
+    if (perMaterialView() && pipePhase_ >= PipelinePhase::Cones && dualMBOField_.has_value() &&
+        !materialAttempted_) {
+        if (!materialAnnounced_) {
+            console_.log("[Per material] laying every material region out on its own and "
+                         "matching them across the interfaces, this blocks...");
+            materialAnnounced_ = true;
+        } else {
+            runTORSIONPerMaterial();
+        }
+    }
+    if (perMaterialView() && pipePhase_ >= PipelinePhase::Patches && materialLayout_ &&
+        !patchesAttempted_) {
+        runTORSIONGluedPatches();
     }
 
     // ── Both pipelines: Stage 2, the cutting graph ───────────────────────────
@@ -6466,7 +6856,20 @@ bool CrossGenWidget::inUVSplitScreen() const {
             immersion_.has_value()) ||
            // Stage 7 draws the same domain again, with the curves on it.
            (inPipeline() && pipePhase_ == PipelinePhase::Separatrices &&
-            immersion_.has_value());
+            immersion_.has_value()) ||
+           // The per-material mode's three, one region at a time.
+           perMaterialRegionPanel();
+}
+
+bool CrossGenWidget::perMaterialRegionPanel() const {
+    if (!materialLayout_ || !perMaterialView()) return false;
+    if (pipePhase_ != PipelinePhase::Metric && pipePhase_ != PipelinePhase::Layout &&
+        pipePhase_ != PipelinePhase::Separatrices)
+        return false;
+    const std::vector<MaterialLayout::Region> &regions = materialLayout_->getRegions();
+    if (regionShown_ < 0 || regionShown_ >= static_cast<int>(regions.size())) return false;
+    const MaterialLayout::Region &R = regions[regionShown_];
+    return R.layout && R.layout->hasImmersion();
 }
 
 void CrossGenWidget::applyHalfOrtho(int x, int vpW, const viewer::ViewState &vs) const {
@@ -6603,8 +7006,23 @@ void CrossGenWidget::renderMERIDIANModel() {
     if (showFrames)
         viewer::drawCombedFrames(*mesh_, *frames_, scale_);
 
+    // The per-material mode's regions, each with its own frames, cut and cones
+    // on its own mesh -- whose vertices are the model's, so they are drawn
+    // straight over it.
+    const std::vector<MaterialLayout::Region> *regions =
+        materialLayout_ ? &materialLayout_->getRegions() : nullptr;
+    if (regions && pipePhase_ == PipelinePhase::Flow) {
+        for (const MaterialLayout::Region &R : *regions)
+            if (R.layout && R.layout->hasFrames())
+                viewer::drawCombedFrames(*R.mesh, R.layout->getFrames(), scale_);
+    }
+
     if (pipePhase_ >= PipelinePhase::Cut && coneCut_.has_value())
         viewer::drawCuttingGraph(*coneCut_, showMetric ? 2.0f : 3.5f);
+    if (regions && pipePhase_ >= PipelinePhase::Cut) {
+        for (const MaterialLayout::Region &R : *regions)
+            if (R.layout && R.layout->hasCut()) viewer::drawCuttingGraph(R.layout->getCut(), 3.0f);
+    }
     viewer::drawBoundaryEdges(*mesh_);
 
     // The interface network over all of it and under the cones. It is an input
@@ -6615,6 +7033,11 @@ void CrossGenWidget::renderMERIDIANModel() {
 
     if (cones_.has_value())
         viewer::drawCones(*mesh_, *cones_, 0.5 * avgEdge_);
+    if (regions) {
+        for (const MaterialLayout::Region &R : *regions)
+            if (R.layout && R.layout->hasCones())
+                viewer::drawCones(*R.mesh, R.layout->getCones(), 0.5 * avgEdge_);
+    }
 }
 
 // ── normal render ─────────────────────────────────────────────────────────────
@@ -6957,6 +7380,66 @@ void CrossGenWidget::renderNormal() {
             // failed to leave the interior.
             renderUMBERField();
         }
+    } else if (perMaterialRegionPanel()) {
+        // ── Split-screen: left = the model, right = one region's own map ─────
+        //
+        // The per-material mode's psi_0 and Psi are one map per region, each in
+        // a plane of its own and at a scale of its own, so the right half shows
+        // one of them -- '[' and ']' step through the regions -- with the region
+        // tinted on the left. At the separatrix phase the left half has every
+        // region's curves, and the layout vertices the matching put on the
+        // interfaces: green where one region's met the other's, red where one
+        // was left single and the face across from it has a T-junction.
+        const MaterialLayout::Region &R = materialLayout_->getRegions()[regionShown_];
+        const TORSION &T = *R.layout;
+        const int w = fbw();
+        const int halfW = w / 2;
+
+        applyHalfOrtho(0, halfW, view_);
+        {
+            viewer::ViewState leftVs = view_;
+            leftVs.fbw = halfW;
+            leftVs.fbh = fbh();
+            viewer::drawAxis(leftVs);
+        }
+        renderMERIDIANModel();
+        viewer::drawMeshOverlay(*R.mesh, 0.95f, 0.6f, 0.1f, 0.30f, 1.0f);
+        if (pipePhase_ == PipelinePhase::Separatrices) {
+            for (const MaterialLayout::Region &Q : materialLayout_->getRegions()) {
+                if (Q.layout && Q.layout->hasSeparatrices())
+                    viewer::drawSeparatrices(Q.layout->getSeparatrices(),
+                                             Separatrices::Space::Model, 0.35 * avgEdge_, 2.5f);
+            }
+            const std::vector<MaterialLayout::Station> &st = materialLayout_->getStations();
+            std::vector<char> single(st.size(), 0);
+            for (int i : materialLayout_->getUnmatched())
+                if (i >= 0 && i < static_cast<int>(st.size())) single[i] = 1;
+            const double r = 0.22 * avgEdge_;
+            for (size_t i = 0; i < st.size(); ++i) {
+                if (single[i]) viewer::drawDisk3D(st[i].p, 1.8 * r, 0.95f, 0.1f, 0.1f);
+                else viewer::drawDisk3D(st[i].p, r, 0.15f, 0.65f, 0.25f);
+            }
+        }
+
+        applyHalfOrtho(halfW, w - halfW, uvView_);
+        {
+            const double diag = std::hypot(uvView_.baseW, uvView_.baseH);
+            if (pipePhase_ == PipelinePhase::Metric || !T.hasLayout()) {
+                const std::vector<Point> &uv =
+                    (showIntegrated_ && !T.getIntegratedMap().empty()) ? T.getIntegratedMap()
+                                                                       : T.getImmersion().getUV();
+                viewer::drawLayoutUV(T.getImmersion(), nullptr, uv, 0.010 * diag * uvView_.zoom);
+            } else {
+                const std::vector<Point> &uv =
+                    showPsiR_ ? T.getImmersion().getUV() : T.getLayout().getUV();
+                viewer::drawLayoutUV(T.getImmersion(), T.hasLabels() ? &T.getLabels() : nullptr,
+                                     uv, 0.010 * diag * uvView_.zoom);
+                if (pipePhase_ == PipelinePhase::Separatrices && T.hasSeparatrices())
+                    viewer::drawSeparatrices(T.getSeparatrices(), Separatrices::Space::Image,
+                                             0.007 * diag * uvView_.zoom, 2.5f);
+            }
+        }
+        drawSplitDivider(halfW);
     } else if (inPipeline() &&
                (pipePhase_ == PipelinePhase::Layout ||
                 pipePhase_ == PipelinePhase::Separatrices) &&
@@ -7078,7 +7561,7 @@ void CrossGenWidget::renderNormal() {
         drawSplitDivider(halfW);
     } else if (inPipeline()) {
         viewer::drawAxis(view_);
-        if (pipePhase_ < PipelinePhase::Cones || !cones_.has_value()) {
+        if (pipePhase_ < PipelinePhase::Cones || (!cones_.has_value() && !materialLayout_)) {
             // The three DualMBO stages both pipelines start from: the field whose
             // holonomy Sec. 3.1 is about to turn into cone indices, and the
             // interior singularities it already found.
@@ -7273,9 +7756,24 @@ void CrossGenWidget::renderNormal() {
              ? std::string("press 'i' to show/hide the interface network\n"
                            "press 'm' to fill the triangles by material\n")
              : std::string()) +
+        ((mode_ == Mode::TORSION && interfaces_.has_value() && interfaces_->multiMaterial() &&
+          pipePhase_ < PipelinePhase::Cones)
+             ? std::string(perMaterial_ ? "press 'w' to lay the whole model out at once\n"
+                                        : "press 'w' to lay it out one material region at a time\n")
+             : std::string()) +
+        (perMaterialRegionPanel()
+             ? std::string("press '[' / ']' for the previous / next region on the right\n")
+             : std::string()) +
         ((mode_ == Mode::ATLAS && atlasMultiMaterial_)
              ? std::string("press 'm' to fill the elements by material\n")
              : std::string());
+
+    // The connectivity dialog re-traces Stage 7 on the one map the traced
+    // route has; the per-material mode has one per region and no such key.
+    const std::string connectivityKey =
+        immersion_.has_value() ? std::string("press 'n' to change the connectivity settings "
+                                             "and trace again\n")
+                               : std::string();
 
     // UMBER's own, on the same footing: whatever refused, and the material
     // fill where the blocks landed in more than one material.
@@ -7327,6 +7825,13 @@ void CrossGenWidget::renderNormal() {
     } else if (mode_ == Mode::OASIS) {
         renderOverlay("press 'c' to change lambda / orientation\n"
                       "press 'r' to restart\npress 'q' to quit");
+    } else if (perMaterialRegionPanel() && (pipePhase_ == PipelinePhase::Metric ||
+                                            pipePhase_ == PipelinePhase::Layout)) {
+        renderOverlay((meridianKeys +
+                       (pipePhase_ == PipelinePhase::Metric
+                            ? "press 'p' to swap the region's psi_0 / its Stage 4F map\n"
+                            : "press 'p' to swap the region's psi_0 / its Psi\n") +
+                       "press 'r' to restart\npress 'q' to quit").c_str());
     } else if (mode_ == Mode::TORSION && pipePhase_ == PipelinePhase::Metric &&
                immersion_.has_value() && !integratedMap_.empty()) {
         renderOverlay((meridianKeys + "press 'p' to swap psi_0 / the Stage 4F map\n"
@@ -7339,17 +7844,17 @@ void CrossGenWidget::renderNormal() {
         renderOverlay((meridianKeys +
                        "press 'c' to smooth again at other TMOP settings\n"
                        "press 'e' to mesh again at another target edge length\n"
-                       "press 'n' to change the connectivity settings and trace again\n"
+                       + connectivityKey +
                        "press 'r' to restart\npress 'q' to quit").c_str());
     } else if (inPipeline() && pipePhase_ == PipelinePhase::Mesh) {
         renderOverlay((meridianKeys +
                        "press 'c' to smooth the mesh with TMOP (Stage 12)\n"
                        "press 'e' to mesh again at another target edge length\n"
-                       "press 'n' to change the connectivity settings and trace again\n"
+                       + connectivityKey +
                        "press 'r' to restart\npress 'q' to quit").c_str());
     } else if (inPipeline() && pipePhase_ == PipelinePhase::Patches) {
         renderOverlay((meridianKeys + "press 'c' to mesh the patches (Stage 10)\n"
-                       "press 'n' to change the connectivity settings and trace again\n"
+                       + connectivityKey +
                        "press 'r' to restart\npress 'q' to quit").c_str());
     } else if (mode_ == Mode::ZIPLINE && ziplinePhase_ == ZIPLINEPhase::Blocks) {
         renderOverlay((ziplineKeys + "press 'c' to mesh the blocks\n"
@@ -7404,9 +7909,10 @@ void CrossGenWidget::drawLegends() {
 
     // Either pipeline: the node colours of the interface network, above the
     // cone legend, whenever the network is on screen.
-    const bool sepLegendShown = (inPipeline() && cones_.has_value() &&
-                                 pipePhase_ == PipelinePhase::Separatrices &&
-                                 separatrices_.has_value());
+    const bool sepLegendShown = (inPipeline() &&
+                                 ((cones_.has_value() && separatrices_.has_value()) ||
+                                  (materialLayout_ && perMaterialView())) &&
+                                 pipePhase_ == PipelinePhase::Separatrices);
     // ZIPLINE draws the network up to the quantization and at its Blocks
     // phase, and not over the mesh; the key goes with it.
     const bool ziplineNetworkShown =
@@ -7419,13 +7925,21 @@ void CrossGenWidget::drawLegends() {
     // Either pipeline: the cone colours everywhere they are drawn, and
     // whichever ramp -- or, on the field route, whichever palette -- the
     // current phase is using under them.
-    if (inPipeline() && cones_.has_value()) {
+    const MaterialLayout::Region *shown =
+        (materialLayout_ && perMaterialView() && regionShown_ >= 0 &&
+         regionShown_ < static_cast<int>(materialLayout_->getRegions().size()))
+            ? &materialLayout_->getRegions()[regionShown_]
+            : nullptr;
+    if (inPipeline() && (cones_.has_value() || shown)) {
         viewer::drawConeLegend(fbw(), fbh());
-        if (pipePhase_ == PipelinePhase::Separatrices && separatrices_.has_value()) {
+        if (pipePhase_ == PipelinePhase::Separatrices && (separatrices_.has_value() || shown)) {
             viewer::drawSeparatrixLegend(fbw(), fbh());
         } else if (mode_ == Mode::TORSION && pipePhase_ == PipelinePhase::Flow &&
                    frames_.has_value()) {
             viewer::drawCombedFrameLegend(fbw(), fbh(), *frames_);
+        } else if (mode_ == Mode::TORSION && pipePhase_ == PipelinePhase::Flow && shown &&
+                   shown->layout && shown->layout->hasFrames()) {
+            viewer::drawCombedFrameLegend(fbw(), fbh(), shown->layout->getFrames());
         } else if (pipePhase_ == PipelinePhase::Flow && ricciU_.size() > 0) {
             viewer::drawScalarFieldLegend(fbw(), fbh(), -ricciUAbsMax_, ricciUAbsMax_,
                                           "conformal factor u, mean removed");
@@ -7488,7 +8002,7 @@ QString CrossGenWidget::nextFigurePath(const char *extension) const {
     const char *phase = "";
     switch (mode_) {
     case Mode::TORSION:
-    case Mode::MERIDIAN:   phase = pipelinePhaseName(pipePhase_, mode_); break;
+    case Mode::MERIDIAN:   phase = pipelinePhaseName(pipePhase_, mode_, perMaterialView()); break;
     case Mode::ZIPLINE:        phase = ziplinePhaseName(ziplinePhase_);              break;
     case Mode::MedialAxis: phase = medialAxisPhaseName(maPhase_);        break;
     case Mode::OASIS:      phase = oasisPhaseName(oasisPhase_);          break;

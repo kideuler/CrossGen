@@ -38,10 +38,12 @@
 #include "MERIDIAN/SplineFit.hxx"
 #include "dualmbo/DualMBO.hxx"
 #include "TORSION/ConeMetric.hxx"
+#include "TORSION/MaterialLayout.hxx"
 #include "TORSION/TORSION.hxx"
 #include "TestHelper.hxx"
 #include "mesh/QuadMesh.hxx"
 #include "mesh/TMOP.hxx"
+#include "mesh/Pillow.hxx"
 
 namespace {
 
@@ -675,6 +677,20 @@ void usage(const char *prog) {
               << "                                 input has no cones at all\n"
               << "                       ricci     Pipeline A's flat cone metric, computed for\n"
               << "                                 the reference alone; the known-good yardstick\n\n"
+              << "Per-material mode (a multi-material model; docs/cf_flow_pipeline.md Sec. 15)\n"
+              << "  --whole-model      lay the whole model out at once rather than one material\n"
+              << "                     region at a time (Options::perMaterial off)\n"
+              << "  --pm-rounds <n>    rounds of matching at most                  (default 10)\n"
+              << "  --pm-threads <n>   regions laid out at once, 0 = one per hardware thread\n"
+              << "  --pm-tolerance <e> how many edges apart two layout vertices across an\n"
+              << "                     interface may be and still be matched       (default 3)\n"
+              << "  --pm-no-fallback   keep the glued layout even when it is not valid, rather\n"
+              << "                     than running the whole model as well\n"
+              << "  --pm-cancel-always keep a region's +1/-1 cancellation even when it leaves\n"
+              << "                     faces that are not simple quadrilaterals\n"
+              << "  --pm-most-pairs    match by most pairs alone, wherever the glued nodes land\n"
+              << "  --pm-move-ends     move a matched curve's last point onto its glued node\n"
+              << "                     instead of bending the curve into it\n\n"
               << "Stages 5 to 10 (MERIDIAN's, unchanged)\n"
               << "  --gamma <g>        edge penalty                          (default 10)\n"
               << "  --steps <n>        dual-mesh MBO steps                        (default 500)\n"
@@ -692,6 +708,8 @@ void usage(const char *prog) {
               << "  --no-cancel-dipoles    keep the +1/-1 pairs on curved interfaces\n"
               << "  --no-dipole-retry  do not rerun Stages 1-4R keeping the pairs when\n"
               << "                     cancelling them cost Stage 4F the alignment\n"
+              << "  --keep-flat-cones  leave a +1 cone where Stage 1 put it on straight dS\n"
+              << "                     (a patch corner of pi; Stage 1 before 2026-10-02)\n"
               << "  --no-e6            leave the interfaces to E3 alone\n"
               << "  --no-seam-turns    give every chain of an interface branch the branch's\n"
               << "                     label, ignoring the quarter turns of the cuts it crosses\n"
@@ -718,6 +736,10 @@ void usage(const char *prog) {
               << "  --collapse-span <f>  contract a chord whose every patch is thinner\n"
               << "                     than this times the target                 (default 0.5)\n"
               << "  --no-collapse      keep every chord, however thin its patches\n"
+              << "  --sample-materials give each element the material its samples find, not\n"
+              << "                     its layout face's (Stage 10 before 2026-10-01)\n"
+              << "  --contract-at-root place a contracted run of nodes where the union-find\n"
+              << "                     left its root, on dS or an interface or not\n"
               << "  --disk-templates   excise every circular inclusion (Stage 0c) and fill it\n"
               << "                     back in with an O-grid template (Stage 11)\n"
               << "  --disk-squareness <w>  how square the template's core is  (default 0.55)\n"
@@ -735,160 +757,38 @@ void usage(const char *prog) {
               << "  --quads <file.obj> write the Stage 10 quadrilateral mesh\n"
               << "  --mfem <f.mesh>    write the final mesh for MFEM, material id per element\n"
               << "  --tmop <n>         smooth the final mesh with n TMOP sweeps (metric 007,\n"
-              << "                     shape and size) before writing it, 0 = off (default 0)\n";
+              << "                     shape and size) before writing it, 0 = off (default 0)\n"
+              << "  --tmop-gauss       sample TMOP at the 2x2 Gauss points, not the element\n"
+              << "                     corners (Stage 12 before 2026-10-02)\n"
+              << "  --no-pillow        TMOP straight away, without first pillowing the feature\n"
+              << "                     corners an element spans flat (Stage 12 before 2026-10-02)\n";
 }
 
 } // namespace
 
-int main(int argc, char **argv) {
-    if (argc < 2) { usage(argv[0]); return 1; }
-    const std::string first = argv[1];
-    if (first == "--selftest") return selfTest();
-    if (first == "--ref-test") {
-        if (argc < 3) { usage(argv[0]); return 1; }
-        return referenceTest(argv[2]);
-    }
-
-    const std::string path = first;
-    TORSION::Options opts;
-    std::string psiOut, rawOut, tutteOut, layoutOut, cutOut, quadOut, arrOut, mfemOut;
+// ---------------------------------------------------------------------------
+// Stages 1 to 6 as the whole-model route reports them. Returns -1 to go on to
+// Stage 7, or main()'s exit code where the pipeline stopped short.
+// ---------------------------------------------------------------------------
+struct WholeModelOutputs {
+    std::string cutOut, rawOut, tutteOut, psiOut, layoutOut;
     int coneListLimit = 20;
-    int tmopSweeps = 0;
+};
 
-    for (int i = 2; i < argc; ++i) {
-        const std::string a = argv[i];
-        if (a == "--h" && i + 1 < argc)                 opts.targetEdge = std::stod(argv[++i]);
-        else if (a == "--no-untangle")                  opts.untangle = false;
-        else if (a == "--untangle-outer" && i + 1 < argc) opts.untangleOuterSteps = std::stoi(argv[++i]);
-        else if (a == "--untangle-mu" && i + 1 < argc)  opts.untangleSeamWeight = std::stod(argv[++i]);
-        else if (a == "--reg" && i + 1 < argc)          opts.integrationRegularisation = std::stod(argv[++i]);
-        else if (a == "--no-seed-check")                opts.checkSecondSeed = false;
-        else if (a == "--no-align")                     opts.alignInIntegration = false;
-        else if (a == "--no-conformal-sizing")          opts.conformalSizing = false;
-        else if (a == "--no-align-fallback")            opts.alignmentFallback = false;
-        else if (a == "--no-seam-align")                opts.alignAcrossSeams = false;
-        else if (a == "--choose-by-flips")              opts.alignmentChooseByLadder = false;
-        else if (a == "--no-regularised-untangle")      opts.regularisedUntangleRings = 0;
-        else if (a == "--no-sector-reconcile")          opts.reconcileSectors = false;
-        else if (a == "--release-rounds" && i + 1 < argc) opts.alignmentReleaseRounds = std::stoi(argv[++i]);
-        else if (a == "--no-pull")                      opts.pullOntoAlignment = false;
-        else if (a == "--ref" && i + 1 < argc) {
-            const std::string r = argv[++i];
-            if (r == "cone")           opts.reference = TORSION::Options::Reference::Cone;
-            else if (r == "induced")   opts.reference = TORSION::Options::Reference::Induced;
-            else if (r == "field")     opts.reference = TORSION::Options::Reference::Field;
-            else if (r == "euclidean") opts.reference = TORSION::Options::Reference::Euclidean;
-            else if (r == "ricci")     opts.reference = TORSION::Options::Reference::Ricci;
-            else { std::cerr << "Unknown reference: " << r << "\n"; return 1; }
-        }
-        else if (a == "--gamma" && i + 1 < argc)        opts.dualMBOGamma = std::stod(argv[++i]);
-        else if (a == "--steps" && i + 1 < argc)        opts.dualMBOMaxSteps = std::stoi(argv[++i]);
-        else if (a == "--weight" && i + 1 < argc) {
-            const std::string w = argv[++i];
-            if      (w == "min")  opts.dualMBOWeight = DualMBO::PenaltyWeight::MinHeight;
-            else if (w == "harm") opts.dualMBOWeight = DualMBO::PenaltyWeight::HarmonicHeight;
-            else if (w == "orth") opts.dualMBOWeight = DualMBO::PenaltyWeight::Orthogonal;
-            else { std::cerr << "Unknown --weight '" << w << "' (expected min|harm|orth)\n"; return 1; }
-        }
-        else if (a == "--no-continuation")              opts.dualMBOTauContinuation = false;
-        else if (a == "--tau-ratio" && i + 1 < argc)     opts.dualMBOTauRatio = std::stod(argv[++i]);
-        else if (a == "--tau-floor" && i + 1 < argc)     opts.dualMBOTauFloorEdges = std::stod(argv[++i]);
-        else if (a == "--cut-to-graph")                 opts.coneCutsToBoundary = false;
-        else if (a == "--no-interfaces")                opts.materialInterfaces = false;
-        else if (a == "--no-field-interfaces")          opts.alignFieldToInterfaces = false;
-        else if (a == "--no-cancel-dipoles")            opts.cancelInterfaceDipoles = false;
-        else if (a == "--no-dipole-retry")              opts.retryKeepingDipoles = false;
-        else if (a == "--no-e6")                        opts.interfaceCorners = false;
-        else if (a == "--no-seam-turns")                opts.seamTurnInterfaceLabels = false;
-        else if (a == "--outer" && i + 1 < argc)        opts.outerSteps = std::stoi(argv[++i]);
-        else if (a == "--inner" && i + 1 < argc)        opts.innerIterations = std::stoi(argv[++i]);
-        else if (a == "--lambda" && i + 1 < argc)       opts.lambdaInit = std::stod(argv[++i]);
-        else if (a == "--growth" && i + 1 < argc)       opts.lambdaGrowth = std::stod(argv[++i]);
-        else if (a == "--align-factor" && i + 1 < argc) opts.lambdaAlignmentFactor = std::stod(argv[++i]);
-        else if (a == "--seam-factor" && i + 1 < argc)  opts.lambdaSeamFactor = std::stod(argv[++i]);
-        else if (a == "--no-topo")                      opts.seedTopoConstraints = false;
-        else if (a == "--no-retry") {
-            opts.topoNearMissRetry = 0.0;
-            opts.topoNearMissLastRetry = 0.0;
-            opts.topoRetryUnseeded = false;
-        }
-        else if (a == "--retry" && i + 1 < argc)       opts.topoNearMissRetry = std::stod(argv[++i]);
-        else if (a == "--last-retry" && i + 1 < argc)  opts.topoNearMissLastRetry = std::stod(argv[++i]);
-        else if (a == "--no-unseeded-retry")           opts.topoRetryUnseeded = false;
-        else if (a == "--near-miss" && i + 1 < argc)    opts.topoNearMiss = std::stod(argv[++i]);
-        else if (a == "--no-layout")                    opts.runLayout = false;
-        else if (a == "--no-trace")                     opts.runSeparatrices = false;
-        else if (a == "--no-arrange")                   opts.runArrangement = false;
-        else if (a == "--no-splines")                   opts.runSplines = false;
-        else if (a == "--no-mesh")                      opts.runQuadMesh = false;
-        else if (a == "--collapse-span" && i + 1 < argc) opts.quadCollapseSpan = std::stod(argv[++i]);
-        else if (a == "--no-collapse")                 opts.quadCollapseSpan = 0.0;
-        else if (a == "--target" && i + 1 < argc)       opts.quadTargetEdge = std::stod(argv[++i]);
-        else if (a == "--disk-templates")               opts.diskTemplates = true;
-        else if (a == "--disk-squareness" && i + 1 < argc)
-            opts.diskCoreSquareness = std::stod(argv[++i]);
-        else if (a == "--disk-ring" && i + 1 < argc)    opts.diskRingDepth = std::stoi(argv[++i]);
-        else if (a == "--disk-smooth" && i + 1 < argc)
-            opts.diskSmoothingPasses = std::stoi(argv[++i]);
-        else if (a == "--repair" && i + 1 < argc)       opts.repairPasses = std::stoi(argv[++i]);
-        else if (a == "--cones" && i + 1 < argc)        coneListLimit = std::stoi(argv[++i]);
-        else if (a == "--psi" && i + 1 < argc)          psiOut = argv[++i];
-        else if (a == "--raw" && i + 1 < argc)          rawOut = argv[++i];
-        else if (a == "--tutte" && i + 1 < argc)        tutteOut = argv[++i];
-        else if (a == "--layout" && i + 1 < argc)       layoutOut = argv[++i];
-        else if (a == "--cut" && i + 1 < argc)          cutOut = argv[++i];
-        else if (a == "--quads" && i + 1 < argc)        quadOut = argv[++i];
-        else if (a == "--mfem" && i + 1 < argc)         mfemOut = argv[++i];
-        else if (a == "--arr" && i + 1 < argc)          arrOut = argv[++i];
-        else if (a == "--tmop" && i + 1 < argc)         tmopSweeps = std::stoi(argv[++i]);
-        else { std::cerr << "Unknown option: " << a << "\n"; usage(argv[0]); return 1; }
-    }
-
-    std::shared_ptr<Mesh> mesh;
-    try {
-        mesh = std::make_shared<Mesh>(path);
-    } catch (const std::exception &e) {
-        std::cout << kFail << " Failed to load mesh: " << e.what() << "\n";
-        return 2;
-    }
-
-    std::cout << "TORSION -- Pipeline B: the layout of Shepherd, Gu and Hughes (2022) with\n"
-              << "psi_0 integrated from the DualMBO cross field (docs/cf_flow_pipeline.md)\n";
-    std::cout << "Mesh: " << path << "\n";
-    std::cout << "  " << mesh->vertices.size() << " vertices, "
-              << mesh->edges.size() << " edges, "
-              << mesh->triangles.size() << " triangles, "
-              << mesh->boundaryEdges.size() << " boundary edges\n";
-
-    TORSION pipeline(mesh, opts);
-    bool ok = false;
-    try {
-        ok = pipeline.run();
-    } catch (const std::exception &e) {
-        std::cout << kFail << " Pipeline threw: " << e.what() << "\n";
-        return 3;
-    }
+static int reportWholeModel(const TORSION &pipeline, const std::shared_ptr<Mesh> &mesh,
+                            const TORSION::Options &opts, const WholeModelOutputs &outputs) {
     const TORSION::Status &st = pipeline.getStatus();
-
     auto stageMessages = [&](const std::string &prefix) {
         for (const std::string &m : st.messages) {
             if (m.rfind(prefix, 0) == 0) warn(m.substr(prefix.size()));
         }
     };
-
-    // ---------------------------------------------------------------------
-    heading("Stage 0  Cross field (p=0 dual-mesh MBO)");
-    std::cout << "  MBO steps: " << st.mboSteps << ", residual " << std::scientific
-              << std::setprecision(3) << pipeline.getField().error << std::defaultfloat << "\n";
-    verdict(st.fieldConverged, "Field converged");
-    if (st.materials > 1) {
-        std::cout << "  " << st.materials << " material(s) in " << st.regions
-                  << " region(s); " << st.interfaceEdges << " interface edge(s) in "
-                  << st.interfaceBranches << " branch(es), " << st.interfaceNodes << " node(s)\n";
-        verdict(st.fieldAlignedToInterfaces, "The interfaces are Dirichlet data for the field");
-        verdict(st.regionsBalanced == st.regions,
-                "Every material region satisfies its own Eq. (4)");
-    }
+    const int coneListLimit = outputs.coneListLimit;
+    const std::string &cutOut = outputs.cutOut;
+    const std::string &rawOut = outputs.rawOut;
+    const std::string &tutteOut = outputs.tutteOut;
+    const std::string &psiOut = outputs.psiOut;
+    const std::string &layoutOut = outputs.layoutOut;
 
     // ---------------------------------------------------------------------
     heading("Stage 1  Cone singularities (Sec. 3.1)");
@@ -1247,6 +1147,250 @@ int main(int argc, char **argv) {
         else warn("Failed to write " + layoutOut);
     }
 
+    return -1;
+}
+
+// ---------------------------------------------------------------------------
+// Stages 1 to 8 as the per-material mode ran them: one line per material
+// region, then what the matching across the interfaces came to.
+// ---------------------------------------------------------------------------
+static void reportPerMaterial(const TORSION &pipeline) {
+    const TORSION::Status &st = pipeline.getStatus();
+    heading("Stages 1 to 8, one material region at a time (Sec. 15)");
+    if (!pipeline.hasMaterialLayout()) {
+        std::cout << "  " << kFail << " The regions were not laid out.\n";
+        return;
+    }
+    const MaterialLayout &ml = pipeline.getMaterialLayout();
+    const MaterialLayout::Report &mr = ml.getReport();
+    std::cout << "  " << mr.regions << " region(s); " << mr.regionRuns << " layout(s) from Stage 1 and "
+              << mr.regionRelayouts << " from Stage 5 again over " << mr.rounds
+              << " round(s) of matching, " << std::fixed << std::setprecision(1) << mr.seconds
+              << " s" << std::defaultfloat << "\n";
+    if (!mr.askedPerRound.empty()) {
+        std::cout << "  Layout edges asked per round:";
+        for (int a : mr.askedPerRound) std::cout << " " << a;
+        std::cout << "\n";
+    }
+    std::cout << "  " << mr.emitters << " layout edge(s) asked of a region by its neighbours; "
+              << mr.matched << " layout vertex/vertices matched across an interface, "
+              << mr.unmatched << " left single; worst match "
+              << std::fixed << std::setprecision(2) << mr.maxMatchOffset << " edge(s)"
+              << std::defaultfloat << "\n";
+    const std::vector<MaterialLayout::Region> &regions = ml.getRegions();
+    for (size_t r = 0; r < regions.size(); ++r) {
+        const MaterialLayout::Region &R = regions[r];
+        std::cout << "    r" << r << "  material " << R.material << ", " << R.triangles.size()
+                  << " triangle(s)";
+        if (!R.layout) {
+            std::cout << ": not laid out\n";
+            continue;
+        }
+        const TORSION::Status &rs = R.layout->getStatus();
+        std::cout << "; " << rs.interiorCones << " + " << rs.boundaryCones << " cone(s)";
+        if (R.laidOut()) {
+            const Arrangement::Report &ar = R.layout->getArrangement().getReport();
+            std::cout << "; " << ar.patches << " patch(es), " << ar.simpleQuads << " simple";
+        }
+        std::cout << "; " << R.emitters.size() << " emitter(s)"
+                  << (R.dipolesKept ? "; +1/-1 pairs kept" : "")
+                  << (rs.layoutValid ? "" : "; Stage 6 short of Definition 2.1") << "; "
+                  << std::fixed << std::setprecision(2) << R.seconds << " s" << std::defaultfloat
+                  << "\n";
+    }
+    verdict(mr.regionsValid == mr.regions,
+            "Every region's own layout reaches Definition 2.1 with every face a simple quadrilateral");
+    verdict(mr.converged, "The matching settled: no region is asked for another layout edge");
+    verdict(mr.unmatched == 0, "Every layout vertex on an interface is matched on the other side");
+    for (const std::string &m : st.messages) {
+        if (m.rfind("Per material: ", 0) == 0) warn(m.substr(14));
+    }
+    if (st.perMaterialFallbackRan) {
+        std::cout << "  The whole model was laid out as well; the "
+                  << (st.perMaterialKept ? "glued" : "whole-model") << " layout is the one kept.\n";
+    }
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) { usage(argv[0]); return 1; }
+    const std::string first = argv[1];
+    if (first == "--selftest") return selfTest();
+    if (first == "--ref-test") {
+        if (argc < 3) { usage(argv[0]); return 1; }
+        return referenceTest(argv[2]);
+    }
+
+    const std::string path = first;
+    TORSION::Options opts;
+    std::string psiOut, rawOut, tutteOut, layoutOut, cutOut, quadOut, arrOut, mfemOut;
+    int coneListLimit = 20;
+    int tmopSweeps = 0;
+    bool tmopGauss = false;
+    bool tmopPillow = true;
+
+    for (int i = 2; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "--h" && i + 1 < argc)                 opts.targetEdge = std::stod(argv[++i]);
+        else if (a == "--no-untangle")                  opts.untangle = false;
+        else if (a == "--untangle-outer" && i + 1 < argc) opts.untangleOuterSteps = std::stoi(argv[++i]);
+        else if (a == "--untangle-mu" && i + 1 < argc)  opts.untangleSeamWeight = std::stod(argv[++i]);
+        else if (a == "--reg" && i + 1 < argc)          opts.integrationRegularisation = std::stod(argv[++i]);
+        else if (a == "--no-seed-check")                opts.checkSecondSeed = false;
+        else if (a == "--no-align")                     opts.alignInIntegration = false;
+        else if (a == "--no-conformal-sizing")          opts.conformalSizing = false;
+        else if (a == "--no-align-fallback")            opts.alignmentFallback = false;
+        else if (a == "--no-seam-align")                opts.alignAcrossSeams = false;
+        else if (a == "--choose-by-flips")              opts.alignmentChooseByLadder = false;
+        else if (a == "--no-regularised-untangle")      opts.regularisedUntangleRings = 0;
+        else if (a == "--no-sector-reconcile")          opts.reconcileSectors = false;
+        else if (a == "--release-rounds" && i + 1 < argc) opts.alignmentReleaseRounds = std::stoi(argv[++i]);
+        else if (a == "--no-pull")                      opts.pullOntoAlignment = false;
+        else if (a == "--whole-model")                  opts.perMaterial = false;
+        else if (a == "--pm-rounds" && i + 1 < argc)    opts.perMaterialRounds = std::stoi(argv[++i]);
+        else if (a == "--pm-threads" && i + 1 < argc)   opts.perMaterialThreads = std::stoi(argv[++i]);
+        else if (a == "--pm-tolerance" && i + 1 < argc) opts.perMaterialMatchTolerance = std::stod(argv[++i]);
+        else if (a == "--pm-no-fallback")               opts.perMaterialFallback = false;
+        else if (a == "--pm-cancel-always")             opts.perMaterialKeepDipoles = false;
+        else if (a == "--pm-most-pairs")                opts.perMaterialSpacedMatching = false;
+        else if (a == "--pm-move-ends")                 opts.perMaterialBendEnds = false;
+        else if (a == "--ref" && i + 1 < argc) {
+            const std::string r = argv[++i];
+            if (r == "cone")           opts.reference = TORSION::Options::Reference::Cone;
+            else if (r == "induced")   opts.reference = TORSION::Options::Reference::Induced;
+            else if (r == "field")     opts.reference = TORSION::Options::Reference::Field;
+            else if (r == "euclidean") opts.reference = TORSION::Options::Reference::Euclidean;
+            else if (r == "ricci")     opts.reference = TORSION::Options::Reference::Ricci;
+            else { std::cerr << "Unknown reference: " << r << "\n"; return 1; }
+        }
+        else if (a == "--gamma" && i + 1 < argc)        opts.dualMBOGamma = std::stod(argv[++i]);
+        else if (a == "--steps" && i + 1 < argc)        opts.dualMBOMaxSteps = std::stoi(argv[++i]);
+        else if (a == "--weight" && i + 1 < argc) {
+            const std::string w = argv[++i];
+            if      (w == "min")  opts.dualMBOWeight = DualMBO::PenaltyWeight::MinHeight;
+            else if (w == "harm") opts.dualMBOWeight = DualMBO::PenaltyWeight::HarmonicHeight;
+            else if (w == "orth") opts.dualMBOWeight = DualMBO::PenaltyWeight::Orthogonal;
+            else { std::cerr << "Unknown --weight '" << w << "' (expected min|harm|orth)\n"; return 1; }
+        }
+        else if (a == "--no-continuation")              opts.dualMBOTauContinuation = false;
+        else if (a == "--tau-ratio" && i + 1 < argc)     opts.dualMBOTauRatio = std::stod(argv[++i]);
+        else if (a == "--tau-floor" && i + 1 < argc)     opts.dualMBOTauFloorEdges = std::stod(argv[++i]);
+        else if (a == "--cut-to-graph")                 opts.coneCutsToBoundary = false;
+        else if (a == "--no-interfaces")                opts.materialInterfaces = false;
+        else if (a == "--no-field-interfaces")          opts.alignFieldToInterfaces = false;
+        else if (a == "--no-cancel-dipoles")            opts.cancelInterfaceDipoles = false;
+        else if (a == "--no-dipole-retry")              opts.retryKeepingDipoles = false;
+        else if (a == "--keep-flat-cones")              opts.relocateFlatCones = false;
+        else if (a == "--no-e6")                        opts.interfaceCorners = false;
+        else if (a == "--no-seam-turns")                opts.seamTurnInterfaceLabels = false;
+        else if (a == "--outer" && i + 1 < argc)        opts.outerSteps = std::stoi(argv[++i]);
+        else if (a == "--inner" && i + 1 < argc)        opts.innerIterations = std::stoi(argv[++i]);
+        else if (a == "--lambda" && i + 1 < argc)       opts.lambdaInit = std::stod(argv[++i]);
+        else if (a == "--growth" && i + 1 < argc)       opts.lambdaGrowth = std::stod(argv[++i]);
+        else if (a == "--align-factor" && i + 1 < argc) opts.lambdaAlignmentFactor = std::stod(argv[++i]);
+        else if (a == "--seam-factor" && i + 1 < argc)  opts.lambdaSeamFactor = std::stod(argv[++i]);
+        else if (a == "--no-topo")                      opts.seedTopoConstraints = false;
+        else if (a == "--no-retry") {
+            opts.topoNearMissRetry = 0.0;
+            opts.topoNearMissLastRetry = 0.0;
+            opts.topoRetryUnseeded = false;
+        }
+        else if (a == "--retry" && i + 1 < argc)       opts.topoNearMissRetry = std::stod(argv[++i]);
+        else if (a == "--last-retry" && i + 1 < argc)  opts.topoNearMissLastRetry = std::stod(argv[++i]);
+        else if (a == "--no-unseeded-retry")           opts.topoRetryUnseeded = false;
+        else if (a == "--near-miss" && i + 1 < argc)    opts.topoNearMiss = std::stod(argv[++i]);
+        else if (a == "--no-layout")                    opts.runLayout = false;
+        else if (a == "--no-trace")                     opts.runSeparatrices = false;
+        else if (a == "--no-arrange")                   opts.runArrangement = false;
+        else if (a == "--no-splines")                   opts.runSplines = false;
+        else if (a == "--no-mesh")                      opts.runQuadMesh = false;
+        else if (a == "--collapse-span" && i + 1 < argc) opts.quadCollapseSpan = std::stod(argv[++i]);
+        else if (a == "--no-collapse")                 opts.quadCollapseSpan = 0.0;
+        else if (a == "--sample-materials")            opts.quadMaterialsFromFaces = false;
+        else if (a == "--contract-at-root")            opts.quadContractOntoFeatures = false;
+        else if (a == "--target" && i + 1 < argc)       opts.quadTargetEdge = std::stod(argv[++i]);
+        else if (a == "--disk-templates")               opts.diskTemplates = true;
+        else if (a == "--disk-squareness" && i + 1 < argc)
+            opts.diskCoreSquareness = std::stod(argv[++i]);
+        else if (a == "--disk-ring" && i + 1 < argc)    opts.diskRingDepth = std::stoi(argv[++i]);
+        else if (a == "--disk-smooth" && i + 1 < argc)
+            opts.diskSmoothingPasses = std::stoi(argv[++i]);
+        else if (a == "--repair" && i + 1 < argc)       opts.repairPasses = std::stoi(argv[++i]);
+        else if (a == "--cones" && i + 1 < argc)        coneListLimit = std::stoi(argv[++i]);
+        else if (a == "--psi" && i + 1 < argc)          psiOut = argv[++i];
+        else if (a == "--raw" && i + 1 < argc)          rawOut = argv[++i];
+        else if (a == "--tutte" && i + 1 < argc)        tutteOut = argv[++i];
+        else if (a == "--layout" && i + 1 < argc)       layoutOut = argv[++i];
+        else if (a == "--cut" && i + 1 < argc)          cutOut = argv[++i];
+        else if (a == "--quads" && i + 1 < argc)        quadOut = argv[++i];
+        else if (a == "--mfem" && i + 1 < argc)         mfemOut = argv[++i];
+        else if (a == "--arr" && i + 1 < argc)          arrOut = argv[++i];
+        else if (a == "--tmop" && i + 1 < argc)         tmopSweeps = std::stoi(argv[++i]);
+        else if (a == "--tmop-gauss")                    tmopGauss = true;
+        else if (a == "--no-pillow")                     tmopPillow = false;
+        else { std::cerr << "Unknown option: " << a << "\n"; usage(argv[0]); return 1; }
+    }
+
+    std::shared_ptr<Mesh> mesh;
+    try {
+        mesh = std::make_shared<Mesh>(path);
+    } catch (const std::exception &e) {
+        std::cout << kFail << " Failed to load mesh: " << e.what() << "\n";
+        return 2;
+    }
+
+    std::cout << "TORSION -- Pipeline B: the layout of Shepherd, Gu and Hughes (2022) with\n"
+              << "psi_0 integrated from the DualMBO cross field (docs/cf_flow_pipeline.md)\n";
+    std::cout << "Mesh: " << path << "\n";
+    std::cout << "  " << mesh->vertices.size() << " vertices, "
+              << mesh->edges.size() << " edges, "
+              << mesh->triangles.size() << " triangles, "
+              << mesh->boundaryEdges.size() << " boundary edges\n";
+
+    TORSION pipeline(mesh, opts);
+    bool ok = false;
+    try {
+        ok = pipeline.run();
+    } catch (const std::exception &e) {
+        std::cout << kFail << " Pipeline threw: " << e.what() << "\n";
+        return 3;
+    }
+    const TORSION::Status &st = pipeline.getStatus();
+
+    auto stageMessages = [&](const std::string &prefix) {
+        for (const std::string &m : st.messages) {
+            if (m.rfind(prefix, 0) == 0) warn(m.substr(prefix.size()));
+        }
+    };
+
+    // ---------------------------------------------------------------------
+    heading("Stage 0  Cross field (p=0 dual-mesh MBO)");
+    std::cout << "  MBO steps: " << st.mboSteps << ", residual " << std::scientific
+              << std::setprecision(3) << pipeline.getField().error << std::defaultfloat << "\n";
+    verdict(st.fieldConverged, "Field converged");
+    if (st.materials > 1) {
+        std::cout << "  " << st.materials << " material(s) in " << st.regions
+                  << " region(s); " << st.interfaceEdges << " interface edge(s) in "
+                  << st.interfaceBranches << " branch(es), " << st.interfaceNodes << " node(s)\n";
+        verdict(st.fieldAlignedToInterfaces, "The interfaces are Dirichlet data for the field");
+        verdict(st.regionsBalanced == st.regions,
+                "Every material region satisfies its own Eq. (4)");
+    }
+
+    // ---------------------------------------------------------------------
+    // Stages 1 to 6 (or 1 to 8), by the route that produced the layout kept.
+    if (st.perMaterialRan) reportPerMaterial(pipeline);
+    if (!st.perMaterialRan || !st.perMaterialKept) {
+        WholeModelOutputs outputs;
+        outputs.cutOut = cutOut;
+        outputs.rawOut = rawOut;
+        outputs.tutteOut = tutteOut;
+        outputs.psiOut = psiOut;
+        outputs.layoutOut = layoutOut;
+        outputs.coneListLimit = coneListLimit;
+        const int rc = reportWholeModel(pipeline, mesh, opts, outputs);
+        if (rc >= 0) return rc;
+    }
+
     // ---------------------------------------------------------------------
     if (st.separatricesRan) {
         heading("Stage 7  Separatrices (Sec. 4)");
@@ -1372,11 +1516,45 @@ int main(int argc, char **argv) {
                 "Every element is counter-clockwise with a positive Jacobian at every corner");
         verdict(fq.nonManifoldEdges == 0, "Every edge is shared by at most two elements");
 
+        // Stage 12 starts with a pillow, as TestMERIDIAN's does: one layer of
+        // quads along each stretch of feature on which a block corner spans
+        // 180 degrees, so that its node has two elements and the corner is
+        // half an element inside, where TMOP can move it. src/mesh/Pillow.hxx.
+        if (tmopSweeps > 0 && tmopPillow) {
+            heading("Pillowing flat feature corners (mesh::Pillow)");
+            mesh::Pillow pillow(finalMesh);
+            pillow.run();
+            const mesh::Pillow::Report &pr = pillow.getReport();
+            std::cout << "  " << pr.defectsBefore << " element corner(s) with both sides on a "
+                      << "feature, opening past " << pillow.getOptions().flatAngle << " degrees";
+            if (pr.defectsBefore > 0)
+                std::cout << " (the flattest " << std::fixed << std::setprecision(1)
+                          << pr.flattestBefore << std::defaultfloat << ")";
+            std::cout << "\n";
+            if (pr.layers > 0) {
+                std::cout << "  " << pr.layers << " layer(s)";
+                if (pr.closedLayers > 0)
+                    std::cout << ", " << pr.closedLayers << " round a closed loop";
+                std::cout << ": " << pr.layerQuads << " quad(s) along the features, "
+                          << pr.splitQuads << " split carrying the layers' chords on to dS; "
+                          << pr.quadsBefore << " -> " << pr.quadsAfter << " quadrilateral(s)\n";
+                std::cout << "  Scaled Jacobian before smoothing: worst " << std::fixed
+                          << std::setprecision(4) << pr.minScaledJacobianBefore << " -> "
+                          << pr.minScaledJacobianAfter << std::defaultfloat << "\n";
+            }
+            for (const std::string &m : pr.messages) warn(m);
+            verdict(pr.defectsAfter == 0,
+                    "No element spans a flat corner with both of its sides on a feature");
+        }
+
         if (tmopSweeps > 0) {
             heading("TMOP smoothing (mesh::TMOP)");
             mesh::TMOP::Options topt;
             topt.metric = mesh::TMOP::ShapeSize007;
             topt.maxSweeps = tmopSweeps;
+            // Sampled at the corners, as the viewer's Stage 12: at the 2x2
+            // Gauss points a corner can fold without the barrier seeing it.
+            topt.quadrature = tmopGauss ? mesh::TMOP::Gauss2x2 : mesh::TMOP::Corners;
             mesh::TMOP smoother(finalMesh, topt);
             smoother.run();
             const mesh::TMOP::Report &tr = smoother.getReport();
@@ -1427,7 +1605,10 @@ int main(int argc, char **argv) {
     for (const std::string &m : st.messages) {
         if (m.rfind("Stopping", 0) == 0) warn(m);
     }
-    if (ok) {
+    if (ok && st.perMaterialRan && st.perMaterialKept) {
+        std::cout << "  " << kPass << " A layout satisfying Q1-Q5 on every material region, "
+                  << "each integrated out of the cross field, glued across the interfaces.\n";
+    } else if (ok) {
         std::cout << "  " << kPass << " A layout satisfying Q1-Q5, from a map integrated out of "
                   << "the cross field rather than unfolded from a metric.\n";
     } else {

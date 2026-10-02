@@ -14,6 +14,8 @@ optional Qt6 viewer. It backs an IMR 2027 paper: a p=0 dual-mesh MBO cross field
   include, anywhere else. The build enforces it (OCC is linked PRIVATE to
   `CrossGenGeom`) and so does ctest `Geom_OpenCascadeConfinedToGeom`. New geometry
   goes into `src/geom`, behind public headers that name no OCC type.
+- **Ignore `paper_tests/`.** Don't read it, run it, log findings in its README, or wire
+  new options into it. Its `Paper_` ctests are not a signal either. Jacob looks after it.
 - Put throwaway drivers, corpus sweeps and dumps in the session scratchpad, not in the repo.
 - Match the house style: `.hxx`/`.cxx`, `#ifndef __NAME_HXX__` guards, include paths
   relative to `src/` (`"MERIDIAN/Immersion.hxx"`). Comments are long-form prose that
@@ -38,7 +40,8 @@ cmake --build build -j8                                 # or: --target TestMERID
 
 ## Test
 
-- `cd build && ctest` (or `ctest -R MERIDIAN`, `-R TORSION`, `-R ZIPLINE`, `-R Geom`, `-R ShapeDNA`, `-R Paper_`, `-R Python`).
+- `cd build && ctest` (or `ctest -R MERIDIAN`, `-R TORSION`, `-R ZIPLINE`, `-R Geom`, `-R ShapeDNA`, `-R Python`;
+  `ctest -E Paper_` leaves out the paper_tests cases, which are ignored).
   A project PreToolUse hook (`.claude/hooks/filter-test-output.sh`) cuts `ctest`/`make test`
   output down to the FAIL/ERROR lines. The end-to-end cases have 2400 s timeouts; the
   bubbles template cases are the slow ones.
@@ -57,17 +60,17 @@ cmake --build build -j8                                 # or: --target TestMERID
 
 | Path | What |
 |---|---|
-| `src/mesh` | `Mesh` (triangle mesh, material tags), `QuadMesh` + MFEM `.mesh` writer, `TMOP` smoother, `BoundaryFeatures` (corners by the 20° rule, holes, T3's `minimumDefect` that `BlockDecomposition::regularity()` grades against) |
+| `src/mesh` | `Mesh` (triangle mesh, material tags), `QuadMesh` + MFEM `.mesh` writer, `TMOP` smoother, `Pillow` (a layer of quads along dS/an interface wherever an element spans a flat feature corner, which no smoothing can repair; the pipelines' Stage 12 runs it before TMOP), `BoundaryFeatures` (corners by the 20° rule, holes, T3's `minimumDefect` that `BlockDecomposition::regularity()` grades against) |
 | `src/dualmbo` | **DualMBO**, our method: p=0 dual-mesh MBO. Crosses on faces, singularities on vertices |
 | `src/crossfield`, `src/polyvector` | Baselines B1 (P1-MBO, per vertex) and B2 (polyvectors) |
 | `src/MERIDIAN` | **Pipeline A**, Shepherd 2022 Stages 0b–11: Interfaces → ConeSingularities → ConeCut → RicciFlow → Immersion → SubdomainLabels → LayoutEnergy → Separatrices → Arrangement → SplineFit → QuadMesh, plus DiskTemplate (0c/11). The stage map is in the header comment of `MERIDIAN.hxx` |
-| `src/TORSION` | **Pipeline B**: the same stages, but Stages 3–4 are swapped for integrating the DualMBO field (ConeMetric, FieldFrames, FieldIntegration, TutteEmbedding). Both pipelines meet at `Immersion`, and every stage after that is shared |
+| `src/TORSION` | **Pipeline B**: the same stages, but Stages 3–4 are swapped for integrating the DualMBO field (ConeMetric, FieldFrames, FieldIntegration, TutteEmbedding). Both pipelines meet at `Immersion`, and every stage after that is shared. On a multi-material model it lays each material region out on its own by default (`MaterialLayout`, `Options::perMaterial`; `--whole-model` / `per_material=False` for the old route): Stages 1–8 per region, matched across the interfaces, glued into one `Arrangement` for Stages 9–11, with the whole-model run as fallback. The viewer's TORSION mode does the same ('w' switches before the cone phase), on TORSION's own tau-continued field (`TORSION::prepareFieldLevel`/`fieldTauLadder`; MERIDIAN mode keeps MERIDIAN's single-tau one) |
 | `src/geom` | Splines, polylines, Coons, B-rep (`Vertex/Edge/Face/Shape`), STEP/BREP output, all on top of OCC |
 | `src/ZIPLINE` | **ZIPLINE**, Viertel IMR19 (class `ZIPLINE` in `ZIPLINE.hxx` runs every stage; viewer mode 2 and driver `TestZIPLINE` both go through it): separatrices → T-layout → Sec. 4 simplification + Sec. 12 stem extension → `LayoutBlocks` (the shared BlockDecomposition on src/geom splines; faces with a T-junction are not blocks, so read it by coverage) → BlockQuadMesh/TMOP. Honours material interfaces through MERIDIAN's Stage 0b `Interfaces` and an interface-aligned `CrossField`. `docs/viertel_2019.md` Sec. 14 maps the spec to the code |
 | `src/quantization`, `src/medialaxis`, `src/UMBER`, `src/OASIS`, `src/Parameterization` | Older approaches (QGP, medial axis, polysquare, spectral, seam cuts). Rarely touched now |
 | `src/viewer` | Qt6 `Viewer`. `run_meshes.sh` opens every mesh in turn; it has figure/SVG export |
 | `src/python` | **`crossgen`**, the CPython extension module (plain `Python.h`, no pybind): `crossgen.load(obj)` → `Mesh`; `m.zipline()/umber()/meridian()/torsion()/atlas()` → `BlockDecomposition`; `b.mesh(h)` → `QuadMesh`; `q.smooth(n)` (TMOP); `m.shape_dna()` → ndarray; `m.boundary_features()` → dict; `b.valid`; `b.regularity()/angle_quality()/chord_quality()` (the C++ `BlockDecomposition` methods, qualities in [0, 1], higher better, NaN when `b.valid` is False; `docs/block_decomposition_metrics.md` Sec. 6). `py/build_dataset.py` writes the selector's training CSVs from these (the `shape_dna(normalization='weyl_ratio')` spectrum only with `--eigs K`: it made the selector worse and was a third of the build), each method averaged over `--copies` exact symmetries of the mesh, plus ZIPLINE's first run on its own as `probe_zipline_*`; a rerun reuses `cache.jsonl` and runs only missing tasks. `py/train_classifier.py` trains on them (a validity head and a quality head) for the probe rule: run ZIPLINE, keep it if it ranks first, else run the top other method and keep the better. Keywords are the C++ `Options` fields in snake_case, from one table per struct (`PyOptions.hxx`); `crossgen.options(method, stage)` lists them. Each method meshes through its own mesher (`Methods.hxx` says why). UMBER has no driver class, so `MethodUMBER.cxx` chains its stages the way `TestUMBER` does, and `MethodLayout.cxx` rebuilds Stages 10–11 the way `MERIDIAN::run()` does. Change those two files if the driver or `run()` changes. ctest `Python_Module` |
-| `paper_tests/` | E1–E5 paper experiments (`make paper`; E1/E2 are also ctests). **Read `paper_tests/README.md` first.** It is the running log of findings, methods and protocol. Results go in `paper_tests/results/` |
+| `paper_tests/` | E1–E5 paper experiments. **Ignored** (see Rules): not read, run, logged in or extended |
 | `data/geometry/{singlemat,multimat}` | `.geo` sources. `Mesh2Dgmsh` turns them into `data/meshes/<kind>/*.obj` (gitignored) |
 | `data/meshes/{singlemat,multimat,mechanism}` | Corpus: 24 + 11 + mechanism set (built by `MakeDomains`, kept separate from the corpus on purpose) |
 | `data/geometry_extra/` | Models dropped from the corpus. Not used |

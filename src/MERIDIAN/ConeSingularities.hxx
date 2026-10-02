@@ -1,6 +1,7 @@
 #ifndef __CONESINGULARITIES_HXX__
 #define __CONESINGULARITIES_HXX__
 
+#include <cmath>
 #include <complex>
 #include <memory>
 #include <string>
@@ -199,8 +200,79 @@ public:
     // -1 if the residual could not be placed at all.
     int rebalance();
 
+    // One unit relocateFlatCones() moved: from the vertex of dS it was on, to a
+    // corner further along the same side or to a vertex inside the model.
+    struct Relocation {
+        int from = -1;
+        int to = -1;
+        bool inside = false;      // to an interior vertex, not a corner of dS
+        double distance = 0.0;    // |to - from| on the model
+    };
+
+    // Move every boundary cone of index +1 off a stretch of dS that runs
+    // (nearly) straight, to where a quadrilateral mesh can carry it.
+    //
+    // A +1 on dS is a corner of the layout: one patch meets dS there and turns
+    // through a quarter. Where dS itself turns through about a quarter that is
+    // exactly right. Where dS runs straight on it is not -- the patch has a
+    // corner whose angle on the model is pi, Stage 10 puts the whole of that
+    // angle into the one element at the corner of its grid, and the element is
+    // a triangle with a fourth node in the middle of one side. The node is a
+    // corner of the feature graph, so a smoother may not move it, and nothing
+    // downstream can repair the element. It is the flat corner of
+    // Report::reflexCorners' family, made here.
+    //
+    // It is made by the clamp at maxBoundaryIndex. A corner sharper than about
+    // 45 degrees, where the field runs into it along both sides, reads two
+    // quarter turns rather than one -- 1.6 at the vertex and 0.2 on each
+    // neighbour on multimat/basin's 35 degree pinch-outs, 1.5 and 0.5 on the
+    // 45 degree end of multimat/rocket's nozzle strip -- because to a field
+    // tangent to both sides they are the same direction and the corner is a
+    // cusp. A cusp has no quadrilateral, so the vertex keeps one quarter, and
+    // rebalance() puts the other where |I - raw| is cheapest, which is the
+    // neighbour carrying 0.2: a vertex of dS where nothing turns.
+    //
+    // Each such unit goes, in order of preference:
+    //
+    //   * to the corner at the far end of the same side -- the first vertex of
+    //     dS along it, either way, that is a corner (dS turns by more than
+    //     20 degrees there) or a cone -- if that corner carries no cone and is
+    //     no wider than maxCornerAngle. That is the slanted end of a strip:
+    //     rocket's 45 and 135 degree corners take a quarter each and the end is
+    //     a parallelogram, where the field had put both quarters at the sharp
+    //     one;
+    //   * otherwise inside, as an interior cone of index +1: at the vertex
+    //     furthest from dS within a quarter of the side's length of where the
+    //     unit was, and never on or within Sec. 3.1's clustering distance of a
+    //     cone. That is the wedge tip and the triangle: three patches meeting
+    //     at a valence-three vertex inside, one of them holding the sharp
+    //     corner, which is how a triangle is split into quadrilaterals. On a
+    //     disk whose four quarters the field put on its rim, it is the O-grid.
+    //
+    // Neither is always one Stage 6 can make a layout round: whether a corner
+    // the field reads as two quarters opens to a right angle once one of them
+    // has gone is only settled by Stages 4 to 6. So the pipelines lay a model
+    // out again with the units left where they were when the moved set's
+    // layout is not valid, and keep the better (MERIDIAN::Options::
+    // keepFlatConesOnFailure, and its TORSION and MaterialLayout namesakes).
+    //
+    // Either way the unit stays in the same material region (`group`, as in
+    // cancelDipoles(); empty is one group), Eq. (4) is unchanged, and the field
+    // is not: Pipeline B's Stage 3F moves the field's own singularities onto
+    // the cone set it is handed (FieldFrames::reconcileSectors), and Pipeline
+    // A's flow takes the cone set as its target curvature. Prescribed vertices
+    // are never moved from or to.
+    //
+    // Returns the number of units moved.
+    int relocateFlatCones(const std::vector<int> &group,
+                          double maxCornerAngle = 5.0 * M_PI / 6.0);
+    const std::vector<Relocation>& getRelocations() const { return relocations; }
+
     // I(v) for every vertex, zero away from the cones.
     const std::vector<int>& getIndices() const { return index; }
+    // The unrounded quarter-turn count at every vertex the field was read at
+    // (Cone::raw, for the vertices that are not cones too), zero elsewhere.
+    const std::vector<double>& getRawIndices() const { return rawIndex; }
 
     // Kbar_i = (pi/2) I(v_i): the target curvature of Eq. (9), one per vertex.
     const std::vector<double>& getTargetCurvature() const { return targetCurvature; }
@@ -267,6 +339,7 @@ private:
     int lastCancelledUnits = 0;
     int lastRebalanceUnits = 0;
     double lastRebalanceCost = 0.0;
+    std::vector<Relocation> relocations;
 };
 
 #endif // __CONESINGULARITIES_HXX__

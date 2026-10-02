@@ -9,6 +9,7 @@
 #include "mesh/BoundaryFeatures.hxx"
 #include "mesh/QuadMesh.hxx"
 #include "mesh/TMOP.hxx"
+#include "mesh/Pillow.hxx"
 
 // The tables more than one method's binding reads: the mesh a smoother works
 // on, the smoother itself, the method-agnostic block mesher, and ShapeDNA.
@@ -106,6 +107,10 @@ const Table<mesh::QuadMesh::Quality> &qualityTable();
 const Table<mesh::TMOP::Options> &tmopOptionsTable();
 const Table<mesh::TMOP::Report> &tmopReportTable();
 
+// mesh::Pillow's report, which QuadMesh.smooth adds under "pillow_" whenever
+// it pillowed the mesh before smoothing it.
+const Table<mesh::Pillow::Report> &pillowReportTable();
+
 // BlockQuadMesh::Options, less targetEdgeLength (BlockDecomposition.mesh's `h`).
 const Table<BlockQuadMesh::Options> &blockQuadMeshOptionsTable();
 const Table<BlockQuadMesh::Report> &blockQuadMeshReportTable();
@@ -129,8 +134,9 @@ mesh::TMOP::Options blockGridSmoothing();
 PyObject *meshingDefaults(double h, std::initializer_list<Source> sources);
 
 // crossgen.options(<method>, "smooth"): the TMOP table over `defaults`, with
-// the default sweep count under "niters".
-PyObject *smoothingDefaults(const mesh::TMOP::Options &defaults);
+// the default sweep count under "niters" and whether the first smooth()
+// pillows the flat feature corners before it smooths under "pillow".
+PyObject *smoothingDefaults(const mesh::TMOP::Options &defaults, bool pillow = false);
 
 // Build every table once, so that a table defect (two fields one keyword)
 // fails `import crossgen` instead of the first call that happens to use it.

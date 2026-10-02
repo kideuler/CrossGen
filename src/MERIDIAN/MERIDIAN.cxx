@@ -139,6 +139,105 @@ bool MERIDIAN::run() {
     // --- Stage 0: cross field ---------------------------------------------
     runField();
 
+    // --- Stages 1 to 11 -----------------------------------------------------
+    //
+    // Once, and a second time with Stage 1's flat +1s left where they were when
+    // the first moved some and its layout is not valid. Moving a +1 off a
+    // straight stretch of dS is right for the mesh -- left there it is a patch
+    // corner of pi, which Stage 10 meshes as an element with a node in the
+    // middle of a side -- but Stage 6 does not always make a valid layout round
+    // where it went (singlemat/geom033), and an invalid layout is worse than a
+    // flat corner. Stage 0 is not repeated; the interface network is restored
+    // to what it was before the first attempt's balance().
+    const Status afterField = status;
+    std::unique_ptr<Interfaces> pristine =
+        interfaces ? std::make_unique<Interfaces>(*interfaces) : nullptr;
+    bool ok = runFromCones(balanceMessagesSeen);
+    const bool moved = status.flatConesToCorners + status.flatConesInside > 0;
+    if (!options.relocateFlatCones || !options.keepFlatConesOnFailure || !moved ||
+        status.layoutValid)
+        return ok;
+
+    struct Attempt {
+        std::unique_ptr<Interfaces> interfaces;
+        std::unique_ptr<ConeSingularities> cones;
+        std::unique_ptr<ConeCut> cutter;
+        std::unique_ptr<RicciFlow> ricci;
+        std::unique_ptr<Immersion> immersion;
+        std::unique_ptr<SubdomainLabels> labels;
+        std::unique_ptr<LayoutEnergy> layout;
+        std::unique_ptr<Separatrices> separatrices;
+        std::unique_ptr<Arrangement> arrangement;
+        std::unique_ptr<SplineFit> splines;
+        std::unique_ptr<QuadMesh> quads;
+        std::unique_ptr<DiskTemplate> diskFill;
+        Status status;
+        bool ok = false;
+    };
+    auto take = [&](bool okNow) {
+        Attempt a;
+        a.interfaces = std::move(interfaces);
+        a.cones = std::move(cones);
+        a.cutter = std::move(cutter);
+        a.ricci = std::move(ricci);
+        a.immersion = std::move(immersion);
+        a.labels = std::move(labels);
+        a.layout = std::move(layout);
+        a.separatrices = std::move(separatrices);
+        a.arrangement = std::move(arrangement);
+        a.splines = std::move(splines);
+        a.quads = std::move(quads);
+        a.diskFill = std::move(diskFill);
+        a.status = status;
+        a.ok = okNow;
+        return a;
+    };
+    auto put = [&](Attempt &a) {
+        interfaces = std::move(a.interfaces);
+        cones = std::move(a.cones);
+        cutter = std::move(a.cutter);
+        ricci = std::move(a.ricci);
+        immersion = std::move(a.immersion);
+        labels = std::move(a.labels);
+        layout = std::move(a.layout);
+        separatrices = std::move(a.separatrices);
+        arrangement = std::move(a.arrangement);
+        splines = std::move(a.splines);
+        quads = std::move(a.quads);
+        diskFill = std::move(a.diskFill);
+        status = a.status;
+    };
+    auto unmeshable = [&](const Attempt &a) {
+        return a.arrangement ? unmeshableFraction(*a.arrangement) : 2.0;
+    };
+
+    Attempt first = take(ok);
+    status = afterField;
+    interfaces = pristine ? std::make_unique<Interfaces>(*pristine) : nullptr;
+    options.relocateFlatCones = false;
+    const bool okKept = runFromCones(balanceMessagesSeen);
+    options.relocateFlatCones = true;
+    Attempt kept = take(okKept);
+
+    // Valid first, then the less of S left without a grid; a tie keeps the move.
+    const bool useKept = kept.status.layoutValid || unmeshable(kept) < unmeshable(first) - 1e-12;
+    Attempt &chosen = useKept ? kept : first;
+    put(chosen);
+    std::ostringstream oss;
+    oss << "Stage 1 moved " << (first.status.flatConesToCorners + first.status.flatConesInside)
+        << " +1 cone(s) off straight dS and the layout was not valid, so Stages 1 to 11 were "
+        << "run again with them where they were: "
+        << (useKept ? "that one is kept, and its patch corners of pi with it."
+                    : "that was no better, so the move stands.");
+    status.flatConesKept = useKept;
+    status.messages.push_back("Stage 1: " + oss.str());
+    return chosen.ok;
+}
+
+// ---------------------------------------------------------------------------
+// runFromCones()  --  Stages 1 to 11 on the field and network run() built
+// ---------------------------------------------------------------------------
+bool MERIDIAN::runFromCones(size_t balanceMessagesSeen) {
     // --- Stage 1: cone singularities, Sec. 3.1 ----------------------------
     cones = std::make_unique<ConeSingularities>(*field);
     cones->setBoundaryIndexRange(options.minBoundaryIndex, options.maxBoundaryIndex);
@@ -189,6 +288,32 @@ bool MERIDIAN::run() {
             status.messages.push_back(
                 "Could not restore Eq. (4): no boundary cone left within the allowed "
                 "index range to take the residual.");
+        }
+        gb = cones->gaussBonnet();
+    }
+
+    // The +1s that ended up on straight dS -- an acute corner's second quarter,
+    // which no vertex of dS can hold, is where rebalance() leaves it -- moved to
+    // where a quadrilateral can hold them. After the rebalance, because it is
+    // the rebalance that puts them there, and before the cut, which has to see
+    // them where they will be.
+    status.flatConesToCorners = status.flatConesInside = 0;
+    if (options.relocateFlatCones && gb.admissible) {
+        const int nV = static_cast<int>(mesh->vertices.size());
+        std::vector<int> region;
+        if (interfaces && interfaces->multiMaterial()) {
+            region.assign(nV, -1);
+            for (int v = 0; v < nV; ++v) region[v] = interfaces->regionAt(v);
+        }
+        if (cones->relocateFlatCones(region, options.flatConeAngle) > 0) {
+            for (const ConeSingularities::Relocation &r : cones->getRelocations())
+                (r.inside ? status.flatConesInside : status.flatConesToCorners) += 1;
+            std::ostringstream oss;
+            oss << "Moved " << cones->getRelocations().size()
+                << " +1 cone(s) off straight dS, where each was a patch corner of pi: "
+                << status.flatConesToCorners << " to the corner at the end of its side, "
+                << status.flatConesInside << " inside.";
+            status.messages.push_back("Stage 1: " + oss.str());
         }
         gb = cones->gaussBonnet();
     }
@@ -384,6 +509,8 @@ bool MERIDIAN::run() {
     qopts.collapseSpan = options.quadCollapseSpan;
     qopts.useSplines = options.quadUseSplines;
     qopts.featuresOnTracedArcs = options.quadFeaturesOnTracedArcs;
+    qopts.materialsFromFaces = options.quadMaterialsFromFaces;
+    qopts.contractOntoFeatures = options.quadContractOntoFeatures;
     qopts.smoothingPasses = options.quadSmoothingPasses;
     qopts.smoothingThreshold = options.quadSmoothingThreshold;
     // Each excised rim has to come out with an even number of edges or Stage 11

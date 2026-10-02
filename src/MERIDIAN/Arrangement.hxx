@@ -2,6 +2,7 @@
 #define __ARRANGEMENT_HXX__
 
 #include <array>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -374,6 +375,29 @@ public:
     Arrangement(const Separatrices &separatrices, const SubdomainLabels &labels,
                 const Options &opts);
 
+    // A layout put together rather than traced: TORSION's per-material mode
+    // (MaterialLayout) lays each material region of S out on its own, and what
+    // comes back from each is an arrangement of that region alone. They are
+    // glued here -- the nodes two regions share on an interface made one node,
+    // the two copies of an interface arc between them made one arc with a
+    // patch on either side -- by the caller, which is the only party that
+    // knows which node of one region is which node of the next. What arrives
+    // is therefore already a subdivision: every face with its half-edge cycle,
+    // its corners, its sides and its turns, every half-edge with its twin and
+    // its successor, the two half-edges of arc a at 2a (running from -> to)
+    // and 2a + 1. This constructor measures S, collects the patches and runs
+    // check() on them, the same validation a traced arrangement gets, and
+    // nothing else: there is no map behind the result, so hasMap() is false
+    // and getSeparatrices(), getLabels() and getImmersion() throw. Stages 9 to
+    // 11 read none of the three.
+    struct Assembly {
+        std::vector<Node> nodes;
+        std::vector<Arc> arcs;
+        std::vector<HalfEdge> halves;
+        std::vector<Face> faces;
+    };
+    Arrangement(const Mesh &mesh, Assembly parts, const Options &opts);
+
     const std::vector<Node>& getNodes() const { return nodes; }
     const std::vector<Arc>& getArcs() const { return arcs; }
     const std::vector<HalfEdge>& getHalfEdges() const { return halves; }
@@ -381,9 +405,21 @@ public:
     const Report& getReport() const { return report; }
     const Options& getOptions() const { return options; }
 
-    const Separatrices& getSeparatrices() const { return *sep; }
-    const SubdomainLabels& getLabels() const { return *lab; }
-    const Immersion& getImmersion() const { return *imm; }
+    // Whether the arrangement was traced on a map of S (the two-argument
+    // constructors) or assembled from pieces laid out on their own.
+    bool hasMap() const { return sep != nullptr; }
+    const Separatrices& getSeparatrices() const {
+        if (!sep) throw std::logic_error("Arrangement: an assembled layout has no separatrices");
+        return *sep;
+    }
+    const SubdomainLabels& getLabels() const {
+        if (!lab) throw std::logic_error("Arrangement: an assembled layout has no labels");
+        return *lab;
+    }
+    const Immersion& getImmersion() const {
+        if (!imm) throw std::logic_error("Arrangement: an assembled layout has no immersion");
+        return *imm;
+    }
     const Mesh& getMesh() const { return *orig; }
 
     // The patches, in the order Stage 9 will fit them.
@@ -441,6 +477,9 @@ private:
     };
 
     void buildFan(int v);
+    // How big S is and its area: the part of buildDomain() an assembled
+    // arrangement needs too.
+    void measureDomain();
     void buildDomain();
     void dedupeCurves();
     void collapseShortArcs();
@@ -459,6 +498,10 @@ private:
     void linkHalfEdges();
     void extractFaces();
     void classifyFaces();
+    // The patches among the classified faces, and the report's area and
+    // corner counts over them: the end of classifyFaces(), which an assembled
+    // arrangement arrives already past.
+    void collectPatches();
     void checkFeatures();
     void check();
 

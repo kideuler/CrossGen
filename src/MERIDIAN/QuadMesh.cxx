@@ -627,12 +627,48 @@ void QuadMesh::meshArcs() {
         }
     }
 
+    // Where the one vertex of a class goes. Not wherever the union-find put its
+    // root, which is the `from` end of the first contracted arc: a separatrix
+    // run from inside a face to a landing on an interface puts its inside end
+    // first, and the vertex every interface edge there then ends at was that
+    // far off the interface -- a whole contracted width, up to half an element
+    // -- with nothing downstream able to put it back, since mesh::QuadMesh
+    // binds an interface node to the curve through the nodes it is handed. A
+    // node of dS or of the interface network outranks one inside a face, and a
+    // node where the features turn or meet -- a corner of dS, a junction of the
+    // network, a cone on either -- outranks one partway along them, which
+    // Stage 12 holds fixed. Among equals the root stands, so a class with no
+    // feature in it is placed exactly where it always was.
+    const std::vector<Arrangement::Node> &arrNodes = arr->getNodes();
+    std::vector<int> featureArcs(arrNodes.size(), 0);
+    for (const Arrangement::Arc &ar : list) {
+        if (ar.kind == Arrangement::ArcKind::Separatrix) continue;
+        if (ar.from >= 0) ++featureArcs[ar.from];
+        if (ar.to >= 0) ++featureArcs[ar.to];
+    }
+    auto rank = [&](int n) {
+        const Arrangement::Node &nd = arrNodes[n];
+        if (featureArcs[n] == 0) return 0;
+        const bool turns = nd.kind == Arrangement::NodeKind::BoundaryCorner ||
+                           nd.kind == Arrangement::NodeKind::InterfaceNode ||
+                           nd.kind == Arrangement::NodeKind::Cone || featureArcs[n] > 2;
+        return turns ? 2 : 1;
+    };
+    std::vector<int> placedAt(arrNodes.size(), -1);
+    for (size_t n = 0; n < arrNodes.size(); ++n) {
+        const int r = findRoot(nodeClass, static_cast<int>(n));
+        if (placedAt[r] < 0) placedAt[r] = r;
+        if (options.contractOntoFeatures && rank(static_cast<int>(n)) > rank(placedAt[r])) {
+            placedAt[r] = static_cast<int>(n);
+        }
+    }
+
     auto vertexForNode = [&](int n) {
         if (n < 0 || n >= static_cast<int>(nodeVert.size())) return -1;
         n = findRoot(nodeClass, n);
         if (nodeVert[n] < 0) {
             nodeVert[n] = static_cast<int>(verts.size());
-            verts.push_back(arr->getNodes()[n].p);
+            verts.push_back(arrNodes[placedAt[n]].p);
         }
         return nodeVert[n];
     };
@@ -1018,13 +1054,52 @@ void QuadMesh::smooth() {
 // an element pure whenever the interface clipped only a corner of it, which is
 // exactly the case a nearly-aligned layout produces and exactly the one worth
 // catching.
+//
+// ### What the element is *given* is the face's material, not the samples'
+//
+// The samples measure; they do not decide. Each element carries the material
+// of the layout face its block was meshed in, whenever the arrangement knows it
+// (Face::material, on a face whose own samples agreed: exact in a glued
+// arrangement, where it is the region the face came from, and read a short
+// step inside the face's sides in any other), and its samples only where it
+// does not. The two agree on every element that lies inside its face by more
+// than its own width. Where they disagree it is the element's samples that
+// have nothing to go on: a face a fraction of an element wide along an
+// interface -- a separatrix that came out running beside the interface instead
+// of meeting it, which TORSION's per-material layouts produce wherever a
+// region's own map puts a curve a hair inside its boundary -- is meshed as one
+// row of slivers, and whether a sliver's centroid falls on its own side of the
+// interface polyline or the other is a coin toss. Assigned by the toss, the
+// elements of one row alternate between the two materials, the material
+// boundary zigzags between the interface and the curve beside it, and
+// everything that reads the interface off the element materials reads the
+// zigzag: mesh::QuadMesh marks it as the feature, pins its turns and slides its
+// nodes along it, and Stage 12 then smooths the interface into a row of teeth
+// (salt_dome's flank, seen through the viewer). From the face, the material
+// boundary is the layout's own interface arc -- the polyline the input gave --
+// by construction.
+//
+// Report::mixedQuads is still the samples' verdict, and an element whose
+// samples all lie in another material than its face is counted in
+// Report::relabelledQuads: what the faces overruled, which is a measure of how
+// much of the layout is thinner than its elements.
 // ---------------------------------------------------------------------------
 void QuadMesh::classifyMaterials() {
     const Mesh &m = arr->getMesh();
     cellMaterial.assign(cells.size(), 0);
     report.materials = 0;
     report.mixedQuads = report.unlocatedQuads = report.interfaceEdges = 0;
+    report.relabelledQuads = 0;
     if (m.triangleMatId.size() != m.triangles.size()) return;
+    const std::vector<Arrangement::Face> &faces = arr->getFaces();
+    auto faceMaterial = [&](size_t k) {
+        if (!options.materialsFromFaces || k >= cellBlock.size()) return 0;
+        const int b = cellBlock[k];
+        if (b < 0 || b >= static_cast<int>(grids.size())) return 0;
+        const int f = grids[b].face;
+        if (f < 0 || f >= static_cast<int>(faces.size()) || faces[f].mixed) return 0;
+        return faces[f].material;
+    };
 
     std::set<int> seen;
     for (size_t k = 0; k < cells.size(); ++k) {
@@ -1059,24 +1134,38 @@ void QuadMesh::classifyMaterials() {
             if (mat == 0) mat = id;
             else if (id != mat) mixed = true;
         }
+        const int own = faceMaterial(k);
         if (mat == 0) {
             // Every sample fell outside the triangulation, which happens where
             // the Coons patch bulges a fraction of an element past a curved
             // piece of dS. The element is still in the model and still in one
-            // material; the nearest triangle says which.
+            // material; its face says which, or failing that the nearest
+            // triangle.
             ++report.unlocatedQuads;
-            double best = std::numeric_limits<double>::infinity();
-            for (size_t t = 0; t < m.triangles.size(); ++t) {
-                const Triangle &tri = m.triangles[t];
-                const Point g = (m.vertices[tri[0]] + m.vertices[tri[1]] + m.vertices[tri[2]]) / 3.0;
-                const double d = normP(g - c);
-                if (d < best) { best = d; mat = m.triangleMatId[t]; }
+            if (own == 0) {
+                double best = std::numeric_limits<double>::infinity();
+                for (size_t t = 0; t < m.triangles.size(); ++t) {
+                    const Triangle &tri = m.triangles[t];
+                    const Point g = (m.vertices[tri[0]] + m.vertices[tri[1]] + m.vertices[tri[2]]) / 3.0;
+                    const double d = normP(g - c);
+                    if (d < best) { best = d; mat = m.triangleMatId[t]; }
+                }
             }
-            if (mat == 0) continue;
+        } else if (own != 0 && !mixed && mat != own) {
+            ++report.relabelledQuads;
         }
+        if (own != 0) mat = own;
+        if (mat == 0) continue;
         cellMaterial[k] = mat;
         seen.insert(mat);
         if (mixed) ++report.mixedQuads;
+    }
+    if (report.relabelledQuads > 0) {
+        report.messages.push_back(
+            std::to_string(report.relabelledQuads) +
+            " element(s) lie, by every sample, in another material than the layout face they "
+            "were meshed in -- a face thinner than its elements along an interface. They carry "
+            "the face's material, so the interface the mesh carries is the layout's own arc.");
     }
     report.materials = static_cast<int>(seen.size());
 

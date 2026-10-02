@@ -52,6 +52,14 @@ void applyOverrides(TORSION::Options &t, const std::vector<std::pair<std::string
         else if (key == "retryKeepingDipoles")      t.retryKeepingDipoles = bv;
         else if (key == "topoNearMissLastRetry")    t.topoNearMissLastRetry = val;
         else if (key == "topoRetryUnseeded")        t.topoRetryUnseeded = bv;
+        else if (key == "perMaterial")              t.perMaterial = bv;
+        else if (key == "perMaterialRounds")        t.perMaterialRounds = iv;
+        else if (key == "perMaterialMatchTolerance") t.perMaterialMatchTolerance = val;
+        else if (key == "perMaterialFallback")      t.perMaterialFallback = bv;
+        else if (key == "perMaterialSpacedMatching") t.perMaterialSpacedMatching = bv;
+        else if (key == "perMaterialBendEnds")      t.perMaterialBendEnds = bv;
+        else if (key == "quadMaterialsFromFaces")   t.quadMaterialsFromFaces = bv;
+        else if (key == "quadContractOntoFeatures") t.quadContractOntoFeatures = bv;
         else if (key == "untangle")                 t.untangle = bv;
         else if (key == "localUntangle")            t.localUntangle = bv;
         else if (key == "lambdaInit")               t.lambdaInit = val;

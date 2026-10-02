@@ -76,6 +76,10 @@ struct QuadMeshObject {
     std::unique_ptr<mesh::QuadMesh> mesh;
     PyObject *report;                  // the mesher's, a dict
     mesh::TMOP::Options smoothing;     // the method's defaults
+    // Pillow the flat feature corners before smoothing (mesh::Pillow): the
+    // method's default for the first smooth(), and cleared once that call has
+    // run, since a layer is put in once.
+    bool pillow;
     std::string method;
     // Set while smooth() runs with the GIL released. Everything that reads
     // the mesh refuses while it is, rather than read nodes mid-move.
@@ -579,6 +583,7 @@ PyObject *newQuadMesh(MeshOutput &&out, const char *method) {
     new (&q->smoothing) mesh::TMOP::Options(out.smoothing);
     new (&q->method) std::string(method);
     q->report = out.report;
+    q->pillow = out.pillow;
     q->busy = false;
     out.report = nullptr;
     return o;
@@ -777,13 +782,21 @@ PyGetSetDef quadGetSet[] = {
     {nullptr, nullptr, nullptr, nullptr, nullptr},
 };
 
-// QuadMesh.smooth(niters=None, **options)
+// QuadMesh.smooth(niters=None, pillow=None, **options)
 PyObject *Quad_smooth(PyObject *self, PyObject *args, PyObject *kwargs) {
     QuadMeshObject *q = asQuad(self);
-    PyObject *nArg = nullptr;
+    PyObject *nArg = nullptr, *pArg = nullptr;
     bool ok = true;
-    PyObject *rest = popKeyword(kwargs, "niters", &nArg, ok);
+    PyObject *withPillow = popKeyword(kwargs, "niters", &nArg, ok);
     if (!ok) return nullptr;
+    PyObject *rest = popKeyword(withPillow, "pillow", &pArg, ok);
+    bool pillow = q->pillow;
+    if (ok && pArg && pArg != Py_None && fromPy(pArg, pillow) < 0) ok = false;
+    Py_XDECREF(withPillow);
+    if (!ok) {
+        Py_XDECREF(rest);
+        return nullptr;
+    }
     const Py_ssize_t npos = PyTuple_GET_SIZE(args);
     if (npos > 1 || (npos == 1 && nArg)) {
         Py_XDECREF(rest);
@@ -807,14 +820,24 @@ PyObject *Quad_smooth(PyObject *self, PyObject *args, PyObject *kwargs) {
     if (!quadOf(self)) return nullptr;
 
     mesh::TMOP::Report report;
+    mesh::Pillow::Report pillowed;
     q->busy = true;
     const bool done = compute([&] {
+        if (pillow) {
+            mesh::Pillow p(*q->mesh);
+            p.run();
+            pillowed = p.getReport();
+        }
         mesh::TMOP smoother(*q->mesh, t);
         smoother.run();
         report = smoother.getReport();
     });
     q->busy = false;
     if (!done) return nullptr;
+    q->pillow = false;
+    if (pillowed.ran)
+        return toDict({source(tmopReportTable(), report),
+                       source(pillowReportTable(), pillowed, "pillow_")});
     return toDict({source(tmopReportTable(), report)});
 }
 
@@ -839,14 +862,17 @@ PyObject *Quad_writeMFEM(PyObject *self, PyObject *args) {
 
 PyMethodDef quadMethods[] = {
     {"smooth", asCFunction(Quad_smooth), METH_VARARGS | METH_KEYWORDS,
-     "smooth(niters=1000, **options) -> dict\n\n"
+     "smooth(niters=1000, pillow=None, **options) -> dict\n\n"
      "TMOP (mesh::TMOP) on this mesh, in place, for at most niters sweeps; returns\n"
-     "the smoother's report. Starts from the method's own settings (metric 7;\n"
-     "mu at the element corners for zipline, umber and atlas, at the 2x2 Gauss\n"
-     "points for meridian and torsion), and keywords override any field of\n"
+     "the smoother's report. Starts from the method's own settings (metric 7, mu\n"
+     "at the element corners), and keywords override any field of\n"
      "mesh::TMOP::Options: metric, exponent, quadrature='corners'|'gauss2x2',\n"
      "untangle, threads, ...; crossgen.options(method, 'smooth') lists them.\n"
-     "Calling it again smooths further from where the last call stopped."},
+     "pillow: first put one layer of quads along each stretch of feature on which\n"
+     "an element spans a flat corner (mesh::Pillow), which no smoothing repairs;\n"
+     "the report then carries mesh::Pillow's under 'pillow_'. None is the\n"
+     "method's Stage 12 -- on for meridian and torsion -- on the first call, off\n"
+     "after. Calling it again smooths further from where the last call stopped."},
     {"write_obj", Quad_writeOBJ, METH_VARARGS,
      "write_obj(path): quad faces, `usemtl mat<id>` per material."},
     {"write_vtu", Quad_writeVTU, METH_VARARGS, "write_vtu(path): a VTK unstructured grid."},

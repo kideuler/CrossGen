@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <functional>
 #include <limits>
+#include <queue>
 #include <sstream>
 #include <stdexcept>
 
@@ -545,4 +547,202 @@ int ConeSingularities::rebalance() {
     lastRebalanceCost = cost;
     rebuildCones();
     return moved;
+}
+
+// ---------------------------------------------------------------------------
+// relocateFlatCones()
+//
+// See the header for why. Two notes on the how.
+//
+// "Along the same side" is a walk over dS that stops at the first vertex that
+// is a corner (the 20 degree rule of BoundaryFeatures) or carries any index or
+// was prescribed. The unit only goes to that vertex when it is a convex corner
+// with no cone of its own: never past it, so a quarter is never carried round
+// a corner that already turns, and never onto a reflex corner, whose -1 the
+// unit would cancel into two elements of a half turn apiece.
+//
+// "Inside" is the vertex furthest from every feature -- dS, or an edge between
+// two vertices no group claims, which is the interface network on a model
+// that has one -- among those reachable from the unit's vertex within a
+// quarter of the length of its side. In a wedge that distance grows along the
+// bisector, in a triangle it peaks at the incentre, and in a layer that
+// pinches out it stops growing where the layer reaches its full thickness;
+// those are the three places the extra quarter belongs. The quarter is so
+// that two units leaving the two ends of one side -- a lens has a pinch-out at
+// each -- do not both go to its middle. The search walks through dS as well as
+// the inside, because a wedge a few triangles across has interior vertices no
+// interior path joins, and it never ends on a cone or within Sec. 3.1's
+// clustering distance of one: a cone that close to another is merged with it
+// by Stage 6 whatever Stage 1 says (singlemat/geom033, 1e-4 of the model
+// apart, came out of Stage 6 a half turn off).
+// ---------------------------------------------------------------------------
+int ConeSingularities::relocateFlatCones(const std::vector<int> &group, double maxCornerAngle) {
+    relocations.clear();
+    const int nV = static_cast<int>(mesh->vertices.size());
+    const bool grouped = static_cast<int>(group.size()) >= nV;
+    auto groupOf = [&](int v) { return grouped ? group[v] : 0; };
+    auto isPrescribed = [&](int v) { return !prescribed.empty() && prescribed[v] != 0; };
+    // On dS, inputCurvature is the turning pi - Omega.
+    auto omega = [&](int v) { return M_PI - inputCurvature[v]; };
+    const double cornerTurn = 20.0 * M_PI / 180.0;
+
+    std::vector<std::array<int, 2>> incident(nV, std::array<int, 2>{-1, -1});
+    std::vector<int> degree(nV, 0);
+    for (int e : mesh->boundaryEdges) {
+        for (int k = 0; k < 2; ++k) {
+            const int v = mesh->edges[e][k];
+            if (degree[v] < 2) incident[v][degree[v]] = e;
+            ++degree[v];
+        }
+    }
+    auto otherEnd = [&](int e, int v) {
+        return (mesh->edges[e][0] == v) ? mesh->edges[e][1] : mesh->edges[e][0];
+    };
+    auto stopsWalk = [&](int u) {
+        return degree[u] != 2 || index[u] != 0 || isPrescribed(u) ||
+               std::fabs(omega(u) - M_PI) > cornerTurn;
+    };
+    // From v along `first`, to the first vertex that stops a walk; -1 if the
+    // loop closes first. `length` is the arc length walked either way.
+    auto walk = [&](int v, int first, double &length) -> int {
+        length = 0.0;
+        int prevEdge = first;
+        int u = otherEnd(first, v);
+        length += normP(mesh->vertices[u] - mesh->vertices[v]);
+        for (int guard = 0; u != v && guard < nV; ++guard) {
+            if (stopsWalk(u)) return u;
+            const int e = (incident[u][0] == prevEdge) ? incident[u][1] : incident[u][0];
+            if (e < 0) return -1;
+            const int w = otherEnd(e, u);
+            length += normP(mesh->vertices[w] - mesh->vertices[u]);
+            prevEdge = e;
+            u = w;
+        }
+        return -1;
+    };
+
+    // The features a cone inside keeps its distance from: dS, and on a model
+    // with an interface network the edges between two vertices no group
+    // claims. Built on first use, with the vertex adjacency.
+    std::vector<std::vector<int>> nbr;
+    std::vector<std::array<int, 2>> features;
+    auto prepare = [&]() {
+        nbr.assign(nV, std::vector<int>());
+        for (int e = 0; e < static_cast<int>(mesh->edges.size()); ++e) {
+            const Edge &E = mesh->edges[e];
+            nbr[E[0]].push_back(E[1]);
+            nbr[E[1]].push_back(E[0]);
+            if (mesh->isBoundaryEdge[e] || (grouped && group[E[0]] < 0 && group[E[1]] < 0))
+                features.push_back({E[0], E[1]});
+        }
+    };
+    auto depthOf = [&](int u) {
+        const Point &p = mesh->vertices[u];
+        double best = std::numeric_limits<double>::infinity();
+        for (const std::array<int, 2> &f : features) {
+            const Point &a = mesh->vertices[f[0]];
+            const Point d = mesh->vertices[f[1]] - a;
+            const double L2 = dotP(d, d);
+            double t = (L2 > 0.0) ? dotP(p - a, d) / L2 : 0.0;
+            t = std::max(0.0, std::min(1.0, t));
+            best = std::min(best, normP(p - (a + d * t)));
+        }
+        return best;
+    };
+    // How close an inside destination may come to any cone: Sec. 3.1's
+    // clustering distance, which Stage 4 warns at and Stage 6 cannot keep two
+    // cones apart within, as a fraction of this mesh's own extent.
+    double clearance = 0.0;
+    {
+        Point lo = mesh->vertices.empty() ? Point{0.0, 0.0} : mesh->vertices[0], hi = lo;
+        for (int v = 0; v < nV; ++v) {
+            if (!active[v]) continue;
+            for (int k = 0; k < 2; ++k) {
+                lo[k] = std::min(lo[k], mesh->vertices[v][k]);
+                hi[k] = std::max(hi[k], mesh->vertices[v][k]);
+            }
+        }
+        clearance = 0.01 * normP(hi - lo);
+    }
+    auto nearCone = [&](int u) {
+        for (int w = 0; w < nV; ++w) {
+            if (index[w] != 0 && normP(mesh->vertices[w] - mesh->vertices[u]) < clearance) return true;
+        }
+        return false;
+    };
+    // The deepest vertex of v's group within `radius` of it, through the
+    // group, that carries no cone and keeps the clearance from every cone; -1
+    // if there is none.
+    auto deepestInside = [&](int v, double radius) -> int {
+        const int g = groupOf(v);
+        if (g < 0) return -1;
+        std::vector<double> reach;  // sparse would do; the regions are small
+        reach.assign(nV, std::numeric_limits<double>::infinity());
+        typedef std::pair<double, int> Item;
+        std::priority_queue<Item, std::vector<Item>, std::greater<Item>> open;
+        reach[v] = 0.0;
+        open.push(Item(0.0, v));
+        int best = -1;
+        double bestDepth = 0.0;
+        while (!open.empty()) {
+            const Item it = open.top();
+            open.pop();
+            if (it.first > reach[it.second]) continue;
+            for (int w : nbr[it.second]) {
+                // Never across a vertex of another group or of none.
+                if (!active[w] || groupOf(w) != g) continue;
+                const double d = it.first + normP(mesh->vertices[w] - mesh->vertices[it.second]);
+                if (d > radius || d >= reach[w]) continue;
+                reach[w] = d;
+                open.push(Item(d, w));
+                if (mesh->isBoundaryVertex[w]) continue;
+                if (index[w] != 0 || isPrescribed(w)) continue;
+                const double depth = depthOf(w);
+                if (!(depth > bestDepth) || nearCone(w)) continue;
+                bestDepth = depth;
+                best = w;
+            }
+        }
+        return best;
+    };
+    for (int v : mesh->boundaryVertices) {
+        if (!active[v] || index[v] <= 0 || isPrescribed(v) || degree[v] != 2) continue;
+        if (omega(v) <= maxCornerAngle) continue;
+
+        // The corner at the far end of the side, either way: the nearer convex
+        // one with room.
+        double length[2] = {0.0, 0.0};
+        int corner = -1;
+        double cornerLength = std::numeric_limits<double>::infinity();
+        for (int k = 0; k < 2; ++k) {
+            const int u = walk(v, incident[v][k], length[k]);
+            if (u < 0 || u == v || isPrescribed(u) || index[u] != 0 || degree[u] != 2) continue;
+            if (omega(u) > maxCornerAngle || omega(u) > M_PI - cornerTurn) continue;
+            if (length[k] < cornerLength) { cornerLength = length[k]; corner = u; }
+        }
+
+        // Otherwise inside, no further from it than a quarter of its side.
+        int to = corner;
+        const bool in = (corner < 0);
+        if (in) {
+            if (nbr.empty()) prepare();
+            index[v] -= 1;   // lifted first, so the search does not see it as a cone
+            to = deepestInside(v, 0.25 * (length[0] + length[1]));
+            index[v] += 1;
+        }
+        if (to < 0) continue;
+
+        index[v] -= 1;
+        index[to] += 1;
+        movedByRebalance[to] = 1;
+        Relocation r;
+        r.from = v;
+        r.to = to;
+        r.inside = in;
+        r.distance = normP(mesh->vertices[to] - mesh->vertices[v]);
+        relocations.push_back(r);
+    }
+
+    if (!relocations.empty()) rebuildCones();
+    return static_cast<int>(relocations.size());
 }

@@ -119,6 +119,8 @@ add_library(PolyVector SHARED
     src/mesh/QuadMesh.hxx
     src/mesh/TMOP.cxx
     src/mesh/TMOP.hxx
+    src/mesh/Pillow.cxx
+    src/mesh/Pillow.hxx
     src/mesh/BlockDecomposition.hxx
     src/mesh/BlockDecomposition.cxx
     src/mesh/BoundaryFeatures.hxx
@@ -192,6 +194,8 @@ add_library(PolyVector SHARED
     src/TORSION/FieldIntegration.cxx
     src/TORSION/TORSION.hxx
     src/TORSION/TORSION.cxx
+    src/TORSION/MaterialLayout.hxx
+    src/TORSION/MaterialLayout.cxx
     src/ATLAS/SquareTransport.hxx
     src/ATLAS/PlanarDomain.hxx
     src/ATLAS/PlanarDomain.cxx

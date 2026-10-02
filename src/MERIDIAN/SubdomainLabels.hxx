@@ -288,6 +288,19 @@ public:
         // through the interface: E3 then asks for u constant on a curve and on
         // its own image under a quarter turn. Off restores that behaviour.
         bool seamTurnInterfaceLabels = true;
+
+        // Vertices of dS that emit although Stage 1 put no cone at them, traced
+        // by the seeding alongside the cones and the interface network's nodes
+        // (Separatrices::Options::extraEmitters). TORSION's per-material mode
+        // lays each material region out on its own mesh, and the points where
+        // a neighbouring region's layout meets their shared interface are
+        // points of this region's dS that a layout edge has to leave from. Seeded
+        // like any other emitter, the ray from one pairs with a cone it nearly
+        // meets -- the extension ends on a cone -- and a cone's separatrix that
+        // lands beside one pairs with it, which is the neighbour's isoline
+        // matched rather than doubled. Stage 7 has to be handed the same list,
+        // or the curves seeded against are not the curves Q5 is checked on.
+        std::vector<int> extraEmitters;
     };
 
     struct Report {

@@ -6,7 +6,65 @@ supplement can be built from; each exits non-zero if a check it makes fails, so
 they double as regression tests. E6 (the Laghos bubble run) lives outside this
 repository and is not here.
 
-## 2026-09-28 (latest): E4 and E5 layouts go through a changed TORSION
+## 2026-10-01 (latest): Stage 10 element materials and contractions; the per-material matching
+
+Found from jagged interfaces in Stage 12 output (`docs/cf_flow_pipeline.md`
+Sec. 15.8). Three of the changes reach the experiments; the fourth, the
+viewer's TORSION mode now stepping TORSION's own field, does not:
+
+- **Stage 10 gives each element its layout face's material**
+  (`QuadMesh::Options::materialsFromFaces`) instead of the material its own
+  interior samples find. On a face thinner than its elements along an interface
+  the samples were a coin toss, the element materials zigzagged, and
+  `mesh::QuadMesh` -- so TMOP -- took the zigzag for the interface. Element
+  *positions* are unchanged and so is `mixedQuads`; what changes is the material
+  of those elements (MFEM attributes) and everything Stage 12 does at an
+  interface. Over the 31 multi-material models, both routes, targets 0.05 and
+  0.01: the materials change on 31 of the 124 meshes, and on every one the
+  smoothed interface ends nearer the input (farthest node 0.19-0.22 -> 0.004-0.020).
+- **Stage 10 places a contracted run of nodes on dS or an interface** when the
+  run has a node there (`contractOntoFeatures`), not at the union-find root.
+  This moves vertices on single-material models too: 9 of 70 runs (MERIDIAN
+  geom011, geom032, geom034; TORSION geom010, geom011, geom015, geom032,
+  geom034, geom035) had dS vertices up to 0.06 inside the model.
+- **The per-material matching** weighs where the glued nodes land before the
+  number of pairs, and bends a matched curve into its node
+  (`perMaterialSpacedMatching`, `perMaterialBendEnds`): multi-material layouts
+  of basin, bubbles, dam, ply_drop, tooth (and salt_dome, still invalid) change;
+  29/31 valid either way.
+
+**Nothing in `results/` was re-run.** E4 and E5 change wherever a mesh had a
+contracted chord beside a feature (single- and multi-material) and on the
+multi-material TMOP columns. The behaviour before this date:
+
+```
+--layout-opt quadMaterialsFromFaces=0 --layout-opt quadContractOntoFeatures=0 \
+--layout-opt perMaterialSpacedMatching=0 --layout-opt perMaterialBendEnds=0
+```
+
+## 2026-09-29: TORSION lays a multi-material model out one region at a time
+
+`TORSION::Options::perMaterial` is on by default (`src/TORSION/MaterialLayout`,
+`docs/cf_flow_pipeline.md` Sec. 15): on a multi-material model each material
+region is laid out on its own by Stages 1 to 8, the layout vertices neighbouring
+regions put on a shared interface are matched (the unmatched ones handed to the
+neighbour as emitters and traced through its own map), and the regions' layouts
+are glued into one arrangement for Stages 9 to 11; where the glued layout is not
+valid, the whole model is run as well and the better kept. Over the 31
+multi-material models the count reaching Definition 2.1 with every face
+four-sided goes from 23 to 29, and with every element's scaled Jacobian
+positive from 13 to 18. Single-material models are untouched (byte-identical).
+
+**Nothing in `results/` was re-run.** E4 and E5 multi-material layouts will
+differ on the next run. The 2026-09-28 behaviour is one override:
+
+```
+--layout-opt perMaterial=0
+```
+
+and the behaviour before that is this override together with the set below.
+
+## 2026-09-28: E4 and E5 layouts go through a changed TORSION
 
 `paper::runLayout` hands every field to `TORSION`, and Stages 1 to 5 of it
 changed for the multi-material corpus (`docs/cf_flow_pipeline.md` Sec. 14):

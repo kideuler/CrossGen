@@ -303,6 +303,21 @@ public:
         // vertices. It should never fire, and it is checked rather than assumed
         // for the same reason Stage 9 measures its own watertightness.
         double crackTolerance = 1e-9;
+
+        // Give each element the material of the layout face it was meshed in,
+        // where the arrangement knows it. Off, each takes the material its own
+        // interior samples find, which is what this stage did until 2026-10-01
+        // and which on a face thinner than its elements is a coin toss per
+        // element; see classifyMaterials in the .cxx.
+        bool materialsFromFaces = true;
+
+        // Put the single vertex a contracted run of nodes becomes at a node of
+        // dS or of the interface network when the run has one, and at a node
+        // where those turn or meet before one partway along them. Off, at
+        // whichever node the union-find left as the root -- the `from` end of
+        // the first contracted arc -- as until 2026-10-01, which can be a node
+        // inside a face, half an element off the feature; see meshArcs.
+        bool contractOntoFeatures = true;
     };
 
     // One class of the "opposite sides of a patch" relation: the arcs one chord
@@ -422,6 +437,12 @@ public:
         // dS -- but worth counting, because a large number of them means the
         // fit and the model have parted company.
         int unlocatedQuads = 0;
+        // Elements every sample of which lies in a material other than the one
+        // of the layout face they were meshed in, and which carry the face's
+        // (see classifyMaterials in the .cxx). Not mixed -- the samples agree
+        // with each other -- but slivers of a face thinner than its elements,
+        // whose centroids fell on the far side of the interface they run along.
+        int relabelledQuads = 0;
         // Element edges lying on a material interface. They are the ones two
         // materials share, and both sides carry the same nodes by construction
         // because the interface is a single arc of the layout.
@@ -439,8 +460,10 @@ public:
 
     const std::vector<Point>& vertices() const { return verts; }
     const std::vector<std::array<int, 4>>& quads() const { return cells; }
-    // The material id of each element, from the region of the input mesh its
-    // centroid lies in. All 1s on a single-material model.
+    // The material id of each element: the material of the layout face it was
+    // meshed in, and where the arrangement does not know that, of the region of
+    // the input mesh its interior samples lie in. All 1s on a single-material
+    // model.
     const std::vector<int>& quadMaterials() const { return cellMaterial; }
     const std::vector<Block>& blocks() const { return grids; }
     const std::vector<Chord>& chords() const { return chordList; }
