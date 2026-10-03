@@ -1,6 +1,7 @@
 // QuadMesh.cxx -- see QuadMesh.hxx. Topology, geometry and degree-of-freedom
 // bookkeeping only; there is deliberately no smoothing here.
 #include "QuadMesh.hxx"
+#include "FeatureFrame.hxx"
 
 #include <fstream>
 #include <sstream>
@@ -875,6 +876,19 @@ int QuadMesh::findQuadContainingPoint(const Point &p) const {
         if (inTriangle(a, b, c) || inTriangle(a, c, d)) return q;
     }
     return -1;
+}
+
+double QuadMesh::alignmentQuality(const FeatureFrame &frame) const {
+    // The same cell as a Coons cell of BlockDecomposition::alignmentQuality():
+    // centre at the mean of the corners, directions the mean of opposite sides.
+    FeatureFrame::Alignment grade(frame);
+    for (int q = 0; q < static_cast<int>(quads.size()); ++q) {
+        const Point &p0 = vertices[quads[q][0]], &p1 = vertices[quads[q][1]];
+        const Point &p2 = vertices[quads[q][2]], &p3 = vertices[quads[q][3]];
+        grade.add((p0 + p1 + p2 + p3) * 0.25, ((p1 - p0) + (p2 - p3)) * 0.5,
+                  ((p3 - p0) + (p2 - p1)) * 0.5, std::fabs(signedArea(q)));
+    }
+    return grade.quality();
 }
 
 void QuadMesh::computeQuality() {

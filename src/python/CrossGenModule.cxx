@@ -7,6 +7,7 @@
 //     q.smooth(1000)                   # TMOP, in place
 //     e = m.shape_dna(count=50)        # numpy array of normalised eigenvalues
 //     f = m.boundary_features()        # corners, holes, T3's bound, as a dict
+//     a = b.alignment_quality()        # how the blocks follow the walls, in [0, 1]
 //
 // Three types, each a thin handle on C++ objects the rest of the codebase
 // already has:
@@ -40,6 +41,7 @@
 
 #include "ShapeDNA/ShapeDNA.hxx"
 #include "mesh/BoundaryFeatures.hxx"
+#include "mesh/FeatureFrame.hxx"
 #include "mesh/Mesh.hxx"
 
 namespace pycg {
@@ -56,19 +58,29 @@ PyCFunction asCFunction(F f) {
 // Object layouts. The C++ members are constructed with placement new after
 // tp_alloc and destroyed by hand in tp_dealloc.
 // ---------------------------------------------------------------------------
+
+// What the BlockDecompositions and QuadMeshes made from one Mesh are graded
+// against: its BoundaryFeatures at the default options (regularity()) and its
+// FeatureFrame (alignment_quality()), each made the first time it is asked
+// for. One per Mesh, shared by every object made from it, so that the frame
+// solved for one method's grade serves the other four.
+struct Grading {
+    std::shared_ptr<const Mesh> model;
+    std::shared_ptr<const BoundaryFeatures> features;
+    std::shared_ptr<const FeatureFrame> frame;
+};
+
 struct MeshObject {
     PyObject_HEAD
     std::shared_ptr<const Mesh> mesh;
-    // BoundaryFeatures at the default options, made on first use: what every
-    // BlockDecomposition of this mesh grades its regularity against.
-    std::shared_ptr<const BoundaryFeatures> features;
+    std::shared_ptr<Grading> grading;
 };
 
 struct BlocksObject {
     PyObject_HEAD
     std::shared_ptr<const Method> method;
-    // The model's, from the Mesh it was made from (regularity() reads them).
-    std::shared_ptr<const BoundaryFeatures> features;
+    // The model's, from the Mesh it was made from.
+    std::shared_ptr<Grading> grading;
 };
 
 struct QuadMeshObject {
@@ -84,6 +96,8 @@ struct QuadMeshObject {
     // Set while smooth() runs with the GIL released. Everything that reads
     // the mesh refuses while it is, rather than read nodes mid-move.
     bool busy;
+    // The model's, from the BlockDecomposition it was meshed from.
+    std::shared_ptr<Grading> grading;
 };
 
 PyTypeObject MeshType = {PyVarObject_HEAD_INIT(nullptr, 0)};
@@ -133,31 +147,52 @@ PyObject *popKeyword(PyObject *kwargs, const char *name, PyObject **value, bool 
 // ===========================================================================
 // Mesh
 // ===========================================================================
+// A Mesh object's two members, in place in a block from tp_alloc.
+void initMesh(PyObject *o, std::shared_ptr<const Mesh> m) {
+    new (&asMesh(o)->mesh) std::shared_ptr<const Mesh>(m);
+    new (&asMesh(o)->grading) std::shared_ptr<Grading>(std::make_shared<Grading>());
+    asMesh(o)->grading->model = std::move(m);
+}
+
 PyObject *newMesh(std::shared_ptr<const Mesh> m) {
     PyObject *o = MeshType.tp_alloc(&MeshType, 0);
     if (!o) return nullptr;
-    new (&asMesh(o)->mesh) std::shared_ptr<const Mesh>(std::move(m));
-    new (&asMesh(o)->features) std::shared_ptr<const BoundaryFeatures>();
+    initMesh(o, std::move(m));
     return o;
 }
 
 void Mesh_dealloc(PyObject *self) {
-    asMesh(self)->features.~shared_ptr();
+    asMesh(self)->grading.~shared_ptr();
     asMesh(self)->mesh.~shared_ptr();
     Py_TYPE(self)->tp_free(self);
 }
 
-// The mesh's BoundaryFeatures at the default options, made once. Null with an
-// exception set if they could not be.
-std::shared_ptr<const BoundaryFeatures> defaultFeatures(PyObject *self) {
-    MeshObject *m = asMesh(self);
-    if (!m->features) {
-        const std::shared_ptr<const Mesh> model = m->mesh;
+// The model's BoundaryFeatures at the default options, made once. Null with
+// an exception set if they could not be.
+std::shared_ptr<const BoundaryFeatures> featuresOf(Grading &g) {
+    if (!g.features) {
+        const std::shared_ptr<const Mesh> model = g.model;
         std::shared_ptr<const BoundaryFeatures> f;
         if (!compute([&] { f = std::make_shared<const BoundaryFeatures>(*model); })) return nullptr;
-        m->features = std::move(f);
+        g.features = std::move(f);
     }
-    return m->features;
+    return g.features;
+}
+
+// The model's FeatureFrame, made once. Null with an exception set if it could
+// not be.
+std::shared_ptr<const FeatureFrame> frameOf(Grading &g) {
+    if (!g.frame) {
+        const std::shared_ptr<const Mesh> model = g.model;
+        std::shared_ptr<const FeatureFrame> f;
+        if (!compute([&] { f = std::make_shared<const FeatureFrame>(*model); })) return nullptr;
+        g.frame = std::move(f);
+    }
+    return g.frame;
+}
+
+std::shared_ptr<const BoundaryFeatures> defaultFeatures(PyObject *self) {
+    return featuresOf(*asMesh(self)->grading);
 }
 
 // Mesh(vertices, triangles, materials=None)
@@ -203,8 +238,7 @@ PyObject *Mesh_new(PyTypeObject *type, PyObject *args, PyObject *kwargs) {
     if (!compute([&] { m = std::make_shared<const Mesh>(points, triangles, matIds); })) return nullptr;
     PyObject *o = type->tp_alloc(type, 0);
     if (!o) return nullptr;
-    new (&asMesh(o)->mesh) std::shared_ptr<const Mesh>(std::move(m));
-    new (&asMesh(o)->features) std::shared_ptr<const BoundaryFeatures>();
+    initMesh(o, std::move(m));
     return o;
 }
 
@@ -247,11 +281,11 @@ PyGetSetDef meshGetSet[] = {
     {nullptr, nullptr, nullptr, nullptr, nullptr},
 };
 
-PyObject *newBlocks(std::shared_ptr<const Method> method, std::shared_ptr<const BoundaryFeatures> features) {
+PyObject *newBlocks(std::shared_ptr<const Method> method, std::shared_ptr<Grading> grading) {
     PyObject *o = BlocksType.tp_alloc(&BlocksType, 0);
     if (!o) return nullptr;
     new (&asBlocks(o)->method) std::shared_ptr<const Method>(std::move(method));
-    new (&asBlocks(o)->features) std::shared_ptr<const BoundaryFeatures>(std::move(features));
+    new (&asBlocks(o)->grading) std::shared_ptr<Grading>(std::move(grading));
     return o;
 }
 
@@ -264,11 +298,10 @@ PyObject *Mesh_runMethod(PyObject *self, PyObject *args, PyObject *kwargs) {
     }
     // Held for the call, so the mesh outlives the run whatever else lets go of it.
     const std::shared_ptr<const Mesh> model = asMesh(self)->mesh;
-    std::shared_ptr<const BoundaryFeatures> features = defaultFeatures(self);
-    if (!features) return nullptr;
+    if (!defaultFeatures(self)) return nullptr;
     std::shared_ptr<Method> m = S->run(*model, kwargs);
     if (!m) return nullptr;
-    PyObject *b = newBlocks(m, std::move(features));
+    PyObject *b = newBlocks(m, asMesh(self)->grading);
     if (b && m->decomposition().blocks.empty()) {
         if (PyErr_WarnFormat(PyExc_RuntimeWarning, 1,
                              "%s produced no blocks; BlockDecomposition.report['messages'] says why",
@@ -451,6 +484,36 @@ PyObject *Mesh_boundaryFeatures(PyObject *self, PyObject *args, PyObject *kwargs
     return pair;
 }
 
+// Mesh.feature_frame(points=None)
+PyObject *Mesh_featureFrame(PyObject *self, PyObject *args, PyObject *kwargs) {
+    static const char *kw[] = {"points", nullptr};
+    PyObject *P = Py_None;
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "|O:feature_frame", const_cast<char **>(kw), &P))
+        return nullptr;
+    const std::shared_ptr<const FeatureFrame> frame = frameOf(*asMesh(self)->grading);
+    if (!frame) return nullptr;
+    if (P == Py_None) return complexArray(frame->vertexValues());
+    std::vector<double> xy;
+    Py_ssize_t n = 0;
+    if (!readDoubles(P, 2, "points", xy, n)) return nullptr;
+    std::vector<std::complex<double>> u(static_cast<size_t>(n));
+    if (!compute([&] {
+            for (Py_ssize_t i = 0; i < n; ++i) u[i] = frame->at(Point{xy[2 * i], xy[2 * i + 1]});
+        }))
+        return nullptr;
+    return complexArray(u);
+}
+
+const char *kFeatureFrameDoc =
+    "feature_frame(points=None) -> complex128 array\n\n"
+    "The cross field the walls ask a grid to follow (mesh::FeatureFrame): the\n"
+    "harmonic extension of exp(4i theta), theta the tangent angle of dS and of the\n"
+    "material interfaces, solved on this mesh. u = exp(4i phi) |u|: the cross at\n"
+    "angle phi = angle(u) / 4 (mod 90 degrees), and |u| <= 1, how far the walls\n"
+    "in view agree on it -- 1 on a wall and in a box, r^4 in a unit disk, 0 at\n"
+    "its singular points. Per vertex, or at each row of an (n, 2)\n"
+    "array of points. What alignment_quality() grades against.";
+
 const char *kBoundaryFeaturesDoc =
     "boundary_features(report=False, **options) -> dict\n\n"
     "What a quad layout of this mesh owes to its boundary (mesh::BoundaryFeatures):\n"
@@ -465,14 +528,15 @@ const char *kBoundaryFeaturesDoc =
     "With report=True, returns (summary, report): each corner's position, angle in\n"
     "degrees, k, vertex and region, and each boundary loop's vertices.";
 
-// Filled in readyTypes(): the five methods, shape_dna, boundary_features, the sentinel.
-PyMethodDef meshMethods[kNumMethods + 3];
+// Filled in readyTypes(): the five methods, shape_dna, boundary_features,
+// feature_frame, the sentinel.
+PyMethodDef meshMethods[kNumMethods + 4];
 
 // ===========================================================================
 // BlockDecomposition
 // ===========================================================================
 void Blocks_dealloc(PyObject *self) {
-    asBlocks(self)->features.~shared_ptr();
+    asBlocks(self)->grading.~shared_ptr();
     asBlocks(self)->method.~shared_ptr();
     Py_TYPE(self)->tp_free(self);
 }
@@ -572,7 +636,7 @@ PyGetSetDef blocksGetSet[] = {
     {nullptr, nullptr, nullptr, nullptr, nullptr},
 };
 
-PyObject *newQuadMesh(MeshOutput &&out, const char *method) {
+PyObject *newQuadMesh(MeshOutput &&out, const char *method, std::shared_ptr<Grading> grading) {
     PyObject *o = QuadMeshType.tp_alloc(&QuadMeshType, 0);
     if (!o) {
         Py_XDECREF(out.report);
@@ -585,6 +649,7 @@ PyObject *newQuadMesh(MeshOutput &&out, const char *method) {
     q->report = out.report;
     q->pillow = out.pillow;
     q->busy = false;
+    new (&q->grading) std::shared_ptr<Grading>(std::move(grading));
     out.report = nullptr;
     return o;
 }
@@ -620,7 +685,7 @@ PyObject *Blocks_mesh(PyObject *self, PyObject *args, PyObject *kwargs) {
         Py_XDECREF(out.report);
         return nullptr;
     }
-    return newQuadMesh(std::move(out), method.name());
+    return newQuadMesh(std::move(out), method.name(), asBlocks(self)->grading);
 }
 
 PyObject *Blocks_writeOBJ(PyObject *self, PyObject *args) {
@@ -642,7 +707,9 @@ constexpr double kNotValid = std::numeric_limits<double>::quiet_NaN();
 
 PyObject *Blocks_regularity(PyObject *self, PyObject *) {
     const BlocksObject *b = asBlocks(self);
-    return PyFloat_FromDouble(isValid(self) ? b->method->decomposition().regularity(*b->features) : kNotValid);
+    if (!isValid(self)) return PyFloat_FromDouble(kNotValid);
+    const std::shared_ptr<const BoundaryFeatures> f = featuresOf(*b->grading);
+    return f ? PyFloat_FromDouble(b->method->decomposition().regularity(*f)) : nullptr;
 }
 
 PyObject *Blocks_angleQuality(PyObject *self, PyObject *) {
@@ -651,6 +718,15 @@ PyObject *Blocks_angleQuality(PyObject *self, PyObject *) {
 
 PyObject *Blocks_chordQuality(PyObject *self, PyObject *) {
     return PyFloat_FromDouble(isValid(self) ? decompOf(self).chordQuality() : kNotValid);
+}
+
+PyObject *Blocks_alignmentQuality(PyObject *self, PyObject *) {
+    if (!isValid(self)) return PyFloat_FromDouble(kNotValid);
+    const std::shared_ptr<const FeatureFrame> frame = frameOf(*asBlocks(self)->grading);
+    if (!frame) return nullptr;
+    double q = kNotValid;
+    if (!compute([&] { q = decompOf(self).alignmentQuality(*frame); })) return nullptr;
+    return PyFloat_FromDouble(q);
 }
 
 PyMethodDef blocksMethods[] = {
@@ -690,6 +766,16 @@ PyMethodDef blocksMethods[] = {
      "area each runs through, of longest over shortest macro edge -- the\n"
      "element-size ratio its one interval count forces. 1 when every chord's\n"
      "sides are equal, 1/2 at a factor of two."},
+    {"alignment_quality", Blocks_alignmentQuality, METH_NOARGS,
+     "alignment_quality() -> float in [0, 1], higher better; NaN when not valid\n\n"
+     "How the blocks' grids follow the walls (docs/block_decomposition_metrics.md\n"
+     "Sec. 7): each block's transfinite grid, cell by cell, against the cross of\n"
+     "dS and the interfaces carried inward (Mesh.feature_frame()), weighted by\n"
+     "area and by how far the walls in view agree on a direction. 1 - Delta/45\n"
+     "degrees for Delta the effective angle off: 1 when the grid runs along or\n"
+     "across the walls' cross wherever it has one, 1/2 for a grid at a random\n"
+     "angle to it. For a shock code, where a front leaving a wall is captured\n"
+     "best by faces parallel or orthogonal to it."},
     {nullptr, nullptr, 0, nullptr},
 };
 
@@ -702,6 +788,7 @@ void Quad_dealloc(PyObject *self) {
     q->mesh.~unique_ptr();
     q->smoothing.~Options();
     q->method.~basic_string();
+    q->grading.~shared_ptr();
     Py_TYPE(self)->tp_free(self);
 }
 
@@ -860,6 +947,16 @@ PyObject *Quad_writeMFEM(PyObject *self, PyObject *args) {
     return writeResult(m->writeMFEM(path), path);
 }
 
+PyObject *Quad_alignmentQuality(PyObject *self, PyObject *) {
+    mesh::QuadMesh *m = quadOf(self);
+    if (!m) return nullptr;
+    const std::shared_ptr<const FeatureFrame> frame = frameOf(*asQuad(self)->grading);
+    if (!frame) return nullptr;
+    double q = 0.0;
+    if (!compute([&] { q = m->alignmentQuality(*frame); })) return nullptr;
+    return PyFloat_FromDouble(q);
+}
+
 PyMethodDef quadMethods[] = {
     {"smooth", asCFunction(Quad_smooth), METH_VARARGS | METH_KEYWORDS,
      "smooth(niters=1000, pillow=None, **options) -> dict\n\n"
@@ -878,6 +975,13 @@ PyMethodDef quadMethods[] = {
     {"write_vtu", Quad_writeVTU, METH_VARARGS, "write_vtu(path): a VTK unstructured grid."},
     {"write_mfem", Quad_writeMFEM, METH_VARARGS,
      "write_mfem(path): an MFEM mesh, the material id as the element attribute."},
+    {"alignment_quality", Quad_alignmentQuality, METH_NOARGS,
+     "alignment_quality() -> float in [0, 1], higher better\n\n"
+     "BlockDecomposition.alignment_quality() read on the elements as they are now\n"
+     "(after smooth(), if it has run): each element's two mid-side directions\n"
+     "against the walls' cross (Mesh.feature_frame()), by area and by how far the\n"
+     "walls agree there. The same scale, so the two compare directly; smoothing\n"
+     "raises it only as far as TMOP reaches, which is less the finer the mesh."},
     {nullptr, nullptr, 0, nullptr},
 };
 
@@ -951,7 +1055,8 @@ const char *kModuleDoc =
     "    q = b.mesh(0.05)          # quad mesh at a target edge length\n"
     "    q.smooth(1000)            # TMOP, in place\n"
     "    e = m.shape_dna()         # numpy array of the Shape-DNA\n"
-    "    f = m.boundary_features() # corners, holes, T3's bound, as a dict\n\n"
+    "    f = m.boundary_features() # corners, holes, T3's bound, as a dict\n"
+    "    a = b.alignment_quality() # how the blocks follow the walls, in [0, 1]\n\n"
     "Every option is a keyword with the C++ default; crossgen.options(method,\n"
     "stage) lists them. Calls release the GIL but run one at a time; use\n"
     "processes to run several models in parallel.";
@@ -984,6 +1089,8 @@ int readyTypes() {
                         kShapeDNADoc};
     meshMethods[k++] = {"boundary_features", asCFunction(Mesh_boundaryFeatures),
                         METH_VARARGS | METH_KEYWORDS, kBoundaryFeaturesDoc};
+    meshMethods[k++] = {"feature_frame", asCFunction(Mesh_featureFrame), METH_VARARGS | METH_KEYWORDS,
+                        kFeatureFrameDoc};
     meshMethods[k] = {nullptr, nullptr, 0, nullptr};
     MeshType.tp_methods = meshMethods;
 

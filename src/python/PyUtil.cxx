@@ -98,6 +98,11 @@ PyObject *pointArray(const std::vector<Point> &points) {
                        static_cast<Py_ssize_t>(points.size()), 2);
 }
 
+PyObject *complexArray(const std::vector<std::complex<double>> &v) {
+    return makeArray(v.data(), v.size() * sizeof(std::complex<double>), "complex128",
+                     static_cast<Py_ssize_t>(v.size()), 0);
+}
+
 bool readDoubles(PyObject *o, int cols, const char *what, std::vector<double> &out,
                  Py_ssize_t &rows) {
     Py_buffer view;

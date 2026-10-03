@@ -6,11 +6,12 @@ On the one model given, every Mesh method is taken through the whole chain --
 a block decomposition, a quad mesh on it at h = 0.05, a few TMOP sweeps -- and
 what is asserted is structural: the blocks exist and index what they claim to,
 the mesh has elements and no fold after smoothing, and the arrays have the
-shapes and types the docstrings promise, every layout is valid and its three
+shapes and types the docstrings promise, every layout is valid and its four
 decomposition qualities are in range. The Shape-DNA is checked against
 itself (ascending, positive, and the same through a Mesh rebuilt from the
 arrays), the boundary features against what a quarter disk owes and against a
-mirrored copy, and the keyword errors are checked for being errors. How good a
+mirrored copy, the feature frame against its walls and a mirrored copy, and
+the keyword errors are checked for being errors. How good a
 layout is, is not asserted here: that is the drivers' business, and their
 ctests'.
 """
@@ -81,6 +82,21 @@ def main(path):
           "the same features from a mirrored copy")
     expect(TypeError, lambda: m.boundary_features(corner_angel=10.0), "a misspelt boundary_features keyword")
 
+    # ---- feature frame ----------------------------------------------------------
+    # The walls' cross carried inward: |u| <= 1, and 1 on dS of the quarter
+    # disk, whose three corners are right angles, so no side's cross cancels
+    # its neighbour's. A mirror turns every angle round, so the mirrored
+    # copy's frame is the conjugate; and the frame at a vertex is the same
+    # asked either way.
+    u = m.feature_frame()
+    check(u.dtype == np.complex128 and u.shape == (m.num_vertices,), "feature_frame is (n,) complex128")
+    on = np.unique(m.boundary_edges)
+    check(np.abs(u).max() <= 1.0 + 1e-9 and np.abs(np.abs(u[on]) - 1.0).max() < 1e-2,
+          f"feature_frame: |u| <= 1, and 1 on dS (mean |u| {np.abs(u).mean():.3f})")
+    um = crossgen.Mesh(V * np.array([-1.0, 1.0]), T, M).feature_frame()
+    check(np.abs(um - np.conj(u)).max() < 1e-9, "the conjugate frame on a mirrored copy")
+    check(np.abs(m.feature_frame(V[:20]) - u[:20]).max() < 1e-9, "feature_frame(points) at the vertices")
+
     # ---- options and their errors ---------------------------------------------
     for name in crossgen.methods:
         for stage in ("method", "mesh", "smooth"):
@@ -109,8 +125,10 @@ def main(path):
         # quarter disk owes, so a layout that owes no more reaches 1.
         check(b.valid, f"{name}: a valid decomposition")
         reg, ang, cho = b.regularity(), b.angle_quality(), b.chord_quality()
-        check(0.0 < reg <= 1.0 and 0.0 < ang <= 1.0 and 0.0 < cho <= 1.0,
-              f"{name}: regularity {reg:.3f}, angle quality {ang:.3f}, chord quality {cho:.3f}")
+        ali = b.alignment_quality()
+        check(0.0 < reg <= 1.0 and 0.0 < ang <= 1.0 and 0.0 < cho <= 1.0 and 0.0 < ali <= 1.0,
+              f"{name}: regularity {reg:.3f}, angle quality {ang:.3f}, chord quality {cho:.3f}, "
+              f"alignment quality {ali:.3f}")
 
         q = b.mesh(0.05)
         print(f"  {q}")
@@ -122,6 +140,8 @@ def main(path):
               f"{name}: smooth(20) {before:.3f} -> {r['min_scaled_jacobian_after']:.3f}, no folds")
         check(abs(q.quality["min_scaled_jacobian"] - r["min_scaled_jacobian_after"]) < 1e-12,
               f"{name}: the smoothed mesh is the one the object holds")
+        qa = q.alignment_quality()
+        check(0.0 < qa <= 1.0, f"{name}: mesh alignment quality {qa:.3f}")
     print("all checks passed")
 
 

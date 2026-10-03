@@ -10,14 +10,16 @@ Writes, in --out:
   dataset.csv   one row per mesh: mesh_id, group, source, area, lam_1..lam_K
                 (with --eigs K), feat_<name> for each boundary feature,
                 probe_<PROBE>_<column> (below), then for each method
-                <method>_valid, _regularity, _angle_quality, _chord_quality,
-                _coverage, _num_blocks and _seconds.
+                <method>_valid, _alignment_quality, _regularity, _angle_quality,
+                _chord_quality, _coverage, _num_blocks and _seconds.
   spectra.csv   mesh_id, group, lam_1..lam_K         } the two files memo_data.py
   results.csv   mesh_id, algorithm, metric, value    } writes, for train_selector.py
   cache.jsonl   every task's raw result, one line per mesh; a rerun skips the
                 tasks already in it, so an interrupted run resumes, a run that
                 asks for less (no spectrum, fewer eigenvalues) only rewrites the
-                CSVs, and one that asks for more runs only what is missing.
+                CSVs, and one that asks for more runs only what is missing --
+                more eigenvalues, or a metric added to METRICS since the cache
+                was written, which reruns the method tasks and nothing else.
   logs/, tmp/   each mesh's C++ output and its workers' result files while it
                 runs; both are deleted when the script finishes.
 
@@ -45,7 +47,8 @@ a layout's topology is decided by, and what a spectrum resolves least. On the
 2026-09-26 data they predicted the right method better than the spectrum did.
 
 PROBE's first copy is also written on its own, as probe_<PROBE>_valid,
-_regularity, _angle_quality, _chord_quality, _coverage and _num_blocks. The
+_alignment_quality, _regularity, _angle_quality, _chord_quality, _coverage and
+_num_blocks. The
 selector runs that method first (ZIPLINE: ~0.1 s a mesh) and reads its result
 as inputs, so in training those have to be one run, as they are in use, and
 not the mean over copies. The metrics are empty where the run was not valid;
@@ -55,9 +58,13 @@ On the 2026-09-28 data this input halved the selector's regret: a cross-field
 method's own layout says whether the others will split a face into many
 blocks, which nothing in the boundary features does.
 
-The metrics are BlockDecomposition's regularity(), angleQuality() and
-chordQuality(): in [0, 1], higher better, defined only for a decomposition that
-covers the model. Whether it does is <method>_valid, a separate column, and a
+The metrics are BlockDecomposition's alignmentQuality(), regularity(),
+angleQuality() and chordQuality(): in [0, 1], higher better, defined only for a
+decomposition that covers the model. The first is how the blocks' grids follow
+the walls -- whether a layout "flows" with the model, which a shock code cares
+about and the other three cannot see (docs/block_decomposition_metrics.md
+Sec. 7) -- and is the one py/train_classifier.py trains for unless told
+otherwise. Whether it does is <method>_valid, a separate column, and a
 method that raises, crashes the process or makes no progress for METHOD_TIMEOUT
 is not valid either. Where no run of a method was valid its metrics are empty
 (NaN), not 0: a zero there used to repeat the failure in every quality column
@@ -98,7 +105,9 @@ SPECTRUM_NORMALIZATION = "weyl_ratio"   # a ShapeDNA normalisation; see crossgen
 SHAPE_DNA_OPTIONS = dict(degree=3, boundary="dirichlet")
 SOURCES = {"singlemat": REPO / "data/meshes/singlemat", "mambo": REPO / "data/meshes/mambo"}
 METHODS = ["zipline", "umber", "meridian", "torsion", "atlas"]
-METRICS = ["regularity", "angle_quality", "chord_quality"]   # BlockDecomposition methods = CSV names
+# BlockDecomposition methods = CSV names. alignment_quality first: it is what
+# py/train_classifier.py trains for by default (its --metric).
+METRICS = ["alignment_quality", "regularity", "angle_quality", "chord_quality"]
 # Mesh.boundary_features() keys written as feat_<key>: the ones that do not
 # change with the model's scale (area and perimeter do).
 FEATURES = ["regions", "holes", "euler", "corners", "corners_one_block", "corners_two_blocks",
@@ -220,11 +229,19 @@ def task_list(k, copies):
 def missing_tasks(prior, k, copies):
     """The tasks of task_list(k, copies) that `prior`, a cache record of the
     mesh (or None), has no result for. A spectrum shorter than k counts as
-    missing; one longer is cut to k when the CSVs are written. A task that
-    failed has a result: a failure is final, as in the run that recorded it."""
+    missing; one longer is cut to k when the CSVs are written. So does a method
+    run recorded before one of METRICS existed: the decomposition is gone with
+    its child, so the run is repeated rather than the column left empty. A task
+    that failed has a result: a failure is final, as in the run that recorded
+    it."""
     have = prior["results"] if prior else {}
+
+    def stale(t):
+        r = have[t]
+        return "#" in t and r.get("status") == "ok" and any(m not in r["values"] for m in METRICS)
+
     return [t for t in task_list(k, copies)
-            if t not in have or (t == "spectrum" and prior["k"] < k)]
+            if t not in have or (t == "spectrum" and prior["k"] < k) or stale(t)]
 
 
 def run_mesh(mesh, k, copies, out_dir, progress, prior=None):

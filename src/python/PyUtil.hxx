@@ -5,6 +5,7 @@
 #include <Python.h>
 
 #include <array>
+#include <complex>
 #include <exception>
 #include <mutex>
 #include <new>
@@ -52,6 +53,7 @@ PyObject *indexArray(const int *data, Py_ssize_t rows, Py_ssize_t cols);       /
 PyObject *doubleArray(const std::vector<double> &v);
 PyObject *indexArray(const std::vector<int> &v);
 PyObject *pointArray(const std::vector<Point> &points);                        // (n, 2)
+PyObject *complexArray(const std::vector<std::complex<double>> &v);            // complex128
 
 template <size_t K>
 PyObject *indexArray(const std::vector<std::array<int, K>> &rows) {

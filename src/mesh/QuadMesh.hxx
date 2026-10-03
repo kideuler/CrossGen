@@ -58,6 +58,8 @@
 // contribution needs dA/dx for the *specific* node, which depends on which
 // corner of the element that node occupies; storing it alongside the element
 // index removes a four-way search from the innermost loop.
+class FeatureFrame;
+
 namespace mesh {
 
 typedef std::array<int, 4> Quad;
@@ -567,6 +569,15 @@ public:
     int findQuadContainingPoint(const Point &p) const;
 
     void computeQuality();
+
+    // BlockDecomposition::alignmentQuality() read on the elements themselves:
+    // each element's two mid-side directions held to `frame`'s cross at its
+    // centre, by area and the frame's |u|, graded by FeatureFrame::Alignment
+    // (docs/block_decomposition_metrics.md Sec. 7). 1 for a mesh whose
+    // element sides run along or across the walls' cross wherever it has a
+    // direction, 1/2 for one at a random angle to it. Not in `quality`, which
+    // needs nothing but the mesh: this needs the model's frame.
+    double alignmentQuality(const FeatureFrame &frame) const;
 
     // ---- conversion and I/O ----------------------------------------------
 

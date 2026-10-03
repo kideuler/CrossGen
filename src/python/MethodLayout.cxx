@@ -336,11 +336,25 @@ public:
     LayoutMethod(const Mesh &model, const Options &opts)
         : opts_(opts), pipeline_(std::make_shared<Mesh>(model), opts) {}
 
+    // Each fitted side is carried as a polyline of kSideSamples chords. The
+    // 16 the viewer draws with is too coarse to grade: alignment_quality()
+    // reads the sides' directions between their points, and 16 chords of a
+    // long curved side are each off the spline by half their turning. On
+    // geom021, whose strips run 4 units round a bend, that alone moved the
+    // grade by 0.05 between a 16- and a 32-cell lattice; at 64 chords the
+    // sides are as smooth as ZIPLINE's traced ones. It moved regularity and
+    // angle_quality a little too, since both fit the side tangents over a
+    // side's first tenth: by under 0.001 on most models, by more than 0.01
+    // on 7 of the 67 single-material runs (docs/block_decomposition_metrics.md
+    // Sec. 7.7).
+    static constexpr int kSideSamples = 64;
+
     void run() {
         pipeline_.run();
         if (pipeline_.hasArrangement()) {
             decomposition_ = pipeline_.getArrangement().blockDecomposition(
-                pipeline_.hasSplines() ? &pipeline_.getSplines() : nullptr, 16, Traits<P>::source);
+                pipeline_.hasSplines() ? &pipeline_.getSplines() : nullptr, kSideSamples,
+                Traits<P>::source);
         }
     }
 

@@ -14,13 +14,14 @@ DATA  dataset.csv from build_dataset.py (CSV, or Parquet if the file name ends i
             the probe's metrics and block count, which are missing when it was not valid or raised:
             they count as 0, and its _valid column says which.
   outputs   per method, <method>_valid, the fraction of its runs that produced a decomposition, and
-            the METRICS of a valid one (each in [0, 1], higher better: regularity, angle_quality,
-            chord_quality). The two are learnt by separate heads: a validity logit (binary cross-
-            entropy) and the quality given validity (MSE on runs that were valid). Data from before
+            the one metric --metric names (default alignment_quality; any of METRICS) of a valid
+            one. The two are learnt by separate heads: a validity logit (binary cross-entropy) and
+            the quality given validity (MSE on runs that were valid). Data from before
             build_dataset.py wrote _valid, where a failed method scored 0 on every metric, is read
             the same way: all-zero is not valid. An empty value is masked out.
   utility   of one method on one mesh: p * U(quality) + (1 - p) * U(failure), p the probability it
-            is valid, U the METRICS weighted as below and a failure counting as their failed values;
+            is valid, U the metric standardized over valid runs and a failure counting as its
+            failed value;
             with FALLBACK set, a failed run is taken to be detected (BlockDecomposition.valid) and
             replaced by that method's run, so U(failure) is the fallback's own expected utility.
   probe     PROBE runs before the selector is asked, and its result is an input. The model's own
@@ -37,8 +38,8 @@ DATA  dataset.csv from build_dataset.py (CSV, or Parquet if the file name ends i
             one shape even where the probe ran differently on them.
 
 USAGE
-  python train_classifier.py --data dataset.csv [--onnx selector.onnx] [--plot live|save|off]
-                             [--cv both|part|shape]
+  python train_classifier.py --data dataset.csv [--metric alignment_quality] [--onnx selector.onnx]
+                             [--plot live|save|off] [--cv both|part|shape]
       cross-validated report, then trains on all meshes and saves selector.pt. While it trains, a
       window shows each net's training and validation loss per epoch (--plot live, the default), and
       each stage's curves are saved to --plot-dir as loss_<stage>.png (save: the PNGs only).
@@ -47,8 +48,8 @@ USAGE
       result among them) -> predictions.csv, with the probe rule's action for each mesh
 
 All preprocessing is inside the saved model: it takes the raw input columns and returns the
-predicted quality of a valid layout (method, metric), the probability of one per method, and a
-utility per method. Needs numpy, pandas and torch; Parquet needs pyarrow, --onnx needs onnx and
+predicted quality of a valid layout (method, the one metric), the probability of one per method,
+and a utility per method. Needs numpy, pandas and torch; Parquet needs pyarrow, --onnx needs onnx and
 onnxscript, --plot needs matplotlib.
 """
 import argparse
@@ -67,25 +68,26 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ------------------------------------------------------------------------------------------------
-# EDIT to match your data.   metric name: (better, log_transform, utility_weight, failed_value)
+# EDIT to match your data.   metric name: (better, log_transform, failed_value)
 #   better          "higher" or "lower"
 #   log_transform   True for positive, skewed metrics (errors, runtimes)
-#   utility_weight  importance in the ranking. Metrics are standardized over valid runs, so weights
-#                   are in standard deviations: 1.0 vs 0.5 means one std of the first is worth two
-#                   std of the second. Changing weights later needs no retraining (--predict uses
-#                   the current values).
 #   failed_value    what a run that produced no valid decomposition counts as on this metric, in
 #                   its own units (for the utility only; it is never trained on). 0 is the worst
-#                   value of the three [0, 1] metrics: no layout is the worst layout.
-# angle_quality has no weight: it is read on the method's own polylines before smoothing moves them
-# -- the metrics note's B4, "report it, do not rank on it" -- and it is the least repeatable of the
-# three across copies of one shape. It is still predicted, as a second task for the quality head.
-# The methods are every <method>_<metric> prefix in the data, in column order.
+#                   value of the [0, 1] metrics: no layout is the worst layout.
+# A model is trained for one of these, --metric, and ranks on it alone. The default, METRIC, is
+# alignment_quality: how the blocks' grids follow the walls, what a shock code needs and the others
+# cannot see (docs/block_decomposition_metrics.md Sec. 7). It is read on the method's own polylines,
+# but smoothing undoes less of it the finer the mesh (geom029: ATLAS 0.75 on its blocks, 0.95
+# smoothed at h = 0.05, 0.89 at h = 0.0125). angle_quality is the one to avoid ranking on: it is the
+# metrics note's B4, "report it, do not rank on it", and the least repeatable across copies of one
+# shape. The methods are every <method>_<metric> prefix in the data, in column order.
 METRICS = {
-    "regularity": ("higher", False, 1.0, 0.0),
-    "angle_quality": ("higher", False, 0.0, 0.0),
-    "chord_quality": ("higher", False, 1.0, 0.0),
+    "alignment_quality": ("higher", False, 0.0),
+    "regularity": ("higher", False, 0.0),
+    "chord_quality": ("higher", False, 0.0),
+    "angle_quality": ("higher", False, 0.0),
 }
+METRIC = "alignment_quality"
 # Input column groups, used when the data has them: "feat" is every feat_*, "probe" every
 # probe_<PROBE>_*, "lam" is lam_1..lam_K. Measured on the 2026-09-28 data (442 meshes; 5-fold CV by
 # shape, mean over 3-4 fold assignments, each moving it by ~0.01; lower better): regret with the
@@ -324,7 +326,7 @@ def failed_values(cfg):
     """Each metric's failed_value in transformed units."""
     out = []
     for name, is_log in zip(cfg["metrics"], cfg["is_log"]):
-        v = METRICS[name][3] if name in METRICS else 0.0
+        v = METRICS[name][2] if name in METRICS else 0.0
         if is_log and v <= 0:
             sys.exit(f"metric '{name}' is log-transformed, so its failed_value must be positive")
         out.append(float(np.log(v)) if is_log else float(v))
@@ -684,7 +686,7 @@ def make_config(algs, metrics, input_cols, kinds, hidden):
                dropout=DROPOUT, n_members=N_SEEDS,
                sign=[1.0 if METRICS[m][0] == "higher" else -1.0 for m in metrics],
                is_log=[bool(METRICS[m][1]) for m in metrics],
-               weights=[float(METRICS[m][2]) for m in metrics],
+               weights=[1.0] * len(metrics),   # one metric: its scale is the ranking's
                fallback=algs.index(FALLBACK) if FALLBACK in algs else -1,
                fill=fillable(input_cols), probe=-1, probe_index=[0] * (1 + len(metrics)))
     cfg["t_fail"] = failed_values(cfg)
@@ -696,9 +698,20 @@ def make_config(algs, metrics, input_cols, kinds, hidden):
     return cfg
 
 
+def check_metric(D, metric):
+    """The one metric to train for, as the list the model's config holds; exits if the table has no
+    columns for it."""
+    if not any(str(c).endswith("_" + metric) and not str(c).startswith(("lam_", "feat_", "probe_"))
+               for c in D.columns):
+        sys.exit(f"the data has no <method>_{metric} columns"
+                 + (" (build_dataset.py writes them: rerun it on its cache, which reruns the method tasks only)"
+                    if metric == "alignment_quality" else "") + "; pick another with --metric")
+    return [metric]
+
+
 def train(args):
     D, input_cols = load_data(args.data)
-    metrics = list(METRICS)
+    metrics = check_metric(D, args.metric)
     algs, Y, V = load_targets(D, metrics)
     keep = ~np.isnan(V).all(1)
     if not keep.all():
@@ -714,7 +727,7 @@ def train(args):
     n_parts, n_shapes = len(np.unique(part_groups)), len(np.unique(shapes))
     print(f"{len(D)} meshes, {n_shapes} distinct shapes, in {n_parts} groups | {len(input_cols)} inputs "
           f"({', '.join(g for g in INPUTS if input_columns(D, (g,)))}) -> {len(algs)} methods x (valid + "
-          f"{len(metrics)} metrics) | methods: {', '.join(algs)} | valid runs: "
+          f"{', '.join(metrics)}) | methods: {', '.join(algs)} | valid runs: "
           + ", ".join(f"{a} {np.nanmean(V[:, i]):.0%}" for i, a in enumerate(algs))
           + (f" | probe: {PROBE}" if cfg["probe"] >= 0 else ""))
     plot = None
@@ -755,7 +768,7 @@ def train(args):
             print(f"  {key:34s}" + "".join(fmt.format(t[key]) for t in table.values()))
         p = info["plain"]
         print(f"  Regret = utility lost vs. the best method per mesh (0 = oracle), with a failure counting as "
-              f"METRICS' failed values. Always picking the single best method ({algs[p['sbs']]}) gives "
+              f"its failed value. Always picking the single best method ({algs[p['sbs']]}) gives "
               f"{p['regret_sbs']:.3f}; 'gap closed' is the share of that regret removed.")
         if "fallback" in info:
             fb = info["fallback"]
@@ -834,9 +847,8 @@ def predict(args):
     sel = Selector(cfg)
     sel.load_state_dict(ck["state"])
     sel.eval()
-    if set(METRICS) == set(cfg["metrics"]):   # use the current utility weights and fallback
-        sel.w.copy_(torch.tensor([float(METRICS[m][2]) for m in cfg["metrics"]]))
-        sel.fallback.fill_(cfg["algorithms"].index(FALLBACK) if FALLBACK in cfg["algorithms"] else -1)
+    # The current fallback; the metric and its weight are the model's own.
+    sel.fallback.fill_(cfg["algorithms"].index(FALLBACK) if FALLBACK in cfg["algorithms"] else -1)
     D, input_cols = load_data(args.data, cfg["input_cols"])
     X = torch.tensor(D[input_cols].to_numpy(np.float32))    # a missing probe metric: the model fills it
     with torch.no_grad():
@@ -859,7 +871,7 @@ def predict(args):
         ok = P[i, z] >= 0.5
         then = "keep it" if run[i] is None else f"run {algs[run[i]]}" + (", keep the better" if ok else "")
         print(f"{mid}: {algs[z]} {'valid' if ok else 'not valid'} -> {then}   [{ranking}]")
-    weights = ", ".join(f"{m} {w:g}" for m, w in zip(cfg["metrics"], sel.w.tolist()))
+    weights = ", ".join(f"{m} {w:g}" for m, w in zip(cfg["metrics"], sel.w.tolist()))   # older models: several
     fb = int(sel.fallback)
     print(("...\n" if len(D) > 10 else "") + f"Utility weights: {weights}; "
           + (f"a failed run replaced by {algs[fb]}'s" if fb >= 0 else "a failure is final")
@@ -872,6 +884,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data", required=True, help="dataset.csv from build_dataset.py (CSV or Parquet)")
     ap.add_argument("--model", default="selector.pt", help="model file to save, or to load with --predict")
+    ap.add_argument("--metric", choices=list(METRICS), default=METRIC,
+                    help=f"the one metric to train for and rank on (default {METRIC}); --predict uses the model's")
     ap.add_argument("--predict", action="store_true", help="rank the methods for the meshes in --data")
     ap.add_argument("--out", default="predictions.csv", help="output file for --predict")
     ap.add_argument("--no-cv", action="store_true", help="skip cross-validation; just train and save")

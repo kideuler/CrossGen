@@ -1,6 +1,7 @@
 #include "mesh/BlockDecomposition.hxx"
 
 #include "mesh/BoundaryFeatures.hxx"
+#include "mesh/FeatureFrame.hxx"
 
 #include <algorithm>
 #include <cmath>
@@ -458,6 +459,46 @@ double BlockDecomposition::chordQuality() const {
     // 1/S of the weighted geometric mean S: no free scale, and 1/2 is a chord
     // whose elements differ in size by a factor of two end to end.
     return std::exp(-num / den);
+}
+
+double BlockDecomposition::alignmentQuality(const FeatureFrame &frame) const {
+    if (!covers()) return std::numeric_limits<double>::quiet_NaN();
+    // Cells per side. The Coons grid turns smoothly, so 16 resolves it on the
+    // largest block a method makes; the grade moved by under 0.002 between
+    // 12 and 32 on the corpus.
+    constexpr int n = 16;
+    FeatureFrame::Alignment grade(frame);
+    std::vector<Point> P(static_cast<size_t>(n + 1) * (n + 1));
+    for (int b = 0; b < static_cast<int>(blocks.size()); ++b) {
+        if (!completeBlock(*this, b)) continue;
+        // The four sides at equal arc length, so that node (i, j) is
+        // coonsPoint(b, i / n, j / n) without walking each side 289 times.
+        const std::vector<Point> s0 = sampleSide(b, 0, n), s1 = sampleSide(b, 1, n);
+        const std::vector<Point> s2 = sampleSide(b, 2, n), s3 = sampleSide(b, 3, n);
+        const Point &c00 = s0[0], &c10 = s0[n], &c11 = s2[0], &c01 = s2[n];
+        for (int j = 0; j <= n; ++j) {
+            const double v = static_cast<double>(j) / n;
+            for (int i = 0; i <= n; ++i) {
+                const double u = static_cast<double>(i) / n;
+                const Point ruled = s0[i] * (1.0 - v) + s2[n - i] * v + s3[n - j] * (1.0 - u) + s1[j] * u;
+                const Point bilinear = c00 * ((1.0 - u) * (1.0 - v)) + c10 * (u * (1.0 - v)) +
+                                       c11 * (u * v) + c01 * ((1.0 - u) * v);
+                P[static_cast<size_t>(j) * (n + 1) + i] = ruled - bilinear;
+            }
+        }
+        for (int j = 0; j < n; ++j) {
+            for (int i = 0; i < n; ++i) {
+                const Point &p00 = P[static_cast<size_t>(j) * (n + 1) + i];
+                const Point &p10 = P[static_cast<size_t>(j) * (n + 1) + i + 1];
+                const Point &p01 = P[static_cast<size_t>(j + 1) * (n + 1) + i];
+                const Point &p11 = P[static_cast<size_t>(j + 1) * (n + 1) + i + 1];
+                const Point du = ((p10 - p00) + (p11 - p01)) * 0.5;
+                const Point dv = ((p01 - p00) + (p11 - p10)) * 0.5;
+                grade.add((p00 + p10 + p11 + p01) * 0.25, du, dv, std::fabs(cross2(du, dv)));
+            }
+        }
+    }
+    return grade.quality();
 }
 
 bool BlockDecomposition::writeEdgesOBJ(const std::string &path) const {

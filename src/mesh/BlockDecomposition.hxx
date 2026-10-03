@@ -8,6 +8,7 @@
 #include "mesh/Mesh.hxx"
 
 class BoundaryFeatures;
+class FeatureFrame;
 
 // The quadrilateral block decomposition -- the object every pipeline's
 // "Blocks" or "Patches" phase draws on the model as light-blue sides and
@@ -128,7 +129,8 @@ public:
     //
     // Three scores from docs/block_decomposition_metrics.md, each a weighted
     // form of one of its unweighted counts, so that five methods' answers on
-    // one model can be put in one column. They read the decomposition as the
+    // one model can be put in one column -- and a fourth, alignmentQuality()
+    // at the end, which has no count behind it and is described there. They read the decomposition as the
     // method drew it: its topology, which smoothing does not change (Sec. 2 of
     // the note), and its own polylines, which smoothing does -- the note's
     // after-smoothing reading needs the meshed block grids, which this class
@@ -242,6 +244,39 @@ public:
     // chord's sides are equal, 1/2 when elements along a typical chord differ
     // in size by a factor of two. NaN when the decomposition does not cover.
     double chordQuality() const;
+
+    // How the blocks' grids follow the walls -- whether the layout "flows"
+    // with the model -- for a shock code, where a front leaving a wall or an
+    // interface is captured best by cell faces parallel or orthogonal to it
+    // (docs/block_decomposition_metrics.md Sec. 7; FeatureFrame says why).
+    // The other three cannot see it: a layout whose blocks run across a box on
+    // the diagonal has the regularity, the corner angles and the chords of one
+    // whose blocks run along its walls.
+    //
+    // Each block is read as the transfinite (Coons) grid of its four sides,
+    // the grid BlockQuadMesh lays on it and the one TFI through a chart comes
+    // close to, on a lattice of 16 x 16 cells. Each cell's two grid directions
+    // are held to `frame`'s cross at its centre, weighted by the cell's area
+    // and by the frame's |u| there -- how far the walls in view agree on a
+    // direction -- and the result is FeatureFrame::Alignment's quality,
+    // 1 - Delta_e / 45 degrees for Delta_e the effective angle off: 1 for
+    // blocks whose grid lines run along or across the walls' cross wherever
+    // it has a direction, 1/2 for a grid at a random angle to it. `frame` is
+    // the FeatureFrame of the mesh the method ran on. NaN when the
+    // decomposition does not cover.
+    //
+    // It reads the method's own polylines, as angleQuality() does, and TMOP
+    // moves those -- but only so far, and less the finer the mesh: smoothing
+    // straightens a slanted block side a few elements long and not one a
+    // hundred long. On geom029, ATLAS's blocks score 0.75 here and its
+    // meshes, smoothed by the default 1000 sweeps, 0.95 at h = 0.05 and 0.89
+    // at h = 0.0125 (worst scaled Jacobian 0.94 and 0.73), against 0.95 for
+    // the cross-field methods' blocks and 0.96-0.97 for their meshes at every
+    // size. So this is what a mesh at a production size inherits from the
+    // layout, which is why it is a ranking score where angleQuality() is a
+    // diagnostic. mesh::QuadMesh::alignmentQuality() is the same grade read
+    // on one mesh, for reporting what that mesh got.
+    double alignmentQuality(const FeatureFrame &frame) const;
 
     // The macro edges as OBJ polylines, and the blocks as closed OBJ loops --
     // one pair of writers standing in for what used to be BlockCover::

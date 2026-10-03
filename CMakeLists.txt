@@ -125,6 +125,8 @@ add_library(PolyVector SHARED
     src/mesh/BlockDecomposition.cxx
     src/mesh/BoundaryFeatures.hxx
     src/mesh/BoundaryFeatures.cxx
+    src/mesh/FeatureFrame.hxx
+    src/mesh/FeatureFrame.cxx
     src/mesh/BlockQuadMesh.hxx
     src/mesh/BlockQuadMesh.cxx
     src/ShapeDNA/Parallel.hxx
