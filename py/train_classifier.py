@@ -49,8 +49,10 @@ USAGE
 
 All preprocessing is inside the saved model: it takes the raw input columns and returns the
 predicted quality of a valid layout (method, the one metric), the probability of one per method,
-and a utility per method. Needs numpy, pandas and torch; Parquet needs pyarrow, --onnx needs onnx and
-onnxscript, --plot needs matplotlib.
+and a utility per method. The --onnx file also names its input columns, methods, metric, probe and
+fallback in its metadata (crossgen.*), which is how ORACLE (src/ORACLE, viewer mode 9) reads it.
+Needs numpy, pandas and torch; Parquet needs pyarrow, --onnx needs onnx and onnxscript, --plot needs
+matplotlib.
 """
 import argparse
 import copy
@@ -831,12 +833,31 @@ def export_onnx(sel, cfg, path):
                 torch.onnx.export(sel, (x,), path, **legacy)
     A, M = len(cfg["algorithms"]), len(cfg["metrics"])
     z = cfg.get("probe", -1)
+    # What the graph cannot say about itself -- which input column and which output row is which, the
+    # metric, the probe and the fallback -- as the file's metadata, which src/ORACLE/Selector reads, so a
+    # model retrained on other columns or for another metric is read as what it is.
+    import onnx
+    model = onnx.load(path)
+    fb = cfg["fallback"]
+    meta = {"crossgen.inputs": ",".join(map(str, cfg["input_cols"])),
+            "crossgen.methods": ",".join(cfg["algorithms"]),
+            "crossgen.metric": ",".join(cfg["metrics"]),
+            "crossgen.better": ",".join("higher" if s > 0 else "lower" for s in cfg["sign"]),
+            "crossgen.probe": cfg["algorithms"][z] if z >= 0 else "",
+            "crossgen.fallback": cfg["algorithms"][fb] if fb >= 0 else ""}
+    kept = [p for p in model.metadata_props if p.key not in meta]
+    del model.metadata_props[:]
+    model.metadata_props.extend(kept)
+    for key, value in meta.items():
+        model.metadata_props.add(key=key, value=value)
+    onnx.save(model, path)
     print(f"ONNX -> {path}\n  input  x: float32 [n, {x.shape[1]}] = {cfg['input_cols'][0]}..{cfg['input_cols'][-1]}"
           + (f" ({cfg['algorithms'][z]}'s metrics and block count may be NaN)" if z >= 0 else "") + "\n"
           f"  output metrics: [n, {A}, {M}] (methods {cfg['algorithms']}, metrics {cfg['metrics']}), of a valid run\n"
           f"  output valid:   [n, {A}], the probability of a valid decomposition\n"
           f"  output utility: [n, {A}], higher = better"
-          + (f"; keep {cfg['algorithms'][z]} if it is first, else run the first and keep the better" if z >= 0 else ""))
+          + (f"; keep {cfg['algorithms'][z]} if it is first, else run the first and keep the better" if z >= 0 else "")
+          + f"\n  metadata: {', '.join(meta)} (what src/ORACLE reads)")
 
 
 def predict(args):

@@ -60,6 +60,7 @@
 #include "TORSION/FieldIntegration.hxx"
 #include "TORSION/TutteEmbedding.hxx"
 #include "TORSION/MaterialLayout.hxx"
+#include "ORACLE/ORACLE.hxx"
 
 // ── Enumerations mirroring the original viewer state machine ──────────────────
 
@@ -73,6 +74,7 @@ enum class Mode {
     UMBER       = 6,
     MERIDIAN    = 7,
     ATLAS       = 8,
+    ORACLE      = 9,
 };
 
 enum class Phase {
@@ -374,6 +376,30 @@ enum class ATLASPhase {
     Smoothed = 8,
 };
 
+// ORACLE (mode 9, src/ORACLE/ORACLE.hxx) has no stages of its own to step
+// through: it runs the five methods above as black boxes -- the ZIPLINE probe,
+// then whichever the selector py/train_classifier.py exported
+// (py/selector.onnx) ranks first, the better of the two kept -- so choosing
+// the mode goes straight to the blocks, and the last two phases are every
+// other mode's:
+//
+//   Blocks     ORACLE::run(), blocking and announced a frame ahead. The
+//              console says what the selector ranked, what ran and why, and
+//              which decomposition was kept; the picture is that
+//              decomposition, drawn as every mode draws its blocks.
+//   Mesh       the kept method's own mesher -- BlockQuadMesh for ZIPLINE and
+//              UMBER, Stage 10 on the spline patches for MERIDIAN and TORSION,
+//              BlockMesh through the charts for ATLAS -- on the target edge
+//              length every mode shares ('e' re-opens it).
+//   Smoothed   mesh::TMOP, with the settings the kept method's own mode
+//              smooths with ('c' re-opens the dialog).
+enum class ORACLEPhase {
+    MeshOnly = 1,
+    Blocks   = 2,
+    Mesh     = 3,
+    Smoothed = 4,
+};
+
 // OASIS is a one-shot solve driven by a parameter dialog rather than a
 // sequence of stages, so it has only "before" and "after".
 enum class OASISPhase {
@@ -472,8 +498,10 @@ private:
     // line for line as ATLAS's and Stage 10's meshes are.
     void runUMBERMesh();
     // The mesh dialog and the mesh report both block-decomposition modes
-    // (UMBER and ZIPLINE) share.
-    bool promptBlockQuadMesh(const BlockDecomposition &decomp, const char *title);
+    // (UMBER and ZIPLINE) share. ORACLE's dialog is the same one, with `note`
+    // saying which mesher its kept method meshes with (null: BlockQuadMesh's).
+    bool promptBlockQuadMesh(const BlockDecomposition &decomp, const char *title,
+                             const char *note = nullptr);
     void reportBlockQuadMesh(const BlockQuadMesh &bqm, double ms);
 
     // The mesh with the optimized frame, its cuts and its boundary corners --
@@ -688,6 +716,16 @@ private:
 
     // Everything ATLAS mode draws, phase by phase.
     void renderATLAS();
+
+    // ORACLE::run() on the model as loaded, and its report: the selector's
+    // ranking, every method it ran and why, the decomposition it kept.
+    // Blocking, and announced a frame ahead.
+    void runORACLE();
+    // The kept method's mesh, on the dialog every block mode shares, and its
+    // report; then everything ORACLE mode draws, phase by phase.
+    bool promptORACLEMesh();
+    void runORACLEMesh();
+    void renderORACLE();
 
     // The mesh Stage 12 smooths: ATLAS's TFI mesh in ATLAS mode, Stage 11's
     // merged mesh where there is one, Stage 10's otherwise. mesh::QuadMesh
@@ -975,6 +1013,14 @@ private:
     // the material fill are offered on, since there is no Stage 0b here.
     bool atlasMultiMaterial_ = false;
 
+    // ORACLE: the run it kept, with that method's pipeline, and the mesh on
+    // its blocks. A Stage 10 mesh holds a reference into the pipeline, so the
+    // mesh is declared after the run and destroyed before it.
+    std::unique_ptr<ORACLE>                  oracle_;
+    std::unique_ptr<oracle::CandidateMesh>   oracleMesh_;
+    // As atlasMultiMaterial_, for the 'm' key.
+    bool oracleMultiMaterial_ = false;
+
     // Guiding field for the OASIS orientation term. Held by shared_ptr because
     // OASIS keeps a reference to it for as long as it lives; separate from
     // ZIPLINE's field (zipline_), which follows its own state machine.
@@ -989,6 +1035,7 @@ private:
     UMBERPhase     umberPhase_ = UMBERPhase::MeshOnly;
     PipelinePhase  pipePhase_ = PipelinePhase::MeshOnly;
     ATLASPhase     atlasPhase_ = ATLASPhase::MeshOnly;
+    ORACLEPhase    oraclePhase_ = ORACLEPhase::MeshOnly;
 
     // OASIS parameters and derived display range.
     double oasisLambda_  = 0.0;   // set by the dialog on first use
@@ -1087,6 +1134,11 @@ private:
     bool atlasAttempted_        = false;
     bool atlasBlocksLogged_     = false;
     bool atlasMeshAttempted_    = false;
+    // ORACLE's, the same way: its run announced a frame ahead and attempted
+    // once, its mesh dialog counted as asked once it has opened.
+    bool oracleAnnounced_       = false;
+    bool oracleAttempted_       = false;
+    bool oracleMeshAttempted_   = false;
 
     // Why the last phases have nothing to show, in one clause, or empty when
     // nothing is wrong. Kept on screen rather than only in the console: the

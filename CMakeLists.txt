@@ -357,6 +357,63 @@ target_link_libraries(TestShapeDNA PRIVATE PolyVector)
 add_executable(TestATLAS src/utils/TestATLAS.cxx)
 target_link_libraries(TestATLAS PRIVATE PolyVector)
 
+# ORACLE (src/ORACLE): a block decomposition chosen from among the five methods
+# above by the selector py/train_classifier.py exports (py/selector.onnx) --
+# ZIPLINE run first as the probe, then the best-ranked other method, the
+# better of the two kept. A library of its own because it is the one place
+# that links ONNX Runtime, and links it PRIVATE, so the runtime's headers reach
+# src/ORACLE/Selector.cxx and nothing else, as OpenCASCADE's reach src/geom.
+# Without ONNX Runtime (Homebrew: `brew install onnxruntime`) ORACLE still
+# builds, and says it cannot read a selector; CROSSGEN_ENABLE_ONNXRUNTIME=OFF
+# builds it that way on purpose. The runtime's own CMake package is not used:
+# it names abseil, protobuf and re2 targets it does not find for its users.
+option(CROSSGEN_ENABLE_ONNXRUNTIME "Read ORACLE's selector (py/selector.onnx) with ONNX Runtime" ON)
+set(CROSSGEN_ONNXRUNTIME_FOUND OFF)
+if (CROSSGEN_ENABLE_ONNXRUNTIME)
+    set(ONNXRUNTIME_HINTS "")
+    if (APPLE)
+        execute_process(COMMAND brew --prefix onnxruntime
+                        OUTPUT_VARIABLE ONNXRUNTIME_BREW_PREFIX
+                        OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+        if (ONNXRUNTIME_BREW_PREFIX)
+            list(APPEND ONNXRUNTIME_HINTS "${ONNXRUNTIME_BREW_PREFIX}")
+        endif()
+    endif()
+    find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime_cxx_api.h
+              HINTS ${ONNXRUNTIME_HINTS} PATH_SUFFIXES include/onnxruntime onnxruntime include)
+    find_library(ONNXRUNTIME_LIBRARY onnxruntime HINTS ${ONNXRUNTIME_HINTS} PATH_SUFFIXES lib)
+    if (ONNXRUNTIME_INCLUDE_DIR AND ONNXRUNTIME_LIBRARY)
+        set(CROSSGEN_ONNXRUNTIME_FOUND ON)
+        message(STATUS "ONNX Runtime for ORACLE: ${ONNXRUNTIME_LIBRARY}")
+    else()
+        message(STATUS "No ONNX Runtime: ORACLE builds, but cannot read its selector "
+                       "(brew install onnxruntime)")
+    endif()
+endif()
+
+add_library(CrossGenOracle SHARED
+    src/ORACLE/Selector.hxx
+    src/ORACLE/Selector.cxx
+    src/ORACLE/Candidate.hxx
+    src/ORACLE/Candidate.cxx
+    src/ORACLE/ORACLE.hxx
+    src/ORACLE/ORACLE.cxx
+)
+target_link_libraries(CrossGenOracle PUBLIC PolyVector)
+# The selector read when nothing names one ($CROSSGEN_SELECTOR names another).
+target_compile_definitions(CrossGenOracle PRIVATE
+    CROSSGEN_SELECTOR_DEFAULT="${CMAKE_CURRENT_SOURCE_DIR}/py/selector.onnx")
+if (CROSSGEN_ONNXRUNTIME_FOUND)
+    target_include_directories(CrossGenOracle PRIVATE "${ONNXRUNTIME_INCLUDE_DIR}")
+    target_link_libraries(CrossGenOracle PRIVATE "${ONNXRUNTIME_LIBRARY}")
+    target_compile_definitions(CrossGenOracle PRIVATE CROSSGEN_HAVE_ONNXRUNTIME)
+endif()
+
+# Run ORACLE on models: the selector's ranking, what ran and why, the blocks
+# kept, and optionally a mesh on them by the kept method's own mesher.
+add_executable(TestORACLE src/utils/TestORACLE.cxx)
+target_link_libraries(TestORACLE PRIVATE CrossGenOracle)
+
 # copy all meshes to build directory for easy access, keeping the material
 # subdirectory layout (singlemat/, multimat/, ...) intact
 file(GLOB_RECURSE MESH_FILES RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}/data/meshes"
@@ -684,6 +741,16 @@ foreach(ATLAS_CASE singlemat/geom001 multimat/geom001)
     set_tests_properties(ATLAS_Blocking_${ATLAS_CASE_NAME} PROPERTIES TIMEOUT 2400)
 endforeach()
 
+# ORACLE end to end on geom029, one of the models the alignment metric was made
+# for (docs/block_decomposition_metrics.md Sec. 7): the ZIPLINE probe, the
+# selector, the rule, and a mesh on the blocks it kept. Exit 1 when no valid
+# decomposition was kept. Skipped (77) where the selector cannot be read: a
+# build without ONNX Runtime, or no py/selector.onnx, which
+# py/train_classifier.py --onnx writes.
+add_test(NAME ORACLE_singlemat_geom029
+         COMMAND TestORACLE ${CMAKE_CURRENT_SOURCE_DIR}/data/meshes/singlemat/geom029.obj --mesh 0.05)
+set_tests_properties(ORACLE_singlemat_geom029 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 2400)
+
 # The Shape-DNA module against closed forms (src/ShapeDNA): exact reference
 # integrals for P1-P3, the dense eigensolver against Eigen's, the Cholesky's
 # solves, the rectangle and disk spectra (and the convergence orders 2, 4, 6),
@@ -750,6 +817,7 @@ if (BUILD_OPENGL_VIEWER)
     target_include_directories(Viewer PRIVATE src)
     target_link_libraries(Viewer PRIVATE
         PolyVector
+        CrossGenOracle
         OpenGL::GL
         Qt6::Core
         Qt6::Widgets

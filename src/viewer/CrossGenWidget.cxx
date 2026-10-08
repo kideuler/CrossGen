@@ -134,6 +134,16 @@ ATLASPhase nextATLASPhase(ATLASPhase p) {
     return ATLASPhase::Smoothed;
 }
 
+ORACLEPhase nextORACLEPhase(ORACLEPhase p) {
+    switch (p) {
+        case ORACLEPhase::MeshOnly: return ORACLEPhase::Blocks;
+        case ORACLEPhase::Blocks:   return ORACLEPhase::Mesh;
+        case ORACLEPhase::Mesh:     return ORACLEPhase::Smoothed;
+        case ORACLEPhase::Smoothed: return ORACLEPhase::Smoothed;
+    }
+    return ORACLEPhase::Smoothed;
+}
+
 MedialAxisPhase nextMedialAxisPhase(MedialAxisPhase p) {
     switch (p) {
         case MedialAxisPhase::MeshOnly:     return MedialAxisPhase::DelaunayMesh;
@@ -250,6 +260,19 @@ const char *atlasPhaseName(ATLASPhase p) {
     return "?";
 }
 
+// Straight from the model to the blocks: ORACLE runs the other methods whole.
+// The console says which method was kept and which mesher meshed it, so the
+// names stay short enough to read whole in a figure's file name.
+const char *oraclePhaseName(ORACLEPhase p) {
+    switch (p) {
+        case ORACLEPhase::MeshOnly: return "1) mesh";
+        case ORACLEPhase::Blocks:   return "2) block decomposition";
+        case ORACLEPhase::Mesh:     return "3) quadrilateral mesh";
+        case ORACLEPhase::Smoothed: return "4) TMOP smoothing (mesh::TMOP)";
+    }
+    return "?";
+}
+
 const char *medialAxisPhaseName(MedialAxisPhase p) {
     switch (p) {
         case MedialAxisPhase::MeshOnly:     return "1) mesh";
@@ -282,6 +305,7 @@ const char *modeName(Mode m) {
         case Mode::UMBER:      return "UMBER";
         case Mode::MERIDIAN:   return "MERIDIAN";
         case Mode::ATLAS:      return "ATLAS";
+        case Mode::ORACLE:     return "ORACLE";
     }
     return "?";
 }
@@ -290,7 +314,7 @@ const char *modeName(Mode m) {
 // mode does not mean chasing three copies of it.
 const char *kModeMenu =
     "press '1' for PolyVector, '2' for ZIPLINE, '3' for Medial Axis, '4' for TORSION, "
-    "'5' for OASIS, '6' for UMBER, '7' for MERIDIAN, '8' for ATLAS";
+    "'5' for OASIS, '6' for UMBER, '7' for MERIDIAN, '8' for ATLAS, '9' for ORACLE";
 
 } // anonymous namespace
 
@@ -509,6 +533,15 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
                 ziplinePhase_ = ZIPLINEPhase::Mesh;
             }
         }
+        // And ORACLE's, by whichever mesher its kept method has.
+        if (mode_ == Mode::ORACLE && oraclePhase_ >= ORACLEPhase::Mesh && oracle_ &&
+            oracle_->hasChoice()) {
+            oracleMeshAttempted_ = true;
+            if (promptORACLEMesh()) {
+                runORACLEMesh();
+                oraclePhase_ = ORACLEPhase::Mesh;
+            }
+        }
         break;
 
     case Qt::Key_I:
@@ -531,6 +564,7 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
         // and the flat metric for the same triangles.
         if ((inPipeline() && interfaces_.has_value() && interfaces_->multiMaterial()) ||
             (mode_ == Mode::ATLAS && atlasMultiMaterial_) ||
+            (mode_ == Mode::ORACLE && oracleMultiMaterial_) ||
             (mode_ == Mode::UMBER && umberDecompReport_.materials > 1) ||
             (mode_ == Mode::ZIPLINE && ziplineBlocks() &&
              ziplineBlocks()->getReport().materials > 1)) {
@@ -538,6 +572,9 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
             if (mode_ == Mode::ATLAS)
                 console_.log(showMaterialFill_ ? "[ATLAS] cells and elements filled by material"
                                                : "[ATLAS] material fill off");
+            else if (mode_ == Mode::ORACLE)
+                console_.log(showMaterialFill_ ? "[ORACLE] elements filled by material"
+                                               : "[ORACLE] material fill off");
             else if (mode_ == Mode::UMBER)
                 console_.log(showMaterialFill_ ? "[UMBER] elements filled by material"
                                                : "[UMBER] material fill off");
@@ -792,6 +829,25 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
         }
         break;
 
+    case Qt::Key_9:
+        // Straight to the blocks: ORACLE has no stages of its own to step
+        // through, only the methods it runs whole, so the mode opens on its
+        // Blocks phase and the next frame announces the run. No Stage 0c, as
+        // for ATLAS: crossgen runs every method on the model as loaded, and
+        // the selector was trained on those runs.
+        if (mode_ == Mode::Unselected && phase_ == Phase::MeshOnly) {
+            mode_ = Mode::ORACLE;
+            oraclePhase_ = ORACLEPhase::Blocks;
+            oracleMultiMaterial_ = false;
+            for (size_t t = 1; t < mesh_->triangleMatId.size() && !oracleMultiMaterial_; ++t)
+                oracleMultiMaterial_ = mesh_->triangleMatId[t] != mesh_->triangleMatId[0];
+            std::cerr << "[Viewer] Selected mode: " << modeName(mode_) << ", phase "
+                      << oraclePhaseName(oraclePhase_) << "\n";
+            console_.log("Selected mode: ORACLE (the selector's choice of ZIPLINE, UMBER, MERIDIAN, "
+                         "TORSION or ATLAS, straight to the blocks)");
+        }
+        break;
+
     default:
         QOpenGLWidget::keyPressEvent(event);
         break;
@@ -903,6 +959,10 @@ void CrossGenWidget::doReset() {
     atlasDomain_.reset();
     atlasShowInitial_ = false;
     atlasMultiMaterial_ = false;
+    // ORACLE's: its mesh stands on the kept run's pipeline, so it goes first.
+    oracleMesh_.reset();
+    oracle_.reset();
+    oracleMultiMaterial_ = false;
     // Stage 0c replaced the mesh every later stage was written on, so the reset
     // has to put the loaded one back before anything is built on it again.
     if (inputMesh_) mesh_ = inputMesh_;
@@ -948,6 +1008,7 @@ void CrossGenWidget::doReset() {
     umberPhase_ = UMBERPhase::MeshOnly;
     pipePhase_ = PipelinePhase::MeshOnly;
     atlasPhase_ = ATLASPhase::MeshOnly;
+    oraclePhase_ = ORACLEPhase::MeshOnly;
     // oasisLambda_ deliberately survives a reset so it can be reused as the
     // dialog's default on the next run.
 
@@ -996,6 +1057,9 @@ void CrossGenWidget::doReset() {
     atlasAttempted_        = false;
     atlasBlocksLogged_     = false;
     atlasMeshAttempted_    = false;
+    oracleAnnounced_       = false;
+    oracleAttempted_       = false;
+    oracleMeshAttempted_   = false;
 
     view_.cx    = 0.5 * (bounds_.minx + bounds_.maxx);
     view_.cy    = 0.5 * (bounds_.miny + bounds_.maxy);
@@ -1585,7 +1649,8 @@ bool CrossGenWidget::promptUMBERMesh() {
 // The dialog both UMBER and ZIPLINE open on their Mesh phase: the target edge
 // length and the chord bounds of mesh/BlockQuadMesh, on the one settings object
 // the pipelines' Stage 10 and ATLAS's mesh use too.
-bool CrossGenWidget::promptBlockQuadMesh(const BlockDecomposition &decomp, const char *title) {
+bool CrossGenWidget::promptBlockQuadMesh(const BlockDecomposition &decomp, const char *title,
+                                         const char *note) {
     if (decomp.blocks.empty() || !mesh_) return false;
 
     Point lo{std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity()};
@@ -1647,9 +1712,11 @@ bool CrossGenWidget::promptBlockQuadMesh(const BlockDecomposition &decomp, const
     form->addRow("implied sizing", derived);
     form->addRow("fewest edges per chord", minBox);
     form->addRow("most edges per chord", maxBox);
-    form->addRow(new QLabel("Transfinite interpolation of the four sides per block.\n"
-                            "Only a block that folds is smoothed, by Stage 10's\n"
-                            "Winslow pass.", &dlg));
+    form->addRow(new QLabel(note ? note
+                                 : "Transfinite interpolation of the four sides per block.\n"
+                                   "Only a block that folds is smoothed, by Stage 10's\n"
+                                   "Winslow pass.",
+                            &dlg));
     form->addRow(buttons);
 
     if (dlg.exec() != QDialog::Accepted) return false;
@@ -4182,10 +4249,22 @@ void CrossGenWidget::runMERIDIANMesh() {
 // transfinite grid on a block decomposition. The dialog and the solve both read
 // them through here, so what the dialog sets is what the solve runs -- in UMBER
 // mode the dialog used to edit the pipelines' copy while the solve read UMBER's.
+// ORACLE smooths with the copy of the mode whose method it kept, since that is
+// the mesh it hands over: a TFI grid on blocks for three of them, a Stage 10
+// mesh for MERIDIAN and TORSION, pillowed first as their Stage 12 does.
 CrossGenWidget::TMOPSettings &CrossGenWidget::tmopSettingsForMode() {
     if (mode_ == Mode::ATLAS) return atlasTmopSettings_;
     if (mode_ == Mode::UMBER) return umberTmopSettings_;
     if (mode_ == Mode::ZIPLINE) return ziplineTmopSettings_;
+    if (mode_ == Mode::ORACLE && oracle_ && oracle_->hasChoice()) {
+        switch (oracle_->getChoice().method()) {
+            case oracle::Method::ATLAS:    return atlasTmopSettings_;
+            case oracle::Method::UMBER:    return umberTmopSettings_;
+            case oracle::Method::ZIPLINE:  return ziplineTmopSettings_;
+            case oracle::Method::MERIDIAN:
+            case oracle::Method::TORSION:  return tmopSettings_;
+        }
+    }
     return tmopSettings_;
 }
 
@@ -4193,13 +4272,17 @@ bool CrossGenWidget::promptTMOP() {
     TMOPSettings &ts = tmopSettingsForMode();
     if (!haveFinishedMesh()) return false;
     const bool atlas = (mode_ == Mode::ATLAS);
-    const bool blockMode = atlas || mode_ == Mode::UMBER || mode_ == Mode::ZIPLINE;
+    const bool blockMode =
+        atlas || mode_ == Mode::UMBER || mode_ == Mode::ZIPLINE || mode_ == Mode::ORACLE;
 
     QDialog dlg(this);
     dlg.setWindowTitle(atlas ? "ATLAS — TMOP smoothing"
                              : (mode_ == Mode::UMBER ? "UMBER — TMOP smoothing"
                                                      : (mode_ == Mode::ZIPLINE ? "ZIPLINE — TMOP smoothing"
                                                                                : "Stage 12 — TMOP smoothing")));
+    if (mode_ == Mode::ORACLE && oracle_ && oracle_->hasChoice())
+        dlg.setWindowTitle(QString::fromUtf8("ORACLE (%1) — TMOP smoothing")
+                               .arg(QString::fromUtf8(oracle_->getChoice().name())));
 
     auto *metricBox = new QComboBox(&dlg);
     // Ordered as the header lists them, and paired with the enum value rather
@@ -4448,8 +4531,9 @@ void CrossGenWidget::runTMOP() {
     // ATLAS, UMBER and ZIPLINE keep their own settings; see
     // tmopSettingsForMode().
     const bool atlas = (mode_ == Mode::ATLAS);
-    // UMBER and ZIPLINE: the two that smooth a BlockQuadMesh.
-    const bool blockMesh = (mode_ == Mode::UMBER) || (mode_ == Mode::ZIPLINE);
+    // UMBER and ZIPLINE: the two that smooth a BlockQuadMesh. ORACLE is named
+    // with them, since its stages are not Stage 10's whichever method it kept.
+    const bool blockMesh = (mode_ == Mode::UMBER) || (mode_ == Mode::ZIPLINE) || (mode_ == Mode::ORACLE);
     TMOPSettings &ts = tmopSettingsForMode();
     // The pipelines number this Stage 12 after their Stage 10; ATLAS's stages
     // stop at 6, UMBER's at its decomposition and ZIPLINE's at Sec. 4, so
@@ -4614,6 +4698,7 @@ bool CrossGenWidget::haveFinishedMesh() const {
     if (mode_ == Mode::ATLAS) return atlasMesh_.has_value();
     if (mode_ == Mode::UMBER) return umberMesh_.has_value();
     if (mode_ == Mode::ZIPLINE) return ziplineMesh();
+    if (mode_ == Mode::ORACLE) return oracleMesh_ != nullptr;
     return quadMesh_.has_value();
 }
 
@@ -4621,6 +4706,8 @@ mesh::QuadMesh CrossGenWidget::finishedMesh(const mesh::QuadMesh::Options &o) co
     if (mode_ == Mode::ATLAS) return mesh::QuadMesh::from(*atlasMesh_, o);
     if (mode_ == Mode::UMBER) return mesh::QuadMesh::from(*umberMesh_, o);
     if (mode_ == Mode::ZIPLINE) return mesh::QuadMesh::from(*ziplineMesh(), o);
+    // Stage 11's merged mesh where there is one, and ZIPLINE's open sides held.
+    if (mode_ == Mode::ORACLE) return oracleMesh_->quadMesh(o);
     return diskFill_.has_value() ? mesh::QuadMesh::from(*diskFill_, o)
                                  : mesh::QuadMesh::from(*quadMesh_, o);
 }
@@ -5170,6 +5257,245 @@ void CrossGenWidget::renderATLAS() {
     }
 }
 
+// ── ORACLE ────────────────────────────────────────────────────────────────────
+//
+// src/ORACLE: the selector's choice among the five methods, each run whole, then
+// the last two phases every mode has, by the kept method's own mesher. None of
+// the methods' own stages is drawn -- ORACLE never sees them -- so the console
+// carries what it decided and why: the probe, the ranking, the run after it,
+// and the decomposition kept.
+
+namespace {
+
+std::string oracleNumber(double v, int digits) {
+    if (std::isnan(v)) return "--";
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(digits) << v;
+    return oss.str();
+}
+
+}  // namespace
+
+void CrossGenWidget::runORACLE() {
+    oracleAttempted_ = true;
+    oracleMesh_.reset();
+    oracle_.reset();
+    smoothMesh_.reset();
+    oracleMeshAttempted_ = false;
+    tmopAttempted_ = false;
+    pipelineBlocked_.clear();
+
+    try {
+        oracle_ = std::make_unique<ORACLE>(mesh_);
+        oracle_->run();
+    } catch (const std::exception &e) {
+        oracle_.reset();
+        blockPipeline("ORACLE failed", e.what());
+        return;
+    }
+    const ORACLE::Report &r = oracle_->getReport();
+    if (r.utility.empty()) {
+        // The selector was never asked: it could not be read, or it asks for
+        // an input ORACLE cannot compute.
+        blockPipeline("ORACLE could not ask its selector",
+                      r.messages.empty() ? std::string("no reason given") : r.messages.front());
+        oracle_.reset();
+        return;
+    }
+
+    {
+        std::ostringstream oss;
+        oss << "[ORACLE] selector " << r.selector.substr(r.selector.find_last_of('/') + 1) << ": ";
+        for (size_t i = 0; i < r.methods.size(); ++i) oss << (i ? ", " : "") << r.methods[i];
+        oss << " on " << r.metric;
+        if (!r.described) oss << " (the file names no columns: the trainer's defaults)";
+        console_.log(oss.str());
+    }
+    auto logRun = [&](const ORACLE::Run &run) {
+        std::ostringstream oss;
+        oss << "[ORACLE] ran " << run.method << " (" << run.why << "): ";
+        if (run.raised)
+            oss << "failed: " << run.error;
+        else
+            oss << (run.valid ? "valid, " : "not valid, ") << run.blocks << " block(s), "
+                << oracleNumber(100.0 * run.coverage, 1) << "% covered, " << r.metric << " "
+                << oracleNumber(run.metric, 3);
+        oss << ", " << oracleNumber(run.seconds, 2) << " s";
+        console_.log(oss.str());
+    };
+    // In the order it happened: the probe, the ranking it fed, what ran after.
+    size_t next = 0;
+    if (!r.runs.empty() && r.runs.front().why == "probe") logRun(r.runs[next++]);
+    {
+        std::ostringstream oss, full;
+        oss << "[ORACLE] ranking:";
+        full << "[Viewer] ORACLE ranking on " << r.metric << ":";
+        for (size_t k = 0; k < r.ranking.size(); ++k) {
+            const int i = r.ranking[k];
+            oss << (k ? " >" : "") << " " << r.methods[i] << " " << oracleNumber(r.utility[i], 2);
+            full << (k ? " >" : "") << " " << r.methods[i] << " " << oracleNumber(r.utility[i], 3) << " ("
+                 << oracleNumber(100.0 * r.pValid[i], 0) << "% valid, " << oracleNumber(r.quality[i], 3) << ")";
+        }
+        console_.log(oss.str());
+        std::cerr << full.str() << "\n";
+    }
+    for (; next < r.runs.size(); ++next) logRun(r.runs[next]);
+    console_.log("[ORACLE] " + r.decision);
+    std::cerr << "[Viewer] ORACLE: " << r.decision << "\n";
+
+    if (!oracle_->hasChoice()) {
+        blockPipeline("ORACLE kept nothing", "no method it ran produced any blocks");
+        return;
+    }
+    const ORACLE::Run &kept = r.runs[r.chosen];
+    {
+        std::ostringstream oss;
+        oss << "[ORACLE] kept " << kept.method << ": " << kept.blocks << " block(s), "
+            << oracleNumber(100.0 * kept.coverage, 1) << "% covered, " << r.metric << " "
+            << oracleNumber(kept.metric, 3) << ", " << oracleNumber(r.seconds, 1) << " s in all "
+            << (r.valid ? "[PASS]" : "-- not a decomposition of the model [FAIL]");
+        console_.log(oss.str());
+        std::cerr << "[Viewer] " << oss.str() << "\n";
+    }
+    console_.log("[ORACLE] block sides in light blue, macrovertices in green. Press 'c' to mesh them with " +
+                 kept.method + "'s mesher");
+}
+
+// The dialog every block mode shares, saying which mesher the kept method has.
+bool CrossGenWidget::promptORACLEMesh() {
+    if (!oracle_ || !oracle_->hasChoice()) return false;
+    const oracle::Candidate &c = oracle_->getChoice();
+    const char *note = nullptr;   // BlockQuadMesh's, for ZIPLINE and UMBER
+    switch (c.method()) {
+        case oracle::Method::MERIDIAN:
+        case oracle::Method::TORSION:
+            note = "Stage 10: transfinite interpolation of the fitted spline\n"
+                   "patches. Only a block that folds is smoothed, by\n"
+                   "Stage 10's Winslow pass.";
+            break;
+        case oracle::Method::ATLAS:
+            note = "BlockMesh: transfinite interpolation through each block's\n"
+                   "certified chart. Only a block that folds is smoothed, by\n"
+                   "Stage 10's Winslow pass.";
+            break;
+        default:
+            break;
+    }
+    const std::string title = std::string("ORACLE (") + c.name() + ") — quadrilateral mesh on the blocks";
+    return promptBlockQuadMesh(oracle_->getDecomposition(), title.c_str(), note);
+}
+
+// The kept method's mesher at the dialog's settings, every other setting its
+// own default -- what crossgen's BlockDecomposition.mesh(h) builds -- and the
+// mesher's own verdict on it.
+void CrossGenWidget::runORACLEMesh() {
+    if (!oracle_ || !oracle_->hasChoice()) {
+        blockPipeline("the mesh not built", "ORACLE kept no blocks to mesh");
+        return;
+    }
+    oracleMeshAttempted_ = true;
+    oracleMesh_.reset();
+    // TMOP stood on the mesh that is about to be replaced.
+    smoothMesh_.reset();
+    tmopAttempted_ = false;
+    pipelineBlocked_.clear();
+
+    oracle::Candidate::MeshSettings s;
+    s.target = meshSettings_.target;
+    s.minIntervals = meshSettings_.minEdges;
+    s.maxIntervals = meshSettings_.maxEdges;
+    const oracle::Candidate &c = oracle_->getChoice();
+    auto t0 = Clock::now();
+    mesh::QuadMesh q;
+    try {
+        oracleMesh_ = c.mesh(s);
+        q = oracleMesh_->quadMesh(mesh::QuadMesh::Options());
+    } catch (const std::exception &e) {
+        oracleMesh_.reset();
+        blockPipeline("the mesh failed", e.what());
+        return;
+    }
+    auto t1 = Clock::now();
+
+    const oracle::CandidateMesh &m = *oracleMesh_;
+    std::string mesher;
+    bool conforming = false, valid = false;
+    if (m.stage10) {
+        mesher = m.stage11 ? "Stage 10, and Stage 11's O-grids" : "Stage 10 on the spline patches";
+        conforming = m.stage11 ? m.stage11->getReport().conforming : m.stage10->getReport().conforming;
+        valid = m.stage10->getReport().valid && (!m.stage11 || m.stage11->getReport().valid);
+    } else if (m.blockMesh) {
+        mesher = "BlockMesh through the charts";
+        conforming = m.blockMesh->getReport().conforming;
+        valid = m.blockMesh->getReport().valid;
+    } else if (m.blockQuadMesh) {
+        mesher = "BlockQuadMesh";
+        conforming = m.blockQuadMesh->getReport().conforming;
+        valid = m.blockQuadMesh->getReport().valid;
+    }
+    const mesh::QuadMesh::Quality &qq = q.quality;
+    {
+        std::ostringstream oss;
+        oss << "[Mesh] " << c.name() << "'s mesher, " << mesher << ": " << qq.quads << " quad(s) on "
+            << qq.vertices << " vertices at target " << s.target << ", "
+            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Mesh] scaled Jacobian " << std::fixed << std::setprecision(4) << qq.minScaledJacobian
+            << " worst, " << qq.meanScaledJacobian << " mean";
+        if (qq.invertedQuads > 0) oss << " -- " << qq.invertedQuads << " element(s) fold";
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Mesh] " << (conforming ? "conforming [PASS]" : "not conforming [FAIL]") << "; the mesh "
+            << (valid ? "validates [PASS]" : "does not validate [FAIL]");
+        console_.log(oss.str());
+        std::cerr << "[Viewer] " << oss.str() << "\n";
+    }
+    console_.log("[Mesh] grey is a mesh edge, blue a block wall, red a folded element. Press 'c' to smooth it, "
+                 "'e' to mesh again at another target");
+}
+
+// What ORACLE mode draws: the mesh and its smoothed self as every mode draws
+// them, by the routine for the kept method's mesher (the block walls are that
+// mesher's blocks), or the kept blocks as every mode draws its blocks.
+void CrossGenWidget::renderORACLE() {
+    const bool matFill = showMaterialFill_ && oracleMultiMaterial_;
+    if (oraclePhase_ >= ORACLEPhase::Mesh && oracleMesh_) {
+        const oracle::CandidateMesh &m = *oracleMesh_;
+        const bool smoothed = oraclePhase_ == ORACLEPhase::Smoothed && smoothMesh_.has_value();
+        if (m.stage10) {
+            if (smoothed)
+                viewer::drawQuadMesh(*smoothMesh_, m.stage10.get(), m.stage11.get(), 1.0f, 2.5f, matFill);
+            else if (m.stage11)
+                viewer::drawQuadMesh(*m.stage11, m.stage10.get(), 1.0f, 2.5f, matFill);
+            else
+                viewer::drawQuadMesh(*m.stage10, 1.0f, 2.5f, matFill);
+        } else if (m.blockMesh) {
+            if (smoothed) viewer::drawQuadMesh(*smoothMesh_, *m.blockMesh, 1.0f, 2.5f, matFill);
+            else viewer::drawQuadMesh(*m.blockMesh, 1.0f, 2.5f, matFill);
+        } else if (m.blockQuadMesh) {
+            if (smoothed) viewer::drawQuadMesh(*smoothMesh_, *m.blockQuadMesh, 1.0f, 2.5f, matFill);
+            else viewer::drawQuadMesh(*m.blockQuadMesh, 1.0f, 2.5f, matFill);
+        }
+        return;
+    }
+
+    if (oraclePhase_ >= ORACLEPhase::Blocks && oracle_ && oracle_->hasChoice()) {
+        // A kept run that is not a decomposition of the model leaves part of
+        // it uncovered, and dS underneath is what shows how much.
+        if (!oracle_->getReport().valid) viewer::drawBoundaryEdges(*mesh_);
+        viewer::drawBlockDecomposition(oracle_->getDecomposition(), 0.30 * avgEdge_, 3.0f);
+        return;
+    }
+
+    if (matFill) viewer::drawMaterialFill(*mesh_, 0.28f);
+    viewer::drawMesh(*mesh_);
+}
+
 // ── Stage 0c: the circular inclusions, taken out before anything is built ────
 //
 // Called from the mode keys and nowhere else. Every stage of either pipeline is
@@ -5594,6 +5920,26 @@ void CrossGenWidget::advancePhase() {
             if (promptATLASMesh()) runATLASMesh();
         }
         if (atlasPhase_ == ATLASPhase::Smoothed && atlasMesh_.has_value()) {
+            tmopAttempted_ = true;
+            if (promptTMOP()) runTMOP();
+        }
+    } else if (mode_ == Mode::ORACLE) {
+        ORACLEPhase old = oraclePhase_;
+        oraclePhase_ = nextORACLEPhase(oraclePhase_);
+        if (oraclePhase_ != old)
+            std::cerr << "[Viewer] ORACLE Phase " << oraclePhaseName(oraclePhase_) << "\n";
+
+        // The last two phases as every other mode has them, with the same
+        // catch-up: 'c' pressed before the frame that runs ORACLE runs it
+        // now, rather than entering a phase whose input does not exist.
+        if (old == ORACLEPhase::Blocks && oraclePhase_ == ORACLEPhase::Mesh) {
+            if (!oracleAttempted_) runORACLE();
+            if (oracle_ && oracle_->hasChoice()) {
+                oracleMeshAttempted_ = true;
+                if (promptORACLEMesh()) runORACLEMesh();
+            }
+        }
+        if (oraclePhase_ == ORACLEPhase::Smoothed && oracleMesh_) {
             tmopAttempted_ = true;
             if (promptTMOP()) runTMOP();
         }
@@ -6442,6 +6788,31 @@ void CrossGenWidget::runComputations() {
     }
     if (mode_ == Mode::ATLAS && atlasPhase_ == ATLASPhase::Smoothed && atlasMesh_.has_value() &&
         !tmopAttempted_) {
+        tmopAttempted_ = true;
+        if (promptTMOP()) runTMOP();
+    }
+
+    // ── ORACLE: the run, and the catch-ups ───────────────────────────────────
+    //
+    // Once per run, announced a frame ahead so the notice is on screen while
+    // the GUI thread waits on it: a probe and up to two more methods, which
+    // with ATLAS among them is minutes. The two dialogs are asked for again
+    // here in case the phase was entered before its input existed.
+    if (mode_ == Mode::ORACLE && oraclePhase_ >= ORACLEPhase::Blocks && !oracleAttempted_) {
+        if (!oracleAnnounced_) {
+            console_.log("[ORACLE] reading the boundary features, running the selector's probe, then the "
+                         "method it ranks first; this blocks...");
+            oracleAnnounced_ = true;
+        } else {
+            runORACLE();
+        }
+    }
+    if (mode_ == Mode::ORACLE && oraclePhase_ == ORACLEPhase::Mesh && oracle_ && oracle_->hasChoice() &&
+        !oracleMeshAttempted_) {
+        oracleMeshAttempted_ = true;
+        if (promptORACLEMesh()) runORACLEMesh();
+    }
+    if (mode_ == Mode::ORACLE && oraclePhase_ == ORACLEPhase::Smoothed && oracleMesh_ && !tmopAttempted_) {
         tmopAttempted_ = true;
         if (promptTMOP()) runTMOP();
     }
@@ -7643,6 +8014,9 @@ void CrossGenWidget::renderNormal() {
     } else if (mode_ == Mode::ATLAS) {
         viewer::drawAxis(view_);
         renderATLAS();
+    } else if (mode_ == Mode::ORACLE) {
+        viewer::drawAxis(view_);
+        renderORACLE();
     } else if (mode_ == Mode::MedialAxis) {
         viewer::drawAxis(view_);
         // The map and block phases draw over the boundary alone: the
@@ -7786,6 +8160,14 @@ void CrossGenWidget::renderNormal() {
              ? std::string("press 'm' to fill the elements by material\n")
              : std::string());
 
+    // ORACLE's: whatever refused, and the material fill on a multi-material
+    // model.
+    const std::string oracleKeys =
+        (pipelineBlocked_.empty() ? std::string() : pipelineBlocked_ + "\n") +
+        ((mode_ == Mode::ORACLE && oracleMultiMaterial_)
+             ? std::string("press 'm' to fill the elements by material\n")
+             : std::string());
+
     // ZIPLINE's: whatever refused, and the material fill.
     const std::string ziplineKeys =
         (pipelineBlocked_.empty() ? std::string() : pipelineBlocked_ + "\n") +
@@ -7801,6 +8183,7 @@ void CrossGenWidget::renderNormal() {
                       "press '3' for Medial Axis mode\npress '4' for TORSION mode\n"
                       "press '5' for OASIS mode\npress '6' for UMBER mode\n"
                       "press '7' for MERIDIAN mode\npress '8' for ATLAS mode\n"
+                      "press '9' for ORACLE mode\n"
                       "right-drag to pan, scroll to zoom\n"
                       "press 'r' to restart\npress 'q' to quit");
     } else if (mode_ == Mode::ATLAS && atlasPhase_ == ATLASPhase::Smoothed) {
@@ -7822,6 +8205,20 @@ void CrossGenWidget::renderNormal() {
                        (atlasShowInitial_ ? "press 'p' for the carrier the search ended on\n"
                                           : "press 'p' for the carrier the search started from\n") +
                        "press 'c' to continue\npress 'r' to restart\npress 'q' to quit").c_str());
+    } else if (mode_ == Mode::ORACLE && oraclePhase_ == ORACLEPhase::Smoothed) {
+        renderOverlay((oracleKeys +
+                       "press 'c' to smooth again at other TMOP settings\n"
+                       "press 'e' to mesh again at another target edge length\n"
+                       "press 'r' to restart\npress 'q' to quit").c_str());
+    } else if (mode_ == Mode::ORACLE && oraclePhase_ == ORACLEPhase::Mesh) {
+        renderOverlay((oracleKeys +
+                       "press 'c' to smooth the mesh with TMOP\n"
+                       "press 'e' to mesh again at another target edge length\n"
+                       "press 'r' to restart\npress 'q' to quit").c_str());
+    } else if (mode_ == Mode::ORACLE) {
+        renderOverlay((oracleKeys +
+                       (oracle_ && oracle_->hasChoice() ? "press 'c' to mesh the blocks\n" : "") +
+                       "press 'r' to restart\npress 'q' to quit").c_str());
     } else if (mode_ == Mode::OASIS) {
         renderOverlay("press 'c' to change lambda / orientation\n"
                       "press 'r' to restart\npress 'q' to quit");
@@ -8008,6 +8405,7 @@ QString CrossGenWidget::nextFigurePath(const char *extension) const {
     case Mode::OASIS:      phase = oasisPhaseName(oasisPhase_);          break;
     case Mode::UMBER:      phase = umberPhaseName(umberPhase_);          break;
     case Mode::ATLAS:      phase = atlasPhaseName(atlasPhase_);          break;
+    case Mode::ORACLE:     phase = oraclePhaseName(oraclePhase_);        break;
     case Mode::PolyVector:
     case Mode::Unselected:  phase = phaseName(phase_);                   break;
     }

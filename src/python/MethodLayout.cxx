@@ -17,7 +17,8 @@
 // QuadMesh is built on the spline fit, and where disks were excised the
 // DiskTemplate fills them. Stage 10's options default to the pipeline's quad*
 // options, which is what run() would have passed. If run() ever changes how it
-// builds Stage 10, this has to follow.
+// builds Stage 10, this has to follow, and so does src/ORACLE/Candidate.cxx,
+// which builds Stages 10 and 11 the same way outside Python.
 //
 // The quad* options and the run* switches are therefore not keywords of
 // meridian()/torsion(): the former are mesh()'s, and the latter would stop the

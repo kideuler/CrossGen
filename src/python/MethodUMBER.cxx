@@ -17,7 +17,8 @@
 // setters the stages have that nothing drove before. Its defaults are copied
 // from the stages' own member initialisers (cited on each), so a run with no
 // keywords is exactly `TestUMBER <model>`. If a stage's default changes, the
-// copy here has to follow it.
+// copy here has to follow it -- and so does src/ORACLE/Candidate.cxx, which
+// chains the same stages with the same numbers outside Python.
 #include "python/Methods.hxx"
 #include "python/PyTables.hxx"
 #include "python/PyUtil.hxx"
