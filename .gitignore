@@ -16,3 +16,4 @@ docs/*
 *.csv
 *.pt
 *.jsonl
+!assets/readme/*.png
