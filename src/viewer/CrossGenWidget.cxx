@@ -929,6 +929,7 @@ void CrossGenWidget::doReset() {
     delaunayMesh_.reset();
     blockQuant_.reset();
     quantReport_ = TMeshQuantizer::Report{};
+    skeletonQuads_.reset();
     medialAxisTMesh_.reset();
     medialAxisMap_.reset();
     medialAxis_.reset();
@@ -6910,7 +6911,10 @@ void CrossGenWidget::runComputations() {
         medialAxis_ = std::make_shared<MedialAxis>(delaunayMesh_);
         int rawV = static_cast<int>(medialAxis_->medialVertices.size());
         int rawE = static_cast<int>(medialAxis_->medialEdges.size());
-        medialAxis_->deduplicateMedialVertices();
+        // Step 4 of docs/medial_axis.md: prune and flatten the topological
+        // noise by moving boundary vertices within delta_max, at the same
+        // default h the T-mesh below samples the axis at.
+        medialAxis_->simplify();
         auto t1 = Clock::now();
         std::ostringstream oss;
         oss << "[SKELETON] Computed: " << rawV << " -> "
@@ -6918,6 +6922,17 @@ void CrossGenWidget::runComputations() {
             << rawE << " -> " << medialAxis_->medialEdges.size() << " edges: "
             << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
         console_.log(oss.str());
+        {
+            const auto &ss = medialAxis_->simplifyStats;
+            std::ostringstream simp;
+            simp << "[SKELETON] Simplification: " << ss.cocircularMerges
+                 << " cocircular merges, " << ss.endpointMerges << " endpoints pruned ("
+                 << ss.endpointsKept << " kept), " << ss.flattenedChains
+                 << " arcs flattened (" << ss.removedVertices << " boundary vertices removed), "
+                 << "largest move " << std::fixed << std::setprecision(4)
+                 << ss.maxDisplacement << " of delta_max " << ss.budget;
+            console_.log(simp.str());
+        }
 
         const auto &st = medialAxis_->stats;
         if (st.degenerateCells || st.centersOutsideDomain || st.edgesCrossingBoundary ||
@@ -6976,18 +6991,24 @@ void CrossGenWidget::runComputations() {
             std::ostringstream col;
             col << "[SKELETON] templates: " << st.colorCounts[0] << " green (2 blocks), "
                 << st.colorCounts[1] << " red (3), " << st.colorCounts[2]
-                << " blue (1), " << st.colorCounts[3] << " purple (5)";
+                << " blue (4), " << st.colorCounts[3] << " purple (3)";
             console_.log(col.str());
         }
         {
-            // A sharp corner left inside a block side is a kink no quad grid
-            // can reproduce, so every one of them is forced to be a block
-            // corner. Any that could not be is worth seeing.
-            std::ostringstream cor;
-            cor << "[SKELETON] sharp corners: " << st.sharpCorners << " found, "
-                << st.cornerCuts << " forced into block corners";
-            if (st.cornersUnanchored > 0) cor << ", " << st.cornersUnanchored << " UNANCHORED";
-            console_.log(cor.str());
+            std::ostringstream smp;
+            smp << "[SKELETON] downsampling: " << st.keptVertices << " axis vertices kept, "
+                << st.insertedVertices << " samples inserted, " << st.midpointCuts
+                << " polar sections cut at their midpoint, " << st.dissolvedVertices
+                << " valence-2 vertices dissolved";
+            console_.log(smp.str());
+        }
+        if (st.badFaces > 0 || st.refinements > 0) {
+            // Step 8.6: a folded or badly non-convex cell, with h already
+            // halved locally as often as that helped.
+            std::ostringstream bad;
+            bad << "[SKELETON] geometry check: " << st.badFaces << " bad faces after "
+                << st.refinements << " local refinements";
+            console_.log(bad.str());
         }
         if (st.skippedLoops || st.unpairedEdges) {
             std::ostringstream warn;
@@ -6997,26 +7018,32 @@ void CrossGenWidget::runComputations() {
         }
     }
 
-    // ── SKELETON: quantization of the block decomposition (QGP Sec. 6) ───────
+    // ── SKELETON: quantization and the quad mesh (Steps 9-10) ────────────────
     //
     // The blocks carry no shared-edge identifiers, so the converter welds
     // them geometrically first: corners become nodes, block sides are split
     // where another block's corner lands on them, and the T-junctions the
-    // red and purple templates leave on the mid-radii are recovered that
-    // way. xIdeal is 1 on every edge -- the block-decomposition setting of
-    // QGP Sec. 10.1, where Stage II drives each edge to its minimum and so
-    // acts as an automatic block-merging operator.
+    // red, blue and purple templates leave on the radii are recovered that
+    // way. Each edge then aims at l(e) / h quads, and lengths may drop to
+    // zero as long as no radius chain, boundary feature or boundary loop
+    // does -- the linear surrogates of Prop. 1 -- so the templates' slivers
+    // collapse rather than costing an element each. Step 10 cuts every edge
+    // into its quads, fills every face with a Coons grid and welds what the
+    // zero lengths collapse.
     if (mode_ == Mode::SKELETON && skeletonPhase_ >= SKELETONPhase::Quantize &&
         medialAxisTMesh_.has_value() && !blockQuant_.has_value()) {
         auto t0 = Clock::now();
-        blockQuant_.emplace(makeQuantTMesh(*medialAxisTMesh_));
+        blockQuant_.emplace(makeQuantTMesh(*medialAxisTMesh_, medialAxisTMesh_->targetSize()));
         auto t1 = Clock::now();
 
         const BlockQuant &bq = *blockQuant_;
         std::ostringstream oss;
         oss << "[SKELETON] T-mesh welded: " << bq.nodes.size() << " nodes, "
             << bq.tmesh.edges.size() << " edges, " << bq.tmesh.faces.size()
-            << " faces, " << bq.tmesh.rows.size() << " constraints, from "
+            << " faces, " << bq.tmesh.rows.size() << " constraints, "
+            << bq.requirements.size() << " validity requirements ("
+            << bq.radiusRequirements << " radius chains, " << bq.featureRequirements
+            << " features, " << bq.loopRequirements << " loops), from "
             << medialAxisTMesh_->blocks.size() << " blocks: "
             << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
         console_.log(oss.str());
@@ -7035,54 +7062,46 @@ void CrossGenWidget::runComputations() {
             console_.log("[SKELETON] Quantization aborted: " + bq.error);
         } else {
             auto q0 = Clock::now();
-            quantReport_ = TMeshQuantizer(blockQuant_->tmesh).run();
+            TMeshQuantizer::Options qo;
+            qo.minLength = 0;
+            qo.requirements = blockQuant_->requirements;
+            qo.objective = TMeshQuantizer::Options::Objective::Absolute;
+            quantReport_ = TMeshQuantizer(blockQuant_->tmesh, qo).run();
             auto q1 = Clock::now();
 
-            int total = 0, maxLen = 0;
-            for (const auto &e : blockQuant_->tmesh.edges) {
-                total += e.x;
-                maxLen = std::max(maxLen, e.x);
-            }
+            int collapsed = 0;
+            for (const auto &e : blockQuant_->tmesh.edges) collapsed += e.x == 0;
             std::ostringstream qss;
             qss << "[SKELETON] Quantized: " << quantReport_.stage1Vectors
                 << " stage-I strips, " << quantReport_.stage2Moves << "/"
                 << quantReport_.stage2Tried << " stage-II moves, objective "
                 << std::fixed << std::setprecision(3) << quantReport_.objective
-                << ", " << total << " quads across the boundary (longest edge "
-                << maxLen << "): "
+                << ", " << collapsed << " edges collapsed: "
                 << formatMs(std::chrono::duration<double, std::milli>(q1 - q0).count());
             console_.log(qss.str());
-            if (quantReport_.forcedZeroEdges > 0) {
-                std::ostringstream zss;
-                zss << "[SKELETON] " << quantReport_.forcedZeroEdges
-                    << " edges are forced to zero by the block decomposition "
-                       "itself: no consistent assignment can lift them";
-                console_.log(zss.str());
-
-                // Clear them out the way QGP Sec. 7.1.1 advises, by
-                // deleting the cells they collapse and letting the
-                // neighbours meet in the middle.
-                const ContractReport cr = contractZeroEdges(*blockQuant_);
-                std::ostringstream css;
-                css << "[SKELETON] Zero-cell cleanup: " << cr.mergedCells
-                    << " collapsed cells merged into their neighbours, "
-                    << cr.pointCells << " point cells dropped, " << cr.splitEdges
-                    << " edges split to line the sides up, " << cr.removedEdges
-                    << " edges removed";
-                console_.log(css.str());
-                if (!cr.ok) {
-                    console_.log("[SKELETON] Cleanup rejected, keeping the "
-                                 "uncontracted T-mesh: " + cr.error);
-                } else if (cr.remainingZero > 0) {
-                    std::ostringstream rss;
-                    rss << "[SKELETON] " << cr.remainingZero
-                        << " cells could not be merged and stay collapsed";
-                    console_.log(rss.str());
-                }
+            if (quantReport_.unmetRequirements > 0) {
+                std::ostringstream uss;
+                uss << "[SKELETON] WARNING: " << quantReport_.unmetRequirements
+                    << " validity requirements no strip can meet";
+                console_.log(uss.str());
             }
             if (!quantReport_.consistent) {
                 console_.log("[SKELETON] WARNING: quantization violates the "
                              "consistency system Ax = 0");
+            } else {
+                const QuadExtraction qe = extractQuadMesh(*blockQuant_);
+                std::ostringstream mss;
+                mss << "[SKELETON] Quad mesh: " << qe.vertices.size() << " vertices, "
+                    << qe.quads.size() << " quads, " << qe.collapsedFaces
+                    << " faces collapsed, " << qe.droppedQuads
+                    << " degenerate quads dropped, Euler characteristic "
+                    << qe.eulerCharacteristic << ", " << qe.boundaryLoops << " boundary loops";
+                console_.log(mss.str());
+                if (!qe.ok) {
+                    console_.log("[SKELETON] WARNING: quad mesh is not a manifold: " + qe.error);
+                }
+                std::vector<mesh::Quad> cells(qe.quads.begin(), qe.quads.end());
+                skeletonQuads_.emplace(qe.vertices, cells);
             }
         }
     }
@@ -8029,13 +8048,13 @@ void CrossGenWidget::renderNormal() {
         }
 
         if (medialAxis_) {
-            if (skeletonPhase_ >= SKELETONPhase::Quantized && blockQuant_.has_value() &&
-                blockQuant_->ok) {
-                // The integer edge lengths as the quad grid they prescribe:
-                // transfinite curves through each block's four curved
-                // sides, edges only. Grids meeting flush across a block
-                // wall are the quantization's consistency made visible.
-                viewer::drawQuantizedBlocks(*blockQuant_);
+            if (skeletonPhase_ >= SKELETONPhase::Quantized && skeletonQuads_.has_value()) {
+                // Step 10's quad mesh, drawn by the routine every other
+                // method's mesh is drawn with. A T-mesh face whose length
+                // collapsed to zero is gone from it, welded into its
+                // neighbours, so the mesh -- not the per-face grids -- is
+                // the thing to look at.
+                viewer::drawQuadMesh(*skeletonQuads_, nullptr, nullptr, 1.0f, 2.5f);
             } else if (skeletonPhase_ >= SKELETONPhase::TMesh &&
                        medialAxisTMesh_.has_value()) {
                 // The coarse block decomposition (Fig. 1-left / Fig. 3c):

@@ -34,7 +34,7 @@
 // than ideal is chosen only when nothing cheaper closes up.
 //
 // Stage I grows the trivial (all-zero) solution until every edge has
-// x >= minLength. Stage II then greedily adds or subtracts strips while
+// x >= minLength and every requirement set reaches its bound. Stage II then greedily adds or subtracts strips while
 // the objective sum (x/xIdeal - 1)^2 improves. With xIdeal = 1 everywhere
 // (the block-decomposition setting) Stage II drives every edge toward its
 // minimum, acting as an automatic block-merging operator. The loop always
@@ -42,9 +42,30 @@
 
 class TMeshQuantizer {
 public:
+    struct Requirement {
+        std::vector<int> edges;
+        int atLeast = 1;
+    };
+
     struct Options {
         int minLength = 1;       // lower bound kept on every edge length
         int maxStage2Moves = -1; // accepted Stage II moves; < 0 means no cap
+        // Sets of edges whose lengths must sum to at least `atLeast`. With
+        // minLength = 0 these carry the validity instead of the per-edge
+        // bound: an edge may collapse as long as no set does. This is the
+        // linear surrogate of Prop. 1 in Cheny et al., "Planar quad meshing
+        // with guarantees" (docs/medial_axis.md Step 9) -- every radius chain,
+        // boundary feature and boundary loop of the T-mesh gets one.
+        std::vector<Requirement> requirements;
+        // What Stage II minimizes. Relative is QGP's Sec. 6.3 measure,
+        // sum (x / xIdeal - 1)^2, which weighs an edge by the inverse square
+        // of its ideal length. Absolute is sum (x - xIdeal)^2, the target fit
+        // of docs/medial_axis.md Step 9 (Option B's Delta), which charges
+        // every edge in units of the element size alike -- so an edge far
+        // shorter than an element that validity keeps at 1 costs about 1,
+        // not the inverse square of its length.
+        enum class Objective { Relative, Absolute };
+        Objective objective = Objective::Relative;
     };
 
     struct Report {
@@ -57,7 +78,10 @@ public:
         // T-mesh, not a failure of the search. They are left at zero and
         // the rest is quantized around them.
         int forcedZeroEdges = 0;
-        double objective = 0.0;
+        // Requirement sets no generating vector reaches: like forced zeros,
+        // a defect of the input, left at zero.
+        int unmetRequirements = 0;
+        double objective = 0.0;   // of the kind Options::objective names
         bool consistent = false;
     };
 
@@ -92,8 +116,14 @@ private:
     void stageI(Report &report);
     void stageII(Report &report);
 
+    double objective() const;
+
+    // Whether every requirement through an edge of v still holds.
+    bool requirementsHold(const std::vector<int> &v) const;
+
     QuantTMesh &tm_;
     Options opts_;
+    std::vector<std::vector<int>> requirementsOf_;  // edge -> requirement ids
     double eta_;                // #edges, the tier separation factor
     std::vector<int> sinks_;    // D-nodes whose unbalanced row is PHANTOM
 };

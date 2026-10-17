@@ -2,7 +2,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <map>
+#include <set>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace {
 
@@ -565,4 +568,363 @@ SideCurve sideCurve(const BlockQuant &bq, int face, int side) {
 
 SideCurve sideCurve(const QuadLayoutQuant &lq, int face, int side) {
     return sideCurveImpl(lq.tmesh, lq.edgeGeometry, lq.sideReversed, face, side);
+}
+
+// ─── The medial-axis T-mesh and its Prop. 1 requirements ────────────────────
+
+namespace {
+
+double distanceToSegment(const Point &p, const Point &a, const Point &b) {
+    double along = 0.0;
+    return pointSegment(p, a, b, along);
+}
+
+// Corner and side incidences of the T-mesh nodes: how many faces have a node
+// as a corner, and how many have it inside one of their sides (a T-junction).
+void nodeIncidences(const BlockQuant &bq, std::vector<int> &asCorner,
+                    std::vector<int> &insideSide) {
+    asCorner.assign(bq.nodes.size(), 0);
+    insideSide.assign(bq.nodes.size(), 0);
+    for (const QuantTMesh::Face &face : bq.tmesh.faces) {
+        std::unordered_map<int, int> corner;
+        for (int side = 0; side < 4; ++side) {
+            std::unordered_map<int, int> seen;
+            for (int e : face.sides[side]) {
+                ++seen[bq.edgeNodes[e][0]];
+                ++seen[bq.edgeNodes[e][1]];
+            }
+            for (const auto &kv : seen) {
+                if (kv.second == 1) corner[kv.first] = 1;
+                else ++insideSide[kv.first];
+            }
+        }
+        for (const auto &kv : corner) ++asCorner[kv.first];
+    }
+}
+
+}  // namespace
+
+BlockQuant makeQuantTMesh(const MedialAxisTMesh &tm, double h) {
+    if (!(h > 0.0)) h = tm.targetSize();
+    const double tol = 1e-4 * tm.targetSize();
+    BlockQuant bq = makeQuantTMesh(tm.blocks, tol, h);
+    if (!bq.ok) return bq;
+
+    std::set<std::vector<int>> seen;
+    auto add = [&](std::vector<int> req, int atLeast, int &counter) {
+        if (req.empty()) return;
+        std::sort(req.begin(), req.end());
+        if (!seen.insert(req).second) return;
+        bq.requirements.push_back({std::move(req), atLeast});
+        ++counter;
+    };
+
+    // (1) The integer distance between two boundary components stays
+    // positive: every radius chain -- all T-mesh edges along one radius
+    // [m, phi^-1(m)] -- keeps a length of at least 1, so no half-region
+    // loses its thickness. A radius a template did not keep as an edge (the
+    // two ends of a purple cap) has no chain and needs none.
+    for (const std::array<Point, 2> &r : tm.radii()) {
+        if (normP(r[1] - r[0]) <= tol) continue;
+        std::vector<int> chain;
+        for (size_t e = 0; e < bq.edgeGeometry.size(); ++e) {
+            bool along = true;
+            for (const Point &p : bq.edgeGeometry[e]) {
+                if (distanceToSegment(p, r[0], r[1]) > tol) {
+                    along = false;
+                    break;
+                }
+            }
+            if (along) chain.push_back(static_cast<int>(e));
+        }
+        add(std::move(chain), 1, bq.radiusRequirements);
+    }
+
+    // (2) Every boundary feature -- the arc between two boundary nodes of
+    // valence 2, a node only one cell has a corner at -- keeps a length of at
+    // least 1, and (3) every boundary loop one of at least 3. [R] Prop. 1
+    // asks a loop for 1 only, but a loop of one quad edge is a vertex joined
+    // to itself and one of two a digon, neither a boundary a quad mesh can
+    // have: a hole narrower than an element would close up in Step 10. Three
+    // is the least a polygon has.
+    std::vector<int> asCorner, insideSide;
+    nodeIncidences(bq, asCorner, insideSide);
+    std::unordered_map<int, std::vector<int>> boundaryAt;
+    for (size_t e = 0; e < bq.tmesh.edges.size(); ++e) {
+        if (!bq.tmesh.edges[e].onBoundary()) continue;
+        boundaryAt[bq.edgeNodes[e][0]].push_back(static_cast<int>(e));
+        boundaryAt[bq.edgeNodes[e][1]].push_back(static_cast<int>(e));
+    }
+    auto isFeatureNode = [&](int n) { return asCorner[n] == 1 && insideSide[n] == 0; };
+    std::vector<char> used(bq.tmesh.edges.size(), 0);
+    for (size_t e0 = 0; e0 < bq.tmesh.edges.size(); ++e0) {
+        if (used[e0] || !bq.tmesh.edges[e0].onBoundary()) continue;
+        // Walk the loop through e0 into its sequence of (edge, node ahead).
+        std::vector<std::pair<int, int>> loop;
+        int e = static_cast<int>(e0);
+        int node = bq.edgeNodes[e][1];
+        while (e >= 0 && !used[e]) {
+            used[e] = 1;
+            loop.push_back({e, node});
+            int next = -1;
+            for (int f : boundaryAt[node]) {
+                if (!used[f]) { next = f; break; }
+            }
+            if (next < 0) break;
+            node = bq.edgeNodes[next][0] == node ? bq.edgeNodes[next][1] : bq.edgeNodes[next][0];
+            e = next;
+        }
+        // Start the walk just after a feature node, so arcs do not wrap.
+        int start = -1;
+        for (size_t k = 0; k < loop.size(); ++k) {
+            if (isFeatureNode(loop[k].second)) { start = static_cast<int>(k); break; }
+        }
+        std::vector<int> all;
+        for (const auto &step : loop) all.push_back(step.first);
+        add(std::move(all), 3, bq.loopRequirements);
+        if (start < 0) continue;
+        std::vector<int> arc;
+        for (size_t k = 1; k <= loop.size(); ++k) {
+            const auto &step = loop[(start + k) % loop.size()];
+            arc.push_back(step.first);
+            if (isFeatureNode(step.second)) {
+                add(std::move(arc), 1, bq.featureRequirements);
+                arc.clear();
+            }
+        }
+    }
+    return bq;
+}
+
+// ─── Step 10 ────────────────────────────────────────────────────────────────
+
+namespace {
+
+struct UnionFind {
+    std::vector<int> parent;
+    int add() {
+        parent.push_back(static_cast<int>(parent.size()));
+        return parent.back();
+    }
+    int find(int a) {
+        while (parent[a] != a) a = parent[a] = parent[parent[a]];
+        return a;
+    }
+    void unite(int a, int b) {
+        a = find(a);
+        b = find(b);
+        if (a != b) parent[std::max(a, b)] = std::min(a, b);
+    }
+};
+
+Point coonsPoint(const SideCurve &bottom, const SideCurve &top, const SideCurve &left,
+                 const SideCurve &right, double u, double v) {
+    const Point p = bottom.at(u) * (1.0 - v) + top.at(u) * v +
+                    left.at(v) * (1.0 - u) + right.at(v) * u;
+    return p - (bottom.at(0.0) * ((1.0 - u) * (1.0 - v)) + bottom.at(1.0) * (u * (1.0 - v)) +
+                top.at(0.0) * ((1.0 - u) * v) + top.at(1.0) * (u * v));
+}
+
+}  // namespace
+
+QuadExtraction extractQuadMesh(const BlockQuant &bq) {
+    QuadExtraction out;
+    const QuantTMesh &tm = bq.tmesh;
+    if (!tm.consistent()) {
+        out.error = "the quantization is not consistent";
+        return out;
+    }
+
+    UnionFind uf;
+    std::vector<Point> pos;
+    std::vector<char> boundary;
+    auto vertex = [&](const Point &p, bool onBoundary) {
+        pos.push_back(p);
+        boundary.push_back(onBoundary ? 1 : 0);
+        return uf.add();
+    };
+    for (const Point &p : bq.nodes) vertex(p, false);
+
+    // Each edge's vertices in the direction of its geometry, x + 1 of them;
+    // a zero edge keeps its two ends, now one vertex.
+    std::vector<std::vector<int>> edgeVerts(tm.edges.size());
+    for (size_t e = 0; e < tm.edges.size(); ++e) {
+        const std::vector<Point> &g = bq.edgeGeometry[e];
+        int a = bq.edgeNodes[e][0];
+        int b = bq.edgeNodes[e][1];
+        if (normP(bq.nodes[a] - g.front()) > normP(bq.nodes[b] - g.front())) std::swap(a, b);
+        const bool onBoundary = tm.edges[e].onBoundary();
+        if (onBoundary) boundary[a] = boundary[b] = 1;
+        const int x = tm.edges[e].x;
+        if (x <= 0) {
+            uf.unite(a, b);
+            edgeVerts[e] = {a, b};
+            continue;
+        }
+        double length = 0.0;
+        for (size_t i = 1; i < g.size(); ++i) length += normP(g[i] - g[i - 1]);
+        edgeVerts[e].push_back(a);
+        for (int k = 1; k < x; ++k) {
+            edgeVerts[e].push_back(vertex(pointAt(g, length * k / x), onBoundary));
+        }
+        edgeVerts[e].push_back(b);
+    }
+
+    // The vertices along one side of a face, corner to corner: sideSum + 1.
+    auto sideVerts = [&](int f, int side) {
+        std::vector<int> verts;
+        const std::vector<int> &edges = tm.faces[f].sides[side];
+        for (size_t i = 0; i < edges.size(); ++i) {
+            std::vector<int> seq = edgeVerts[edges[i]];
+            if (i < bq.sideReversed[f][side].size() && bq.sideReversed[f][side][i]) {
+                std::reverse(seq.begin(), seq.end());
+            }
+            if (verts.empty()) verts.push_back(seq.front());
+            if (tm.edges[edges[i]].x <= 0) continue;
+            verts.insert(verts.end(), seq.begin() + 1, seq.end());
+        }
+        return verts;
+    };
+
+    std::vector<std::array<int, 4>> quads;
+    for (size_t fi = 0; fi < tm.faces.size(); ++fi) {
+        const int f = static_cast<int>(fi);
+        const int a = static_cast<int>(tm.sideSum(f, 0));
+        const int b = static_cast<int>(tm.sideSum(f, 1));
+        const std::vector<int> s0 = sideVerts(f, 0), s1 = sideVerts(f, 1);
+        const std::vector<int> s2 = sideVerts(f, 2), s3 = sideVerts(f, 3);
+
+        if (a <= 0 || b <= 0) {
+            // The face collapses: S1 onto reversed S3 and S2 onto reversed
+            // S4, vertex by vertex -- everything onto one point if both are
+            // zero.
+            ++out.collapsedFaces;
+            if (a > 0) {
+                for (int i = 0; i <= a; ++i) uf.unite(s0[i], s2[a - i]);
+            } else if (b > 0) {
+                for (int j = 0; j <= b; ++j) uf.unite(s1[j], s3[b - j]);
+            } else {
+                for (const auto *s : {&s0, &s1, &s2, &s3}) {
+                    for (int v : *s) uf.unite(v, s0.front());
+                }
+            }
+            continue;
+        }
+
+        const SideCurve bottom = sideCurve(bq, f, 0);
+        const SideCurve right = sideCurve(bq, f, 1);
+        const SideCurve top = sideCurve(bq, f, 2).reversed();
+        const SideCurve left = sideCurve(bq, f, 3).reversed();
+
+        // grid[j][i], i along S1 (corner 0 -> 1), j along S4 reversed
+        // (corner 0 -> 3).
+        std::vector<std::vector<int>> grid(b + 1, std::vector<int>(a + 1, -1));
+        for (int i = 0; i <= a; ++i) {
+            grid[0][i] = s0[i];
+            grid[b][i] = s2[a - i];
+        }
+        for (int j = 0; j <= b; ++j) {
+            grid[j][a] = s1[j];
+            grid[j][0] = s3[b - j];
+        }
+        for (int j = 1; j < b; ++j) {
+            for (int i = 1; i < a; ++i) {
+                grid[j][i] = vertex(coonsPoint(bottom, top, left, right,
+                                               static_cast<double>(i) / a,
+                                               static_cast<double>(j) / b),
+                                    false);
+            }
+        }
+        // The corners as placed decide which way the face turns; every quad
+        // of it is emitted CCW.
+        const Point c0 = bottom.at(0.0), c1 = bottom.at(1.0), c2 = top.at(1.0), c3 = top.at(0.0);
+        const double area2 = cross2(c1 - c0, c2 - c0) + cross2(c2 - c0, c3 - c0);
+        for (int j = 0; j < b; ++j) {
+            for (int i = 0; i < a; ++i) {
+                std::array<int, 4> q{grid[j][i], grid[j][i + 1], grid[j + 1][i + 1], grid[j + 1][i]};
+                if (area2 < 0.0) std::swap(q[1], q[3]);
+                quads.push_back(q);
+            }
+        }
+    }
+
+    // Resolve the welds: one vertex per class, at the mean of its boundary
+    // members if it has any.
+    const int nv = static_cast<int>(pos.size());
+    std::vector<Point> sum(nv, Point{0.0, 0.0}), sumB(nv, Point{0.0, 0.0});
+    std::vector<int> count(nv, 0), countB(nv, 0);
+    for (int v = 0; v < nv; ++v) {
+        const int r = uf.find(v);
+        sum[r] = sum[r] + pos[v];
+        ++count[r];
+        if (boundary[v]) {
+            sumB[r] = sumB[r] + pos[v];
+            ++countB[r];
+        }
+    }
+    std::vector<int> index(nv, -1);
+    for (const auto &q : quads) {
+        std::array<int, 4> r;
+        for (int k = 0; k < 4; ++k) r[k] = uf.find(q[k]);
+        bool degenerate = false;
+        for (int k = 0; k < 4 && !degenerate; ++k) {
+            for (int l = k + 1; l < 4; ++l) degenerate = degenerate || r[k] == r[l];
+        }
+        if (degenerate) {
+            ++out.droppedQuads;
+            continue;
+        }
+        for (int k = 0; k < 4; ++k) {
+            if (index[r[k]] < 0) {
+                index[r[k]] = static_cast<int>(out.vertices.size());
+                out.vertices.push_back(countB[r[k]] > 0 ? sumB[r[k]] / countB[r[k]]
+                                                         : sum[r[k]] / count[r[k]]);
+                out.onBoundary.push_back(countB[r[k]] > 0 ? 1 : 0);
+            }
+            r[k] = index[r[k]];
+        }
+        out.quads.push_back(r);
+    }
+
+    // Topology: every mesh edge in one or two quads, the boundary edges
+    // closing into loops, and V - E + F.
+    std::map<std::pair<int, int>, int> edgeUse;
+    for (const auto &q : out.quads) {
+        for (int k = 0; k < 4; ++k) {
+            const int u = q[k], w = q[(k + 1) % 4];
+            ++edgeUse[{std::min(u, w), std::max(u, w)}];
+        }
+    }
+    std::unordered_map<int, std::vector<int>> boundaryNext;
+    for (const auto &kv : edgeUse) {
+        if (kv.second > 2) ++out.nonManifoldEdges;
+        if (kv.second == 1) {
+            boundaryNext[kv.first.first].push_back(kv.first.second);
+            boundaryNext[kv.first.second].push_back(kv.first.first);
+        }
+    }
+    for (const auto &kv : boundaryNext) {
+        if (kv.second.size() != 2) ++out.nonManifoldVertices;
+    }
+    std::unordered_set<int> visited;
+    for (const auto &kv : boundaryNext) {
+        if (visited.count(kv.first)) continue;
+        ++out.boundaryLoops;
+        std::vector<int> stack{kv.first};
+        while (!stack.empty()) {
+            const int v = stack.back();
+            stack.pop_back();
+            if (!visited.insert(v).second) continue;
+            for (int w : boundaryNext[v]) stack.push_back(w);
+        }
+    }
+    out.eulerCharacteristic = static_cast<int>(out.vertices.size()) -
+                              static_cast<int>(edgeUse.size()) +
+                              static_cast<int>(out.quads.size());
+    out.ok = out.nonManifoldEdges == 0 && out.nonManifoldVertices == 0;
+    if (!out.ok) {
+        out.error = std::to_string(out.nonManifoldEdges) + " non-manifold edges, " +
+                    std::to_string(out.nonManifoldVertices) + " non-manifold vertices";
+    }
+    return out;
 }

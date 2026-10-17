@@ -5,17 +5,11 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
-#include <unordered_map>
 #include <unordered_set>
 
 namespace {
 
-// Polyline helpers for the template construction.
-
-std::vector<Point> reversed(std::vector<Point> pts) {
-    std::reverse(pts.begin(), pts.end());
-    return pts;
-}
+// Polyline helpers for the walk and the template construction.
 
 // Append, dropping a duplicated joint point.
 void appendPts(std::vector<Point> &dst, const std::vector<Point> &src) {
@@ -25,42 +19,43 @@ void appendPts(std::vector<Point> &dst, const std::vector<Point> &src) {
     }
 }
 
-// Split a polyline at the given increasing arc-length fractions. Fills
-// `pieces` (fractions.size() + 1 of them, each sharing its cut points with
-// its neighbours) and `cuts` (the split points themselves).
-void splitPolyline(const std::vector<Point> &pts,
-                   const std::vector<double> &fractions,
-                   std::vector<std::vector<Point>> &pieces,
-                   std::vector<Point> &cuts) {
-    pieces.clear();
-    cuts.clear();
+std::vector<double> cumulativeArc(const std::vector<Point> &pts) {
     std::vector<double> arc(pts.size(), 0.0);
     for (size_t i = 1; i < pts.size(); ++i) {
         arc[i] = arc[i - 1] + normP(pts[i] - pts[i - 1]);
     }
-    const double total = arc.back();
+    return arc;
+}
 
-    std::vector<Point> cur{pts.front()};
-    size_t i = 1;
-    for (double f : fractions) {
-        const double target = total * f;
-        while (i < pts.size() && arc[i] < target) {
-            cur.push_back(pts[i]);
-            ++i;
-        }
-        Point cut = pts.back();
-        if (i < pts.size()) {
+// The point at arc-length fraction t of a polyline whose cumulative arc
+// length is `arc`.
+Point pointAtFraction(const std::vector<Point> &pts, const std::vector<double> &arc,
+                      double t) {
+    if (pts.size() == 1 || !(arc.back() > 0.0)) return pts.front();
+    const double target = std::clamp(t, 0.0, 1.0) * arc.back();
+    for (size_t i = 1; i < pts.size(); ++i) {
+        if (arc[i] >= target) {
             const double seg = arc[i] - arc[i - 1];
-            const double t = seg > 0.0 ? (target - arc[i - 1]) / seg : 0.0;
-            cut = pts[i - 1] + (pts[i] - pts[i - 1]) * t;
+            const double f = seg > 0.0 ? (target - arc[i - 1]) / seg : 0.0;
+            return pts[i - 1] + (pts[i] - pts[i - 1]) * f;
         }
-        cur.push_back(cut);
-        cuts.push_back(cut);
-        pieces.push_back(std::move(cur));
-        cur = {cut};
     }
-    for (; i < pts.size(); ++i) cur.push_back(pts[i]);
-    pieces.push_back(std::move(cur));
+    return pts.back();
+}
+
+// Split a polyline in two at arc-length fraction t; both pieces share the
+// cut point.
+void splitAtFraction(const std::vector<Point> &pts, double t,
+                     std::vector<Point> &head, std::vector<Point> &tail) {
+    const std::vector<double> arc = cumulativeArc(pts);
+    const double target = std::clamp(t, 0.0, 1.0) * arc.back();
+    head = {pts.front()};
+    size_t i = 1;
+    while (i < pts.size() && arc[i] < target) head.push_back(pts[i++]);
+    const Point cut = pointAtFraction(pts, arc, t);
+    appendPts(head, {cut});
+    tail = {cut};
+    for (; i < pts.size(); ++i) appendPts(tail, {pts[i]});
 }
 
 double distToSegment(const Point &p, const Point &a, const Point &b) {
@@ -82,26 +77,95 @@ double subPolylineParam(const Point &p, const Point &midPrev, const Point &v,
     return lenPrev + normP(p - v);
 }
 
+double signedArea(const std::vector<Point> &pts) {
+    double a = 0.0;
+    for (size_t i = 0; i < pts.size(); ++i) {
+        a += cross2(pts[i], pts[(i + 1) % pts.size()]);
+    }
+    return 0.5 * a;
+}
+
+// Unsigned angle between two vectors, in [0, pi].
+double angleBetween(const Point &a, const Point &b) {
+    return std::atan2(std::abs(cross2(a, b)), dotP(a, b));
+}
+
+long long pairKey(int a, int b) {
+    return (static_cast<long long>(std::min(a, b)) << 32) |
+           static_cast<long long>(std::max(a, b));
+}
+
+MedialAxisTMesh::Options withSize(double targetSize) {
+    MedialAxisTMesh::Options o;
+    o.targetSize = targetSize;
+    return o;
+}
+
 } // namespace
 
 // ─── Construction ───────────────────────────────────────────────────────────
 
 MedialAxisTMesh::MedialAxisTMesh(const MedialAxisMap &map, double targetSize)
-    : axis(map.axis) {
+    : MedialAxisTMesh(map, withSize(targetSize)) {}
+
+MedialAxisTMesh::MedialAxisTMesh(const MedialAxisMap &map, const Options &opts)
+    : axis(map.axis), opts_(opts) {
     if (!axis) {
         throw std::runtime_error("MedialAxisMap carries no axis.");
     }
+    targetSize_ = opts_.targetSize > 0.0 ? opts_.targetSize : axis->defaultTargetSize();
 
-    targetSize_ = targetSize > 0.0 ? targetSize : 0.1 * axis->boundingBoxDiagonal();
-    passages_.assign(axis->medialVertices.size(), {});
+    // Branches are the unit of downsampling, so make sure they exist.
+    if (axis->polyLines.empty()) axis->createPolylines();
+    branchScale_.assign(axis->polyLines.size(), 1.0);
 
-    // The walk comes first: runs depend only on the map, and both the corner
-    // anchoring and the sampling need to see them.
+    const int nv = static_cast<int>(axis->mesh->vertices.size());
+    originalPrev_.assign(nv, -1);
+    for (int v = 0; v < nv; ++v) {
+        const int n = axis->originalNext[v];
+        if (n >= 0) originalPrev_[n] = v;
+    }
+
+    // Step 8.6: a face that is not a usable cell means h was too coarse
+    // there -- Sec. 5.3 finds invalid embeddings only when it is -- so h is
+    // halved on the branches that produced one and everything from the
+    // downsampling on is rebuilt. A round is kept only if it leaves fewer bad
+    // faces than the best so far: not every failure is one of h -- a purple
+    // cap on a lobe whose neck narrows away from it folds at any size, as
+    // does the collocated fan at a concave corner -- and refining around one
+    // of those only multiplies the faces that fail.
+    build(map);
+    std::vector<int> bad = checkGeometry();
+    std::vector<double> bestScale = branchScale_;
+    int best = stats_.badFaces;
+    int refinements = 0;
+    while (!bad.empty() && refinements < opts_.maxRefinements) {
+        for (int b : bad) branchScale_[b] *= 0.5;
+        build(map);
+        bad = checkGeometry();
+        if (stats_.badFaces >= best) break;
+        best = stats_.badFaces;
+        bestScale = branchScale_;
+        ++refinements;
+    }
+    if (branchScale_ != bestScale) {
+        branchScale_ = bestScale;
+        build(map);
+        checkGeometry();
+    }
+    stats_.refinements = refinements;
+}
+
+void MedialAxisTMesh::build(const MedialAxisMap &map) {
+    zones.clear();
+    edges.clear();
+    blocks.clear();
+    loops_.clear();
+    stats_ = TMeshStats{};
+
+    selectNodes();
     gatherLoops(map);
-    anchorCorners(map);
-    selectKeptVertices();
     emitZones();
-
     buildEdges();
     classify();
     buildBlocks();
@@ -111,55 +175,217 @@ MedialAxisTMesh::MedialAxisTMesh(const MedialAxisMap &map, double targetSize)
     stats_.blocks = static_cast<int>(blocks.size());
 }
 
+int MedialAxisTMesh::nodeCount() const {
+    return static_cast<int>(axis->medialVertices.size() + inserted_.size());
+}
+
+Point MedialAxisTMesh::nodeCoord(int node) const {
+    const int nAxis = static_cast<int>(axis->medialVertices.size());
+    return node < nAxis ? axis->medialVertices[node].coord : inserted_[node - nAxis].coord;
+}
+
+double MedialAxisTMesh::nodeRadius(int node) const {
+    const int nAxis = static_cast<int>(axis->medialVertices.size());
+    return node < nAxis ? axis->medialVertices[node].radius : inserted_[node - nAxis].radius;
+}
+
+int MedialAxisTMesh::nodeDegree(int node) const {
+    const int nAxis = static_cast<int>(axis->medialVertices.size());
+    return node < nAxis ? axis->medialVertices[node].degree : 2;
+}
+
+bool MedialAxisTMesh::isKept(int node) const {
+    const int nAxis = static_cast<int>(axis->medialVertices.size());
+    if (node < 0) return false;
+    if (node >= nAxis) return node < nodeCount();
+    return node < static_cast<int>(kept_.size()) && kept_[node] != 0;
+}
+
+int MedialAxisTMesh::contactCount(int node) const {
+    return node >= 0 && node < static_cast<int>(runCount_.size()) ? runCount_[node] : 0;
+}
+
+std::vector<std::array<Point, 2>> MedialAxisTMesh::radii() const {
+    std::vector<std::array<Point, 2>> out;
+    out.reserve(spokes_.size());
+    for (const Spoke &sp : spokes_) out.push_back({nodeCoord(sp.node), sp.foot});
+    return out;
+}
+
+double MedialAxisTMesh::originalTurn(int v) const {
+    const int p = originalPrev_[v];
+    const int n = axis->originalNext[v];
+    if (p < 0 || n < 0) return 0.0;
+    const Point in  = axis->originalPosition[v] - axis->originalPosition[p];
+    const Point out = axis->originalPosition[n] - axis->originalPosition[v];
+    return std::atan2(cross2(in, out), dotP(in, out));
+}
+
+// ─── Step 6.1: downsampling ─────────────────────────────────────────────────
+
+void MedialAxisTMesh::selectNodes() {
+    const int nAxis = static_cast<int>(axis->medialVertices.size());
+    kept_.assign(nAxis, 0);
+    inserted_.clear();
+    insertedOn_.clear();
+    coarseBranch_.clear();
+
+    const double tiny = 1e-12 * axis->boundingBoxDiagonal();
+    for (size_t b = 0; b < axis->polyLines.size(); ++b) {
+        const std::vector<int> &pl = axis->polyLines[b];
+        const std::vector<int> &pe = axis->polyLineEdges[b];
+        // A branch of one vertex is a medial vertex the inside filter left
+        // isolated: its circle is not inside the domain, so it is not on the
+        // axis and must not cut the boundary. Its passages still lie in the
+        // walk, inside whichever zone they fall in.
+        if (pl.size() < 2) continue;
+        // Branch ends are always kept: junctions and endpoints are where the
+        // coarse axis has to have its vertices.
+        kept_[pl.front()] = 1;
+        kept_[pl.back()] = 1;
+
+        std::vector<double> arc(pl.size(), 0.0);
+        for (size_t i = 1; i < pl.size(); ++i) {
+            arc[i] = arc[i - 1] + normP(axis->medialVertices[pl[i]].coord -
+                                        axis->medialVertices[pl[i - 1]].coord);
+        }
+        const double L = arc.back();
+
+        // n = max(n_min, round(L / h)). n_min [R] keeps the endpoint
+        // templates of a branch from overlapping: a branch ending in an
+        // endpoint gets two coarse edges, one ending in two endpoints or
+        // closing on itself three.
+        const bool cyclic = axis->polyLineIsCycle[b];
+        const bool endA = !cyclic && axis->medialVertices[pl.front()].degree == 1;
+        const bool endB = !cyclic && axis->medialVertices[pl.back()].degree == 1;
+        const int nMin = (cyclic || (endA && endB)) ? 3 : ((endA || endB) ? 2 : 1);
+        const double hb = targetSize_ * branchScale_[b];
+        int n = std::max(nMin, static_cast<int>(std::lround(L / hb)));
+        // A branch of no length has nowhere to put samples apart.
+        if (!(L > tiny)) n = 1;
+        const double spacing = L / n;
+
+        std::vector<int> nodes{pl.front()};
+        size_t prev = 0;
+        for (int k = 1; k < n; ++k) {
+            const double target = spacing * k;
+            // The regular vertex closest to k L / n, beyond the last pick and
+            // within half a spacing of the target: anything farther is
+            // closer to a neighbouring target, and the sampling would bunch.
+            size_t best = 0;
+            double bestD = 0.5 * spacing;
+            for (size_t i = prev + 1; i + 1 < pl.size(); ++i) {
+                const double d = std::abs(arc[i] - target);
+                if (d <= bestD) {
+                    bestD = d;
+                    best = i;
+                }
+                if (arc[i] > target + 0.5 * spacing) break;
+            }
+            if (best > 0) {
+                kept_[pl[best]] = 1;
+                nodes.push_back(pl[best]);
+                prev = best;
+                continue;
+            }
+
+            // Too few fine vertices: insert a sample on the fine edge that
+            // holds the target. It sits on the Voronoi edge between the two
+            // samples that edge is dual to, which gives its radius and, in
+            // the walk, its preimage through each of their cells.
+            size_t i = prev;
+            while (i + 2 < pl.size() && arc[i + 1] < target) ++i;
+            const double seg = arc[i + 1] - arc[i];
+            const double f = seg > 0.0 ? std::clamp((target - arc[i]) / seg, 0.0, 1.0) : 0.0;
+            const Point &a = axis->medialVertices[pl[i]].coord;
+            const Point &c = axis->medialVertices[pl[i + 1]].coord;
+            const Point q = a + (c - a) * f;
+            const Edge &dual = axis->medialEdgeDual[pe[i]];
+            InsertedNode node;
+            node.coord = q;
+            node.radius = normP(q - axis->mesh->vertices[dual[0]]);
+            const int id = nAxis + static_cast<int>(inserted_.size());
+            inserted_.push_back(node);
+            insertedOn_[MeshEdgeKey(dual[0], dual[1])].push_back(id);
+            nodes.push_back(id);
+            prev = i;
+        }
+        nodes.push_back(pl.back());
+        for (size_t k = 0; k + 1 < nodes.size(); ++k) {
+            coarseBranch_[pairKey(nodes[k], nodes[k + 1])] = static_cast<int>(b);
+        }
+    }
+
+    stats_.keptVertices = 0;
+    for (char k : kept_) stats_.keptVertices += k;
+    stats_.insertedVertices = static_cast<int>(inserted_.size());
+}
+
 // ─── The walk ───────────────────────────────────────────────────────────────
 
-// The fan's contribution to the walk, in boundary order. Each fan emits its
-// chain vertices 0..k-2 (the last belongs to the next fan, which starts with
-// it), plus the boundary vertex itself slotted in by arc length. A collapsed
-// fan emits its single vertex at the interval entry, so consecutive collapsed
-// fans build up the run that becomes a cap zone.
-void MedialAxisTMesh::appendFanEvents(const MedialFan &fan, const Point &vpos,
-                                      int vIndex, std::vector<WalkEvent> &events) {
-    const int k = static_cast<int>(fan.chain.size());
-    if (k == 1) {
-        events.push_back({fan.midPrev, fan.chain[0], -1});
-        events.push_back({vpos, -1, vIndex});
-        return;
+// The passages a fan contributes, in fan order: its chain vertices 0..k-2
+// (the last belongs to the next fan, which starts with it) with the samples
+// inserted on the medial edge between each consecutive pair. `feet` gets the
+// preimage of each on the fan's sub-polyline. A collapsed fan contributes
+// its one vertex at the interval entry, so consecutive collapsed fans build
+// up the run that is a polar section.
+std::vector<int> MedialAxisTMesh::fanSequenceNodes(const MedialAxisMap &map, int v,
+                                                   std::vector<Point> &feet) const {
+    feet.clear();
+    const MedialFan *fan = map.fanOf(v);
+    if (!fan || fan->chain.empty()) return {};
+    if (fan->collapsed) {
+        feet.push_back(fan->midPrev);
+        return {fan->chain[0]};
     }
 
-    const double vparam = normP(vpos - fan.midPrev);
-    bool vEmitted = false;
+    std::vector<int> nodes;
+    const int k = static_cast<int>(fan->chain.size());
     for (int i = 0; i + 1 < k; ++i) {
-        const double p = subPolylineParam(fan.footpoints[i], fan.midPrev, vpos,
-                                          fan.midNext);
-        if (!vEmitted && p > vparam) {
-            events.push_back({vpos, -1, vIndex});
-            vEmitted = true;
+        nodes.push_back(fan->chain[i]);
+        feet.push_back(fan->footpoints[i]);
+        if (i >= static_cast<int>(fan->crossed.size())) continue;
+        const auto it = insertedOn_.find(MeshEdgeKey(v, fan->crossed[i]));
+        if (it == insertedOn_.end()) continue;
+        std::vector<int> ids = it->second;
+        const Point from = nodeCoord(fan->chain[i]);
+        std::sort(ids.begin(), ids.end(), [&](int x, int y) {
+            return normP(nodeCoord(x) - from) < normP(nodeCoord(y) - from);
+        });
+        for (int id : ids) {
+            bool missed = false;
+            nodes.push_back(id);
+            feet.push_back(map.preimage(v, nodeCoord(id), missed));
         }
-        events.push_back({fan.footpoints[i], fan.chain[i], -1});
     }
-    if (!vEmitted) events.push_back({vpos, -1, vIndex});
+    return nodes;
 }
 
 void MedialAxisTMesh::gatherLoops(const MedialAxisMap &map) {
-    std::vector<char> visited(axis->mesh->vertices.size(), 0);
+    const std::vector<Point> &x = axis->mesh->vertices;
+    const std::vector<Point> &x0 = axis->originalPosition;
+    const int nv = static_cast<int>(x.size());
+    std::vector<char> visited(nv, 0);
+    runCount_.assign(nodeCount(), 0);
 
-    for (int start = 0; start < static_cast<int>(axis->mesh->vertices.size()); ++start) {
+    // A passage as a parameter on a current boundary edge: t in [0, 1/2] on
+    // the half beside the edge's start, [1/2, 1] beside its end.
+    struct Passage {
+        int node;
+        double t;
+    };
+
+    for (int start = 0; start < nv; ++start) {
         if (visited[start] || axis->boundaryLinks[start].nextBoundaryVertex < 0) continue;
         ++stats_.loops;
 
-        LoopWalk loop;
+        std::vector<int> loopVerts;
         int v = start;
-        int guard = static_cast<int>(axis->mesh->vertices.size()) + 1;
+        int guard = nv + 1;
         bool closed = false;
         while (guard-- > 0) {
             visited[v] = 1;
-            const MedialFan *fan = map.fanOf(v);
-            if (fan) {
-                appendFanEvents(*fan, axis->mesh->vertices[v], v, loop.events);
-            } else {
-                loop.events.push_back({axis->mesh->vertices[v], -1, v});
-            }
+            loopVerts.push_back(v);
             v = axis->boundaryLinks[v].nextBoundaryVertex;
             if (v == start) { closed = true; break; }
             // Broken or pinched links: the loop never closes, and zones cut
@@ -167,185 +393,138 @@ void MedialAxisTMesh::gatherLoops(const MedialAxisMap &map) {
             if (v < 0 || visited[v]) break;
         }
         if (!closed) { ++stats_.skippedLoops; continue; }
+        const int n = static_cast<int>(loopVerts.size());
+
+        // Each fan's passages split at its vertex: those before it lie on
+        // the edge coming in, those after it on the edge going out.
+        // Monotonicity orders them; the clamp only absorbs roundoff.
+        std::vector<std::vector<Passage>> before(n), after(n);
+        for (int i = 0; i < n; ++i) {
+            const int u = loopVerts[i];
+            const MedialFan *fan = map.fanOf(u);
+            if (!fan) continue;
+            std::vector<Point> feet;
+            const std::vector<int> nodes = fanSequenceNodes(map, u, feet);
+            const double vparam = normP(x[u] - fan->midPrev);
+            const double nextLen = normP(fan->midNext - x[u]);
+            double last = 0.0;
+            for (size_t j = 0; j < nodes.size(); ++j) {
+                double p = fan->collapsed
+                               ? 0.0
+                               : subPolylineParam(feet[j], fan->midPrev, x[u], fan->midNext);
+                p = std::max(p, last);
+                last = p;
+                if (fan->collapsed || p <= vparam) {
+                    before[i].push_back({nodes[j], 0.5 + 0.5 * (vparam > 0.0 ? p / vparam : 1.0)});
+                } else {
+                    after[i].push_back(
+                        {nodes[j], 0.5 * (nextLen > 0.0 ? (p - vparam) / nextLen : 0.0)});
+                }
+            }
+        }
+
+        // The events of each current edge (u, w): u itself, then the
+        // passages after u and before w, interleaved with whatever input
+        // vertices Step 4.2 removed from between them -- every position
+        // read off the original polyline the edge stands for, at the same
+        // arc-length fraction.
+        LoopWalk loop;
+        for (int i = 0; i < n; ++i) {
+            const int u = loopVerts[i];
+            const int w = loopVerts[(i + 1) % n];
+            const std::vector<Point> orig = axis->originalPolyline(u, w);
+            const std::vector<double> arc = cumulativeArc(orig);
+            loop.events.push_back({x0[u], -1, u});
+
+            std::vector<Passage> on = after[i];
+            const std::vector<Passage> &tail = before[(i + 1) % n];
+            on.insert(on.end(), tail.begin(), tail.end());
+            for (size_t j = 1; j < on.size(); ++j) on[j].t = std::max(on[j].t, on[j - 1].t);
+
+            size_t a = 0;
+            size_t r = 1;   // removed vertices are orig[1 .. size - 2]
+            while (a < on.size() || r + 1 < orig.size()) {
+                const bool takeRemoved =
+                    r + 1 < orig.size() &&
+                    (a >= on.size() || arc[r] < on[a].t * arc.back());
+                if (takeRemoved) {
+                    loop.events.push_back({orig[r], -1, -1});
+                    ++r;
+                } else {
+                    loop.events.push_back({pointAtFraction(orig, arc, on[a].t), on[a].node, -1});
+                    ++a;
+                }
+            }
+        }
 
         // Rotate the stream so it starts at a run boundary -- the first medial
-        // event whose vertex differs from the previous medial event's -- so
+        // event whose node differs from the previous medial event's -- so
         // runs never straddle the wrap-around.
-        const int n = static_cast<int>(loop.events.size());
-        int lastMedial = -1;
-        for (int i = n - 1; i >= 0; --i) {
-            if (loop.events[i].medial >= 0) { lastMedial = loop.events[i].medial; break; }
+        const int ne = static_cast<int>(loop.events.size());
+        int lastNode = -1;
+        for (int i = ne - 1; i >= 0; --i) {
+            if (loop.events[i].node >= 0) { lastNode = loop.events[i].node; break; }
         }
-        if (lastMedial < 0) {
+        if (lastNode < 0) {
             // A loop no fan reached at all.
             ++stats_.skippedLoops;
             continue;
         }
         int rot = -1;
-        int prevMedial = lastMedial;
-        for (int i = 0; i < n; ++i) {
-            if (loop.events[i].medial < 0) continue;
-            if (loop.events[i].medial != prevMedial) { rot = i; break; }
-            prevMedial = loop.events[i].medial;
+        int prevNode = lastNode;
+        for (int i = 0; i < ne; ++i) {
+            if (loop.events[i].node < 0) continue;
+            if (loop.events[i].node != prevNode) { rot = i; break; }
+            prevNode = loop.events[i].node;
         }
 
         if (rot < 0) {
-            // Every passage hits the same medial vertex: the whole loop is one
-            // polar section (a domain reduced to a single inscribed circle).
-            loop.runs.push_back({lastMedial, 0, n - 1});
+            // Every passage is of the same node: the whole loop is one
+            // contact (a domain reduced to a single inscribed circle).
+            int first = -1, lastEv = -1;
+            for (int i = 0; i < ne; ++i) {
+                if (loop.events[i].node < 0) continue;
+                if (first < 0) first = i;
+                lastEv = i;
+            }
+            loop.runs.push_back({lastNode, first, lastEv});
         } else {
             std::rotate(loop.events.begin(), loop.events.begin() + rot, loop.events.end());
-            for (int i = 0; i < n; ++i) {
-                if (loop.events[i].medial < 0) continue;
-                if (!loop.runs.empty() && loop.runs.back().m == loop.events[i].medial) {
+            for (int i = 0; i < ne; ++i) {
+                const int m = loop.events[i].node;
+                if (m < 0) continue;
+                if (!loop.runs.empty() && loop.runs.back().m == m) {
                     loop.runs.back().last = i;
                 } else {
-                    loop.runs.push_back({loop.events[i].medial, i, i});
+                    loop.runs.push_back({m, i, i});
                 }
             }
         }
-
-        // Record the passages: one footpoint per run, at the middle of the
-        // run's interval. These are the discrete medial radii the
-        // classification measures its angles between.
-        for (const MedialRun &r : loop.runs) {
-            passages_[r.m].push_back(
-                (loop.events[r.first].pos + loop.events[r.last].pos) * 0.5);
-        }
-
+        for (const MedialRun &run : loop.runs) ++runCount_[run.m];
         loops_.push_back(std::move(loop));
     }
 }
 
-// ─── Sharp corners ──────────────────────────────────────────────────────────
-
-bool MedialAxisTMesh::isSharpBoundaryCorner(int v) const {
-    if (v < 0 || v >= static_cast<int>(axis->interiorAngle.size())) return false;
-    const double a = axis->interiorAngle[v];
-    return std::isfinite(a) && std::abs(a - M_PI) > MEDIAL_SHARP_CORNER_TOLERANCE;
-}
-
-void MedialAxisTMesh::anchorCorners(const MedialAxisMap &map) {
-    mandatory_.assign(axis->medialVertices.size(), 0);
-
-    for (LoopWalk &loop : loops_) {
-        const int n = static_cast<int>(loop.events.size());
-        const int nr = static_cast<int>(loop.runs.size());
-        if (nr == 0) continue;
-
-        // Cyclic distance from event e to a run's span, 0 when e is inside it.
-        auto forward = [n](int from, int to) { return ((to - from) % n + n) % n; };
-        auto distToRun = [&](int e, const MedialRun &r) {
-            const int span = forward(r.first, r.last);
-            if (forward(r.first, e) <= span) return 0;
-            return std::min(forward(e, r.first), forward(r.last, e));
-        };
-
-        for (int e = 0; e < n; ++e) {
-            const int bv = loop.events[e].boundaryVertex;
-            if (bv < 0 || !isSharpBoundaryCorner(bv)) continue;
-            ++stats_.sharpCorners;
-
-            // Only a medial vertex whose inscribed circle actually touches the
-            // corner can carry it: the spoke from the corner to that vertex
-            // has to be a real medial radius, or the zone it bounds would not
-            // be a subdomain of the map. Those are exactly the vertices of the
-            // corner's own fan.
-            const MedialFan *fan = map.fanOf(bv);
-            if (!fan || fan->chain.empty()) { ++stats_.cornersUnanchored; continue; }
-            const std::unordered_set<int> touching(fan->chain.begin(), fan->chain.end());
-
-            int bestRun = -1;
-            int bestDist = std::numeric_limits<int>::max();
-            for (int r = 0; r < nr; ++r) {
-                if (!touching.count(loop.runs[r].m)) continue;
-                const int d = distToRun(e, loop.runs[r]);
-                if (d < bestDist) { bestDist = d; bestRun = r; }
-            }
-            if (bestRun < 0) { ++stats_.cornersUnanchored; continue; }
-
-            loop.cornerCuts.push_back({bestRun, e});
-            mandatory_[loop.runs[bestRun].m] = 1;
-            ++stats_.cornerCuts;
-        }
-    }
-}
-
-// ─── Downsampling ───────────────────────────────────────────────────────────
-
-void MedialAxisTMesh::selectKeptVertices() {
-    // Corner anchors are already in: they are as mandatory as a junction.
-    kept_ = mandatory_;
-    if (kept_.empty()) kept_.assign(axis->medialVertices.size(), 0);
-
-    // Branches are the unit of downsampling, so make sure they exist.
-    if (axis->polyLines.empty()) axis->createPolylines();
-
-    for (size_t b = 0; b < axis->polyLines.size(); ++b) {
-        const std::vector<int> &pl = axis->polyLines[b];
-        kept_[pl.front()] = 1;
-        kept_[pl.back()] = 1;
-        if (pl.size() < 2) continue;
-
-        std::vector<double> arc(pl.size(), 0.0);
-        for (size_t i = 1; i < pl.size(); ++i) {
-            arc[i] = arc[i - 1] + normP(axis->medialVertices[pl[i]].coord -
-                                        axis->medialVertices[pl[i - 1]].coord);
-        }
-
-        // Sample between consecutive survivors rather than across the whole
-        // branch: a corner anchor is a fixed sample, and spacing the rest
-        // around it is what keeps a forced corner from leaving a sliver zone
-        // beside an arc-length sample that happened to land next to it.
-        std::vector<size_t> anchors{0};
-        for (size_t i = 1; i + 1 < pl.size(); ++i) {
-            if (kept_[pl[i]]) anchors.push_back(i);
-        }
-        anchors.push_back(pl.size() - 1);
-
-        for (size_t a = 0; a + 1 < anchors.size(); ++a) {
-            const size_t i0 = anchors[a];
-            const size_t i1 = anchors[a + 1];
-            const double length = arc[i1] - arc[i0];
-            int segments = std::max(1, static_cast<int>(std::lround(length / targetSize_)));
-            // A cycle's ends coincide, so with no interior anchor to break it
-            // fewer than three samples would leave a hole bounded by fewer
-            // than two zones per side.
-            if (axis->polyLineIsCycle[b] && anchors.size() == 2) {
-                segments = std::max(3, segments);
-            }
-
-            size_t cursor = i0 + 1;
-            for (int s = 1; s < segments; ++s) {
-                const double target = arc[i0] + length * s / segments;
-                while (cursor + 1 < i1 && arc[cursor] < target) ++cursor;
-                // Nearest of the two candidates around the target, kept
-                // strictly inside the interval so an anchor is never doubled.
-                size_t pick = cursor;
-                if (cursor > i0 + 1 &&
-                    target - arc[cursor - 1] < arc[cursor] - target) pick = cursor - 1;
-                if (pick > i0 && pick < i1) kept_[pl[pick]] = 1;
-            }
-        }
-    }
-
-    stats_.keptVertices = 0;
-    for (char k : kept_) stats_.keptVertices += k;
-}
-
-// ─── Zones ──────────────────────────────────────────────────────────────────
+// ─── Step 6.2/6.3: zones ────────────────────────────────────────────────────
 
 void MedialAxisTMesh::emitZones() {
-    // Where one zone hands over to the next. A kept run hands over across its
-    // whole span, the stretch of boundary that collapses onto it, so the piece
-    // between `enter` and `exit` becomes a cap zone. A corner hands over at a
-    // single point, so it splits the boundary there and leaves no cap.
+    // A place on a loop's event stream: event i itself, or a point strictly
+    // between events i and i + 1.
+    struct Loc {
+        int i = -1;
+        Point p{0.0, 0.0};
+        bool exact = true;
+    };
+    // Where one zone hands over to the next. A single preimage hands over at
+    // a point (enter == exit). An endpoint's polar section hands over across
+    // its span, and the piece between enter and exit is its cap zone.
     struct Cut {
         int run = -1;
-        int enter = -1;   // where the zone before ends
-        int exit = -1;    // where the zone after starts
+        Loc enter, exit;
         bool cap = false;
+        int enterSpoke = -1, exitSpoke = -1;
     };
+    spokes_.clear();
 
     for (const LoopWalk &loop : loops_) {
         const std::vector<WalkEvent> &events = loop.events;
@@ -354,94 +533,114 @@ void MedialAxisTMesh::emitZones() {
         const int nr = static_cast<int>(runs.size());
         if (nr == 0) continue;
 
-        std::vector<std::vector<int>> cornerAt(nr);
-        for (const std::array<int, 2> &cc : loop.cornerCuts) {
-            cornerAt[cc[0]].push_back(cc[1]);
-        }
+        std::vector<double> s(n, 0.0);
+        for (int i = 1; i < n; ++i) s[i] = s[i - 1] + normP(events[i].pos - events[i - 1].pos);
 
-        // A run carrying corners is cut at them instead of across its span:
-        // the corner is the block corner, and the rest of the run's boundary
-        // simply belongs to the zones on either side.
+        auto at = [&](int i) { return Loc{i, events[i].pos, true}; };
+
         std::vector<Cut> cuts;
         for (int r = 0; r < nr; ++r) {
-            if (!cornerAt[r].empty()) {
-                std::sort(cornerAt[r].begin(), cornerAt[r].end());
-                for (int e : cornerAt[r]) cuts.push_back({r, e, e, false});
-            } else if (kept_[runs[r].m]) {
-                cuts.push_back({r, runs[r].first, runs[r].last,
-                                runs[r].first != runs[r].last});
+            const MedialRun &run = runs[r];
+            if (!isKept(run.m)) continue;
+            if (run.first == run.last) {
+                cuts.push_back({r, at(run.first), at(run.first), false});
+            } else if (nodeDegree(run.m) == 1) {
+                cuts.push_back({r, at(run.first), at(run.last), true});
+            } else {
+                // A polar section away from an endpoint, left by a pruned
+                // branch or an arc 4.2 could not flatten. Its arc-length
+                // midpoint is the single preimage of both subdomains beside
+                // it (Step 5.3, [R]). Runs do not straddle the wrap, so the
+                // span is first .. last in index order.
+                const double mid = 0.5 * (s[run.first] + s[run.last]);
+                int j = run.first;
+                while (j + 1 < run.last && s[j + 1] <= mid) ++j;
+                Loc loc;
+                if (s[j] == mid) {
+                    loc = at(j);
+                } else {
+                    const double seg = s[j + 1] - s[j];
+                    const double f = seg > 0.0 ? (mid - s[j]) / seg : 0.0;
+                    loc = Loc{j, events[j].pos + (events[j + 1].pos - events[j].pos) * f, false};
+                }
+                cuts.push_back({r, loc, loc, false});
+                ++stats_.midpointCuts;
             }
         }
         if (cuts.empty()) {
-            // No kept vertex and no corner on this loop -- degenerate
-            // sampling. Nothing sound to cut, so report rather than fabricate.
+            // No kept vertex on this loop -- degenerate sampling. Nothing
+            // sound to cut, so report rather than fabricate.
             ++stats_.skippedLoops;
             continue;
         }
-        std::stable_sort(cuts.begin(), cuts.end(),
-                         [](const Cut &a, const Cut &b) { return a.enter < b.enter; });
-
-        // Inclusive cyclic slice of event positions.
-        auto slice = [&](int from, int to) {
-            std::vector<Point> pts;
-            for (int i = from;; i = (i + 1) % n) {
-                pts.push_back(events[i].pos);
-                if (i == to) break;
+        // One radius per preimage: a cut at a point is one spoke, shared by
+        // the zones on either side of it; a cap's two ends are two.
+        for (Cut &c : cuts) {
+            const int m = runs[c.run].m;
+            c.enterSpoke = static_cast<int>(spokes_.size());
+            spokes_.push_back({m, c.enter.p});
+            c.exitSpoke = c.enterSpoke;
+            if (c.cap) {
+                c.exitSpoke = static_cast<int>(spokes_.size());
+                spokes_.push_back({m, c.exit.p});
             }
-            return pts;
+        }
+
+        // The stretch of the stream from a forward to b, both ends included:
+        // a's point, every event after it up to b's index, and b's own point
+        // when it falls between events. Two cuts never share a segment --
+        // the next cut belongs to a later run -- so the count below is the
+        // whole story, and a == b (a loop with one cut) walks it all.
+        auto slice = [&](const Loc &a, const Loc &b, MedialZone &zone) {
+            zone.boundarySide = {a.p};
+            zone.boundaryVertexAt = {a.exact ? events[a.i].boundaryVertex : -1};
+            const int first = (a.i + 1) % n;
+            const int count = (b.i - first + n) % n + 1;
+            for (int k = 0, j = first; k < count; ++k, j = (j + 1) % n) {
+                zone.boundarySide.push_back(events[j].pos);
+                zone.boundaryVertexAt.push_back(events[j].boundaryVertex);
+            }
+            if (!b.exact) {
+                zone.boundarySide.push_back(b.p);
+                zone.boundaryVertexAt.push_back(-1);
+            }
         };
 
         for (const Cut &c : cuts) {
             if (!c.cap) continue;
             MedialZone zone;
-            zone.boundarySide = slice(c.enter, c.exit);
-            // A run spanning the whole loop is a domain reduced to one
-            // inscribed circle; close the polyline so the cap covers the full
-            // perimeter.
-            if (nr == 1) zone.boundarySide.push_back(events[c.enter].pos);
+            slice(c.enter, c.exit, zone);
+            zone.spokes = {c.enterSpoke, c.exitSpoke};
             zone.chain = {runs[c.run].m};
             zone.cap = true;
             zone.capVertex = runs[c.run].m;
             zones.push_back(std::move(zone));
             ++stats_.capZones;
         }
+        // A loop that is a single contact has nothing to cut between: its
+        // cap, if its node is an endpoint, is all of it.
+        if (nr == 1) continue;
 
-        // The interval between each pair of consecutive cuts, with the medial
-        // vertices passed in between as its chain. A single cut on a
-        // single-run loop leaves no interval.
+        // The interval between each pair of consecutive cuts, with the nodes
+        // passed in between as its chain.
         const int nc = static_cast<int>(cuts.size());
-        if (nc < 2 && nr == 1) continue;
         for (int j = 0; j < nc; ++j) {
             const Cut &a = cuts[j];
             const Cut &b = cuts[(j + 1) % nc];
             MedialZone zone;
-            zone.boundarySide = slice(a.exit, b.enter);
+            slice(a.exit, b.enter, zone);
+            zone.spokes = {a.exitSpoke, b.enterSpoke};
             zone.chain.push_back(runs[a.run].m);
-            // Two cuts inside one run have no runs between them; the wrap
-            // below is for the single-cut case, which does circle the loop.
-            if (!(nc > 1 && a.run == b.run)) {
-                int ri = a.run;
-                while (true) {
-                    ri = (ri + 1) % nr;
-                    if (ri == b.run) break;
-                    zone.chain.push_back(runs[ri].m);
-                }
+            for (int ri = (a.run + 1) % nr; ri != b.run; ri = (ri + 1) % nr) {
+                zone.chain.push_back(runs[ri].m);
             }
             zone.chain.push_back(runs[b.run].m);
-            // Both spokes landing on the same vertex makes this a polar
-            // wedge, not a quad -- two corners cut out of one run.
-            if (zone.chain.size() == 2 && zone.chain[0] == zone.chain[1]) {
-                zone.chain.resize(1);
-                zone.cap = true;
-                zone.capVertex = zone.chain[0];
-                ++stats_.capZones;
-            }
             zones.push_back(std::move(zone));
         }
     }
 }
 
-// ─── Edges and classification ───────────────────────────────────────────────
+// ─── Edges and Step 7 coloring ──────────────────────────────────────────────
 
 void MedialAxisTMesh::buildEdges() {
     // The two zones flanking a chain see it in opposite directions, so the
@@ -462,6 +661,8 @@ void MedialAxisTMesh::buildEdges() {
         for (size_t i = 0; i < members.size(); i += 2) {
             CoarseEdge edge;
             edge.chain = kv.first;
+            const auto it = coarseBranch_.find(pairKey(edge.chain.front(), edge.chain.back()));
+            if (it != coarseBranch_.end()) edge.branch = it->second;
             edge.zones[0] = members[i];
             zones[members[i]].coarseEdge = static_cast<int>(edges.size());
             if (i + 1 < members.size()) {
@@ -476,50 +677,66 @@ void MedialAxisTMesh::buildEdges() {
 }
 
 void MedialAxisTMesh::classify() {
-    // Blue/purple caps: the polar region around an endpoint, split by what
-    // its dual cell is -- a triangle marks a tip that stayed sharp, anything
-    // larger a round cap the simplification merged together.
-    for (MedialZone &zone : zones) {
+    // Caps first: a blue cap needs its corner p, which is also what makes a
+    // merged endpoint blue rather than purple. A triangle's section is two
+    // boundary edges with the corner between them; a merged cell's section
+    // is blue only if it holds a locked convex corner ([R]), the sharpest of
+    // them serving as p.
+    std::unordered_map<int, int> capOf;
+    for (int z = 0; z < static_cast<int>(zones.size()); ++z) {
+        MedialZone &zone = zones[z];
         if (!zone.cap) continue;
-        zone.color = axis->medialVertices[zone.capVertex].dualIsTriangle
-                         ? MedialColor::Blue
-                         : MedialColor::Purple;
-        ++stats_.colorCounts[static_cast<int>(zone.color)];
+        capOf[zone.capVertex] = z;
+        const int cell = axis->medialVertices[zone.capVertex].cell;
+        const bool triangle = cell >= 0 && axis->cells[cell].dualIsTriangle();
+        int corner = -1;
+        double sharpest = 0.0;
+        const int np = static_cast<int>(zone.boundarySide.size());
+        for (int i = 1; i + 1 < np; ++i) {
+            const int v = zone.boundaryVertexAt[i];
+            if (v < 0) continue;
+            if (triangle) { corner = i; break; }
+            const double turn = originalTurn(v);
+            if (axis->locked[v] && turn > sharpest) {
+                sharpest = turn;
+                corner = i;
+            }
+        }
+        zone.capCorner = corner;
+        zone.color = corner >= 0 ? MedialColor::Blue : MedialColor::Purple;
+        if (corner >= 0 && !triangle) ++stats_.blueByCorner;
     }
 
     for (CoarseEdge &edge : edges) {
-        // Sec. 4.2: an edge incident to an endpoint takes the endpoint's
-        // class; every other edge splits green/red on the medial angle.
+        const int m1 = edge.chain.front();
+        const int m2 = edge.chain.back();
         int endpoint = -1;
-        if (axis->medialVertices[edge.chain.front()].degree <= 1)
-            endpoint = edge.chain.front();
-        else if (axis->medialVertices[edge.chain.back()].degree <= 1)
-            endpoint = edge.chain.back();
+        if (nodeDegree(m1) == 1) endpoint = m1;
+        else if (nodeDegree(m2) == 1) endpoint = m2;
 
         if (endpoint >= 0) {
-            edge.color = axis->medialVertices[endpoint].dualIsTriangle
-                             ? MedialColor::Blue
-                             : MedialColor::Purple;
-        } else {
-            // The medial angle at each chain vertex passed exactly twice: the
-            // angle its two radii (per-side passage footpoints) span.
-            edge.minAngle = M_PI;
-            double sum = 0.0;
-            int measured = 0;
-            for (int m : edge.chain) {
-                if (passages_[m].size() != 2) continue;
-                const Point &c = axis->medialVertices[m].coord;
-                const Point a = passages_[m][0] - c;
-                const Point b = passages_[m][1] - c;
-                const double theta = std::atan2(std::abs(cross2(a, b)), dotP(a, b));
-                edge.minAngle = std::min(edge.minAngle, theta);
-                sum += theta;
-                ++measured;
+            // An edge incident to an endpoint takes the endpoint's class.
+            const auto it = capOf.find(endpoint);
+            edge.color = (it != capOf.end()) ? zones[it->second].color : MedialColor::Purple;
+        } else if (edge.zones[1] >= 0) {
+            // theta_{m,E} at each end: the angle between the radii of the
+            // two contacts beside E, which are the spokes of E's two zones
+            // there. A zone's boundary side runs with its chain, so a zone
+            // walking m1 -> m2 has its m1 spoke at the front.
+            for (int end = 0; end < 2; ++end) {
+                const int m = end == 0 ? m1 : m2;
+                const Point c = nodeCoord(m);
+                Point feet[2];
+                for (int k = 0; k < 2; ++k) {
+                    const MedialZone &z = zones[edge.zones[k]];
+                    feet[k] = (z.chain.front() == m) ? z.boundarySide.front()
+                                                     : z.boundarySide.back();
+                }
+                edge.endAngle[end] = angleBetween(feet[0] - c, feet[1] - c);
             }
-            edge.meanAngle = measured > 0 ? sum / measured : M_PI;
-            edge.color = edge.meanAngle >= MEDIAL_COLOR_ANGLE_THRESHOLD
-                             ? MedialColor::Green
-                             : MedialColor::Red;
+            edge.meanAngle = 0.5 * (edge.endAngle[0] + edge.endAngle[1]);
+            edge.color = edge.meanAngle >= MEDIAL_COLOR_ANGLE_THRESHOLD ? MedialColor::Green
+                                                                        : MedialColor::Red;
         }
         ++stats_.colorCounts[static_cast<int>(edge.color)];
 
@@ -529,49 +746,16 @@ void MedialAxisTMesh::classify() {
     }
 }
 
-// ─── Templates (Fig. 17) ────────────────────────────────────────────────────
+// ─── Step 8: templates (Fig. 17) ────────────────────────────────────────────
 //
 // Each class of coarse edge remeshes its subdomain with one quadrilateral
-// template. The machinery below keeps that table-driven: a template is a
-// function over a TemplateSubdomain -- the subdomain's geometry, oriented so
-// that the end the template treats specially comes first -- which emits its
-// blocks through a BlockBuilder.
-//
-// To add a template: write one such function and add a row to kTemplates
-// naming the class it serves, which end it wants first, and whether it
-// swallows the polar cap at that end. Nothing else here needs to change.
+// template, written exactly as docs/medial_axis.md Step 8 lists them: E =
+// (m1, m2) with m1 the end the template treats specially, L and R the sides
+// on the left and right walking m1 -> m2, b1/b2 the preimages at m1/m2, and
+// s_sigma the midpoint of the radius [m2, b2_sigma]. Every quad comes out
+// CCW, so a cell with non-positive area is a folded one (Step 8.6).
 
 namespace {
-
-// Which end of the coarse edge a template wants as `inner`.
-enum class Orient {
-    Any,       // symmetric template; take the edge as it comes
-    Narrow,    // the smaller medial radius, i.e. the subdomain's concave corner
-    Endpoint,  // the end that terminates the axis
-};
-
-// The subdomain of one coarse edge, oriented for its template.
-struct TemplateSubdomain {
-    Point inner{0.0, 0.0};   // the end the template treats specially
-    Point outer{0.0, 0.0};   // the other one
-
-    std::vector<Point> chain;         // every medial vertex, inner -> outer
-    std::vector<Point> sideA, sideB;  // the two boundary runs, inner -> outer
-
-    // The polar cap at `inner`, split at its midpoint W and joined to the
-    // flanks: arcUp runs outer's contact on side A to W, and arcLo runs W to
-    // outer's contact on side B, so together they are the entire boundary of
-    // a capped subdomain. Only filled for templates that asked for the cap.
-    std::vector<Point> arcUp, arcLo;
-
-    // The cap zone folded in above, for the caller to mark consumed.
-    int capZone = -1;
-
-    // Midpoints of the two radii at `outer` -- where a template that leaves a
-    // T-junction on those radii puts it.
-    Point midRadiusA() const { return (sideA.back() + outer) * 0.5; }
-    Point midRadiusB() const { return (sideB.back() + outer) * 0.5; }
-};
 
 // Assembles one block from its sides. `corner` adds a single vertex; `run`
 // appends a polyline and marks both its ends as corners. Points repeated
@@ -579,8 +763,8 @@ struct TemplateSubdomain {
 // sides costs nothing at the call site.
 class BlockBuilder {
 public:
-    BlockBuilder(std::vector<TMeshBlock> &out, MedialColor color, double weld)
-        : out_(out), color_(color), weld_(weld) {}
+    BlockBuilder(std::vector<TMeshBlock> &out, MedialColor color, int edge, double weld)
+        : out_(out), color_(color), edge_(edge), weld_(weld) {}
 
     BlockBuilder &corner(const Point &p) {
         push(p, true);
@@ -594,7 +778,8 @@ public:
         return *this;
     }
 
-    void emit() {
+    // Index of the emitted block, or -1 if it had too few points to be one.
+    int emit() {
         // The outline is a closed loop, so a last point on top of the first
         // is a duplicate rather than a side.
         if (block_.outline.size() > 1 &&
@@ -605,11 +790,15 @@ public:
             normP(block_.corners.front() - block_.corners.back()) < weld_) {
             block_.corners.pop_back();
         }
+        int index = -1;
         if (block_.outline.size() >= 3) {
             block_.color = color_;
+            block_.edge = edge_;
+            index = static_cast<int>(out_.size());
             out_.push_back(std::move(block_));
         }
         block_ = TMeshBlock{};
+        return index;
     }
 
 private:
@@ -625,170 +814,39 @@ private:
 
     std::vector<TMeshBlock> &out_;
     MedialColor color_;
+    int edge_;
     double weld_;
     TMeshBlock block_;
 };
 
-// ── The four templates ──
-
-// Green: the axis runs along quad edges, so the two zones already are the
-// template -- one quad per side, sharing the medial chain.
-void templateGreen(const TemplateSubdomain &s, BlockBuilder &b) {
-    b.run(s.sideA).run(reversed(s.chain)).emit();
-    b.run(s.sideB).run(reversed(s.chain)).emit();
-}
-
-// Red: three quads around the concave corner.
-//
-// At the narrow medial vertex both radii point back toward the apex, so the
-// subdomain is reflex there -- that is its one concave corner. Splitting it
-// means running an edge from that corner to each of the two opposite sides,
-// which here are the radii at `outer`. Each lands mid-radius and so leaves a
-// T-junction, the subdomain across that radius having no vertex there. The
-// medial edge ends up as the diagonal of the middle quad, which is what red
-// asks for: the axis follows quad diagonals.
-void templateRed(const TemplateSubdomain &s, BlockBuilder &b) {
-    const Point tA = s.midRadiusA();
-    const Point tB = s.midRadiusB();
-    b.corner(s.inner).run(s.sideA).corner(tA).emit();
-    b.corner(s.inner).corner(tA).corner(s.outer).corner(tB).emit();
-    b.corner(s.inner).corner(tB).run(reversed(s.sideB)).emit();
-}
-
-// Blue: one quad spanning the wedge at a sharp tip, the axis on its diagonal.
-void templateBlue(const TemplateSubdomain &s, BlockBuilder &b) {
-    b.corner(s.outer).run(s.arcUp).run(s.arcLo).emit();
-}
-
-// Purple: red's construction at a round cap. The T-junctions and the
-// half-radius running from each one out to the boundary are the same; what
-// differs is the far end, where an endpoint has no pair of inner radii to
-// serve as a concave corner, so its polar cap stands in for them -- split at
-// W, the single boundary point the endpoint maps to.
-void templatePurple(const TemplateSubdomain &s, BlockBuilder &b) {
-    const Point tA = s.midRadiusA();
-    const Point tB = s.midRadiusB();
-    b.run(s.arcUp).corner(s.inner).corner(tA).emit();
-    b.run(s.arcLo).corner(tB).corner(s.inner).emit();
-    b.corner(s.inner).corner(tA).corner(s.outer).corner(tB).emit();
-}
-
-struct TemplateEntry {
-    MedialColor color;
-    Orient orient;
-    bool wantsCap;
-    void (*apply)(const TemplateSubdomain &, BlockBuilder &);
-};
-
-const TemplateEntry kTemplates[] = {
-    {MedialColor::Green,  Orient::Any,      false, templateGreen},
-    {MedialColor::Red,    Orient::Narrow,   false, templateRed},
-    {MedialColor::Blue,   Orient::Endpoint, true,  templateBlue},
-    {MedialColor::Purple, Orient::Endpoint, true,  templatePurple},
-};
-
-const TemplateEntry &templateFor(MedialColor c) {
-    for (const TemplateEntry &t : kTemplates) {
-        if (t.color == c) return t;
-    }
-    return kTemplates[0];   // unreachable while every class has a row
-}
-
-// A zone kept whole, for what no template claimed.
-TMeshBlock zoneAsBlock(const MedialAxis &axis, const MedialZone &zone) {
+// A zone kept whole, for what no template claimed, CCW like the rest.
+TMeshBlock zoneAsBlock(const MedialAxisTMesh &tm, const MedialZone &zone, double weld) {
     TMeshBlock b;
     b.outline = zone.boundarySide;
     std::vector<Point> chainPts;
-    for (int m : zone.chain) chainPts.push_back(axis.medialVertices[m].coord);
-    if (zone.cap) {
+    for (int m : zone.chain) chainPts.push_back(tm.nodeCoord(m));
+    // A zone that leaves a vertex and comes back to it -- around a tip whose
+    // branch the inside filter dropped, so nothing pairs with it, or beside
+    // the axis of a disc, whose two ends are one point -- is shaped like a
+    // cap, and is closed like one.
+    if (zone.cap || normP(chainPts.front() - chainPts.back()) <= weld) {
         // Open caps close through their vertex; a cap spanning a whole closed
         // loop is already a cycle and needs no spoke at all.
-        if (normP(zone.boundarySide.front() - zone.boundarySide.back()) >
-            1e-9 * axis.boundingBoxDiagonal()) {
+        if (normP(zone.boundarySide.front() - zone.boundarySide.back()) > weld) {
             b.outline.push_back(chainPts.front());
         }
-        b.corners = {zone.boundarySide.front(), zone.boundarySide.back(),
-                     chainPts.front()};
+        b.corners = {zone.boundarySide.front(), zone.boundarySide.back(), chainPts.front()};
     } else {
-        appendPts(b.outline, reversed(chainPts));
+        appendPts(b.outline, {chainPts.back(), chainPts.front()});
         b.corners = {zone.boundarySide.front(), zone.boundarySide.back(),
                      chainPts.back(), chainPts.front()};
     }
+    if (signedArea(b.outline) < 0.0) {
+        std::reverse(b.outline.begin(), b.outline.end());
+        std::reverse(b.corners.begin(), b.corners.end());
+    }
     b.color = zone.color;
     return b;
-}
-
-// Orient the two flanking zones of `edge` into the frame `t` expects.
-TemplateSubdomain makeSubdomain(const MedialAxis &axis,
-                                const std::vector<MedialZone> &zones,
-                                const std::unordered_map<int, int> &capOf,
-                                const CoarseEdge &edge,
-                                const TemplateEntry &t) {
-    const MedialZone &A = zones[edge.zones[0]];
-    const MedialZone &B = zones[edge.zones[1]];
-
-    // The two zones walk the shared chain in opposite directions, so side B
-    // comes onto side A's orientation before anything else.
-    std::vector<int> chainIdx = A.chain;
-    std::vector<Point> sideA = A.boundarySide;
-    std::vector<Point> sideB =
-        (B.chain == A.chain) ? B.boundarySide : reversed(B.boundarySide);
-
-    bool innerAtFront = true;
-    if (t.orient == Orient::Narrow) {
-        innerAtFront = axis.medialVertices[chainIdx.front()].radius <=
-                       axis.medialVertices[chainIdx.back()].radius;
-    } else if (t.orient == Orient::Endpoint) {
-        const bool frontIsEnd = axis.medialVertices[chainIdx.front()].degree <= 1;
-        const bool backIsEnd  = axis.medialVertices[chainIdx.back()].degree <= 1;
-        // Both ends can terminate the axis (a lone branch), so prefer the one
-        // that actually carries a cap for the template to swallow.
-        if (frontIsEnd && backIsEnd) {
-            innerAtFront = capOf.count(chainIdx.front()) ||
-                           !capOf.count(chainIdx.back());
-        } else {
-            innerAtFront = frontIsEnd;
-        }
-    }
-    if (!innerAtFront) {
-        std::reverse(chainIdx.begin(), chainIdx.end());
-        std::reverse(sideA.begin(), sideA.end());
-        std::reverse(sideB.begin(), sideB.end());
-    }
-
-    TemplateSubdomain s;
-    s.chain.reserve(chainIdx.size());
-    for (int m : chainIdx) s.chain.push_back(axis.medialVertices[m].coord);
-    s.inner = s.chain.front();
-    s.outer = s.chain.back();
-    s.sideA = std::move(sideA);
-    s.sideB = std::move(sideB);
-    if (!t.wantsCap) return s;
-
-    // The polar cap at `inner`, oriented to leave side A and arrive at side B.
-    std::vector<Point> cap;
-    const auto capIt = capOf.find(chainIdx.front());
-    if (capIt != capOf.end()) {
-        s.capZone = capIt->second;
-        const std::vector<Point> &c = zones[s.capZone].boundarySide;
-        const bool forward = normP(c.front() - s.sideA.front()) <=
-                             normP(c.back() - s.sideA.front());
-        cap = forward ? c : reversed(c);
-    }
-
-    s.arcUp = reversed(s.sideA);                 // outer's contact -> inner's
-    if (cap.size() >= 2) {
-        std::vector<std::vector<Point>> pieces;
-        std::vector<Point> cuts;
-        splitPolyline(cap, {0.5}, pieces, cuts);
-        appendPts(s.arcUp, pieces[0]);           // ... -> W
-        s.arcLo = pieces[1];                     // W -> ...
-    } else {
-        // No cap: the two inner contacts coincide, and that point is W.
-        s.arcLo = {s.sideA.front()};
-    }
-    appendPts(s.arcLo, s.sideB);
-    return s;
 }
 
 } // namespace
@@ -796,7 +854,6 @@ TemplateSubdomain makeSubdomain(const MedialAxis &axis,
 void MedialAxisTMesh::buildBlocks() {
     blocks.clear();
 
-    // Caps by endpoint, so a template that wants one can find it.
     std::unordered_map<int, int> capOf;
     for (int z = 0; z < static_cast<int>(zones.size()); ++z) {
         if (zones[z].cap) capOf[zones[z].capVertex] = z;
@@ -804,29 +861,261 @@ void MedialAxisTMesh::buildBlocks() {
     std::vector<char> consumed(zones.size(), 0);
     const double weld = 1e-12 * axis->boundingBoxDiagonal();
 
-    for (const CoarseEdge &edge : edges) {
-        // Without both flanks the subdomain is incomplete; keep what exists.
-        if (edge.zones[1] < 0) {
-            if (edge.zones[0] >= 0) {
-                blocks.push_back(zoneAsBlock(*axis, zones[edge.zones[0]]));
-                consumed[edge.zones[0]] = 1;
-            }
+    // Orientation of every template: m1 is the end it treats specially --
+    // the smaller medial radius for red ([R]: along red edges r is strictly
+    // monotone, App. A, so the inner end is well defined), the endpoint for
+    // blue and purple, either end for green. R walks m1 -> m2 (a zone lies
+    // right of its own chain) and L walks m2 -> m1; anything else means the
+    // pairing went wrong and the zones are kept as they are.
+    struct Plan {
+        int m1 = -1, m2 = -1;
+        const MedialZone *R = nullptr;
+        const MedialZone *L = nullptr;
+    };
+    std::vector<Plan> plans(edges.size());
+    for (int e = 0; e < static_cast<int>(edges.size()); ++e) {
+        const CoarseEdge &edge = edges[e];
+        if (edge.zones[1] < 0) continue;
+        int m1 = edge.chain.front();
+        int m2 = edge.chain.back();
+        if (edge.color == MedialColor::Red) {
+            if (nodeRadius(m2) < nodeRadius(m1)) std::swap(m1, m2);
+        } else if (edge.color == MedialColor::Blue || edge.color == MedialColor::Purple) {
+            const bool endFront = nodeDegree(m1) == 1 && capOf.count(m1);
+            const bool endBack = nodeDegree(m2) == 1 && capOf.count(m2);
+            if (!endFront && endBack) std::swap(m1, m2);
+        }
+        const MedialZone &A = zones[edge.zones[0]];
+        const MedialZone &B = zones[edge.zones[1]];
+        Plan &plan = plans[e];
+        plan.m1 = m1;
+        plan.m2 = m2;
+        if (A.chain.front() == m1 && A.chain.back() == m2 &&
+            B.chain.front() == m2 && B.chain.back() == m1) {
+            plan.R = &A;
+            plan.L = &B;
+        } else if (B.chain.front() == m1 && B.chain.back() == m2 &&
+                   A.chain.front() == m2 && A.chain.back() == m1) {
+            plan.R = &B;
+            plan.L = &A;
+        }
+    }
+
+    // The points s_sigma on the radii at m2. Assembly item 1 creates one per
+    // radius, shared by every template that asks for it; where two ask --
+    // the two sides of a radius at a junction both outer, or the valence-2
+    // case below -- the nearer to m2 serves both.
+    //
+    // [R] The guide puts s_sigma at the radius midpoint, read off its
+    // canonical wedge where r(m1) = r(m2) / 2. There the midpoint is also the
+    // foot of the perpendicular from m1 onto the radius, and for other ratios
+    // the midpoint can fold the diamond D = (m1, sR, m2, sL) at m1: a point
+    // at distance t from m2 along a radius that leans back towards m1 by
+    // theta/2 keeps m1 outside the triangle (m2, sR, sL) only while
+    // t cos(theta/2) < |m1 - m2|, i.e. t * foot < |m1 - m2|^2 with foot the
+    // projection of m1 - m2 on the radius -- which every red edge more than
+    // three samples from its apex breaks. So the midpoint stays while it is
+    // within half that bound, and the foot takes its place beyond: with the
+    // feet D has right angles at sR and sL, is inscribed in the circle on
+    // m1-m2 and so convex, and a wedge comes out as a grid of squares. A
+    // radius at right angles to the edge -- a purple cap on a strip of
+    // constant width -- has no foot to speak of and puts no bound on t, so
+    // its midpoint always stays.
+    std::vector<double> spokeT(spokes_.size(), std::numeric_limits<double>::infinity());
+    auto request = [&](int spoke, int m1) {
+        if (spoke < 0) return;
+        const Spoke &sp = spokes_[spoke];
+        const Point c = nodeCoord(sp.node);
+        const double len = normP(sp.foot - c);
+        if (!(len > 0.0)) return;
+        const Point u = (sp.foot - c) / len;
+        const Point w = nodeCoord(m1) - c;
+        const double foot = dotP(w, u);
+        double t = 0.5 * len;
+        if (foot > 0.0 && t * foot > 0.5 * dotP(w, w)) t = std::min(t, foot);
+        spokeT[spoke] = std::min(spokeT[spoke], t);
+    };
+    auto spokePoint = [&](int spoke) {
+        const Spoke &sp = spokes_[spoke];
+        const Point c = nodeCoord(sp.node);
+        const double len = normP(sp.foot - c);
+        const double t = std::isfinite(spokeT[spoke]) ? spokeT[spoke] : 0.5 * len;
+        return len > 0.0 ? c + (sp.foot - c) * (t / len) : c;
+    };
+    for (int e = 0; e < static_cast<int>(edges.size()); ++e) {
+        const Plan &plan = plans[e];
+        if (!plan.R || edges[e].color == MedialColor::Green) continue;
+        request(plan.R->spokes[1], plan.m1);
+        request(plan.L->spokes[0], plan.m1);
+    }
+
+    // The diamond D of every non-green template, for the valence-2 pass.
+    std::vector<int> diamondOf(edges.size(), -1);
+    for (int e = 0; e < static_cast<int>(edges.size()); ++e) {
+        const CoarseEdge &edge = edges[e];
+        const Plan &plan = plans[e];
+        if (!plan.R) continue;
+
+        const std::vector<Point> &arcR = plan.R->boundarySide;   // b1R -> b2R
+        const std::vector<Point> &arcL = plan.L->boundarySide;   // b2L -> b1L
+        const Point P1 = nodeCoord(plan.m1);
+        const Point P2 = nodeCoord(plan.m2);
+        // An edge of no length has no subdomain to remesh: the axis of a
+        // disc, both its endpoints on the centre. Its caps stay as they are.
+        if (normP(P2 - P1) <= weld) {
+            ++stats_.pointEdges;
             continue;
         }
         consumed[edge.zones[0]] = 1;
         consumed[edge.zones[1]] = 1;
 
-        const TemplateEntry &t = templateFor(edge.color);
-        const TemplateSubdomain s = makeSubdomain(*axis, zones, capOf, edge, t);
-        if (s.capZone >= 0) consumed[s.capZone] = 1;
+        BlockBuilder b(blocks, edge.color, e, weld);
+        if (edge.color == MedialColor::Green) {
+            // Keep the initial decomposition: QL, QR, the medial edge a shared
+            // mesh edge, straight between its coarse ends (Step 6.4, [R]).
+            b.corner(P1).corner(P2).run(arcL).emit();                // (m1, m2, b2L, b1L)
+            b.corner(P1).run(arcR).corner(P2).emit();                // (m1, b1R, b2R, m2)
+            continue;
+        }
+        const Point sR = spokePoint(plan.R->spokes[1]);
+        const Point sL = spokePoint(plan.L->spokes[0]);
 
-        BlockBuilder builder(blocks, edge.color, weld);
-        t.apply(s, builder);
+        // The polar region at an endpoint m1, running aL -> aR with the walk:
+        // it starts where L's boundary ends and ends where R's begins.
+        std::vector<Point> cap;
+        int capCorner = -1;
+        if (edge.color != MedialColor::Red) {
+            const auto it = capOf.find(plan.m1);
+            if (it != capOf.end()) {
+                const MedialZone &C = zones[it->second];
+                if (normP(C.boundarySide.front() - arcL.back()) <= weld &&
+                    normP(C.boundarySide.back() - arcR.front()) <= weld) {
+                    cap = C.boundarySide;
+                    capCorner = C.capCorner;
+                    consumed[it->second] = 1;
+                }
+            }
+        }
+
+        if (edge.color == MedialColor::Blue && !cap.empty() && capCorner > 0) {
+            // C = (m_e, aL, p, aR): the endpoint stays regular (valence 4)
+            // and the corner p is a boundary node of valence 2.
+            const std::vector<Point> toCorner(cap.begin(), cap.begin() + capCorner + 1);
+            const std::vector<Point> fromCorner(cap.begin() + capCorner, cap.end());
+            b.corner(P1).run(toCorner).run(fromCorner).emit();
+            b.corner(P1).corner(sL).run(arcL).emit();               // (m_e, sL, b2L, aL)
+            b.corner(P1).run(arcR).corner(sR).emit();               // (m_e, aR, b2R, sR)
+        } else if (edge.color == MedialColor::Purple && !cap.empty()) {
+            // Blue with aL and aR merged into one apex q, the arc-length
+            // midpoint of the section: C disappears, m_e has valence 3 and
+            // q boundary valence 3, so the cap adds no boundary singularity.
+            std::vector<Point> toQ, fromQ;
+            splitAtFraction(cap, 0.5, toQ, fromQ);
+            std::vector<Point> left = arcL;
+            appendPts(left, toQ);
+            std::vector<Point> right = fromQ;
+            appendPts(right, arcR);
+            b.corner(P1).corner(sL).run(left).emit();               // (m_e, sL, b2L, q)
+            b.corner(P1).run(right).corner(sR).emit();              // (m_e, q, b2R, sR)
+        } else {
+            // Red, m1 inner and m2 outer -- or an endpoint whose cap could
+            // not be matched, meshed the same way around whatever contacts
+            // it has.
+            b.corner(P1).corner(sL).run(arcL).emit();               // (m1, sL, b2L, b1L)
+            b.corner(P1).run(arcR).corner(sR).emit();               // (m1, b1R, b2R, sR)
+        }
+        // The diamond: the medial edge m1-m2 is its diagonal, not a mesh edge.
+        diamondOf[e] = b.corner(P1).corner(sR).corner(P2).corner(sL).emit();
     }
 
-    // Whatever the templates did not absorb -- standalone caps, zones of
-    // unpaired edges -- still tiles part of the domain, so it stays a block.
+    // Whatever the templates did not absorb -- zones of unpaired edges, caps
+    // no edge matched -- still tiles part of the domain, so it stays a block,
+    // unless it encloses nothing (the two sides of an edge of no length).
+    const double minArea = 1e-12 * targetSize_ * targetSize_;
     for (int z = 0; z < static_cast<int>(zones.size()); ++z) {
-        if (!consumed[z]) blocks.push_back(zoneAsBlock(*axis, zones[z]));
+        if (consumed[z]) continue;
+        TMeshBlock b = zoneAsBlock(*this, zones[z], weld);
+        if (signedArea(b.outline) > minArea) blocks.push_back(std::move(b));
     }
+
+    dissolveValenceTwo(diamondOf);
+}
+
+// Step 8.5: an interior vertex where two templates both put their outer end
+// -- two non-green edges meeting at a regular vertex, each with it as m2 --
+// is touched only by the two diamonds, along the two radii they share: a
+// vertex of valence 2. Merging the two diamonds removes it ([R]); the
+// merged cell is the quad on the two diamonds' far corners.
+void MedialAxisTMesh::dissolveValenceTwo(const std::vector<int> &diamondOf) {
+    std::unordered_map<int, std::vector<int>> outerAt;
+    for (int e = 0; e < static_cast<int>(edges.size()); ++e) {
+        const int d = diamondOf[e];
+        if (d < 0 || blocks[d].corners.size() != 4) continue;
+        // D = (m1, sR, m2, sL): the outer end is corner 2.
+        const Point outer = blocks[d].corners[2];
+        const int m = normP(nodeCoord(edges[e].chain.front()) - outer) <
+                              normP(nodeCoord(edges[e].chain.back()) - outer)
+                          ? edges[e].chain.front()
+                          : edges[e].chain.back();
+        outerAt[m].push_back(d);
+    }
+
+    const double weld = 1e-12 * axis->boundingBoxDiagonal();
+    std::vector<char> drop(blocks.size(), 0);
+    for (const auto &kv : outerAt) {
+        if (kv.second.size() != 2 || nodeDegree(kv.first) != 2) continue;
+        // Rotated so the shared vertex comes last: D1 = (a1, b1, c1, m) and
+        // D2 = (a2, b2, c2, m) share m-a1 = m-c2 and m-c1 = m-a2.
+        std::array<std::array<Point, 4>, 2> q;
+        for (int k = 0; k < 2; ++k) {
+            const std::vector<Point> &c = blocks[kv.second[k]].corners;
+            for (int i = 0; i < 4; ++i) q[k][i] = c[(i + 3) % 4];
+        }
+        if (normP(q[0][0] - q[1][2]) > weld || normP(q[0][2] - q[1][0]) > weld) continue;
+        TMeshBlock &merged = blocks[kv.second[0]];
+        merged.corners = {q[0][0], q[0][1], q[0][2], q[1][1]};
+        merged.outline = merged.corners;
+        drop[kv.second[1]] = 1;
+        ++stats_.dissolvedVertices;
+    }
+    std::vector<TMeshBlock> kept;
+    kept.reserve(blocks.size());
+    for (size_t i = 0; i < blocks.size(); ++i) {
+        if (!drop[i]) kept.push_back(std::move(blocks[i]));
+    }
+    blocks = std::move(kept);
+}
+
+// Step 8.6: every face has positive area and is not severely non-convex. Two
+// corners closer than the T-mesh welder's tolerance (1e-4 h, see
+// QuantTMeshConvert.hxx) count as neither: they become one node, that side
+// has no length, and the cell is the collocated fan Step 11 exists to repair
+// at a concave corner.
+std::vector<int> MedialAxisTMesh::checkGeometry() {
+    std::vector<int> branches;
+    stats_.badFaces = 0;
+    const double minArea = 1e-10 * targetSize_ * targetSize_;
+    const double minSide = 1e-4 * targetSize_;
+    for (const TMeshBlock &b : blocks) {
+        if (b.edge < 0 || b.corners.size() != 4) continue;
+        bool bad = signedArea(b.outline) <= minArea;
+        for (int i = 0; i < 4 && !bad; ++i) {
+            const Point toNext = b.corners[(i + 1) % 4] - b.corners[i];
+            const Point toPrev = b.corners[(i + 3) % 4] - b.corners[i];
+            if (normP(toNext) <= minSide) {
+                bad = true;
+                break;
+            }
+            double interior = std::atan2(cross2(toNext, toPrev), dotP(toNext, toPrev));
+            if (interior < 0.0) interior += 2.0 * M_PI;
+            if (interior > opts_.maxCornerAngle) bad = true;
+        }
+        if (!bad) continue;
+        ++stats_.badFaces;
+        const int branch = edges[b.edge].branch;
+        if (branch >= 0 && std::find(branches.begin(), branches.end(), branch) == branches.end()) {
+            branches.push_back(branch);
+        }
+    }
+    return branches;
 }

@@ -12,23 +12,32 @@
 
 // ─── Discrete medial axis of a planar domain ────────────────────────────────
 //
-// The axis is the subset of the Voronoi diagram of the boundary samples that
-// lies inside the domain. It is represented through its dual: a polygonal
-// complex over the boundary vertices (a constrained Delaunay triangulation to
-// begin with). Each active DualCell carries one medial vertex at its
-// circumcenter; each complex edge shared by two active cells carries one
-// medial edge.
+// Steps 3-5.1 of docs/medial_axis.md (Cheny et al., "Planar quad meshing with
+// guarantees", Sec. 3.3-3.5). The axis is the subset of the Voronoi diagram
+// of the boundary samples that lies inside the domain. It is represented
+// through its dual: a polygonal complex M over the boundary vertices (a
+// constrained Delaunay triangulation to begin with). Each active DualCell
+// carries one medial vertex at the centre of its stored circle; each complex
+// edge shared by two active cells carries one medial edge.
 //
-// The dual is polygonal rather than strictly triangular on purpose: merging
-// two cells is the combinatorial half of the medial-axis simplification, and a
-// merged cell is in general a k-gon whose vertices are (exactly or
-// approximately) cocircular. Cells therefore store an ordered CCW vertex ring
-// instead of a triangle index, and `dualIsTriangle()` distinguishes the two
-// cases.
-
-// Merge tolerance for deduplicateMedialVertices, relative to the local medial
-// radius.
-const double MEDIAL_VERTEX_MERGE_TOLERANCE = 0.01;
+// The dual is polygonal rather than strictly triangular on purpose (Sec.
+// 3.5): merging two cells is the combinatorial half of the medial-axis
+// simplification, and a merged cell is in general a k-gon whose vertices are
+// cocircular. Cells therefore store an ordered CCW vertex ring instead of a
+// triangle index, and `dualIsTriangle()` distinguishes the two cases. From
+// construction on, M is the single source of truth (Step 3.4): nothing is
+// ever re-triangulated, and a cell's circle is stored, never recomputed from
+// its ring.
+//
+// simplify() is Step 4. The axis is never edited directly: boundary
+// vertices are moved onto a neighbouring circle (4.1) or removed from the
+// loop (4.2), within a displacement budget delta_max of their original
+// position, and the cells are merged to match, so the axis and the boundary
+// map phi built on it stay consistent. That means the boundary this class
+// describes after simplify() is not the input boundary any more: the input
+// mesh's vertex positions are moved in place, and the original positions and
+// loop order are kept in `originalPosition` / `originalNext`, which is what
+// later stages draw block sides along (Step 1.6, Step 8.3).
 
 // Boundary vertex connectivity. `next`/`prev` are oriented so that the domain
 // interior lies on the LEFT of next: v -> boundaryLinks[v].next. The outer
@@ -46,13 +55,13 @@ struct DualCell {
     // Delaunay triangle, more once cells have been merged.
     std::vector<int> verts;
 
-    // Circumcenter and circumradius: the position and medial radius of the
-    // medial vertex dual to this cell.
-    //
-    // After a merge the ring is only approximately cocircular, because the
-    // survivor's circle is kept as-is and the absorbed cell's vertices are not
-    // projected onto it. `maxRadiusDeviation` records how far the ring has
-    // drifted, as a fraction of `radius`; it is 0 for an unmerged triangle.
+    // The stored circle (c_F, r_F): the position and medial radius of the
+    // medial vertex dual to this cell. Set once from the triangle and kept
+    // through every merge -- the survivor of a merge keeps its own circle,
+    // and the absorbed cell's private vertices are projected onto it (Step
+    // 4.1), so the merged ring is cocircular up to rounding.
+    // `maxRadiusDeviation` measures that, as a fraction of `radius`; it is 0
+    // for an unmerged triangle.
     Point  center{0.0, 0.0};
     double radius = 0.0;
     double maxRadiusDeviation = 0.0;
@@ -76,7 +85,7 @@ struct DualCell {
 };
 
 struct MedialVertex {
-    Point coord{0.0, 0.0};   // Voronoi vertex = circumcenter of the dual cell
+    Point coord{0.0, 0.0};   // Voronoi vertex = centre of the dual cell's circle
     double radius = 0.0;     // medial radius
 
     int cell = -1;           // index into MedialAxis::cells
@@ -110,8 +119,47 @@ struct MedialAxisStats {
     int centersOutsideDomain = 0;     // active cells whose circumcenter is outside
     int edgesCrossingBoundary = 0;    // candidate medial edges dropped by the inside filter
     int nonManifoldBoundaryVertices = 0; // boundary vertices shared by more than one loop
-    int mergedCells = 0;              // cells absorbed by deduplicateMedialVertices
-    int mergesRejectedMultiEdge = 0;  // merges skipped because the pair shared >1 edge
+};
+
+// ─── Step 4 parameters ──────────────────────────────────────────────────────
+//
+// delta_max and alpha_feat are the guide's [R] defaults (Sec. 1 table): the
+// paper names the displacement budget but not its value, and locking feature
+// corners is a reconstruction that keeps CAD corners out of the pruning.
+struct SimplifyOptions {
+    // h, the target element size. <= 0 takes MedialAxis::defaultTargetSize(),
+    // the same default the T-mesh downsampling uses.
+    double targetSize = 0.0;
+    // delta_max: no boundary vertex ever ends up farther than this from its
+    // original position. < 0 takes 0.05 * h.
+    double maxDisplacement = -1.0;
+    // alpha_feat: a boundary vertex whose turning angle exceeds this is a
+    // locked feature corner, never moved or removed (Step 1.4).
+    double featureAngle = M_PI / 6.0;
+    // Two adjacent cells are one circle when every vertex of one lies within
+    // this fraction of delta_max of the other's circle: the triangulation of
+    // cocircular samples is ambiguous, and whichever choice was made is
+    // merged back into one polygon (Step 2.3). Nothing is moved for it, so
+    // the merged ring is cocircular to a hundredth of what Step 4 may move a
+    // vertex -- enough to take in samples that a CAD circle or a nearly
+    // symmetric shape put on one circle up to rounding, which otherwise
+    // split one intersection point into two a few 1e-6 apart.
+    double cocircularTolerance = 0.01;
+    // 4.1 to a fixpoint, then 4.2, repeated while either changes anything
+    // (the optional iteration of Step 4), at most this many times.
+    int maxRounds = 8;
+};
+
+struct SimplifyStats {
+    int cocircularMerges = 0;   // Step 2.3: coincident circles merged
+    int endpointMerges = 0;     // Step 4.1: endpoint cells absorbed by their neighbour
+    int endpointsKept = 0;      // endpoints 4.1 left alone at the fixpoint
+    int flattenedChains = 0;    // Step 4.2: polar chains replaced by their chord
+    int removedVertices = 0;    // boundary vertices 4.2 deleted from the loop
+    int deletedTwoGons = 0;     // endpoint cells 4.2 reduced to a 2-gon and deleted
+    int rounds = 0;
+    double maxDisplacement = 0.0;  // largest |x - x0| over all boundary vertices
+    double budget = 0.0;           // the delta_max that was applied
 };
 
 class MedialAxis {
@@ -130,45 +178,62 @@ public:
     // ── Medial axis, rebuilt by buildAxis() ──
     std::vector<MedialVertex> medialVertices;
     std::vector<Edge> medialEdges;   // pairs of medialVertices indices
+    // The complex edge each medial edge is dual to, i.e. the two boundary
+    // samples (p_a, p_b) whose Voronoi cells the medial edge separates. A
+    // point inserted on the medial edge maps to the boundary once through
+    // each of their cells (Step 5.3, last remark).
+    std::vector<Edge> medialEdgeDual;
 
     // Medial branches: maximal chains of degree-2 vertices delimited by
     // vertices of degree != 2, plus closed cycles of degree-2 vertices (which
     // arise around holes). polyLineIsCycle marks the branches that close on
     // themselves, i.e. whose first and last entry are the same vertex; that
     // covers both a pure degree-2 cycle and a branch that leaves a junction
-    // and returns to it.
+    // and returns to it. polyLineEdges[b][i] is the medial edge between
+    // polyLines[b][i] and polyLines[b][i + 1] -- two cells can share two
+    // ring edges, so the vertex pair alone does not name it.
     std::vector<std::vector<int>> polyLines;
+    std::vector<std::vector<int>> polyLineEdges;
     std::vector<bool> polyLineIsCycle;
 
     // ── Boundary ──
     std::vector<BoundaryVertex> boundaryLinks;  // indexed by mesh vertex index
-    // Interior angle of the domain at each boundary vertex, in (0, 2*pi).
-    // Values > pi mark concave (reflex) corners. NaN for non-boundary vertices.
+    // Interior angle of the domain at each boundary vertex, in (0, 2*pi), at
+    // the current positions. Values > pi mark concave (reflex) corners. NaN
+    // for non-boundary vertices.
     std::vector<double> interiorAngle;
 
+    // The boundary as it was before simplify(): x0 per mesh vertex, and the
+    // loop successor of every boundary vertex (-1 elsewhere). A vertex 4.2
+    // removed keeps both, so originalPolyline() can still walk through it.
+    std::vector<Point> originalPosition;
+    std::vector<int> originalNext;
+    // Locked feature vertices (Step 1.4), from the original turning angles.
+    std::vector<char> locked;
+
     MedialAxisStats stats;
+    SimplifyStats simplifyStats;
 
     explicit MedialAxis(std::shared_ptr<Mesh> mesh);
 
-    // Merge medial vertices that sit closer together than
-    // `tolerance * localRadius`, leaves first, then chains, then junctions.
-    // Merging two medial vertices merges their dual cells, so the complex
-    // stays consistent and the surviving cell's ring records every boundary
-    // vertex the merged circle touches.
-    //
-    // This is a placeholder for the boundary-perturbation simplification the
-    // axis really wants: it does not move boundary vertices onto a common
-    // circle, so `maxRadiusDeviation` grows and the merged cells are only
-    // approximately cocircular. Calls buildAxis() when done.
-    void deduplicateMedialVertices(double tolerance = MEDIAL_VERTEX_MERGE_TOLERANCE);
+    // Step 4. Moves and removes boundary vertices (in `mesh`, in place) and
+    // merges cells to match, then rebuilds the boundary links, the angles and
+    // the axis. Run it once, before building the boundary map.
+    void simplify(const SimplifyOptions &opts = SimplifyOptions());
 
     // (Re)build medialVertices / medialEdges from the active complex. A
     // candidate medial edge is kept only if its Voronoi segment lies inside
     // the domain; rejected candidates are counted in stats.
     void buildAxis();
 
-    // Fill polyLines / polyLineIsCycle from the current axis.
+    // Fill polyLines / polyLineEdges / polyLineIsCycle from the current axis.
     void createPolylines();
+
+    // The original boundary polyline from boundary vertex a forward to b
+    // (both included), at the original positions. For two vertices adjacent
+    // on the current loop this is the stretch of input boundary the current
+    // edge (a, b) stands for, removed vertices and all.
+    std::vector<Point> originalPolyline(int a, int b) const;
 
     // ── Complex queries, for building simplification passes on top ──
 
@@ -202,6 +267,10 @@ public:
     // displacement thresholds.
     double boundingBoxDiagonal() const { return bboxDiagonal_; }
 
+    // The h every stage falls back to when given none: a tenth of the
+    // bounding-box diagonal.
+    double defaultTargetSize() const { return 0.1 * bboxDiagonal_; }
+
 private:
     void buildComplex();
     void rebuildBoundaryLinks();
@@ -213,10 +282,21 @@ private:
 
     // Merge `absorbed` into `survivor` across their single shared ring edge.
     // Returns false (leaving both untouched) if they do not share exactly one
-    // edge.
+    // edge or their union would pinch.
     bool mergeCells(int survivor, int absorbed);
 
+    // Whether segment ab properly crosses a current boundary edge, ignoring
+    // the edges incident to any vertex in `ignore`.
+    bool crossesBoundary(const Point &a, const Point &b,
+                         const std::unordered_set<int> &ignore) const;
+
+    // The three passes of simplify(); each returns how much it changed.
+    int mergeCocircular(double tolerance, std::vector<int> &regionCells);
+    int removeEndpoints(double budget, std::vector<int> &regionCells);
+    int flattenArcs(double budget, std::vector<int> &regionCells);
+
     std::vector<int> vertexCellCount_;
+    std::vector<int> regionOf_;   // cell -> connected component of the complex
     double bboxDiagonal_ = 1.0;
 };
 

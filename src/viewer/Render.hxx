@@ -112,8 +112,10 @@ void drawMedialAxis(const MedialAxis &ma, double vertexRadius);
 // block corners. `cornerRadius` sizes the corner disks.
 void drawMedialTMesh(const MedialAxisTMesh &tm, double cornerRadius);
 
-// The quantized block decomposition: the integer edge lengths the QGP
-// quantizer settled on, drawn as the quad grid they prescribe -- edges
+// The quantized T-mesh a QuadLayout converts to directly (see
+// QuantTMeshConvert.hxx): the block decomposition tracing leaves after
+// separatrix tracing and chord collapse, with the integer edge lengths the
+// QGP quantizer settled on drawn as the quad grid they prescribe -- edges
 // only, no fill.
 //
 // Every grid line is a transfinite (Coons) curve through the four sides of
@@ -123,11 +125,6 @@ void drawMedialTMesh(const MedialAxisTMesh &tm, double cornerRadius);
 // the quantization ticks, so the grids of two faces meet flush along the
 // edge they share exactly when the quantization is consistent -- a
 // violated constraint shows up as a visible mismatch.
-void drawQuantizedBlocks(const BlockQuant &bq);
-
-// The same, for the T-mesh a QuadLayout converts to directly (see
-// QuantTMeshConvert.hxx): the block decomposition tracing leaves after
-// separatrix tracing and chord collapse, rather than the medial axis one.
 //
 // `vertexRadius` > 0 marks every grid vertex with a disk of that radius --
 // block corners and interior cell corners alike, since after quantization

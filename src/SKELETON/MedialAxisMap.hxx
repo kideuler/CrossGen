@@ -37,6 +37,10 @@ struct MedialFan {
     // chain.back() of one fan is chain.front() of the next.
     std::vector<int> cells;
     std::vector<int> chain;
+    // crossed[i] is the far end w of the complex edge (v, w) that separates
+    // cells[i] from cells[i + 1]: the medial edge between their vertices is
+    // dual to it. One entry fewer than `chain`.
+    std::vector<int> crossed;
 
     // Where the two boundary-crossing Voronoi edges cross: the midpoints of
     // the two boundary edges at v. They delimit the sub-polyline this fan
@@ -90,6 +94,14 @@ public:
     // phi evaluated at p, which should lie on the sub-polyline of
     // `boundaryVertex`. Returns p unchanged when that vertex has no fan.
     Point mapToAxis(int boundaryVertex, const Point &p) const;
+
+    // phi^-1 restricted to the Voronoi cell of `boundaryVertex`: the point of
+    // its sub-polyline on the polar line through medial point m (Sec. 3.3).
+    // m should lie on the fan's chain -- a medial vertex of it, or a point
+    // on one of its medial edges, which is how Step 6.1 maps the samples it
+    // inserts. Sets `missed` when no leg lies on that line and the closest
+    // point stands in. Returns m when the vertex has no fan.
+    Point preimage(int boundaryVertex, const Point &m, bool &missed) const;
 
     const std::vector<MedialFan> &fans() const { return fans_; }
 

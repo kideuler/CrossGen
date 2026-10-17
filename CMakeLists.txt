@@ -523,6 +523,12 @@ add_test(NAME ZIPLINE_LayoutsOnAllMeshes
 # the square, the L-shape and a T-junction taken through to blocks and a mesh.
 add_test(NAME ZIPLINE_SelfTest COMMAND TestZIPLINE --selftest)
 
+# docs/medial_axis.md Sec. 15 on SKELETON: the square, the 4x2 rectangle, the
+# equilateral triangle, the annulus, the ellipse, the rounded rectangle, the
+# L-shape and a noisy square, each taken through Steps 2-10 to a quad mesh and
+# checked against what the guide expects of it.
+add_test(NAME SKELETON_SelfTest COMMAND TestSKELETON --selftest)
+
 # Discrete Ricci flow (Shepherd et al. Sec. 3.2.1) against prescribed cone sets
 # with far more curvature to move than anything in data/meshes asks for, which
 # is what puts the weighted-Delaunay flipping under load. Checks the cone angle

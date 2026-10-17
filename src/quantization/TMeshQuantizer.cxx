@@ -19,6 +19,14 @@ TMeshQuantizer::TMeshQuantizer(QuantTMesh &tmesh, Options opts)
         throw std::runtime_error("TMeshQuantizer: T-mesh not finalized");
     }
     eta_ = static_cast<double>(std::max<size_t>(tm_.edges.size(), 1));
+    requirementsOf_.assign(tm_.edges.size(), {});
+    for (size_t r = 0; r < opts_.requirements.size(); ++r) {
+        for (int e : opts_.requirements[r].edges) {
+            if (e >= 0 && e < static_cast<int>(tm_.edges.size())) {
+                requirementsOf_[e].push_back(static_cast<int>(r));
+            }
+        }
+    }
     for (size_t e = 0; e < tm_.edges.size(); ++e) {
         for (int k = 0; k < 2; ++k) {
             if (tm_.edges[e].row[k] == QuantTMesh::PHANTOM) {
@@ -201,7 +209,7 @@ void TMeshQuantizer::stageI(Report &report) {
                 e0 = static_cast<int>(e);
             }
         }
-        if (e0 < 0) return;
+        if (e0 < 0) break;
         if (!findGeneratingVector(e0, +1, v)) {
             forced[e0] = 1;
             ++report.forcedZeroEdges;
@@ -210,6 +218,61 @@ void TMeshQuantizer::stageI(Report &report) {
         for (size_t e = 0; e < v.size(); ++e) tm_.edges[e].x += v[e];
         ++report.stage1Vectors;
     }
+
+    // Then every requirement set, through whichever of its edges is cheapest
+    // to lengthen. Adding never shortens anything, so a set met stays met.
+    for (const Requirement &requirement : opts_.requirements) {
+        const std::vector<int> &req = requirement.edges;
+        std::vector<char> tried(req.size(), 0);
+        while (true) {
+            long long sum = 0;
+            for (int e : req) sum += tm_.edges[e].x;
+            if (sum >= requirement.atLeast) break;
+            int pick = -1;
+            double best = INF;
+            for (size_t k = 0; k < req.size(); ++k) {
+                if (tried[k] || forced[req[k]]) continue;
+                const double w = weight(req[k], +1);
+                if (w < best) {
+                    best = w;
+                    pick = static_cast<int>(k);
+                }
+            }
+            if (pick < 0) {
+                ++report.unmetRequirements;
+                break;
+            }
+            if (!findGeneratingVector(req[pick], +1, v)) {
+                tried[pick] = 1;
+                continue;
+            }
+            for (size_t e = 0; e < v.size(); ++e) tm_.edges[e].x += v[e];
+            ++report.stage1Vectors;
+        }
+    }
+}
+
+double TMeshQuantizer::objective() const {
+    if (opts_.objective == Options::Objective::Relative) return tm_.objective();
+    double sum = 0.0;
+    for (const QuantTMesh::Edge &e : tm_.edges) {
+        const double d = e.x - e.xIdeal;
+        sum += d * d;
+    }
+    return sum;
+}
+
+bool TMeshQuantizer::requirementsHold(const std::vector<int> &v) const {
+    for (size_t e = 0; e < v.size(); ++e) {
+        if (v[e] == 0) continue;
+        for (int r : requirementsOf_[e]) {
+            const Requirement &req = opts_.requirements[r];
+            long long sum = 0;
+            for (int g : req.edges) sum += tm_.edges[g].x;
+            if (sum < req.atLeast) return false;
+        }
+    }
+    return true;
 }
 
 // Stage II (Sec. 6.3): repeatedly pick the edge most eager to change, build
@@ -219,7 +282,7 @@ void TMeshQuantizer::stageI(Report &report) {
 void TMeshQuantizer::stageII(Report &report) {
     std::vector<std::pair<double, int>> candidates;
     std::vector<int> v;
-    double objective = tm_.objective();
+    double current = objective();
 
     while (opts_.maxStage2Moves < 0 || report.stage2Moves < opts_.maxStage2Moves) {
         candidates.clear();
@@ -248,10 +311,11 @@ void TMeshQuantizer::stageII(Report &report) {
                         break;
                     }
                 }
+                valid = valid && requirementsHold(v);
             }
-            const double after = tm_.objective();
-            if (valid && after < objective) {
-                objective = after;
+            const double after = objective();
+            if (valid && after < current) {
+                current = after;
                 improved = true;
                 ++report.stage2Moves;
                 break;
@@ -267,7 +331,7 @@ TMeshQuantizer::Report TMeshQuantizer::run() {
     Report report;
     stageI(report);
     stageII(report);
-    report.objective = tm_.objective();
+    report.objective = objective();
     report.consistent = tm_.consistent();
     return report;
 }

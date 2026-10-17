@@ -4,6 +4,7 @@
 #include <cmath>
 #include <deque>
 #include <limits>
+#include <queue>
 #include <stdexcept>
 
 namespace {
@@ -66,6 +67,13 @@ bool properlyIntersect(const Point &p1, const Point &p2,
     const bool straddleP = (d1 > eps && d2 < -eps) || (d1 < -eps && d2 > eps);
     const bool straddleQ = (d3 > eps && d4 < -eps) || (d3 < -eps && d4 > eps);
     return straddleP && straddleQ;
+}
+
+double distToSegment(const Point &p, const Point &a, const Point &b) {
+    const Point e = b - a;
+    const double len2 = dotP(e, e);
+    const double t = len2 > 0.0 ? std::clamp(dotP(p - a, e) / len2, 0.0, 1.0) : 0.0;
+    return normP(p - (a + e * t));
 }
 
 // ─── Uniform grid over the boundary polyline ────────────────────────────────
@@ -173,6 +181,16 @@ MedialAxis::MedialAxis(std::shared_ptr<Mesh> meshIn) : mesh(std::move(meshIn)) {
     buildComplex();
     rebuildBoundaryLinks();
     computeInteriorAngles();
+
+    // The input boundary, frozen before simplify() moves anything: x0 for the
+    // displacement budget of Step 4, and the loop order for walking the
+    // original polyline through vertices 4.2 later removes.
+    originalPosition = mesh->vertices;
+    originalNext.assign(mesh->vertices.size(), -1);
+    for (int v = 0; v < static_cast<int>(mesh->vertices.size()); ++v) {
+        originalNext[v] = boundaryLinks[v].nextBoundaryVertex;
+    }
+    locked.assign(mesh->vertices.size(), 0);
 
     // Whether each circumcenter is interior is decided once, here, while every
     // cell is still a triangle: a triangle's centroid is guaranteed to lie
@@ -311,7 +329,9 @@ void MedialAxis::computeInteriorAngles() {
 void MedialAxis::buildAxis() {
     medialVertices.clear();
     medialEdges.clear();
+    medialEdgeDual.clear();
     polyLines.clear();
+    polyLineEdges.clear();
     polyLineIsCycle.clear();
     stats.centersOutsideDomain = 0;
     stats.edgesCrossingBoundary = 0;
@@ -367,6 +387,7 @@ void MedialAxis::buildAxis() {
                 }
                 const int id = static_cast<int>(medialEdges.size());
                 medialEdges.push_back({m, cells[nb].medialVertex});
+                medialEdgeDual.push_back({key.a, key.b});
                 medialEdgeOf.emplace(key, id);
                 medialVertices[m].incidentEdges.push_back(id);
             } else if (it->second >= 0) {
@@ -450,7 +471,6 @@ bool MedialAxis::mergeCells(int survivor, int absorbed) {
         if (neighborAcross(absorbed, i) == survivor) { p = i; ++sharedCount; }
     }
     if (sharedCount != 1) {
-        ++stats.mergesRejectedMultiEdge;
         return false;
     }
 
@@ -464,7 +484,6 @@ bool MedialAxis::mergeCells(int survivor, int absorbed) {
         if (S.verts[i] == b && S.verts[(i + 1) % nS] == a) { q = i; break; }
     }
     if (q == -1) {
-        ++stats.mergesRejectedMultiEdge;
         return false;
     }
 
@@ -474,8 +493,7 @@ bool MedialAxis::mergeCells(int survivor, int absorbed) {
         std::unordered_set<int> sVerts(S.verts.begin(), S.verts.end());
         for (int v : A.verts) {
             if (v != a && v != b && sVerts.count(v)) {
-                ++stats.mergesRejectedMultiEdge;
-                return false;
+                        return false;
             }
         }
     }
@@ -515,9 +533,9 @@ bool MedialAxis::mergeCells(int survivor, int absorbed) {
     S.verts = std::move(merged);
     S.timesFused += A.timesFused + 1;
 
-    // The survivor keeps its circle, so the merged ring is only approximately
-    // cocircular. Record the drift: a real simplification pass would instead
-    // project the absorbed vertices onto this circle and keep it exact.
+    // The survivor keeps its circle. Every caller has put the absorbed
+    // cell's private vertices on it first (Step 4.1 projects them, the
+    // cocircular merge finds them there), so this only records rounding.
     double deviation = S.maxRadiusDeviation;
     if (S.radius > 0.0) {
         for (int v : S.verts) {
@@ -533,79 +551,448 @@ bool MedialAxis::mergeCells(int survivor, int absorbed) {
     return true;
 }
 
-void MedialAxis::deduplicateMedialVertices(double tolerance) {
-    stats.mergedCells = 0;
-    stats.mergesRejectedMultiEdge = 0;
+// ─── Step 4: simplification ─────────────────────────────────────────────────
+//
+// Topological noise -- endpoints and intersection points crowded together by
+// a dense or slightly irregular sampling (Fig. 10, 15) -- each puts a polar
+// region into phi, so it has to go before the map is built. The axis is
+// never edited directly: boundary vertices are moved or removed so that the
+// complex, and hence the axis and phi, stay consistent. Every move is
+// charged against x0, so no boundary vertex ever ends up farther than
+// delta_max from where the input put it.
 
-    // Leaves first, then chains, then junctions: pruning noise leaves before
-    // touching junctions keeps a spurious leaf from dragging a real branch
-    // point with it.
-    const int phases[3][2] = {{1, 1}, {2, 2}, {3, std::numeric_limits<int>::max()}};
+void MedialAxis::simplify(const SimplifyOptions &opts) {
+    simplifyStats = SimplifyStats{};
+    const double h = opts.targetSize > 0.0 ? opts.targetSize : defaultTargetSize();
+    const double budget = opts.maxDisplacement >= 0.0 ? opts.maxDisplacement : 0.05 * h;
+    simplifyStats.budget = budget;
 
-    std::vector<char> queued(cells.size(), 0);
-    std::deque<int> queue;
-
-    auto enqueue = [&](int ci) {
-        if (ci < 0 || !cells[ci].active || queued[ci]) return;
-        queued[ci] = 1;
-        queue.push_back(ci);
-    };
-
-    for (const auto &phase : phases) {
-        const int lo = phase[0];
-        const int hi = phase[1];
-
-        std::fill(queued.begin(), queued.end(), 0);
-        queue.clear();
-        for (int ci = 0; ci < static_cast<int>(cells.size()); ++ci) {
-            if (cells[ci].active) enqueue(ci);
+    // Locked features (Step 1.4), from the input geometry: a turning angle
+    // above alpha_feat either way is a CAD corner, convex or concave, and
+    // Step 4 may neither move it nor flatten it away. A pinched vertex has no
+    // single loop to slide along, so it is locked as well. The boundary is
+    // only boundary loops here -- no interfaces, hence no junctions, tips or
+    // contacts to add.
+    const int nv = static_cast<int>(mesh->vertices.size());
+    std::vector<int> originalPrev(nv, -1);
+    for (int v = 0; v < nv; ++v) {
+        if (originalNext[v] >= 0) originalPrev[originalNext[v]] = v;
+    }
+    locked.assign(nv, 0);
+    for (int v = 0; v < nv; ++v) {
+        const int p = originalPrev[v];
+        const int n = originalNext[v];
+        if (p < 0 && n < 0) continue;
+        if (p < 0 || n < 0 || boundaryLinks[v].nextBoundaryVertex < 0 ||
+            boundaryLinks[v].prevBoundaryVertex < 0) {
+            locked[v] = 1;
+            continue;
         }
+        const Point in  = originalPosition[v] - originalPosition[p];
+        const Point out = originalPosition[n] - originalPosition[v];
+        const double turn = std::atan2(cross2(in, out), dotP(in, out));
+        if (std::abs(turn) > opts.featureAngle) locked[v] = 1;
+    }
 
-        // A worklist rather than a rescan-from-zero: each merge only disturbs
-        // the survivor and its neighbours, so only those need revisiting.
+    // Regions are the connected components of the complex. "Merging would
+    // leave the region with a single face" is checked against these counts:
+    // keeping two faces keeps at least one medial edge, without which there
+    // is no axis to lay templates on.
+    regionOf_.assign(cells.size(), -1);
+    std::vector<int> regionCells;
+    for (int c0 = 0; c0 < static_cast<int>(cells.size()); ++c0) {
+        if (!cells[c0].active || regionOf_[c0] >= 0) continue;
+        const int region = static_cast<int>(regionCells.size());
+        regionCells.push_back(0);
+        std::deque<int> queue{c0};
+        regionOf_[c0] = region;
         while (!queue.empty()) {
-            const int ci = queue.front();
+            const int c = queue.front();
             queue.pop_front();
-            queued[ci] = 0;
-            if (!cells[ci].active) continue;
-
-            const int degree = cellDegree(ci);
-            if (degree < lo || degree > hi) continue;
-
-            // Closest neighbour within tolerance of the local medial radius.
-            int target = -1;
-            double bestDist = std::numeric_limits<double>::max();
-            const int n = static_cast<int>(cells[ci].verts.size());
-            for (int i = 0; i < n; ++i) {
-                const int nb = neighborAcross(ci, i);
-                if (nb < 0) continue;
-                const double dist = normP(cells[ci].center - cells[nb].center);
-                const double localRadius = std::max(cells[ci].radius, cells[nb].radius);
-                if (dist < tolerance * localRadius && dist < bestDist) {
-                    bestDist = dist;
-                    target = nb;
+            ++regionCells[region];
+            for (int i = 0; i < static_cast<int>(cells[c].verts.size()); ++i) {
+                const int nb = neighborAcross(c, i);
+                if (nb >= 0 && regionOf_[nb] < 0) {
+                    regionOf_[nb] = region;
+                    queue.push_back(nb);
                 }
             }
-            if (target < 0) continue;
-
-            if (!mergeCells(target, ci)) continue;
-            ++stats.mergedCells;
-
-            enqueue(target);
-            const int tn = static_cast<int>(cells[target].verts.size());
-            for (int i = 0; i < tn; ++i) enqueue(neighborAcross(target, i));
         }
+    }
+
+    // 4.1 to a fixpoint, then 4.2 (the paper's order), and round again while
+    // either changes anything: deleting a 2-gon turns its neighbour into a
+    // new endpoint that 4.1 has not seen. The cocircular merge leads each
+    // round, since a cell that 4.1 grew can come to share its circle with a
+    // neighbour.
+    for (int round = 0; round < opts.maxRounds; ++round) {
+        ++simplifyStats.rounds;
+        const int changed = mergeCocircular(opts.cocircularTolerance * budget, regionCells) +
+                            removeEndpoints(budget, regionCells) +
+                            flattenArcs(budget, regionCells);
+        if (changed == 0) break;
+    }
+
+    for (int c = 0; c < static_cast<int>(cells.size()); ++c) {
+        if (cells[c].active && cellDegree(c) == 1) ++simplifyStats.endpointsKept;
     }
 
     rebuildBoundaryLinks();
     computeInteriorAngles();
+    for (int v = 0; v < nv; ++v) {
+        if (boundaryLinks[v].nextBoundaryVertex < 0) continue;
+        simplifyStats.maxDisplacement = std::max(
+            simplifyStats.maxDisplacement, normP(mesh->vertices[v] - originalPosition[v]));
+    }
     buildAxis();
+}
+
+bool MedialAxis::crossesBoundary(const Point &a, const Point &b,
+                                 const std::unordered_set<int> &ignore) const {
+    const double eps = 1e-12 * bboxDiagonal_ * bboxDiagonal_;
+    for (int u = 0; u < static_cast<int>(boundaryLinks.size()); ++u) {
+        const int w = boundaryLinks[u].nextBoundaryVertex;
+        if (w < 0 || ignore.count(u) || ignore.count(w)) continue;
+        if (properlyIntersect(a, b, mesh->vertices[u], mesh->vertices[w], eps)) return true;
+    }
+    return false;
+}
+
+// Step 2.3: a cocircular set of samples has no unique Delaunay
+// triangulation, and whichever one Triangle picked splits a single medial
+// vertex into several sitting on top of each other, joined by medial edges
+// of no length. Merging the cells back costs nothing -- every vertex is
+// already on the survivor's circle to within `tolerance`, so nothing moves.
+int MedialAxis::mergeCocircular(double tolerance, std::vector<int> &regionCells) {
+    std::vector<char> queued(cells.size(), 0);
+    std::deque<int> queue;
+    auto enqueue = [&](int c) {
+        if (c < 0 || !cells[c].active || queued[c]) return;
+        queued[c] = 1;
+        queue.push_back(c);
+    };
+    for (int c = 0; c < static_cast<int>(cells.size()); ++c) enqueue(c);
+
+    int merged = 0;
+    while (!queue.empty()) {
+        const int f = queue.front();
+        queue.pop_front();
+        queued[f] = 0;
+        if (!cells[f].active) continue;
+
+        for (int i = 0; i < static_cast<int>(cells[f].verts.size()); ++i) {
+            const int g = neighborAcross(f, i);
+            if (g < 0) continue;
+            const DualCell &F = cells[f];
+            const DualCell &G = cells[g];
+            // Rounding is all the slack an exactly cocircular input needs.
+            const double tol = std::max(tolerance, 1e-12 * std::max(F.radius, G.radius));
+            if (std::abs(F.radius - G.radius) > tol) continue;
+            if (regionCells[regionOf_[f]] <= 2) continue;
+            // The samples themselves decide it, not the two centres: a
+            // degenerate cell's placeholder circle agrees with nothing, and
+            // two nearly equal circles through the same samples can have
+            // centres much farther apart than the samples are off either.
+            bool onCircle = true;
+            for (int v : F.verts) {
+                if (std::abs(normP(mesh->vertices[v] - G.center) - G.radius) > tol) {
+                    onCircle = false;
+                    break;
+                }
+            }
+            if (!onCircle || !mergeCells(g, f)) continue;
+            --regionCells[regionOf_[f]];
+            ++merged;
+            enqueue(g);
+            break;
+        }
+    }
+    simplifyStats.cocircularMerges += merged;
+    return merged;
+}
+
+// Step 4.1 (Fig. 11, 12): an endpoint F is absorbed into its one interior
+// neighbour G by projecting F's private vertices radially onto G's circle.
+// Those vertices belong to F alone -- both their boundary edges are F's -- so
+// the move changes no other part of the axis, and the merged ring is exactly
+// cocircular on G's circle, which G keeps. Absorbing an endpoint can make G
+// one, so merges cascade along a branch until the budget stops them: noisy
+// branches are pruned and the polar sections along a round boundary merge
+// into one (Fig. 15).
+int MedialAxis::removeEndpoints(double budget, std::vector<int> &regionCells) {
+    // The unique interior neighbour of an endpoint, and the ring index of
+    // the edge shared with it.
+    auto soleNeighbour = [&](int f, int &edge) {
+        const int n = static_cast<int>(cells[f].verts.size());
+        int g = -1;
+        for (int i = 0; i < n; ++i) {
+            const int nb = neighborAcross(f, i);
+            if (nb < 0) continue;
+            if (g >= 0) return -1;
+            g = nb;
+            edge = i;
+        }
+        return g;
+    };
+
+    // Where F's private vertices land on G's circle, and the largest
+    // cumulative displacement that costs. Negative when F cannot be absorbed
+    // at all: a locked feature among them, or a vertex some other cell also
+    // uses (a pinch).
+    auto plan = [&](int f, int g, int edge, std::vector<int> &Q, std::vector<Point> &xNew) {
+        Q.clear();
+        xNew.clear();
+        const DualCell &F = cells[f];
+        const DualCell &G = cells[g];
+        const int n = static_cast<int>(F.verts.size());
+        double cost = 0.0;
+        for (int t = 2; t < n; ++t) {
+            const int q = F.verts[(edge + t) % n];
+            if (locked[q] || vertexCellCount(q) != 1) return -1.0;
+            const Point d = mesh->vertices[q] - G.center;
+            const double len = normP(d);
+            if (!(len > 0.0)) return -1.0;
+            const Point x = G.center + d * (G.radius / len);
+            cost = std::max(cost, normP(x - originalPosition[q]));
+            Q.push_back(q);
+            xNew.push_back(x);
+        }
+        return cost;
+    };
+
+    using Item = std::pair<double, int>;
+    std::priority_queue<Item, std::vector<Item>, std::greater<Item>> heap;
+    std::vector<int> Q;
+    std::vector<Point> xNew;
+    auto push = [&](int f) {
+        int edge = -1;
+        const int g = soleNeighbour(f, edge);
+        if (g < 0) return;
+        const double cost = plan(f, g, edge, Q, xNew);
+        if (cost >= 0.0 && cost <= budget) heap.push({cost, f});
+    };
+    for (int f = 0; f < static_cast<int>(cells.size()); ++f) {
+        if (cells[f].active) push(f);
+    }
+
+    const double eps = 1e-12 * bboxDiagonal_ * bboxDiagonal_;
+    int merges = 0;
+    while (!heap.empty()) {
+        const int f = heap.top().second;
+        heap.pop();
+        if (!cells[f].active) continue;
+        int edge = -1;
+        const int g = soleNeighbour(f, edge);
+        if (g < 0) continue;
+        if (regionCells[regionOf_[f]] <= 2) continue;
+        // Re-planned on pop: F may have grown since it was queued, and the
+        // queue order is only a heuristic ([R]: least displacement first).
+        const double cost = plan(f, g, edge, Q, xNew);
+        if (cost < 0.0 || cost > budget) continue;
+
+        std::vector<Point> xOld;
+        for (size_t k = 0; k < Q.size(); ++k) {
+            xOld.push_back(mesh->vertices[Q[k]]);
+            mesh->vertices[Q[k]] = xNew[k];
+        }
+        const std::unordered_set<int> moved(Q.begin(), Q.end());
+
+        // The merged ring F u G, spliced the way mergeCells will splice it,
+        // must stay a simple polygon. Only an edge touching a moved vertex
+        // can have become a crossing.
+        const DualCell &F = cells[f];
+        const DualCell &G = cells[g];
+        const int nF = static_cast<int>(F.verts.size());
+        const int a = F.verts[edge];
+        const int b = F.verts[(edge + 1) % nF];
+        std::vector<int> ring;
+        for (size_t j = 0; j < G.verts.size(); ++j) {
+            if (G.verts[j] != b) continue;
+            for (size_t k = 0; k < G.verts.size(); ++k) {
+                ring.push_back(G.verts[(j + k) % G.verts.size()]);
+                if (k == 0) {
+                    for (int t = 2; t < nF; ++t) ring.push_back(F.verts[(edge + t) % nF]);
+                }
+            }
+            break;
+        }
+        bool ok = !ring.empty();
+        const int nr = static_cast<int>(ring.size());
+        double area2 = 0.0;
+        for (int i = 0; i < nr && ok; ++i) {
+            const Point &p0 = mesh->vertices[ring[i]];
+            const Point &p1 = mesh->vertices[ring[(i + 1) % nr]];
+            area2 += cross2(p0, p1);
+            if (!moved.count(ring[i]) && !moved.count(ring[(i + 1) % nr])) continue;
+            for (int j = 0; j < nr; ++j) {
+                if (j == i || j == (i + 1) % nr || (j + 1) % nr == i) continue;
+                if (properlyIntersect(p0, p1, mesh->vertices[ring[j]],
+                                      mesh->vertices[ring[(j + 1) % nr]], eps)) {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        ok = ok && area2 > 0.0;
+
+        // Nor may a moved boundary edge cut through the rest of the boundary.
+        for (size_t k = 0; k < Q.size() && ok; ++k) {
+            const int q = Q[k];
+            for (int nbr : {boundaryLinks[q].prevBoundaryVertex,
+                            boundaryLinks[q].nextBoundaryVertex}) {
+                if (nbr < 0) continue;
+                const std::unordered_set<int> ignore{q, nbr};
+                if (crossesBoundary(mesh->vertices[q], mesh->vertices[nbr], ignore)) {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+
+        // The optional check of Step 4.1: a moved vertex must not enter the
+        // circle of another cell next to G, or that cell's centre would stop
+        // being a medial vertex of the new boundary.
+        for (int i = 0; i < static_cast<int>(G.verts.size()) && ok; ++i) {
+            const int h = neighborAcross(g, i);
+            if (h < 0 || h == f) continue;
+            for (int q : Q) {
+                if (normP(mesh->vertices[q] - cells[h].center) <
+                    cells[h].radius * (1.0 - 1e-9)) {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+
+        if (!ok || !mergeCells(g, f)) {
+            for (size_t k = 0; k < Q.size(); ++k) mesh->vertices[Q[k]] = xOld[k];
+            continue;
+        }
+        --regionCells[regionOf_[f]];
+        ++merges;
+        push(g);
+    }
+    simplifyStats.endpointMerges += merges;
+    return merges;
+}
+
+// Step 4.2 (Fig. 13): a chain of two or more boundary edges in a merged cell
+// is a polar section -- phi collapses the whole chain onto the cell's
+// medial vertex. Where the input boundary under the chain is straight to
+// within delta_max, the chain is a circular arc only because the sampling
+// put it on one: its interior vertices are deleted and the chord takes its
+// place, so the contact becomes a single boundary edge and the polar region
+// disappears.
+int MedialAxis::flattenArcs(double budget, std::vector<int> &regionCells) {
+    int changes = 0;
+    for (int f = 0; f < static_cast<int>(cells.size()); ++f) {
+        bool again = true;
+        while (again && cells[f].active && !cells[f].dualIsTriangle()) {
+            again = false;
+            const std::vector<int> ring = cells[f].verts;
+            const int n = static_cast<int>(ring.size());
+            std::vector<char> constrained(n, 0);
+            int start = -1;
+            for (int i = 0; i < n; ++i) {
+                constrained[i] = isConstrained(f, i) ? 1 : 0;
+                if (!constrained[i]) start = i;
+            }
+            if (start < 0) break;   // a cell with no interior edge: nothing to keep
+
+            // Maximal runs of constrained ring edges, scanned from just after
+            // an interior one so that no run straddles the start.
+            for (int k = 1; k <= n && !again; ++k) {
+                const int s = (start + k) % n;
+                if (!constrained[s] || constrained[(s + n - 1) % n]) continue;
+                int len = 0;
+                while (len < n && constrained[(s + len) % n]) ++len;
+                if (len < 2) continue;
+
+                const int first = ring[s];
+                const int last = ring[(s + len) % n];
+                std::vector<int> interior;
+                bool admissible = true;
+                for (int t = 1; t < len; ++t) {
+                    const int v = ring[(s + t) % n];
+                    if (locked[v] || vertexCellCount(v) != 1) admissible = false;
+                    interior.push_back(v);
+                }
+                if (!admissible) continue;
+
+                // The deviation the chord would cost, against the input
+                // boundary it replaces ([R]: original positions and the
+                // original polyline between the chain ends) and against the
+                // chain as it now stands.
+                const Point &pa = mesh->vertices[first];
+                const Point &pb = mesh->vertices[last];
+                double d = 0.0;
+                for (const Point &p : originalPolyline(first, last)) {
+                    d = std::max(d, distToSegment(p, pa, pb));
+                }
+                for (int v : interior) {
+                    d = std::max(d, distToSegment(mesh->vertices[v], pa, pb));
+                }
+                if (d > budget) continue;
+
+                // The whole boundary of an endpoint: the cell degenerates to
+                // the 2-gon (first, last) and is deleted, its interior edge
+                // becoming a boundary edge of the neighbour ([R]).
+                const bool twoGon = (len == n - 1);
+                if (twoGon && regionCells[regionOf_[f]] <= 2) continue;
+                const MeshEdgeKey chord(first, last);
+                if (!twoGon && edgeCells.count(chord)) continue;
+
+                std::unordered_set<int> ignore(interior.begin(), interior.end());
+                ignore.insert(first);
+                ignore.insert(last);
+                if (crossesBoundary(pa, pb, ignore)) continue;
+
+                // Commit.
+                for (int t = 0; t < len; ++t) {
+                    edgeCells.erase(MeshEdgeKey(ring[(s + t) % n], ring[(s + t + 1) % n]));
+                }
+                for (int v : interior) {
+                    vertexCellCount_[v] = 0;
+                    boundaryLinks[v].nextBoundaryVertex = -1;
+                    boundaryLinks[v].prevBoundaryVertex = -1;
+                }
+                boundaryLinks[first].nextBoundaryVertex = last;
+                boundaryLinks[last].prevBoundaryVertex = first;
+
+                if (twoGon) {
+                    for (int &slot : edgeCells[chord]) {
+                        if (slot == f) slot = -1;
+                    }
+                    --vertexCellCount_[first];
+                    --vertexCellCount_[last];
+                    cells[f].active = false;
+                    cells[f].medialVertex = -1;
+                    cells[f].verts.clear();
+                    --regionCells[regionOf_[f]];
+                    ++simplifyStats.deletedTwoGons;
+                } else {
+                    edgeCells[chord] = {f, -1};
+                    std::vector<int> kept;
+                    for (int v : ring) {
+                        if (!ignore.count(v) || v == first || v == last) kept.push_back(v);
+                    }
+                    cells[f].verts = std::move(kept);
+                }
+                ++simplifyStats.flattenedChains;
+                simplifyStats.removedVertices += static_cast<int>(interior.size());
+                ++changes;
+                again = true;
+            }
+        }
+    }
+    return changes;
 }
 
 // ─── Branches ───────────────────────────────────────────────────────────────
 
 void MedialAxis::createPolylines() {
     polyLines.clear();
+    polyLineEdges.clear();
     polyLineIsCycle.clear();
 
     const int numEdges = static_cast<int>(medialEdges.size());
@@ -620,10 +1007,12 @@ void MedialAxis::createPolylines() {
     // being traced once from each end.
     auto walk = [&](int start, int edge) {
         std::vector<int> path{start};
+        std::vector<int> pathEdges;
         int cur = start;
         int ce = edge;
         while (true) {
             used[ce] = 1;
+            pathEdges.push_back(ce);
             const int next = otherEnd(ce, cur);
             path.push_back(next);
             if (medialVertices[next].degree != 2) break;
@@ -636,7 +1025,13 @@ void MedialAxis::createPolylines() {
             cur = next;
             ce = following;
         }
-        return path;
+        polyLines.push_back(std::move(path));
+        polyLineEdges.push_back(std::move(pathEdges));
+        // A branch can leave a junction and come straight back to it, so
+        // closure has to be tested for every branch, not only in the cycle
+        // pass.
+        polyLineIsCycle.push_back(polyLines.back().size() > 1 &&
+                                  polyLines.back().front() == polyLines.back().back());
     };
 
     for (int i = 0; i < static_cast<int>(medialVertices.size()); ++i) {
@@ -646,16 +1041,12 @@ void MedialAxis::createPolylines() {
             // An isolated medial vertex still belongs in the output, otherwise
             // it silently disappears from anything iterating branches.
             polyLines.push_back({i});
+            polyLineEdges.push_back({});
             polyLineIsCycle.push_back(false);
             continue;
         }
         for (int e : mv.incidentEdges) {
-            if (used[e]) continue;
-            polyLines.push_back(walk(i, e));
-            // A branch can leave a junction and come straight back to it, so
-            // closure has to be tested here too, not only in the cycle pass.
-            polyLineIsCycle.push_back(polyLines.back().size() > 1 &&
-                                      polyLines.back().front() == polyLines.back().back());
+            if (!used[e]) walk(i, e);
         }
     }
 
@@ -663,10 +1054,22 @@ void MedialAxis::createPolylines() {
     // medial structure -- every hole in the domain produces one -- and seeding
     // only from vertices of degree != 2 would never reach them.
     for (int e = 0; e < numEdges; ++e) {
-        if (used[e]) continue;
-        std::vector<int> path = walk(medialEdges[e][0], e);
-        polyLines.push_back(std::move(path));
-        polyLineIsCycle.push_back(polyLines.back().size() > 1 &&
-                                  polyLines.back().front() == polyLines.back().back());
+        if (!used[e]) walk(medialEdges[e][0], e);
     }
+}
+
+std::vector<Point> MedialAxis::originalPolyline(int a, int b) const {
+    std::vector<Point> pts{originalPosition[a]};
+    int v = a;
+    int guard = static_cast<int>(originalNext.size()) + 1;
+    while (guard-- > 0) {
+        v = originalNext[v];
+        if (v < 0) break;
+        pts.push_back(originalPosition[v]);
+        if (v == b) return pts;
+    }
+    // b is not downstream of a on any original loop: the two are not the
+    // ends of one current boundary edge. The straight segment is all there
+    // is to say about them.
+    return {originalPosition[a], originalPosition[b]};
 }

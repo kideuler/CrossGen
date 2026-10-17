@@ -635,7 +635,7 @@ void drawMedialTMesh(const MedialAxisTMesh &tm, double cornerRadius) {
         medialClassColor(zone.color, 1.0f);
         glBegin(GL_LINE_STRIP);
         for (int m : zone.chain) {
-            const Point &p = ma.medialVertices[m].coord;
+            const Point p = tm.nodeCoord(m);
             glVertex2d(p[0], p[1]);
         }
         glEnd();
@@ -766,10 +766,10 @@ int gridSamples(int cells, const SideCurve &a, const SideCurve &b) {
 
 namespace {
 
-// Shared by drawQuantizedBlocks() and drawQuantizedLayout(): both quant
-// structs (BlockQuant, QuadLayoutQuant) carry a QuantTMesh plus per-edge
-// geometry and per-side reversal flags, and sideCurve() is overloaded on
-// both, so the grid-drawing walk below only needs the type as a parameter.
+// The grid-drawing walk behind drawQuantizedLayout(). Both quant structs
+// (BlockQuant, QuadLayoutQuant) carry a QuantTMesh plus per-edge geometry and
+// per-side reversal flags, and sideCurve() is overloaded on both, so it
+// takes the type as a parameter.
 //
 // `vertexRadius` > 0 additionally marks every grid vertex -- every point
 // where two grid lines cross, block corners and interior cell corners
@@ -937,8 +937,6 @@ void drawQuantizedTMesh(const Quant &bq, double vertexRadius = 0.0) {
 }
 
 }  // namespace
-
-void drawQuantizedBlocks(const BlockQuant &bq) { drawQuantizedTMesh(bq); }
 
 void drawQuantizedLayout(const QuadLayoutQuant &lq, double vertexRadius) {
     drawQuantizedTMesh(lq, vertexRadius);

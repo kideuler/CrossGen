@@ -3,6 +3,7 @@
 
 #include "SKELETON/MedialAxisTMesh.hxx"
 #include "quantization/QuantTMesh.hxx"
+#include "quantization/TMeshQuantizer.hxx"
 #include "ZIPLINE/QuadLayout.hxx"
 
 #include <array>
@@ -82,6 +83,15 @@ struct BlockQuant {
     // produce a sliver that is exactly the overlap of its two neighbours.
     // The late claimant is dropped so the rest of the model still stands.
     int skippedOverlapping = 0;
+
+    // Edge sets whose lengths the quantization must keep up to a bound to be
+    // valid (TMeshQuantizer::Options::requirements). Empty unless the T-mesh
+    // came from a MedialAxisTMesh, which fills Prop. 1's surrogates.
+    std::vector<TMeshQuantizer::Requirement> requirements;
+    int radiusRequirements = 0;   // of which: radius chains
+    int featureRequirements = 0;  //           boundary arcs between valence-2 nodes
+    int loopRequirements = 0;     //           boundary loops with no such node
+
     bool ok = false;
     std::string error;
 };
@@ -94,13 +104,47 @@ struct BlockQuant {
 BlockQuant makeQuantTMesh(const std::vector<TMeshBlock> &blocks,
                           double weldTol, double h = 0.0);
 
-// A default tolerance of 1e-4 of the target block size: on the models in
-// data/meshes the shortest genuine block side is a few 1e-3 of that size
-// while the near-coincident corners a template occasionally emits are a few
-// 1e-6 of it, so this sits with room on both sides.
-inline BlockQuant makeQuantTMesh(const MedialAxisTMesh &tm, double h = 0.0) {
-    return makeQuantTMesh(tm.blocks, 1e-4 * tm.targetSize(), h);
-}
+// The T-mesh of docs/medial_axis.md Step 8, ready for Step 9: the blocks
+// welded with a tolerance of 1e-4 of the target size (on the models in
+// data/meshes the shortest genuine block side is a few 1e-3 of it, the
+// near-coincident corners a template occasionally emits a few 1e-6), with
+// xIdeal = l(e) / h -- Step 9's target t(e) -- and `requirements` filled with
+// the linear surrogates of Prop. 1: every radius chain and every boundary arc
+// between two boundary nodes of valence 2 must keep a length of at least 1,
+// and every boundary loop of at least 3. Quantize it with minLength = 0 and
+// those requirements. h <= 0 takes the T-mesh's own target size.
+BlockQuant makeQuantTMesh(const MedialAxisTMesh &tm, double h = 0.0);
+
+// ─── Step 10: the quad mesh a quantized T-mesh prescribes ───────────────────
+//
+// docs/medial_axis.md Step 10 (Sec. 5.1 of the paper). An edge of length 0
+// welds its two ends; any other edge is cut into x pieces at equal arc length
+// along its geometry. A face with both side sums positive becomes an a x b
+// grid whose interior is placed by Coons interpolation of its four sides; a
+// face with a zero side sum collapses, its two long sides identified vertex
+// by vertex. Welded vertices sit at the mean of the boundary vertices among
+// them, if any, so the boundary does not move, and at the mean of all of
+// them otherwise. Quads two of whose corners were welded together are
+// dropped.
+struct QuadExtraction {
+    std::vector<Point> vertices;
+    std::vector<std::array<int, 4>> quads;   // CCW
+    std::vector<char> onBoundary;            // per vertex
+
+    int collapsedFaces = 0;     // faces with a zero side sum
+    int droppedQuads = 0;       // quads with two corners welded together
+    int nonManifoldEdges = 0;   // mesh edges with more than two quads
+    // Vertices where two fans of quads touch -- more than two boundary edges
+    // meet there.
+    int nonManifoldVertices = 0;
+    int boundaryLoops = 0;
+    int eulerCharacteristic = 0;  // V - E + F over the vertices quads use
+    bool ok = false;
+    std::string error;
+};
+
+// Requires a quantized, consistent tmesh.
+QuadExtraction extractQuadMesh(const BlockQuant &bq);
 
 // One side of a face as a curve carrying its quantization.
 //

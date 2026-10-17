@@ -116,6 +116,7 @@ void MedialAxisMap::buildFan(int v) {
         }
         if (idx < 0) break;   // inconsistent complex; keep what we have
         cur = ma.neighborAcross(fan.cells.back(), idx);
+        if (cur >= 0) fan.crossed.push_back(ring[(idx + 1) % ring.size()]);
     }
     if (fan.chain.empty() || fan.chain.front() < 0) {
         ++stats_.skippedVertices;
@@ -174,6 +175,15 @@ Point MedialAxisMap::mapToAxis(int boundaryVertex, const Point &p) const {
     if (!fan) return p;
     bool missed = false;
     return mapOnFan(*fan, p, missed);
+}
+
+Point MedialAxisMap::preimage(int boundaryVertex, const Point &m, bool &missed) const {
+    missed = false;
+    const MedialFan *fan = fanOf(boundaryVertex);
+    if (!fan) return m;
+    const Point &pv = axis->mesh->vertices[boundaryVertex];
+    if (fan->collapsed) return pv;
+    return footpointOnBoundary(*fan, m, pv, missed);
 }
 
 Point MedialAxisMap::mapOnFan(const MedialFan &fan, const Point &p,

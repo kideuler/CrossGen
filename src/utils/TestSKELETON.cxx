@@ -1,11 +1,25 @@
-// Structural checks on the discrete medial axis built from an .obj mesh:
-// dual-complex integrity, boundary orientation, the inside filter, cell
-// merging, and branch extraction.
-// Usage: TestSKELETON <mesh.obj>
+// Checks on SKELETON, the medial-axis block decomposition of
+// docs/medial_axis.md (Cheny et al., "Planar quad meshing with guarantees").
+//
+// TestSKELETON <mesh.obj> [--h size] runs the chain the viewer runs and
+// checks, in order: the dual complex of Step 3 (integrity, boundary
+// orientation, the inside filter); Step 4's simplify() (displacement budget,
+// locked corners left alone, cocircular rings); the branches of Step 5.1; and
+// the invariants of Sec. 15 on Steps 5-9 -- one contact per medial edge at
+// every vertex, every face four-cornered with positive area, the faces tiling
+// the domain, a consistent quantization, and the valence identity
+// sum_int (4 - deg) + sum_bdry (3 - deg) = 4 chi on the quad mesh it
+// prescribes.
+//
+// TestSKELETON --selftest builds the unit-test domains of Sec. 15 (square,
+// 4x2 rectangle, equilateral triangle, annulus, ellipse, rounded rectangle,
+// L-shape, noisy square), sampled at s = h / 8 (Step 2's default), and checks
+// what the guide expects of each.
 
 #include <iostream>
 #include <iomanip>
 #include <memory>
+#include <random>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -16,6 +30,10 @@
 #include "mesh/Mesh.hxx"
 #include "triangle/TriangleMesher.hpp"
 #include "SKELETON/MedialAxis.hxx"
+#include "SKELETON/MedialAxisMap.hxx"
+#include "SKELETON/MedialAxisTMesh.hxx"
+#include "quantization/QuantTMeshConvert.hxx"
+#include "quantization/TMeshQuantizer.hxx"
 
 // ANSI colour helpers
 #define GREEN "\033[32m"
@@ -201,16 +219,517 @@ void checkAxisConsistency(const MedialAxis& ma, const std::string& when) {
           std::to_string(badBackref) + " bad");
 }
 
+
+// Step 4: what simplify() promises, whatever it chose to do.
+void checkSimplification(const MedialAxis& ma, int cellsBefore) {
+    const SimplifyStats& ss = ma.simplifyStats;
+    std::cout << "  Cocircular merges " << ss.cocircularMerges << ", endpoints pruned "
+              << ss.endpointMerges << " (" << ss.endpointsKept << " kept), arcs flattened "
+              << ss.flattenedChains << " (" << ss.removedVertices << " vertices, "
+              << ss.deletedTwoGons << " 2-gons), rounds " << ss.rounds << "\n";
+    std::cout << "  Largest move " << ss.maxDisplacement << " of delta_max " << ss.budget << "\n";
+
+    int active = 0;
+    double drift = 0.0;
+    for (const auto& cell : ma.cells) {
+        if (!cell.active) continue;
+        ++active;
+        for (int v : cell.verts) {
+            drift = std::max(drift, std::abs(normP(ma.mesh->vertices[v] - cell.center) - cell.radius));
+        }
+    }
+    check(cellsBefore - active ==
+              ss.cocircularMerges + ss.endpointMerges + ss.deletedTwoGons,
+          "deactivated cells == merges + deleted 2-gons",
+          std::to_string(cellsBefore - active));
+
+    // Every boundary vertex within delta_max of where the input put it, and
+    // every locked feature exactly there, still on the loop.
+    const double slack = 1e-12 * ma.boundingBoxDiagonal();
+    int overBudget = 0, lockedMoved = 0;
+    for (int v = 0; v < static_cast<int>(ma.boundaryLinks.size()); ++v) {
+        const bool onLoop = ma.boundaryLinks[v].nextBoundaryVertex >= 0;
+        const double moved = normP(ma.mesh->vertices[v] - ma.originalPosition[v]);
+        if (onLoop && moved > ss.budget + slack) ++overBudget;
+        if (ma.locked[v] && (!onLoop || moved > slack)) ++lockedMoved;
+    }
+    check(overBudget == 0, "every boundary vertex within delta_max of x0",
+          std::to_string(overBudget) + " over");
+    check(lockedMoved == 0, "locked feature vertices neither moved nor removed",
+          std::to_string(lockedMoved) + " disturbed");
+    // Merged rings sit on the survivor's stored circle (Step 3.2): exactly,
+    // up to rounding, where 4.1 projected them, and to the cocircular
+    // tolerance (a hundredth of delta_max) where Step 2.3's merge found them
+    // there.
+    check(drift <= 0.01 * ss.budget + slack, "merged cells are cocircular on their stored circle",
+          "worst drift " + std::to_string(drift) + " of delta_max " + std::to_string(ss.budget));
+}
+
+// Valences of the Step 10 quad mesh: edges per vertex, i.e. quads around an
+// interior vertex and one more than that on the boundary.
+struct Valences {
+    std::map<int, int> interior, boundary;
+    int interiorIrregular = 0, boundaryIrregular = 0;
+    long long identity = 0;   // sum_int (4 - deg) + sum_bdry (3 - deg)
+    std::vector<std::pair<Point, int>> irregularInterior;
+};
+
+Valences meshValences(const QuadExtraction& qe) {
+    std::vector<int> quads(qe.vertices.size(), 0);
+    for (const auto& q : qe.quads) {
+        for (int v : q) ++quads[v];
+    }
+    Valences out;
+    for (size_t v = 0; v < qe.vertices.size(); ++v) {
+        if (qe.onBoundary[v]) {
+            const int deg = quads[v] + 1;
+            ++out.boundary[deg];
+            out.identity += 3 - deg;
+            if (deg != 3) ++out.boundaryIrregular;
+        } else {
+            const int deg = quads[v];
+            ++out.interior[deg];
+            out.identity += 4 - deg;
+            if (deg != 4) {
+                ++out.interiorIrregular;
+                out.irregularInterior.push_back({qe.vertices[v], deg});
+            }
+        }
+    }
+    return out;
+}
+
+// Quads with a corner whose Jacobian is not positive.
+int invertedQuads(const QuadExtraction& qe) {
+    int inverted = 0;
+    for (const auto& q : qe.quads) {
+        for (int k = 0; k < 4; ++k) {
+            const Point& c = qe.vertices[q[k]];
+            if (cross2(qe.vertices[q[(k + 1) % 4]] - c, qe.vertices[q[(k + 3) % 4]] - c) <= 0.0) {
+                ++inverted;
+                break;
+            }
+        }
+    }
+    return inverted;
+}
+
+std::string histogram(const std::map<int, int>& h) {
+    std::string s;
+    for (const auto& kv : h) {
+        s += (s.empty() ? "" : " ") + std::to_string(kv.second) + "x" + std::to_string(kv.first);
+    }
+    return s.empty() ? "none" : s;
+}
+
+double signedArea(const std::vector<Point>& pts) {
+    double a = 0.0;
+    for (size_t i = 0; i < pts.size(); ++i) a += cross2(pts[i], pts[(i + 1) % pts.size()]);
+    return 0.5 * a;
+}
+
+// Steps 5-9 end to end, as the viewer runs them.
+struct Pipeline {
+    std::shared_ptr<MedialAxis> ma;
+    std::unique_ptr<MedialAxisMap> map;
+    std::unique_ptr<MedialAxisTMesh> tm;
+    BlockQuant bq;
+    TMeshQuantizer::Report quant;
+    QuadExtraction mesh;
+    Valences valences;
+};
+
+void runSteps5to10(Pipeline& p, double h) {
+    p.map = std::make_unique<MedialAxisMap>(p.ma);
+    MedialAxisTMesh::Options to;
+    to.targetSize = h;
+    p.tm = std::make_unique<MedialAxisTMesh>(*p.map, to);
+    p.bq = makeQuantTMesh(*p.tm, p.tm->targetSize());
+    if (!p.bq.ok) return;
+    // Step 9: x >= 0, valid through Prop. 1's requirements.
+    TMeshQuantizer::Options qo;
+    qo.minLength = 0;
+    qo.requirements = p.bq.requirements;
+    qo.objective = TMeshQuantizer::Options::Objective::Absolute;
+    p.quant = TMeshQuantizer(p.bq.tmesh, qo).run();
+    p.mesh = extractQuadMesh(p.bq);
+    p.valences = meshValences(p.mesh);
+}
+
+// The invariants of Sec. 15 on Steps 5-9.
+void checkSteps5to9(const Pipeline& p, const std::string& when) {
+    const MedialAxis& ma = *p.ma;
+    const MedialAxisTMesh& tm = *p.tm;
+    const TMeshStats& st = tm.stats();
+    std::cout << "  h " << tm.targetSize() << ": " << st.keptVertices << " vertices kept, "
+              << st.insertedVertices << " inserted, " << st.zones << " zones (" << st.capZones
+              << " caps), " << st.coarseEdges << " coarse edges: " << st.colorCounts[0]
+              << " green, " << st.colorCounts[1] << " red, " << st.colorCounts[2] << " blue, "
+              << st.colorCounts[3] << " purple; " << tm.blocks.size() << " faces, "
+              << st.midpointCuts << " midpoint cuts, " << st.dissolvedVertices
+              << " valence-2 dissolved, " << st.refinements << " refinements\n";
+
+    // Step 5.2: a vertex has one contact per incident medial edge, so the
+    // walk passes it once per edge.
+    int badContacts = 0;
+    for (int m = 0; m < tm.nodeCount(); ++m) {
+        if (!tm.isKept(m)) continue;
+        if (m < static_cast<int>(ma.medialVertices.size()) && ma.medialVertices[m].degree == 0) continue;
+        if (tm.contactCount(m) != tm.nodeDegree(m)) ++badContacts;
+    }
+    check(badContacts == 0, when + ": #contacts == valence at every coarse vertex",
+          std::to_string(badContacts) + " off");
+    check(st.skippedLoops == 0 && st.unpairedEdges == 0,
+          when + ": every loop walked, every coarse edge has two sides",
+          std::to_string(st.skippedLoops) + " loops, " + std::to_string(st.unpairedEdges) + " edges");
+
+    // Step 8: four corners, positive area -- and Step 8.6 found nothing it
+    // could not repair.
+    int notQuad = 0, folded = 0, leftovers = 0;
+    double blockArea = 0.0;
+    for (const auto& b : tm.blocks) {
+        if (b.edge < 0) ++leftovers;
+        else if (b.corners.size() != 4) ++notQuad;
+        const double a = signedArea(b.outline);
+        if (a <= 0.0) ++folded;
+        blockArea += a;
+    }
+    // A cell no template claimed -- the caps of a disc, whose axis is a
+    // point; a zone around a tip the sampling was too coarse for -- keeps the
+    // corners it has, and the welder gives a three-cornered one a fourth.
+    if (leftovers > 0) {
+        std::cout << "  " << leftovers << " cells no template claimed\n";
+    }
+    check(notQuad == 0, when + ": every template face has four corners",
+          std::to_string(notQuad) + " not");
+    check(folded == 0, when + ": every face is CCW with positive area", std::to_string(folded) + " folded");
+    check(st.badFaces == 0, when + ": Step 8.6 geometry check passes",
+          std::to_string(st.badFaces) + " bad faces left");
+
+    // The faces tile the domain: their areas add up to the area the input
+    // boundary encloses.
+    double domainArea = 0.0;
+    {
+        std::vector<char> seen(ma.originalNext.size(), 0);
+        for (int v0 = 0; v0 < static_cast<int>(ma.originalNext.size()); ++v0) {
+            if (seen[v0] || ma.originalNext[v0] < 0) continue;
+            std::vector<Point> loop;
+            for (int v = v0; v >= 0 && !seen[v]; v = ma.originalNext[v]) {
+                seen[v] = 1;
+                loop.push_back(ma.originalPosition[v]);
+            }
+            domainArea += signedArea(loop);
+        }
+    }
+    check(std::abs(blockArea - domainArea) <= 1e-9 * std::abs(domainArea),
+          when + ": faces tile the domain (areas add up)",
+          std::to_string(blockArea) + " vs " + std::to_string(domainArea));
+
+    // Step 9.
+    check(p.bq.ok && p.bq.skippedBlocks == 0, when + ": every face welded into the T-mesh",
+          p.bq.error + " " + std::to_string(p.bq.skippedBlocks) + " dropped");
+    if (!p.bq.ok) return;
+    check(p.quant.consistent, when + ": quantization consistent (Ax = 0)");
+    check(p.quant.unmetRequirements == 0,
+          when + ": Prop. 1 requirements met (radius chains, features, loops >= 1)",
+          std::to_string(p.quant.unmetRequirements) + " of " +
+              std::to_string(p.bq.requirements.size()) + " unmet");
+    int zero = 0, total = 0;
+    for (const auto& e : p.bq.tmesh.edges) {
+        zero += e.x == 0;
+        total += e.x;
+    }
+    std::cout << "  Quantized: " << p.bq.requirements.size() << " requirements ("
+              << p.bq.radiusRequirements << " radius chains, " << p.bq.featureRequirements
+              << " features, " << p.bq.loopRequirements << " loops), "
+              << p.quant.stage1Vectors << " stage-I strips, " << p.quant.stage2Moves
+              << " stage-II moves, objective " << p.quant.objective << ", " << zero << " of "
+              << p.bq.tmesh.edges.size() << " T-mesh edges collapsed\n";
+
+    // Step 10: a manifold quad mesh with the domain's loops and Euler
+    // characteristic, and the valence identity that goes with it.
+    int loops = 0;
+    {
+        std::vector<char> seen(ma.boundaryLinks.size(), 0);
+        for (int v0 = 0; v0 < static_cast<int>(ma.boundaryLinks.size()); ++v0) {
+            if (seen[v0] || ma.boundaryLinks[v0].nextBoundaryVertex < 0) continue;
+            ++loops;
+            for (int u = v0; u >= 0 && !seen[u]; u = ma.boundaryLinks[u].nextBoundaryVertex) seen[u] = 1;
+        }
+    }
+    const int chi = 2 - loops;
+    const QuadExtraction& qe = p.mesh;
+    std::cout << "  Quad mesh: " << qe.vertices.size() << " vertices, " << qe.quads.size()
+              << " quads, " << qe.collapsedFaces << " faces collapsed, " << qe.droppedQuads
+              << " degenerate quads dropped, " << invertedQuads(qe) << " inverted\n";
+    check(qe.ok, when + ": quad mesh is manifold", qe.error);
+    check(qe.boundaryLoops == loops, when + ": quad mesh keeps the boundary loops",
+          std::to_string(qe.boundaryLoops) + " vs " + std::to_string(loops));
+    check(qe.eulerCharacteristic == chi, when + ": Euler characteristic of the domain",
+          std::to_string(qe.eulerCharacteristic) + " vs " + std::to_string(chi));
+    const Valences& v = p.valences;
+    std::cout << "  Valences: interior " << histogram(v.interior) << "; boundary "
+              << histogram(v.boundary) << "\n";
+    check(v.identity == 4 * chi, when + ": valence identity sum(4 - deg) + sum(3 - deg) = 4 chi",
+          std::to_string(v.identity) + " vs " + std::to_string(4 * chi));
+}
+
+// ─── Self-test domains (Sec. 15) ────────────────────────────────────────────
+
+// A closed polygon sampled at spacing <= s, every corner kept.
+std::vector<Point> samplePolygon(const std::vector<Point>& corners, double s) {
+    std::vector<Point> out;
+    for (size_t i = 0; i < corners.size(); ++i) {
+        const Point& a = corners[i];
+        const Point& b = corners[(i + 1) % corners.size()];
+        const int n = std::max(1, static_cast<int>(std::ceil(normP(b - a) / s - 1e-9)));
+        for (int k = 0; k < n; ++k) out.push_back(a + (b - a) * (static_cast<double>(k) / n));
+    }
+    return out;
+}
+
+// An ellipse sampled at spacing about s.
+std::vector<Point> sampleEllipse(const Point& c, double a, double b, double s) {
+    const double perimeter = M_PI * (3.0 * (a + b) - std::sqrt((3.0 * a + b) * (a + 3.0 * b)));
+    const int n = std::max(8, static_cast<int>(std::ceil(perimeter / s)));
+    std::vector<Point> out;
+    for (int k = 0; k < n; ++k) {
+        const double t = 2.0 * M_PI * k / n;
+        out.push_back({c[0] + a * std::cos(t), c[1] + b * std::sin(t)});
+    }
+    return out;
+}
+
+// A rectangle with rounded corners of radius rho.
+std::vector<Point> sampleRoundedRect(double w, double hgt, double rho, double s) {
+    std::vector<Point> out;
+    const Point centres[4] = {{w - rho, rho}, {w - rho, hgt - rho}, {rho, hgt - rho}, {rho, rho}};
+    const int arcN = std::max(4, static_cast<int>(std::ceil(0.5 * M_PI * rho / s)));
+    for (int c = 0; c < 4; ++c) {
+        const double t0 = -0.5 * M_PI + 0.5 * M_PI * c;
+        for (int k = 0; k < arcN; ++k) {
+            const double t = t0 + 0.5 * M_PI * k / arcN;
+            out.push_back({centres[c][0] + rho * std::cos(t), centres[c][1] + rho * std::sin(t)});
+        }
+        const Point a{centres[c][0] + rho * std::cos(t0 + 0.5 * M_PI),
+                      centres[c][1] + rho * std::sin(t0 + 0.5 * M_PI)};
+        const Point& nc = centres[(c + 1) % 4];
+        const double t1 = t0 + 0.5 * M_PI;
+        const Point b{nc[0] + rho * std::cos(t1), nc[1] + rho * std::sin(t1)};
+        const int n = std::max(1, static_cast<int>(std::ceil(normP(b - a) / s)));
+        for (int k = 0; k < n; ++k) out.push_back(a + (b - a) * (static_cast<double>(k) / n));
+    }
+    return out;
+}
+
+// The constrained Delaunay triangulation of sampled loops, the first one the
+// outer boundary and the rest holes, with no interior points (Step 3.1).
+std::shared_ptr<Mesh> triangulateLoops(const std::vector<std::vector<Point>>& loops) {
+    std::vector<std::array<double, 2>> vertlist;
+    std::vector<std::vector<std::array<int, 2>>> segmentLoops;
+    std::vector<int> types;
+    for (size_t li = 0; li < loops.size(); ++li) {
+        const int base = static_cast<int>(vertlist.size());
+        const int n = static_cast<int>(loops[li].size());
+        std::vector<std::array<int, 2>> segs;
+        for (int i = 0; i < n; ++i) {
+            vertlist.push_back(loops[li][i]);
+            segs.push_back({base + i, base + (i + 1) % n});
+        }
+        segmentLoops.push_back(std::move(segs));
+        types.push_back(li == 0 ? 0 : 1);
+    }
+    triangle_wrapper::TriangleMesher2D::Options opts;
+    opts.just_delaunay = true;
+    triangle_wrapper::TriangleMesher2D mesher(opts);
+    triangle_wrapper::TriangleMesher2D::MeshInput input;
+    input.vertlist = vertlist;
+    input.segment_loops = segmentLoops;
+    input.type = types;
+    input.h = 0.0;
+    auto output = mesher.triangulate(input);
+    return std::make_shared<Mesh>(output.verts, output.triangles);
+}
+
+struct Shape {
+    int endpoints = 0;
+    int junctions = 0;      // vertices of degree >= 3
+    int maxJunctionDegree = 0;
+};
+
+Shape axisShape(const MedialAxis& ma) {
+    Shape s;
+    for (const auto& mv : ma.medialVertices) {
+        if (mv.degree == 1) ++s.endpoints;
+        if (mv.degree >= 3) {
+            ++s.junctions;
+            s.maxJunctionDegree = std::max(s.maxJunctionDegree, mv.degree);
+        }
+    }
+    return s;
+}
+
+Pipeline runDomain(const std::string& name, const std::vector<std::vector<Point>>& loops,
+                   double h) {
+    std::cout << "\n── " << name << " (h = " << h << ", s = h/8) ──\n";
+    Pipeline p;
+    p.ma = std::make_shared<MedialAxis>(triangulateLoops(loops));
+    const int cellsBefore = static_cast<int>(p.ma->cells.size());
+    SimplifyOptions so;
+    so.targetSize = h;
+    p.ma->simplify(so);
+    checkSimplification(*p.ma, cellsBefore);
+    runSteps5to10(p, h);
+    checkSteps5to9(p, name);
+    return p;
+}
+
+int runSelfTest() {
+    // Square: an X of four red diagonals ending in four blue corners, the
+    // centre the outer end of all four, so nothing is singular but the
+    // corners themselves.
+    {
+        const double h = 0.25;
+        Pipeline p = runDomain("square", {samplePolygon({{0, 0}, {1, 0}, {1, 1}, {0, 1}}, h / 8)}, h);
+        const Shape a = axisShape(*p.ma);
+        const TMeshStats& st = p.tm->stats();
+        check(a.endpoints == 4 && a.junctions == 1 && a.maxJunctionDegree == 4,
+              "square: X-shaped axis (4 endpoints, one junction of degree 4)",
+              std::to_string(a.endpoints) + " endpoints, " + std::to_string(a.junctions) +
+                  " junctions of degree up to " + std::to_string(a.maxJunctionDegree));
+        check(st.colorCounts[2] == 4 && st.colorCounts[3] == 0 && st.colorCounts[0] == 0,
+              "square: blue corners, red diagonals");
+        check(p.valences.interiorIrregular == 0, "square: no interior singular vertex",
+              std::to_string(p.valences.interiorIrregular));
+        check(p.valences.boundaryIrregular == 4 && p.valences.boundary[2] == 4,
+              "square: the four corners are the only boundary irregulars (valence 2)",
+              histogram(p.valences.boundary));
+    }
+    // 4 x 2 rectangle: two junctions joined by a green edge, the rest as the
+    // square -- a regular grid.
+    {
+        const double h = 0.5;
+        Pipeline p = runDomain("4x2 rectangle", {samplePolygon({{0, 0}, {4, 0}, {4, 2}, {0, 2}}, h / 8)}, h);
+        const Shape a = axisShape(*p.ma);
+        const TMeshStats& st = p.tm->stats();
+        check(a.endpoints == 4 && a.junctions == 2 && a.maxJunctionDegree == 3,
+              "rectangle: two junctions of degree 3, four endpoints");
+        check(st.colorCounts[0] >= 1 && st.colorCounts[2] == 4,
+              "rectangle: green between the junctions, blue corners",
+              std::to_string(st.colorCounts[0]) + " green");
+        check(p.valences.interiorIrregular == 0, "rectangle: regular grid inside",
+              std::to_string(p.valences.interiorIrregular));
+        check(p.valences.boundaryIrregular == 4, "rectangle: only the corners irregular on the boundary",
+              histogram(p.valences.boundary));
+    }
+    // Equilateral triangle: three quads around a valence-3 centre.
+    {
+        const double h = 0.2;
+        const double r3 = std::sqrt(3.0) / 2.0;
+        Pipeline p = runDomain("equilateral triangle",
+                               {samplePolygon({{0, 0}, {1, 0}, {0.5, r3}}, h / 8)}, h);
+        const Shape a = axisShape(*p.ma);
+        check(a.endpoints == 3 && a.junctions == 1 && a.maxJunctionDegree == 3,
+              "triangle: three branches from one junction");
+        check(p.tm->stats().colorCounts[2] == 3, "triangle: blue corners");
+        const bool centre = p.valences.interiorIrregular == 1 &&
+                            p.valences.irregularInterior[0].second == 3 &&
+                            normP(p.valences.irregularInterior[0].first - Point{0.5, r3 / 3.0}) < 1e-6;
+        check(centre, "triangle: the one interior singularity is valence 3 at the centre",
+              histogram(p.valences.interior));
+    }
+    // Annulus: an all-green cycle, a regular ring.
+    {
+        const double h = 0.25;
+        std::vector<Point> inner = sampleEllipse({0, 0}, 0.5, 0.5, h / 8);
+        std::reverse(inner.begin(), inner.end());
+        Pipeline p = runDomain("annulus", {sampleEllipse({0, 0}, 1.0, 1.0, h / 8), inner}, h);
+        const TMeshStats& st = p.tm->stats();
+        check(axisShape(*p.ma).endpoints == 0, "annulus: no endpoints");
+        check(st.colorCounts[1] == 0 && st.colorCounts[2] == 0 && st.colorCounts[3] == 0 &&
+                  st.colorCounts[0] >= 3,
+              "annulus: all green, at least three coarse edges");
+        check(p.valences.interiorIrregular == 0 && p.valences.boundaryIrregular == 0,
+              "annulus: regular ring");
+    }
+    // Ellipse: a short segment with a purple cap at each end; the caps are
+    // valence-3 vertices, and nothing else is worse than 3 or 5.
+    {
+        const double h = 0.2;
+        Pipeline p = runDomain("ellipse", {sampleEllipse({0, 0}, 1.0, 0.6, h / 8)}, h);
+        const TMeshStats& st = p.tm->stats();
+        check(axisShape(*p.ma).endpoints == 2, "ellipse: one branch, two endpoints");
+        check(st.colorCounts[3] == 2 && st.colorCounts[2] == 0, "ellipse: purple at both ends");
+        bool only35 = p.valences.interiorIrregular > 0;
+        for (const auto& kv : p.valences.interior) {
+            if (kv.first != 4 && kv.first != 3 && kv.first != 5) only35 = false;
+        }
+        check(only35 && p.valences.boundaryIrregular == 0,
+              "ellipse: singularities of valence 3 or 5 only, none on the boundary",
+              histogram(p.valences.interior));
+    }
+    // Rounded rectangle: a purple cap at each fillet centre.
+    {
+        const double h = 0.25;
+        Pipeline p = runDomain("rounded rectangle", {sampleRoundedRect(3.0, 1.5, 0.3, h / 8)}, h);
+        const TMeshStats& st = p.tm->stats();
+        check(st.colorCounts[3] == 4 && st.colorCounts[2] == 0, "rounded rectangle: four purple caps",
+              std::to_string(st.colorCounts[3]) + " purple, " + std::to_string(st.colorCounts[2]) + " blue");
+    }
+    // L-shape: a blue cap at each of the five convex corners. The concave
+    // corner is left to Step 11, which this implementation does not have.
+    {
+        const double h = 0.25;
+        Pipeline p = runDomain("L-shape", {samplePolygon({{0, 0}, {2, 0}, {2, 1}, {1, 1}, {1, 2}, {0, 2}}, h / 8)}, h);
+        check(p.tm->stats().colorCounts[2] == 5, "L-shape: five blue corners",
+              std::to_string(p.tm->stats().colorCounts[2]));
+    }
+    // Noisy square: Step 4 prunes the branches the noise grows (Fig. 10),
+    // leaving the clean square's four endpoints.
+    {
+        const double h = 0.25;
+        std::vector<Point> pts = samplePolygon({{0, 0}, {1, 0}, {1, 1}, {0, 1}}, h / 8);
+        std::mt19937 rng(12345);
+        std::uniform_real_distribution<double> noise(-0.25, 0.25);
+        const double amplitude = 0.05 * h;   // delta_max
+        for (Point& q : pts) {
+            const bool corner = (q[0] == 0.0 || q[0] == 1.0) && (q[1] == 0.0 || q[1] == 1.0);
+            if (corner) continue;
+            // Along the side's normal, a quarter of delta_max at most.
+            if (q[1] == 0.0 || q[1] == 1.0) q[1] += noise(rng) * amplitude;
+            else q[0] += noise(rng) * amplitude;
+        }
+        const int rawEndpoints = axisShape(MedialAxis(triangulateLoops({pts}))).endpoints;
+        Pipeline p = runDomain("noisy square", {pts}, h);
+        std::cout << "  Raw axis endpoints: " << rawEndpoints << "\n";
+        check(axisShape(*p.ma).endpoints == 4, "noisy square: Step 4 leaves the four corner endpoints",
+              std::to_string(rawEndpoints) + " -> " + std::to_string(axisShape(*p.ma).endpoints));
+    }
+    return g_fails;
+}
+
 } // namespace
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <mesh.obj>\n";
+        std::cerr << "Usage: " << argv[0] << " <mesh.obj> [--h size] | --selftest\n";
         return 1;
     }
 
+    if (std::string(argv[1]) == "--selftest") {
+        runSelfTest();
+        std::cout << "\n";
+        if (g_fails == 0) std::cout << GREEN "[ALL PASSED]" RESET "\n";
+        else              std::cout << RED "[" << g_fails << " FAILURE(S)]" RESET "\n";
+        return g_fails > 0 ? 1 : 0;
+    }
+
     const std::string path = argv[1];
+    double h = 0.0;
+    for (int i = 2; i + 1 < argc; ++i) {
+        if (std::string(argv[i]) == "--h") h = std::stod(argv[i + 1]);
+    }
     std::cout << "Loading mesh: " << path << "\n";
 
     auto originalMesh = std::make_shared<Mesh>(path);
@@ -227,7 +746,9 @@ int main(int argc, char** argv) {
               << delaunayMesh->vertices.size() << " vertices, "
               << delaunayMesh->boundaryEdges.size() << " boundary edges\n";
 
-    MedialAxis ma(delaunayMesh);
+    Pipeline pipeline;
+    pipeline.ma = std::make_shared<MedialAxis>(delaunayMesh);
+    MedialAxis& ma = *pipeline.ma;
     std::cout << "  Dual cells:      " << ma.cells.size() << "\n";
     std::cout << "  Medial vertices: " << ma.medialVertices.size() << "\n";
     std::cout << "  Medial edges:    " << ma.medialEdges.size() << "\n";
@@ -235,7 +756,6 @@ int main(int argc, char** argv) {
               << ma.stats.centersOutsideDomain << " centers outside, "
               << ma.stats.edgesCrossingBoundary << " edges crossing boundary, "
               << ma.stats.nonManifoldBoundaryVertices << " pinched boundary vertices\n";
-
     std::cout << "\n── Raw complex ──\n";
 
     check(ma.cells.size() == delaunayMesh->triangles.size(),
@@ -349,55 +869,24 @@ int main(int argc, char** argv) {
                   << "\n";
     }
 
-    // ── Simplification ──
-    std::cout << "\n── After deduplication ──\n";
+    // ── Step 4 ──
+    std::cout << "\n── After simplification (Step 4) ──\n";
     const size_t rawVertices = ma.medialVertices.size();
-    ma.deduplicateMedialVertices();
-
-    int activeCells = 0;
-    int polygonalCells = 0;
-    double worstDeviation = 0.0;
-    for (const auto& cell : ma.cells) {
-        if (!cell.active) continue;
-        ++activeCells;
-        if (!cell.dualIsTriangle()) ++polygonalCells;
-        worstDeviation = std::max(worstDeviation, cell.maxRadiusDeviation);
-    }
-    std::cout << "  Active cells:    " << activeCells << " (" << polygonalCells
-              << " non-triangular)\n";
+    const int cellsBefore = static_cast<int>(ma.cells.size());
+    SimplifyOptions so;
+    so.targetSize = h;
+    ma.simplify(so);
     std::cout << "  Medial vertices: " << rawVertices << " -> " << ma.medialVertices.size() << "\n";
     std::cout << "  Medial edges:    " << ma.medialEdges.size() << "\n";
-    std::cout << "  Merges:          " << ma.stats.mergedCells << " applied, "
-              << ma.stats.mergesRejectedMultiEdge << " rejected\n";
-    std::cout << "  Worst cocircularity drift: " << worstDeviation << " of the medial radius\n";
-
-    check(static_cast<int>(ma.medialVertices.size()) == activeCells,
-          "one medial vertex per surviving cell");
-    check(static_cast<int>(ma.cells.size()) - activeCells == ma.stats.mergedCells,
-          "deactivated cells == merges applied",
-          std::to_string(static_cast<int>(ma.cells.size()) - activeCells) + " vs " +
-          std::to_string(ma.stats.mergedCells));
-
-    checkComplexIntegrity(ma, "post-dedup");
-    checkAxisConsistency(ma, "post-dedup");
-
-    // Merging must not fuse two circumcenters that were meant to stay apart,
-    // nor leave two survivors sitting on top of each other.
-    {
-        const double minSep = 1e-9 * ma.boundingBoxDiagonal();
-        int coincident = 0;
-        for (const auto& e : ma.medialEdges) {
-            if (normP(ma.medialVertices[e[0]].coord - ma.medialVertices[e[1]].coord) < minSep) {
-                ++coincident;
-            }
-        }
-        check(coincident == 0, "no medial edge has coincident endpoints",
-              std::to_string(coincident) + " degenerate");
-    }
+    checkSimplification(ma, cellsBefore);
+    checkComplexIntegrity(ma, "simplified");
+    checkAxisConsistency(ma, "simplified");
 
     // ── Branches ──
     std::cout << "\n── Branches ──\n";
     ma.createPolylines();
+    check(ma.polyLineEdges.size() == ma.polyLines.size(),
+          "polyLineEdges is parallel to polyLines");
 
     int cyclic = 0, pureCycles = 0;
     for (size_t i = 0; i < ma.polyLines.size(); ++i) {
@@ -461,6 +950,11 @@ int main(int argc, char** argv) {
               std::to_string(badInterior) + " bad");
         check(badCycle == 0, "cycle flag matches closure", std::to_string(badCycle) + " bad");
     }
+
+    // ── Steps 5-9 ──
+    std::cout << "\n── Boundary map, T-mesh, quantization (Steps 5-9) ──\n";
+    runSteps5to10(pipeline, h);
+    checkSteps5to9(pipeline, "model");
 
     // ── Summary ──
     std::cout << "\n";
