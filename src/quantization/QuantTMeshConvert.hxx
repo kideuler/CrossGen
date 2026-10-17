@@ -1,7 +1,7 @@
 #ifndef _QUANT_TMESH_CONVERT_HXX_
 #define _QUANT_TMESH_CONVERT_HXX_
 
-#include "medialaxis/MedialAxisTMesh.hxx"
+#include "SKELETON/MedialAxisTMesh.hxx"
 #include "quantization/QuantTMesh.hxx"
 #include "ZIPLINE/QuadLayout.hxx"
 

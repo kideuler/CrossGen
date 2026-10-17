@@ -1,7 +1,7 @@
-#ifndef _MEDIAL_AXIS_MAP_HXX_
-#define _MEDIAL_AXIS_MAP_HXX_
+#ifndef __MEDIAL_AXIS_MAP_HXX__
+#define __MEDIAL_AXIS_MAP_HXX__
 
-#include "medialaxis/MedialAxis.hxx"
+#include "SKELETON/MedialAxis.hxx"
 
 #include <memory>
 #include <vector>
@@ -122,4 +122,4 @@ private:
     MedialAxisMapStats stats_;
 };
 
-#endif // _MEDIAL_AXIS_MAP_HXX_
+#endif // __MEDIAL_AXIS_MAP_HXX__

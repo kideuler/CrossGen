@@ -1,7 +1,7 @@
 // Structural checks on the discrete medial axis built from an .obj mesh:
 // dual-complex integrity, boundary orientation, the inside filter, cell
 // merging, and branch extraction.
-// Usage: TestMedialAxis <mesh.obj>
+// Usage: TestSKELETON <mesh.obj>
 
 #include <iostream>
 #include <iomanip>
@@ -15,7 +15,7 @@
 
 #include "mesh/Mesh.hxx"
 #include "triangle/TriangleMesher.hpp"
-#include "medialaxis/MedialAxis.hxx"
+#include "SKELETON/MedialAxis.hxx"
 
 // ANSI colour helpers
 #define GREEN "\033[32m"

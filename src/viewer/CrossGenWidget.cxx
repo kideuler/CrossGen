@@ -144,17 +144,17 @@ ORACLEPhase nextORACLEPhase(ORACLEPhase p) {
     return ORACLEPhase::Smoothed;
 }
 
-MedialAxisPhase nextMedialAxisPhase(MedialAxisPhase p) {
+SKELETONPhase nextSKELETONPhase(SKELETONPhase p) {
     switch (p) {
-        case MedialAxisPhase::MeshOnly:     return MedialAxisPhase::DelaunayMesh;
-        case MedialAxisPhase::DelaunayMesh: return MedialAxisPhase::MedialAxis;
-        case MedialAxisPhase::MedialAxis:   return MedialAxisPhase::Map;
-        case MedialAxisPhase::Map:          return MedialAxisPhase::TMesh;
-        case MedialAxisPhase::TMesh:        return MedialAxisPhase::Quantize;
-        case MedialAxisPhase::Quantize:     return MedialAxisPhase::Quantized;
-        case MedialAxisPhase::Quantized:    return MedialAxisPhase::Quantized;
+        case SKELETONPhase::MeshOnly:     return SKELETONPhase::DelaunayMesh;
+        case SKELETONPhase::DelaunayMesh: return SKELETONPhase::MedialAxis;
+        case SKELETONPhase::MedialAxis:   return SKELETONPhase::Map;
+        case SKELETONPhase::Map:          return SKELETONPhase::TMesh;
+        case SKELETONPhase::TMesh:        return SKELETONPhase::Quantize;
+        case SKELETONPhase::Quantize:     return SKELETONPhase::Quantized;
+        case SKELETONPhase::Quantized:    return SKELETONPhase::Quantized;
     }
-    return MedialAxisPhase::Quantized;
+    return SKELETONPhase::Quantized;
 }
 
 const char *phaseName(Phase p) {
@@ -273,15 +273,15 @@ const char *oraclePhaseName(ORACLEPhase p) {
     return "?";
 }
 
-const char *medialAxisPhaseName(MedialAxisPhase p) {
+const char *skeletonPhaseName(SKELETONPhase p) {
     switch (p) {
-        case MedialAxisPhase::MeshOnly:     return "1) mesh";
-        case MedialAxisPhase::DelaunayMesh: return "2) Delaunay re-triangulation";
-        case MedialAxisPhase::MedialAxis:   return "3) Medial axis";
-        case MedialAxisPhase::Map:          return "4) Boundary map";
-        case MedialAxisPhase::TMesh:        return "5) Coarse block decomposition";
-        case MedialAxisPhase::Quantize:     return "6) Quantization";
-        case MedialAxisPhase::Quantized:    return "7) Quantized block decomposition";
+        case SKELETONPhase::MeshOnly:     return "1) mesh";
+        case SKELETONPhase::DelaunayMesh: return "2) Delaunay re-triangulation";
+        case SKELETONPhase::MedialAxis:   return "3) Medial axis";
+        case SKELETONPhase::Map:          return "4) Boundary map";
+        case SKELETONPhase::TMesh:        return "5) Coarse block decomposition";
+        case SKELETONPhase::Quantize:     return "6) Quantization";
+        case SKELETONPhase::Quantized:    return "7) Quantized block decomposition";
     }
     return "?";
 }
@@ -299,7 +299,7 @@ const char *modeName(Mode m) {
         case Mode::Unselected: return "unselected";
         case Mode::PolyVector: return "PolyVector";
         case Mode::ZIPLINE:    return "ZIPLINE";
-        case Mode::MedialAxis: return "Medial Axis";
+        case Mode::SKELETON:   return "SKELETON";
         case Mode::TORSION:    return "TORSION";
         case Mode::OASIS:      return "OASIS";
         case Mode::UMBER:      return "UMBER";
@@ -313,7 +313,7 @@ const char *modeName(Mode m) {
 // The line every mode-selection prompt prints, kept in one place so adding a
 // mode does not mean chasing three copies of it.
 const char *kModeMenu =
-    "press '1' for PolyVector, '2' for ZIPLINE, '3' for Medial Axis, '4' for TORSION, "
+    "press '1' for PolyVector, '2' for ZIPLINE, '3' for SKELETON, '4' for TORSION, "
     "'5' for OASIS, '6' for UMBER, '7' for MERIDIAN, '8' for ATLAS, '9' for ORACLE";
 
 } // anonymous namespace
@@ -760,9 +760,9 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
 
     case Qt::Key_3:
         if (mode_ == Mode::Unselected && phase_ == Phase::MeshOnly) {
-            mode_ = Mode::MedialAxis;
+            mode_ = Mode::SKELETON;
             std::cerr << "[Viewer] Selected mode: " << modeName(mode_) << " (press 'c' to advance)\n";
-            console_.log("Selected mode: Medial Axis");
+            console_.log("Selected mode: SKELETON");
         }
         break;
 
@@ -1003,7 +1003,7 @@ void CrossGenWidget::doReset() {
     mode_     = Mode::Unselected;
     phase_    = Phase::MeshOnly;
     ziplinePhase_ = ZIPLINEPhase::MeshOnly;
-    maPhase_  = MedialAxisPhase::MeshOnly;
+    skeletonPhase_ = SKELETONPhase::MeshOnly;
     oasisPhase_ = OASISPhase::MeshOnly;
     umberPhase_ = UMBERPhase::MeshOnly;
     pipePhase_ = PipelinePhase::MeshOnly;
@@ -5836,11 +5836,11 @@ void CrossGenWidget::advancePhase() {
             tmopAttempted_ = true;
             if (promptTMOP()) runTMOP();
         }
-    } else if (mode_ == Mode::MedialAxis) {
-        MedialAxisPhase old = maPhase_;
-        maPhase_ = nextMedialAxisPhase(maPhase_);
-        if (maPhase_ != old)
-            std::cerr << "[Viewer] Medial Axis Phase " << medialAxisPhaseName(maPhase_) << "\n";
+    } else if (mode_ == Mode::SKELETON) {
+        SKELETONPhase old = skeletonPhase_;
+        skeletonPhase_ = nextSKELETONPhase(skeletonPhase_);
+        if (skeletonPhase_ != old)
+            std::cerr << "[Viewer] SKELETON Phase " << skeletonPhaseName(skeletonPhase_) << "\n";
     } else if (mode_ == Mode::UMBER) {
         UMBERPhase old = umberPhase_;
         umberPhase_ = nextUMBERPhase(umberPhase_);
@@ -6817,8 +6817,8 @@ void CrossGenWidget::runComputations() {
         if (promptTMOP()) runTMOP();
     }
 
-    // ── Medial Axis: Delaunay re-triangulation ────────────────────────────────
-    if (mode_ == Mode::MedialAxis && maPhase_ >= MedialAxisPhase::DelaunayMesh && !delaunayMesh_) {
+    // ── SKELETON: Delaunay re-triangulation ───────────────────────────────────
+    if (mode_ == Mode::SKELETON && skeletonPhase_ >= SKELETONPhase::DelaunayMesh && !delaunayMesh_) {
         auto t0 = Clock::now();
 
         // Build boundary loops
@@ -6851,7 +6851,7 @@ void CrossGenWidget::runComputations() {
         }
 
         if (loops.empty()) {
-            console_.log("[MedialAxis] No boundary loops found!");
+            console_.log("[SKELETON] No boundary loops found!");
         } else {
             std::unordered_map<int, int> vertRemap;
             std::vector<std::array<double, 2>> vertlist;
@@ -6895,7 +6895,7 @@ void CrossGenWidget::runComputations() {
 
             auto t1 = Clock::now();
             std::ostringstream oss;
-            oss << "[MedialAxis] Delaunay re-triangulation: "
+            oss << "[SKELETON] Delaunay re-triangulation: "
                 << delaunayMesh_->triangles.size() << " triangles, "
                 << delaunayMesh_->vertices.size() << " vertices: "
                 << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
@@ -6903,8 +6903,8 @@ void CrossGenWidget::runComputations() {
         }
     }
 
-    // ── Medial Axis: compute axis ─────────────────────────────────────────────
-    if (mode_ == Mode::MedialAxis && maPhase_ >= MedialAxisPhase::MedialAxis &&
+    // ── SKELETON: compute axis ────────────────────────────────────────────────
+    if (mode_ == Mode::SKELETON && skeletonPhase_ >= SKELETONPhase::MedialAxis &&
         delaunayMesh_ && !medialAxis_) {
         auto t0 = Clock::now();
         medialAxis_ = std::make_shared<MedialAxis>(delaunayMesh_);
@@ -6913,7 +6913,7 @@ void CrossGenWidget::runComputations() {
         medialAxis_->deduplicateMedialVertices();
         auto t1 = Clock::now();
         std::ostringstream oss;
-        oss << "[MedialAxis] Computed: " << rawV << " -> "
+        oss << "[SKELETON] Computed: " << rawV << " -> "
             << medialAxis_->medialVertices.size() << " vertices, "
             << rawE << " -> " << medialAxis_->medialEdges.size() << " edges: "
             << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
@@ -6923,7 +6923,7 @@ void CrossGenWidget::runComputations() {
         if (st.degenerateCells || st.centersOutsideDomain || st.edgesCrossingBoundary ||
             st.nonManifoldBoundaryVertices) {
             std::ostringstream warn;
-            warn << "[MedialAxis] Sampling warnings: "
+            warn << "[SKELETON] Sampling warnings: "
                  << st.degenerateCells << " degenerate cells, "
                  << st.centersOutsideDomain << " centers outside, "
                  << st.edgesCrossingBoundary << " edges crossing the boundary, "
@@ -6932,8 +6932,8 @@ void CrossGenWidget::runComputations() {
         }
     }
 
-    // ── Medial Axis: the boundary -> axis map (Sec. 3) ────────────────────────
-    if (mode_ == Mode::MedialAxis && maPhase_ >= MedialAxisPhase::Map &&
+    // ── SKELETON: the boundary -> axis map (Sec. 3) ───────────────────────────
+    if (mode_ == Mode::SKELETON && skeletonPhase_ >= SKELETONPhase::Map &&
         medialAxis_ && !medialAxisMap_.has_value()) {
         auto t0 = Clock::now();
         medialAxisMap_.emplace(medialAxis_);
@@ -6941,24 +6941,24 @@ void CrossGenWidget::runComputations() {
 
         const auto &st = medialAxisMap_->stats();
         std::ostringstream oss;
-        oss << "[MedialAxis] Map phi: " << st.fans << " boundary fans ("
+        oss << "[SKELETON] Map phi: " << st.fans << " boundary fans ("
             << st.collapsedFans << " collapsed), "
             << medialAxisMap_->spokes().size() << " medial radii: "
             << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
         console_.log(oss.str());
         if (st.skippedVertices || st.fallbackProjections) {
             std::ostringstream warn;
-            warn << "[MedialAxis] Map warnings: " << st.skippedVertices
+            warn << "[SKELETON] Map warnings: " << st.skippedVertices
                  << " boundary vertices skipped, " << st.fallbackProjections
                  << " polar rays missed (closest-point fallback)";
             console_.log(warn.str());
         }
-        console_.log("[MedialAxis] blue = bijective radii, magenta = polar "
+        console_.log("[SKELETON] blue = bijective radii, magenta = polar "
                      "sections (axis endpoints)");
     }
 
-    // ── Medial Axis: the coarse block decomposition (Sec. 4) ──────────────────
-    if (mode_ == Mode::MedialAxis && maPhase_ >= MedialAxisPhase::TMesh &&
+    // ── SKELETON: the coarse block decomposition (Sec. 4) ─────────────────────
+    if (mode_ == Mode::SKELETON && skeletonPhase_ >= SKELETONPhase::TMesh &&
         medialAxisMap_.has_value() && !medialAxisTMesh_.has_value()) {
         auto t0 = Clock::now();
         medialAxisTMesh_.emplace(*medialAxisMap_);
@@ -6966,7 +6966,7 @@ void CrossGenWidget::runComputations() {
 
         const auto &st = medialAxisTMesh_->stats();
         std::ostringstream oss;
-        oss << "[MedialAxis] T-mesh: " << st.blocks << " blocks from " << st.zones
+        oss << "[SKELETON] T-mesh: " << st.blocks << " blocks from " << st.zones
             << " zones (" << st.capZones << " caps) over " << st.coarseEdges
             << " coarse edges, target size " << std::fixed << std::setprecision(3)
             << medialAxisTMesh_->targetSize() << ": "
@@ -6974,7 +6974,7 @@ void CrossGenWidget::runComputations() {
         console_.log(oss.str());
         {
             std::ostringstream col;
-            col << "[MedialAxis] templates: " << st.colorCounts[0] << " green (2 blocks), "
+            col << "[SKELETON] templates: " << st.colorCounts[0] << " green (2 blocks), "
                 << st.colorCounts[1] << " red (3), " << st.colorCounts[2]
                 << " blue (1), " << st.colorCounts[3] << " purple (5)";
             console_.log(col.str());
@@ -6984,20 +6984,20 @@ void CrossGenWidget::runComputations() {
             // can reproduce, so every one of them is forced to be a block
             // corner. Any that could not be is worth seeing.
             std::ostringstream cor;
-            cor << "[MedialAxis] sharp corners: " << st.sharpCorners << " found, "
+            cor << "[SKELETON] sharp corners: " << st.sharpCorners << " found, "
                 << st.cornerCuts << " forced into block corners";
             if (st.cornersUnanchored > 0) cor << ", " << st.cornersUnanchored << " UNANCHORED";
             console_.log(cor.str());
         }
         if (st.skippedLoops || st.unpairedEdges) {
             std::ostringstream warn;
-            warn << "[MedialAxis] Block warnings: " << st.skippedLoops
+            warn << "[SKELETON] Block warnings: " << st.skippedLoops
                  << " loops skipped, " << st.unpairedEdges << " unpaired edges";
             console_.log(warn.str());
         }
     }
 
-    // ── Medial Axis: quantization of the block decomposition (QGP Sec. 6) ────
+    // ── SKELETON: quantization of the block decomposition (QGP Sec. 6) ───────
     //
     // The blocks carry no shared-edge identifiers, so the converter welds
     // them geometrically first: corners become nodes, block sides are split
@@ -7006,7 +7006,7 @@ void CrossGenWidget::runComputations() {
     // way. xIdeal is 1 on every edge -- the block-decomposition setting of
     // QGP Sec. 10.1, where Stage II drives each edge to its minimum and so
     // acts as an automatic block-merging operator.
-    if (mode_ == Mode::MedialAxis && maPhase_ >= MedialAxisPhase::Quantize &&
+    if (mode_ == Mode::SKELETON && skeletonPhase_ >= SKELETONPhase::Quantize &&
         medialAxisTMesh_.has_value() && !blockQuant_.has_value()) {
         auto t0 = Clock::now();
         blockQuant_.emplace(makeQuantTMesh(*medialAxisTMesh_));
@@ -7014,7 +7014,7 @@ void CrossGenWidget::runComputations() {
 
         const BlockQuant &bq = *blockQuant_;
         std::ostringstream oss;
-        oss << "[MedialAxis] T-mesh welded: " << bq.nodes.size() << " nodes, "
+        oss << "[SKELETON] T-mesh welded: " << bq.nodes.size() << " nodes, "
             << bq.tmesh.edges.size() << " edges, " << bq.tmesh.faces.size()
             << " faces, " << bq.tmesh.rows.size() << " constraints, from "
             << medialAxisTMesh_->blocks.size() << " blocks: "
@@ -7022,7 +7022,7 @@ void CrossGenWidget::runComputations() {
         console_.log(oss.str());
         if (bq.skippedBlocks > 0) {
             std::ostringstream skip;
-            skip << "[MedialAxis] " << bq.skippedBlocks
+            skip << "[SKELETON] " << bq.skippedBlocks
                  << " blocks dropped as unusable cells: " << bq.skippedNonQuad
                  << " not four-sided, " << bq.skippedUnlocatable
                  << " with a corner off their outline, " << bq.skippedDegenerate
@@ -7032,7 +7032,7 @@ void CrossGenWidget::runComputations() {
         }
 
         if (!bq.ok) {
-            console_.log("[MedialAxis] Quantization aborted: " + bq.error);
+            console_.log("[SKELETON] Quantization aborted: " + bq.error);
         } else {
             auto q0 = Clock::now();
             quantReport_ = TMeshQuantizer(blockQuant_->tmesh).run();
@@ -7044,7 +7044,7 @@ void CrossGenWidget::runComputations() {
                 maxLen = std::max(maxLen, e.x);
             }
             std::ostringstream qss;
-            qss << "[MedialAxis] Quantized: " << quantReport_.stage1Vectors
+            qss << "[SKELETON] Quantized: " << quantReport_.stage1Vectors
                 << " stage-I strips, " << quantReport_.stage2Moves << "/"
                 << quantReport_.stage2Tried << " stage-II moves, objective "
                 << std::fixed << std::setprecision(3) << quantReport_.objective
@@ -7054,7 +7054,7 @@ void CrossGenWidget::runComputations() {
             console_.log(qss.str());
             if (quantReport_.forcedZeroEdges > 0) {
                 std::ostringstream zss;
-                zss << "[MedialAxis] " << quantReport_.forcedZeroEdges
+                zss << "[SKELETON] " << quantReport_.forcedZeroEdges
                     << " edges are forced to zero by the block decomposition "
                        "itself: no consistent assignment can lift them";
                 console_.log(zss.str());
@@ -7064,24 +7064,24 @@ void CrossGenWidget::runComputations() {
                 // neighbours meet in the middle.
                 const ContractReport cr = contractZeroEdges(*blockQuant_);
                 std::ostringstream css;
-                css << "[MedialAxis] Zero-cell cleanup: " << cr.mergedCells
+                css << "[SKELETON] Zero-cell cleanup: " << cr.mergedCells
                     << " collapsed cells merged into their neighbours, "
                     << cr.pointCells << " point cells dropped, " << cr.splitEdges
                     << " edges split to line the sides up, " << cr.removedEdges
                     << " edges removed";
                 console_.log(css.str());
                 if (!cr.ok) {
-                    console_.log("[MedialAxis] Cleanup rejected, keeping the "
+                    console_.log("[SKELETON] Cleanup rejected, keeping the "
                                  "uncontracted T-mesh: " + cr.error);
                 } else if (cr.remainingZero > 0) {
                     std::ostringstream rss;
-                    rss << "[MedialAxis] " << cr.remainingZero
+                    rss << "[SKELETON] " << cr.remainingZero
                         << " cells could not be merged and stay collapsed";
                     console_.log(rss.str());
                 }
             }
             if (!quantReport_.consistent) {
-                console_.log("[MedialAxis] WARNING: quantization violates the "
+                console_.log("[SKELETON] WARNING: quantization violates the "
                              "consistency system Ax = 0");
             }
         }
@@ -7496,7 +7496,7 @@ void CrossGenWidget::renderNormal() {
         const bool showNetwork = showInterfaces_ && interfaceNetwork() &&
                                  ziplinePhase_ < ZIPLINEPhase::Quantized;
         // The quantized grid is the payoff of this whole mode, and the
-        // triangulation underneath only buries it -- the medial axis mode's
+        // triangulation underneath only buries it -- the SKELETON mode's
         // Quantized phase drops the mesh the same way.
         if (ziplinePhase_ < ZIPLINEPhase::Quantized) viewer::drawMesh(*mesh_);
         if (showNetwork) viewer::drawInterfaceNetwork(*interfaceNetwork(), 0.3 * avgEdge_, 3.0f);
@@ -7537,7 +7537,7 @@ void CrossGenWidget::renderNormal() {
         // interior lines and still leave the outline out.
         if (ziplinePhase_ >= ZIPLINEPhase::Quantized && ziplineQuant_.has_value() && ziplineQuant_->ok) {
             // The integer edge lengths as the quad grid they prescribe, same
-            // as the medial axis mode's Quantized phase: transfinite curves
+            // as the SKELETON mode's Quantized phase: transfinite curves
             // through each component's four sides -- plus a yellow disk on
             // every grid vertex, interior cell corners included, since after
             // quantization every crossing of two grid lines is a vertex of
@@ -8017,11 +8017,11 @@ void CrossGenWidget::renderNormal() {
     } else if (mode_ == Mode::ORACLE) {
         viewer::drawAxis(view_);
         renderORACLE();
-    } else if (mode_ == Mode::MedialAxis) {
+    } else if (mode_ == Mode::SKELETON) {
         viewer::drawAxis(view_);
         // The map and block phases draw over the boundary alone: the
         // triangulation underneath would bury the radii / zone edges.
-        if (maPhase_ < MedialAxisPhase::Map) {
+        if (skeletonPhase_ < SKELETONPhase::Map) {
             if (delaunayMesh_)
                 viewer::drawMesh(*delaunayMesh_);
             else
@@ -8029,14 +8029,14 @@ void CrossGenWidget::renderNormal() {
         }
 
         if (medialAxis_) {
-            if (maPhase_ >= MedialAxisPhase::Quantized && blockQuant_.has_value() &&
+            if (skeletonPhase_ >= SKELETONPhase::Quantized && blockQuant_.has_value() &&
                 blockQuant_->ok) {
                 // The integer edge lengths as the quad grid they prescribe:
                 // transfinite curves through each block's four curved
                 // sides, edges only. Grids meeting flush across a block
                 // wall are the quantization's consistency made visible.
                 viewer::drawQuantizedBlocks(*blockQuant_);
-            } else if (maPhase_ >= MedialAxisPhase::TMesh &&
+            } else if (skeletonPhase_ >= SKELETONPhase::TMesh &&
                        medialAxisTMesh_.has_value()) {
                 // The coarse block decomposition (Fig. 1-left / Fig. 3c):
                 // zones filled with a translucent tint of the class colour
@@ -8044,7 +8044,7 @@ void CrossGenWidget::renderNormal() {
                 // and the downsampled axis in full colour on top.
                 viewer::drawMedialTMesh(*medialAxisTMesh_, avgEdge_ / 4.0);
                 viewer::drawBoundaryEdges(*medialAxis_->mesh);
-            } else if (maPhase_ == MedialAxisPhase::Map && medialAxisMap_.has_value()) {
+            } else if (skeletonPhase_ == SKELETONPhase::Map && medialAxisMap_.has_value()) {
                 viewer::drawBoundaryEdges(*medialAxis_->mesh);
 
                 // The map phi drawn as its medial radii (Fig. 7/8 of the
@@ -8066,7 +8066,7 @@ void CrossGenWidget::renderNormal() {
                 glEnd();
 
                 viewer::drawMedialAxis(*medialAxis_, avgEdge_ / 6.0);
-            } else if (maPhase_ >= MedialAxisPhase::MedialAxis) {
+            } else if (skeletonPhase_ >= SKELETONPhase::MedialAxis) {
                 double ballRadius_ma = avgEdge_ / 5.0;
                 viewer::drawMedialAxis(*medialAxis_, ballRadius_ma);
                 for (int i = 0; i < static_cast<int>(medialAxis_->interiorAngle.size()); ++i) {
@@ -8180,7 +8180,7 @@ void CrossGenWidget::renderNormal() {
 
     if (mode_ == Mode::Unselected) {
         renderOverlay("press '1' for PolyVector mode\npress '2' for ZIPLINE mode\n"
-                      "press '3' for Medial Axis mode\npress '4' for TORSION mode\n"
+                      "press '3' for SKELETON mode\npress '4' for TORSION mode\n"
                       "press '5' for OASIS mode\npress '6' for UMBER mode\n"
                       "press '7' for MERIDIAN mode\npress '8' for ATLAS mode\n"
                       "press '9' for ORACLE mode\n"
@@ -8401,7 +8401,7 @@ QString CrossGenWidget::nextFigurePath(const char *extension) const {
     case Mode::TORSION:
     case Mode::MERIDIAN:   phase = pipelinePhaseName(pipePhase_, mode_, perMaterialView()); break;
     case Mode::ZIPLINE:        phase = ziplinePhaseName(ziplinePhase_);              break;
-    case Mode::MedialAxis: phase = medialAxisPhaseName(maPhase_);        break;
+    case Mode::SKELETON:   phase = skeletonPhaseName(skeletonPhase_);    break;
     case Mode::OASIS:      phase = oasisPhaseName(oasisPhase_);          break;
     case Mode::UMBER:      phase = umberPhaseName(umberPhase_);          break;
     case Mode::ATLAS:      phase = atlasPhaseName(atlasPhase_);          break;

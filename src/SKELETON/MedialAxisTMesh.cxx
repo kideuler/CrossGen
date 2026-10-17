@@ -1,4 +1,4 @@
-#include "medialaxis/MedialAxisTMesh.hxx"
+#include "SKELETON/MedialAxisTMesh.hxx"
 
 #include <algorithm>
 #include <cmath>

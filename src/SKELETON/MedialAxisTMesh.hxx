@@ -1,7 +1,7 @@
-#ifndef _MEDIAL_AXIS_TMESH_HXX_
-#define _MEDIAL_AXIS_TMESH_HXX_
+#ifndef __MEDIAL_AXIS_TMESH_HXX__
+#define __MEDIAL_AXIS_TMESH_HXX__
 
-#include "medialaxis/MedialAxisMap.hxx"
+#include "SKELETON/MedialAxisMap.hxx"
 
 #include <array>
 #include <memory>
@@ -208,4 +208,4 @@ private:
     TMeshStats stats_;
 };
 
-#endif // _MEDIAL_AXIS_TMESH_HXX_
+#endif // __MEDIAL_AXIS_TMESH_HXX__

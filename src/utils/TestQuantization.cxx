@@ -7,7 +7,7 @@
 #include <iostream>
 #include <string>
 
-#include "medialaxis/MedialAxisTMesh.hxx"
+#include "SKELETON/MedialAxisTMesh.hxx"
 #include "quantization/QuantTMesh.hxx"
 #include "quantization/QuantTMeshConvert.hxx"
 #include "quantization/TMeshContract.hxx"

@@ -341,7 +341,7 @@ were drawn from them with matplotlib, except the cross fields, which came straig
 `PATH`; pass `-DPython3_EXECUTABLE=...` to CMake to pick another interpreter.
 
 **Viewer.** `./build/Viewer <mesh.obj>` opens a model. The keys `1`–`9` pick a mode
-(polyvectors, ZIPLINE, medial axis, TORSION, OASIS, UMBER, MERIDIAN, ATLAS, ORACLE), `c`
+(polyvectors, ZIPLINE, SKELETON, TORSION, OASIS, UMBER, MERIDIAN, ATLAS, ORACLE), `c`
 advances one stage, `s` exports the view as a vector PDF, and `h` hides the overlays.
 
 **Tests.** Run `cd build && ctest -E Paper_`. Filter with `-R MERIDIAN`, `-R TORSION`,
@@ -368,7 +368,7 @@ over exact symmetries of each, and writes the training CSVs. Then
 | `src/geom` | B-splines, polylines, Coons patches, B-rep and STEP/BREP output; the only code that includes OpenCASCADE |
 | `src/ShapeDNA` | Laplacian spectra: P1–P3 FEM, nested-dissection Cholesky, block Lanczos |
 | `src/crossfield`, `src/polyvector` | Baseline cross fields B1 (P1 MBO) and B2 (polyvectors) |
-| `src/quantization`, `src/medialaxis`, `src/OASIS`, `src/Parameterization` | Earlier approaches: quantised T-meshes, medial axis, spectral quadrangulation, seam cuts |
+| `src/quantization`, `src/SKELETON`, `src/OASIS`, `src/Parameterization` | Earlier approaches: quantised T-meshes, SKELETON (medial axis), spectral quadrangulation, seam cuts |
 | `src/python` | The `crossgen` CPython extension |
 | `src/viewer` | Qt 6 / OpenGL viewer |
 | `src/utils` | Command-line drivers, plus `Mesh2Dgmsh` and `Mesh3Dto2Dfacesgmsh` |

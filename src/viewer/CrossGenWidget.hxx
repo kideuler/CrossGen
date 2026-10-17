@@ -44,9 +44,9 @@
 #include "ZIPLINE/QuadLayout.hxx"
 #include "ZIPLINE/SeparatrixTrace.hxx"
 #include "ZIPLINE/ZIPLINE.hxx"
-#include "medialaxis/MedialAxis.hxx"
-#include "medialaxis/MedialAxisMap.hxx"
-#include "medialaxis/MedialAxisTMesh.hxx"
+#include "SKELETON/MedialAxis.hxx"
+#include "SKELETON/MedialAxisMap.hxx"
+#include "SKELETON/MedialAxisTMesh.hxx"
 #include "quantization/QuantTMeshConvert.hxx"
 #include "quantization/TMeshContract.hxx"
 #include "quantization/TMeshQuantizer.hxx"
@@ -68,7 +68,7 @@ enum class Mode {
     Unselected = 0,
     PolyVector  = 1,
     ZIPLINE     = 2,
-    MedialAxis  = 3,
+    SKELETON    = 3,
     TORSION     = 4,
     OASIS       = 5,
     UMBER       = 6,
@@ -90,7 +90,7 @@ enum class Phase {
 //
 // Quantize and Quantized run the Campen et al. 2015 quantizer on that T-layout
 // (a QuadLayout's faces are its blocks, T-junctions and all, so this is the
-// same solve the MedialAxisPhase stages below run, on the T-mesh a QuadLayout
+// same solve the SKELETONPhase stages below run, on the T-mesh a QuadLayout
 // converts to directly). Split the same way, so the console reports the solve
 // before the picture that depends on it. They are a detour: the three phases
 // after them do not read them.
@@ -412,7 +412,7 @@ enum class OASISPhase {
 // solves it for integer edge lengths, and Quantized draws the quad grid
 // those lengths prescribe. They are split so the console reports the solve
 // before the picture that depends on it.
-enum class MedialAxisPhase {
+enum class SKELETONPhase {
     MeshOnly     = 0,
     DelaunayMesh = 1,
     MedialAxis   = 2,
@@ -1030,7 +1030,7 @@ private:
     Mode           mode_     = Mode::Unselected;
     Phase          phase_    = Phase::MeshOnly;
     ZIPLINEPhase   ziplinePhase_ = ZIPLINEPhase::MeshOnly;
-    MedialAxisPhase maPhase_ = MedialAxisPhase::MeshOnly;
+    SKELETONPhase  skeletonPhase_ = SKELETONPhase::MeshOnly;
     OASISPhase     oasisPhase_ = OASISPhase::MeshOnly;
     UMBERPhase     umberPhase_ = UMBERPhase::MeshOnly;
     PipelinePhase  pipePhase_ = PipelinePhase::MeshOnly;

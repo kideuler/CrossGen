@@ -1,5 +1,5 @@
-#ifndef _MEDIAL_AXIS_HXX_
-#define _MEDIAL_AXIS_HXX_
+#ifndef __MEDIAL_AXIS_HXX__
+#define __MEDIAL_AXIS_HXX__
 
 #include "mesh/Mesh.hxx"
 
@@ -220,4 +220,4 @@ private:
     double bboxDiagonal_ = 1.0;
 };
 
-#endif // _MEDIAL_AXIS_HXX_
+#endif // __MEDIAL_AXIS_HXX__

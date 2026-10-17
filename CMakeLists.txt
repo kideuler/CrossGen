@@ -249,12 +249,12 @@ add_library(PolyVector SHARED
     src/triangle/triangle.cpp
     src/triangle/triangle.h
     src/triangle/TriangleMesher.hpp
-    src/medialaxis/MedialAxis.hxx
-    src/medialaxis/MedialAxis.cxx
-    src/medialaxis/MedialAxisMap.hxx
-    src/medialaxis/MedialAxisMap.cxx
-    src/medialaxis/MedialAxisTMesh.hxx
-    src/medialaxis/MedialAxisTMesh.cxx
+    src/SKELETON/MedialAxis.hxx
+    src/SKELETON/MedialAxis.cxx
+    src/SKELETON/MedialAxisMap.hxx
+    src/SKELETON/MedialAxisMap.cxx
+    src/SKELETON/MedialAxisTMesh.hxx
+    src/SKELETON/MedialAxisTMesh.cxx
     src/quantization/QuantTMesh.hxx
     src/quantization/QuantTMesh.cxx
     src/quantization/TMeshQuantizer.hxx
@@ -285,9 +285,9 @@ target_link_libraries(TestZIPLINE PRIVATE PolyVector)
 add_executable(TestCutMesh src/utils/TestCutMesh.cxx)
 target_link_libraries(TestCutMesh PRIVATE PolyVector)
 
-# Test medial axis construction and phi-inverse mapping
-add_executable(TestMedialAxis src/utils/TestMedialAxis.cxx)
-target_link_libraries(TestMedialAxis PRIVATE PolyVector)
+# SKELETON: test medial axis construction and phi-inverse mapping
+add_executable(TestSKELETON src/utils/TestSKELETON.cxx)
+target_link_libraries(TestSKELETON PRIVATE PolyVector)
 
 # Test the QGP T-mesh quantizer and its converters
 add_executable(TestQuantization src/utils/TestQuantization.cxx)
