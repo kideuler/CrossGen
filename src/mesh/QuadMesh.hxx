@@ -198,6 +198,17 @@ public:
         // every genuinely curved run in the corpus and still refuses the
         // overshoot a cubic makes at a 45 degree turn.
         double curveMaxDeviation = 0.25;
+
+        // Take each quad's vertex order as given. Off -- the default, and what
+        // a mesh read from a file with some elements wound clockwise wants --
+        // every quad of negative area is turned round on construction
+        // (orientQuads). A mesh whose quads are counter-clockwise by
+        // construction and some of which are folded right over wants it on:
+        // turned round, such a quad looks sound to TMOP while its neighbours
+        // disagree with it about which way is up, so the untangler never sees
+        // the fold. SKELETON's trace mesh is one (Step 10's Coons patches turn
+        // a few quads wholly over: 114 of 1392 on multimat/geom003).
+        bool keepOrientation = false;
     };
 
     // Element quality, computed on demand by `computeQuality()`. Nothing here

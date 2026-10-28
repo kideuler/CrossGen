@@ -127,7 +127,7 @@ void QuadMesh::buildTopology() {
     if (quadMatId.size() != quads.size()) quadMatId.assign(quads.size(), 1);
     if (pinned.size() != vertices.size()) pinned.resize(vertices.size(), false);
 
-    orientQuads();
+    if (!options.keepOrientation) orientQuads();
     buildEdges();
     buildBoundary();
     buildVertexQuads();

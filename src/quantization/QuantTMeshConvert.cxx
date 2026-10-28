@@ -725,9 +725,7 @@ Point coonsPoint(const SideCurve &bottom, const SideCurve &top, const SideCurve 
                 top.at(0.0) * ((1.0 - u) * v) + top.at(1.0) * (u * v));
 }
 
-}  // namespace
-
-QuadExtraction extractQuadMesh(const BlockQuant &bq) {
+QuadExtraction extract(const BlockQuant &bq) {
     QuadExtraction out;
     const QuantTMesh &tm = bq.tmesh;
     if (!tm.consistent()) {
@@ -886,6 +884,124 @@ QuadExtraction extractQuadMesh(const BlockQuant &bq) {
         out.quads.push_back(r);
     }
 
+    // Doublets: an interior vertex in exactly two quads, which share both of
+    // its edges. Collapsed faces leave one now and then (geom003, multimat/
+    // geom004), and no placement of its vertices makes both quads convex --
+    // their two angles at it add to 360 degrees -- so one of them is always
+    // folded at a corner, however long an untangler works. The two quads
+    // [v, b, p, d] and [v, d, q, b] are one quad [b, p, d, q] without it,
+    // and Sigma (4 - deg) is unchanged: v's +2 goes, b and d gain +1 each.
+    for (bool again = true; again;) {
+        again = false;
+        std::vector<std::vector<int>> at(out.vertices.size());
+        for (size_t qi = 0; qi < out.quads.size(); ++qi) {
+            for (const int v : out.quads[qi]) at[v].push_back(static_cast<int>(qi));
+        }
+        std::vector<char> gone(out.quads.size(), 0);
+        for (size_t v = 0; v < out.vertices.size(); ++v) {
+            if (out.onBoundary[v] || at[v].size() != 2) continue;
+            const int q1 = at[v][0], q2 = at[v][1];
+            if (gone[q1] || gone[q2]) continue;
+            auto from = [&](int qi) {   // the quad rotated to start at v
+                std::array<int, 4> r = out.quads[qi];
+                while (r[0] != static_cast<int>(v)) std::rotate(r.begin(), r.begin() + 1, r.end());
+                return r;
+            };
+            const std::array<int, 4> a = from(q1), b = from(q2);
+            const bool sameRing = (a[1] == b[1] && a[3] == b[3]) || (a[1] == b[3] && a[3] == b[1]);
+            if (!sameRing || a[2] == b[2]) continue;
+            out.quads[q1] = {a[1], a[2], a[3], b[2]};
+            gone[q2] = 1;
+            ++out.doublets;
+            again = true;
+        }
+        if (!again) break;
+        std::vector<std::array<int, 4>> kept;
+        for (size_t qi = 0; qi < out.quads.size(); ++qi) {
+            if (!gone[qi]) kept.push_back(out.quads[qi]);
+        }
+        out.quads = std::move(kept);
+    }
+    if (out.doublets > 0) {
+        // The vertices no quad uses any more.
+        std::vector<int> index(out.vertices.size(), -1);
+        std::vector<Point> vertices;
+        std::vector<char> onBoundary;
+        for (auto &q : out.quads) {
+            for (int &v : q) {
+                if (index[v] < 0) {
+                    index[v] = static_cast<int>(vertices.size());
+                    vertices.push_back(out.vertices[v]);
+                    onBoundary.push_back(out.onBoundary[v]);
+                }
+                v = index[v];
+            }
+        }
+        out.vertices = std::move(vertices);
+        out.onBoundary = std::move(onBoundary);
+    }
+
+    // One orientation for the whole mesh, read off its connectivity. Each
+    // face's quads were turned by the sign of the face's own area, and a face
+    // Step 10 placed folded -- an exact disc's caps, a sliver the welds turned
+    // over -- came out wound against its neighbours: a mesh no placement of
+    // its vertices can untangle, since its quads disagree about which way is
+    // up. Across every edge two quads share, they must run it opposite ways;
+    // each connected piece is walked from one quad and turned to agree, and
+    // then turned over as a whole if its signed area says it was wound
+    // clockwise.
+    {
+        std::map<std::pair<int, int>, std::vector<int>> byEdge;
+        for (size_t qi = 0; qi < out.quads.size(); ++qi) {
+            const auto &q = out.quads[qi];
+            for (int k = 0; k < 4; ++k)
+                byEdge[std::minmax(q[k], q[(k + 1) % 4])].push_back(static_cast<int>(qi));
+        }
+        auto runs = [&](int qi, int a, int b) {   // true when quad qi has the edge as a -> b
+            const auto &q = out.quads[qi];
+            for (int k = 0; k < 4; ++k)
+                if (q[k] == a && q[(k + 1) % 4] == b) return true;
+            return false;
+        };
+        auto flip = [&](int qi) { std::swap(out.quads[qi][1], out.quads[qi][3]); };
+        std::vector<char> seen(out.quads.size(), 0);
+        for (size_t start = 0; start < out.quads.size(); ++start) {
+            if (seen[start]) continue;
+            std::vector<int> piece{static_cast<int>(start)}, stack{static_cast<int>(start)};
+            seen[start] = 1;
+            int turned = 0;
+            while (!stack.empty()) {
+                const int qi = stack.back();
+                stack.pop_back();
+                for (int k = 0; k < 4; ++k) {
+                    const int a = out.quads[qi][k], b = out.quads[qi][(k + 1) % 4];
+                    const auto &sharing = byEdge[std::minmax(a, b)];
+                    if (sharing.size() != 2) continue;   // dS, or non-manifold
+                    const int other = sharing[0] == qi ? sharing[1] : sharing[0];
+                    if (seen[other]) continue;
+                    seen[other] = 1;
+                    if (runs(other, a, b)) {
+                        flip(other);
+                        ++turned;
+                    }
+                    piece.push_back(other);
+                    stack.push_back(other);
+                }
+            }
+            double area = 0.0;
+            for (const int qi : piece) {
+                const auto &q = out.quads[qi];
+                area += cross2(out.vertices[q[2]] - out.vertices[q[0]],
+                               out.vertices[q[3]] - out.vertices[q[1]]);
+            }
+            if (area < 0.0) {
+                for (const int qi : piece) flip(qi);
+                turned = static_cast<int>(piece.size()) - turned;
+            }
+            out.reorientedQuads += turned;
+        }
+    }
+
     // Topology: every mesh edge in one or two quads, the boundary edges
     // closing into loops, and V - E + F.
     std::map<std::pair<int, int>, int> edgeUse;
@@ -927,4 +1043,16 @@ QuadExtraction extractQuadMesh(const BlockQuant &bq) {
                     std::to_string(out.nonManifoldVertices) + " non-manifold vertices";
     }
     return out;
+}
+
+}  // namespace
+
+QuadExtraction extractQuadMesh(const BlockQuant &bq, int subdivisions) {
+    if (subdivisions <= 1) return extract(bq);
+    // Every length times k is as consistent as the lengths were (Ax = 0 is
+    // homogeneous), and it is the same mesh with each quad cut k x k: the
+    // ticks of an edge at multiples of k are where its ticks were.
+    BlockQuant fine = bq;
+    for (auto &e : fine.tmesh.edges) e.x *= subdivisions;
+    return extract(fine);
 }

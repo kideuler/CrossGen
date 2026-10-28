@@ -1,20 +1,46 @@
-// Checks on SKELETON, the medial-axis block decomposition of
-// docs/medial_axis.md (Cheny et al., "Planar quad meshing with guarantees").
+// Checks on SKELETON (src/SKELETON/SKELETON.hxx), the medial-axis quad mesher
+// of docs/medial_axis.md (Cheny et al., "Planar quad meshing with
+// guarantees"), and on the blocks, mesh and smoothed mesh it is finished with.
 //
-// TestSKELETON <mesh.obj> [--h size] runs the chain the viewer runs and
-// checks, in order: the dual complex of Step 3 (integrity, boundary
+//   TestSKELETON <mesh.obj> [--h size] [--mesh h] [--tmop sweeps]
+//                [--blocks-obj f] [--obj f]
+//   TestSKELETON --selftest
+//
+// On a model it runs the SKELETON class -- the one the viewer's mode 3 runs --
+// and checks, in order: the dual complex of Step 3 (integrity, boundary
 // orientation, the inside filter); Step 4's simplify() (displacement budget,
-// locked corners left alone, cocircular rings); the branches of Step 5.1; and
-// the invariants of Sec. 15 on Steps 5-9 -- one contact per medial edge at
-// every vertex, every face four-cornered with positive area, the faces tiling
-// the domain, a consistent quantization, and the valence identity
+// locked corners left alone, cocircular rings); the branches of Step 5.1; the
+// invariants of Sec. 15 on Steps 5-10 -- one contact per medial edge at every
+// vertex, every face four-cornered with positive area, the faces tiling the
+// domain, a consistent quantization, and the valence identity
 // sum_int (4 - deg) + sum_bdry (3 - deg) = 4 chi on the quad mesh it
-// prescribes.
+// prescribes; and the blocks, that mesh's base complex: every side a macro
+// edge between its own block's corners, every side on dS laid on the model's
+// own polyline, and the mesh's singular vertices the blocks' irregular ones.
+// How much of the model the blocks cover is printed, with the
+// docs/block_decomposition_metrics.md scores, not asserted: it is what the
+// method achieves on the model.
+//
+//   --h size          the target size h of Steps 4 and 6-9 (default a tenth
+//                     of the bounding-box diagonal)
+//   --mesh h          mesh the blocks with BlockQuadMesh at target edge length
+//                     h, and check that the mesh conforms
+//   --tmop sweeps     then smooth it with mesh::TMOP (implies --mesh 0.05)
+//   --blocks-obj f    the blocks' macro edges as OBJ polylines
+//   --obj f           the mesh (smoothed with --tmop) as an OBJ
+//   --no-block-smoothing  read the blocks off the trace mesh as Step 10 left
+//                     it (SKELETON::Options::blockSmoothing)
+//   --block-subdivisions k  trace the Step 10 mesh at k times its resolution
+//                     (SKELETON::Options::blockSubdivisions, default 4)
+//   --boundary-stages n  stages that lay the trace mesh's boundary onto dS
+//                     where a block side crosses it (Options::boundaryStages,
+//                     default 4; 0 never)
 //
 // TestSKELETON --selftest builds the unit-test domains of Sec. 15 (square,
 // 4x2 rectangle, equilateral triangle, annulus, ellipse, rounded rectangle,
-// L-shape, noisy square), sampled at s = h / 8 (Step 2's default), and checks
-// what the guide expects of each.
+// L-shape, noisy square), sampled at s = h / 8 (Step 2's default), checks what
+// the guide expects of each, and that each one's blocks cover it and mesh
+// conformingly at h / 2.
 
 #include <iostream>
 #include <iomanip>
@@ -26,98 +52,20 @@
 #include <unordered_set>
 #include <map>
 #include <cmath>
+#include <cstdlib>
 
+#include "mesh/BoundaryFeatures.hxx"
+#include "mesh/FeatureFrame.hxx"
 #include "mesh/Mesh.hxx"
+#include "mesh/QuadMesh.hxx"
 #include "triangle/TriangleMesher.hpp"
-#include "SKELETON/MedialAxis.hxx"
-#include "SKELETON/MedialAxisMap.hxx"
-#include "SKELETON/MedialAxisTMesh.hxx"
-#include "quantization/QuantTMeshConvert.hxx"
-#include "quantization/TMeshQuantizer.hxx"
+#include "SKELETON/SKELETON.hxx"
 
 // ANSI colour helpers
 #define GREEN "\033[32m"
 #define RED   "\033[31m"
 #define YELLOW "\033[33m"
 #define RESET "\033[0m"
-
-// ─── Delaunay re-triangulation (same logic as ViewerMain.cxx) ───────────────
-static std::shared_ptr<Mesh> buildDelaunayMesh(const std::shared_ptr<Mesh>& mesh) {
-    // 1) Collect ordered boundary loops
-    std::unordered_map<int, std::vector<int>> bAdj;
-    for (int beIdx : mesh->boundaryEdges) {
-        int a = mesh->edges[beIdx][0];
-        int b = mesh->edges[beIdx][1];
-        bAdj[a].push_back(b);
-        bAdj[b].push_back(a);
-    }
-
-    std::unordered_set<int> visited;
-    std::vector<std::vector<int>> loops;
-    for (int bv : mesh->boundaryVertices) {
-        if (visited.count(bv)) continue;
-        std::vector<int> loop;
-        int prev = -1, curr = bv;
-        while (true) {
-            visited.insert(curr);
-            loop.push_back(curr);
-            int next = -1;
-            for (int nb : bAdj[curr]) {
-                if (nb != prev && !visited.count(nb)) { next = nb; break; }
-            }
-            if (next == -1) break;
-            prev = curr;
-            curr = next;
-        }
-        if (loop.size() >= 3) loops.push_back(std::move(loop));
-    }
-
-    if (loops.empty()) {
-        std::cerr << "No boundary loops found!\n";
-        return nullptr;
-    }
-
-    // 2) Build TriangleMesher input
-    std::unordered_map<int, int> vertRemap;
-    std::vector<std::array<double, 2>> vertlist;
-    for (const auto& loop : loops) {
-        for (int vi : loop) {
-            if (!vertRemap.count(vi)) {
-                int newIdx = static_cast<int>(vertlist.size());
-                vertRemap[vi] = newIdx;
-                vertlist.push_back(mesh->vertices[vi]);
-            }
-        }
-    }
-
-    std::vector<std::vector<std::array<int, 2>>> segment_loops;
-    std::vector<int> loopTypes;
-    for (size_t li = 0; li < loops.size(); ++li) {
-        const auto& loop = loops[li];
-        std::vector<std::array<int, 2>> segments;
-        for (size_t i = 0; i < loop.size(); ++i) {
-            int a = vertRemap[loop[i]];
-            int b = vertRemap[loop[(i + 1) % loop.size()]];
-            segments.push_back({a, b});
-        }
-        segment_loops.push_back(std::move(segments));
-        loopTypes.push_back(li == 0 ? 0 : 1);
-    }
-
-    // 3) Triangulate
-    triangle_wrapper::TriangleMesher2D::Options opts;
-    opts.just_delaunay = true;
-    triangle_wrapper::TriangleMesher2D mesher(opts);
-
-    triangle_wrapper::TriangleMesher2D::MeshInput input;
-    input.vertlist = vertlist;
-    input.segment_loops = segment_loops;
-    input.type = loopTypes;
-    input.h = 0.0;
-
-    auto output = mesher.triangulate(input);
-    return std::make_shared<Mesh>(output.verts, output.triangles);
-}
 
 // ─── Check harness ──────────────────────────────────────────────────────────
 namespace {
@@ -328,38 +276,10 @@ double signedArea(const std::vector<Point>& pts) {
     return 0.5 * a;
 }
 
-// Steps 5-9 end to end, as the viewer runs them.
-struct Pipeline {
-    std::shared_ptr<MedialAxis> ma;
-    std::unique_ptr<MedialAxisMap> map;
-    std::unique_ptr<MedialAxisTMesh> tm;
-    BlockQuant bq;
-    TMeshQuantizer::Report quant;
-    QuadExtraction mesh;
-    Valences valences;
-};
-
-void runSteps5to10(Pipeline& p, double h) {
-    p.map = std::make_unique<MedialAxisMap>(p.ma);
-    MedialAxisTMesh::Options to;
-    to.targetSize = h;
-    p.tm = std::make_unique<MedialAxisTMesh>(*p.map, to);
-    p.bq = makeQuantTMesh(*p.tm, p.tm->targetSize());
-    if (!p.bq.ok) return;
-    // Step 9: x >= 0, valid through Prop. 1's requirements.
-    TMeshQuantizer::Options qo;
-    qo.minLength = 0;
-    qo.requirements = p.bq.requirements;
-    qo.objective = TMeshQuantizer::Options::Objective::Absolute;
-    p.quant = TMeshQuantizer(p.bq.tmesh, qo).run();
-    p.mesh = extractQuadMesh(p.bq);
-    p.valences = meshValences(p.mesh);
-}
-
-// The invariants of Sec. 15 on Steps 5-9.
-void checkSteps5to9(const Pipeline& p, const std::string& when) {
-    const MedialAxis& ma = *p.ma;
-    const MedialAxisTMesh& tm = *p.tm;
+// The invariants of Sec. 15 on Steps 5-10.
+void checkSteps5to10(const SKELETON& sk, const std::string& when) {
+    const MedialAxis& ma = sk.getAxis();
+    const MedialAxisTMesh& tm = sk.getTMesh();
     const TMeshStats& st = tm.stats();
     std::cout << "  h " << tm.targetSize() << ": " << st.keptVertices << " vertices kept, "
               << st.insertedVertices << " inserted, " << st.zones << " zones (" << st.capZones
@@ -426,25 +346,27 @@ void checkSteps5to9(const Pipeline& p, const std::string& when) {
           std::to_string(blockArea) + " vs " + std::to_string(domainArea));
 
     // Step 9.
-    check(p.bq.ok && p.bq.skippedBlocks == 0, when + ": every face welded into the T-mesh",
-          p.bq.error + " " + std::to_string(p.bq.skippedBlocks) + " dropped");
-    if (!p.bq.ok) return;
-    check(p.quant.consistent, when + ": quantization consistent (Ax = 0)");
-    check(p.quant.unmetRequirements == 0,
+    const BlockQuant& bq = sk.getQuantization();
+    const TMeshQuantizer::Report& quant = sk.getQuantReport();
+    check(bq.ok && bq.skippedBlocks == 0, when + ": every face welded into the T-mesh",
+          bq.error + " " + std::to_string(bq.skippedBlocks) + " dropped");
+    if (!bq.ok) return;
+    check(quant.consistent, when + ": quantization consistent (Ax = 0)");
+    check(quant.unmetRequirements == 0,
           when + ": Prop. 1 requirements met (radius chains, features, loops >= 1)",
-          std::to_string(p.quant.unmetRequirements) + " of " +
-              std::to_string(p.bq.requirements.size()) + " unmet");
+          std::to_string(quant.unmetRequirements) + " of " +
+              std::to_string(bq.requirements.size()) + " unmet");
     int zero = 0, total = 0;
-    for (const auto& e : p.bq.tmesh.edges) {
+    for (const auto& e : bq.tmesh.edges) {
         zero += e.x == 0;
         total += e.x;
     }
-    std::cout << "  Quantized: " << p.bq.requirements.size() << " requirements ("
-              << p.bq.radiusRequirements << " radius chains, " << p.bq.featureRequirements
-              << " features, " << p.bq.loopRequirements << " loops), "
-              << p.quant.stage1Vectors << " stage-I strips, " << p.quant.stage2Moves
-              << " stage-II moves, objective " << p.quant.objective << ", " << zero << " of "
-              << p.bq.tmesh.edges.size() << " T-mesh edges collapsed\n";
+    std::cout << "  Quantized: " << bq.requirements.size() << " requirements ("
+              << bq.radiusRequirements << " radius chains, " << bq.featureRequirements
+              << " features, " << bq.loopRequirements << " loops), "
+              << quant.stage1Vectors << " stage-I strips, " << quant.stage2Moves
+              << " stage-II moves, objective " << quant.objective << ", " << zero << " of "
+              << bq.tmesh.edges.size() << " T-mesh edges collapsed\n";
 
     // Step 10: a manifold quad mesh with the domain's loops and Euler
     // characteristic, and the valence identity that goes with it.
@@ -458,20 +380,142 @@ void checkSteps5to9(const Pipeline& p, const std::string& when) {
         }
     }
     const int chi = 2 - loops;
-    const QuadExtraction& qe = p.mesh;
+    if (!sk.hasQuadMesh()) {
+        check(false, when + ": Step 10 produced a quad mesh");
+        return;
+    }
+    const QuadExtraction& qe = sk.getQuadMesh();
     std::cout << "  Quad mesh: " << qe.vertices.size() << " vertices, " << qe.quads.size()
               << " quads, " << qe.collapsedFaces << " faces collapsed, " << qe.droppedQuads
-              << " degenerate quads dropped, " << invertedQuads(qe) << " inverted\n";
+              << " degenerate quads dropped, " << qe.doublets << " doublets merged, "
+              << qe.reorientedQuads << " reoriented, " << invertedQuads(qe) << " inverted\n";
     check(qe.ok, when + ": quad mesh is manifold", qe.error);
     check(qe.boundaryLoops == loops, when + ": quad mesh keeps the boundary loops",
           std::to_string(qe.boundaryLoops) + " vs " + std::to_string(loops));
     check(qe.eulerCharacteristic == chi, when + ": Euler characteristic of the domain",
           std::to_string(qe.eulerCharacteristic) + " vs " + std::to_string(chi));
-    const Valences& v = p.valences;
+    const Valences v = meshValences(qe);
     std::cout << "  Valences: interior " << histogram(v.interior) << "; boundary "
               << histogram(v.boundary) << "\n";
     check(v.identity == 4 * chi, when + ": valence identity sum(4 - deg) + sum(3 - deg) = 4 chi",
           std::to_string(v.identity) + " vs " + std::to_string(4 * chi));
+}
+
+// The blocks: the Step 10 mesh's base complex, as the shared decomposition.
+// Sound means every block side resolves to a macro edge that runs between
+// that block's own corners and names the block back, every block outline is
+// counter-clockwise, every side on dS is the model's own polyline, and --
+// where every patch became a block -- the macrovertices that are not
+// four-valent inside are exactly the Step 10 mesh's interior singularities.
+void checkBlocks(const SKELETON& sk, const std::string& when) {
+    if (!sk.hasBlocks()) {
+        check(false, when + ": blocks built from the Step 10 mesh");
+        return;
+    }
+    const BaseComplex::Report& r = sk.getBlocks().getReport();
+    const BlockDecomposition& D = sk.getDecomposition();
+    std::cout << "  Blocks: " << r.blocks << " of " << r.patches << " patches, "
+              << D.edges.size() << " macro edges, " << D.vertices.size()
+              << " macrovertices; on a " << r.quads << "-quad trace mesh: " << r.interiorSingular
+              << " interior and " << r.boundarySingular << " boundary singular vertices, "
+              << r.corners << " corners (" << r.missedCorners << " with no vertex), "
+              << r.separatrices << " separatrices, " << r.cuts << " cuts in " << r.cutRounds
+              << " rounds, " << r.snappedVertices << " vertices snapped onto dS (up to "
+              << r.maxSnap << " of the diagonal); covering " << std::fixed << std::setprecision(1) << 100.0 * r.coverage
+              << "%" << std::defaultfloat << std::setprecision(6) << "\n";
+
+    const mesh::TMOP::Report& sr = sk.getBlockSmoothingReport();
+    if (!sr.ran && sr.sweeps + sr.untangleSweeps > 0)
+        std::cout << "  Trace mesh NOT smoothed: " << sr.sweeps << " sweeps after " << sr.untangleSweeps
+                  << " untangling left " << sr.invertedAfter << " folds\n";
+    if (sr.ran)
+        std::cout << std::fixed << std::setprecision(3) << "  Trace mesh "
+                  << SKELETON::name(sk.blockGeometry()) << ": " << sr.sweeps
+                  << " sweeps, folds " << sr.invertedBefore << " -> " << sr.invertedAfter
+                  << ", worst scaled Jacobian " << sr.minScaledJacobianBefore << " -> "
+                  << sr.minScaledJacobianAfter << std::defaultfloat << std::setprecision(6) << "\n";
+    // How jagged the sides are: the mean total turning of an interior side
+    // between its two corners.
+    // The turning is all of it, a smooth bend included. A kink is a vertex
+    // whose turn differs from the mean of its two neighbours' by more than 15
+    // degrees: a side bending steadily round a hole turns by as much at every
+    // vertex and has none, a zigzag has one at every vertex it zigzags at.
+    {
+        double turning = 0.0;
+        int interior = 0, kinks = 0;
+        for (const auto& E : D.edges) {
+            if (E.boundary) continue;
+            ++interior;
+            std::vector<double> turn(E.points.size(), 0.0);
+            for (size_t i = 1; i + 1 < E.points.size(); ++i) {
+                const Point a = E.points[i] - E.points[i - 1], c = E.points[i + 1] - E.points[i];
+                if (!(normP(a) > 0.0 && normP(c) > 0.0)) continue;
+                turn[i] = std::atan2(cross2(a, c), dotP(a, c));
+                turning += std::abs(turn[i]);
+            }
+            for (size_t i = 1; i + 1 < E.points.size(); ++i) {
+                if (std::abs(turn[i] - 0.5 * (turn[i - 1] + turn[i + 1])) > M_PI / 12.0) ++kinks;
+            }
+        }
+        std::cout << "  Interior sides: " << interior << ", turning " << std::fixed << std::setprecision(3)
+                  << (interior ? turning / interior : 0.0) << " rad on average, " << kinks
+                  << " kinks" << std::defaultfloat << std::setprecision(6) << "\n";
+    }
+
+    int badSides = 0, folded = 0;
+    for (size_t b = 0; b < D.blocks.size(); ++b) {
+        const BlockDecomposition::Block& B = D.blocks[b];
+        std::vector<Point> outline;
+        for (int s = 0; s < 4; ++s) {
+            const BlockDecomposition::MacroEdge& E = D.edges[B.edges[s]];
+            const int from = B.flip[s] ? E.to : E.from, to = B.flip[s] ? E.from : E.to;
+            const bool named = B.flip[s] ? (E.blockB == static_cast<int>(b) && E.sideB == s)
+                                         : (E.blockA == static_cast<int>(b) && E.sideA == s);
+            if (from != B.corners[s] || to != B.corners[(s + 1) % 4] || !named) ++badSides;
+            const std::vector<Point> side = D.sidePolyline(static_cast<int>(b), s);
+            outline.insert(outline.end(), side.begin(), side.empty() ? side.end() : side.end() - 1);
+        }
+        if (signedArea(outline) <= 0.0) ++folded;
+    }
+    check(badSides == 0, when + ": every block side is a macro edge between its own corners",
+          std::to_string(badSides) + " off");
+    // A block outline that is not counter-clockwise runs through a fold of
+    // the Step 10 mesh (the inverted quads counted above): the
+    // decomposition is sound and its geometry is what Step 10 left, for the
+    // mesher and TMOP to untangle.
+    if (folded > 0)
+        std::cout << YELLOW "[WARN]" RESET " " << folded
+                  << " block outline(s) not counter-clockwise, through a fold of the Step 10 mesh\n";
+    // A side across dS is a defect of the decomposition, and one this stage
+    // cannot always mend: what is left after the boundary is laid onto dS is
+    // a hole of a few trace vertices or a concave corner the mesh rounds off
+    // (Step 11), so it is reported rather than asserted.
+    if (r.sidesCrossingBoundary > 0)
+        std::cout << YELLOW "[WARN]" RESET " " << r.sidesCrossingBoundary
+                  << " interior side(s) cross dS\n";
+    check(r.chordSides == 0, when + ": every side on dS laid on the model's own boundary",
+          std::to_string(r.chordSides) + " of " + std::to_string(r.boundarySides) +
+              " left as chords");
+    if (r.badPatches == 0) {
+        int irregular = 0;
+        for (const auto& mv : D.vertices) irregular += !mv.onBoundary && mv.valence != 4;
+        check(irregular == r.interiorSingular,
+              when + ": the blocks' irregular interior vertices are Step 10's singularities",
+              std::to_string(irregular) + " vs " + std::to_string(r.interiorSingular));
+    }
+}
+
+// BlockQuadMesh on the blocks: conforming, with what it folded printed.
+void checkMesh(const SKELETON& sk, const std::string& when) {
+    const BlockQuadMesh::Report& qr = sk.getBlockMesh().getReport();
+    std::cout << std::fixed << std::setprecision(4) << "  Mesh: " << qr.quads << " quads on "
+              << qr.vertices << " vertices, " << qr.chords << " chords at " << qr.minIntervals
+              << "-" << qr.maxIntervals << " edges; scaled Jacobian " << qr.minScaledJacobian
+              << " worst, " << qr.meanScaledJacobian << " mean, " << qr.invertedQuads
+              << " folded; boundary deviation " << qr.boundaryDeviation
+              << std::defaultfloat << std::setprecision(6) << "\n";
+    for (const std::string& m : qr.messages) std::cout << "    " << m << "\n";
+    check(qr.conforming, when + ": the mesh on the blocks conforms");
 }
 
 // ─── Self-test domains (Sec. 15) ────────────────────────────────────────────
@@ -569,19 +613,40 @@ Shape axisShape(const MedialAxis& ma) {
     return s;
 }
 
-Pipeline runDomain(const std::string& name, const std::vector<std::vector<Point>>& loops,
-                   double h) {
+std::unique_ptr<SKELETON> runDomain(const std::string& name,
+                                    const std::vector<std::vector<Point>>& loops, double h) {
     std::cout << "\n── " << name << " (h = " << h << ", s = h/8) ──\n";
-    Pipeline p;
-    p.ma = std::make_shared<MedialAxis>(triangulateLoops(loops));
-    const int cellsBefore = static_cast<int>(p.ma->cells.size());
-    SimplifyOptions so;
-    so.targetSize = h;
-    p.ma->simplify(so);
-    checkSimplification(*p.ma, cellsBefore);
-    runSteps5to10(p, h);
-    checkSteps5to9(p, name);
-    return p;
+    SKELETON::Options o;
+    o.targetSize = h;
+    auto sk = std::make_unique<SKELETON>(triangulateLoops(loops), o);
+    sk->triangulate();
+    const int cellsBefore = static_cast<int>(sk->getTriangulation().triangles.size());
+    sk->buildAxis();
+    checkSimplification(sk->getAxis(), cellsBefore);
+    sk->buildTMesh();
+    if (sk->quantize()) sk->extractQuads();
+    checkSteps5to10(*sk, name);
+    sk->buildBlocks();
+    checkBlocks(*sk, name);
+    if (sk->hasBlocks()) {
+        const BaseComplex::Report& r = sk->getBlocks().getReport();
+        check(r.badPatches == 0 && sk->getDecomposition().covers(),
+              name + ": the blocks cover the domain",
+              std::to_string(r.badPatches) + " patches not blocks");
+        BlockQuadMesh::Options mo;
+        mo.targetEdgeLength = 0.5 * h;
+        if (sk->buildMesh(mo)) checkMesh(*sk, name);
+        else check(false, name + ": the blocks mesh");
+    }
+    return sk;
+}
+
+Valences valencesOf(const SKELETON& sk) {
+    return sk.hasQuadMesh() ? meshValences(sk.getQuadMesh()) : Valences();
+}
+
+int blockCount(const SKELETON& sk) {
+    return sk.hasBlocks() ? static_cast<int>(sk.getDecomposition().blocks.size()) : 0;
 }
 
 int runSelfTest() {
@@ -590,89 +655,89 @@ int runSelfTest() {
     // corners themselves.
     {
         const double h = 0.25;
-        Pipeline p = runDomain("square", {samplePolygon({{0, 0}, {1, 0}, {1, 1}, {0, 1}}, h / 8)}, h);
-        const Shape a = axisShape(*p.ma);
-        const TMeshStats& st = p.tm->stats();
+        auto p = runDomain("square", {samplePolygon({{0, 0}, {1, 0}, {1, 1}, {0, 1}}, h / 8)}, h);
+        const Shape a = axisShape(p->getAxis());
+        const TMeshStats& st = p->getTMesh().stats();
         check(a.endpoints == 4 && a.junctions == 1 && a.maxJunctionDegree == 4,
               "square: X-shaped axis (4 endpoints, one junction of degree 4)",
               std::to_string(a.endpoints) + " endpoints, " + std::to_string(a.junctions) +
                   " junctions of degree up to " + std::to_string(a.maxJunctionDegree));
         check(st.colorCounts[2] == 4 && st.colorCounts[3] == 0 && st.colorCounts[0] == 0,
               "square: blue corners, red diagonals");
-        check(p.valences.interiorIrregular == 0, "square: no interior singular vertex",
-              std::to_string(p.valences.interiorIrregular));
-        check(p.valences.boundaryIrregular == 4 && p.valences.boundary[2] == 4,
+        check(valencesOf(*p).interiorIrregular == 0, "square: no interior singular vertex",
+              std::to_string(valencesOf(*p).interiorIrregular));
+        check(valencesOf(*p).boundaryIrregular == 4 && valencesOf(*p).boundary[2] == 4,
               "square: the four corners are the only boundary irregulars (valence 2)",
-              histogram(p.valences.boundary));
+              histogram(valencesOf(*p).boundary));
     }
     // 4 x 2 rectangle: two junctions joined by a green edge, the rest as the
     // square -- a regular grid.
     {
         const double h = 0.5;
-        Pipeline p = runDomain("4x2 rectangle", {samplePolygon({{0, 0}, {4, 0}, {4, 2}, {0, 2}}, h / 8)}, h);
-        const Shape a = axisShape(*p.ma);
-        const TMeshStats& st = p.tm->stats();
+        auto p = runDomain("4x2 rectangle", {samplePolygon({{0, 0}, {4, 0}, {4, 2}, {0, 2}}, h / 8)}, h);
+        const Shape a = axisShape(p->getAxis());
+        const TMeshStats& st = p->getTMesh().stats();
         check(a.endpoints == 4 && a.junctions == 2 && a.maxJunctionDegree == 3,
               "rectangle: two junctions of degree 3, four endpoints");
         check(st.colorCounts[0] >= 1 && st.colorCounts[2] == 4,
               "rectangle: green between the junctions, blue corners",
               std::to_string(st.colorCounts[0]) + " green");
-        check(p.valences.interiorIrregular == 0, "rectangle: regular grid inside",
-              std::to_string(p.valences.interiorIrregular));
-        check(p.valences.boundaryIrregular == 4, "rectangle: only the corners irregular on the boundary",
-              histogram(p.valences.boundary));
+        check(valencesOf(*p).interiorIrregular == 0, "rectangle: regular grid inside",
+              std::to_string(valencesOf(*p).interiorIrregular));
+        check(valencesOf(*p).boundaryIrregular == 4, "rectangle: only the corners irregular on the boundary",
+              histogram(valencesOf(*p).boundary));
     }
     // Equilateral triangle: three quads around a valence-3 centre.
     {
         const double h = 0.2;
         const double r3 = std::sqrt(3.0) / 2.0;
-        Pipeline p = runDomain("equilateral triangle",
+        auto p = runDomain("equilateral triangle",
                                {samplePolygon({{0, 0}, {1, 0}, {0.5, r3}}, h / 8)}, h);
-        const Shape a = axisShape(*p.ma);
+        const Shape a = axisShape(p->getAxis());
         check(a.endpoints == 3 && a.junctions == 1 && a.maxJunctionDegree == 3,
               "triangle: three branches from one junction");
-        check(p.tm->stats().colorCounts[2] == 3, "triangle: blue corners");
-        const bool centre = p.valences.interiorIrregular == 1 &&
-                            p.valences.irregularInterior[0].second == 3 &&
-                            normP(p.valences.irregularInterior[0].first - Point{0.5, r3 / 3.0}) < 1e-6;
+        check(p->getTMesh().stats().colorCounts[2] == 3, "triangle: blue corners");
+        const bool centre = valencesOf(*p).interiorIrregular == 1 &&
+                            valencesOf(*p).irregularInterior[0].second == 3 &&
+                            normP(valencesOf(*p).irregularInterior[0].first - Point{0.5, r3 / 3.0}) < 1e-6;
         check(centre, "triangle: the one interior singularity is valence 3 at the centre",
-              histogram(p.valences.interior));
+              histogram(valencesOf(*p).interior));
     }
     // Annulus: an all-green cycle, a regular ring.
     {
         const double h = 0.25;
         std::vector<Point> inner = sampleEllipse({0, 0}, 0.5, 0.5, h / 8);
         std::reverse(inner.begin(), inner.end());
-        Pipeline p = runDomain("annulus", {sampleEllipse({0, 0}, 1.0, 1.0, h / 8), inner}, h);
-        const TMeshStats& st = p.tm->stats();
-        check(axisShape(*p.ma).endpoints == 0, "annulus: no endpoints");
+        auto p = runDomain("annulus", {sampleEllipse({0, 0}, 1.0, 1.0, h / 8), inner}, h);
+        const TMeshStats& st = p->getTMesh().stats();
+        check(axisShape(p->getAxis()).endpoints == 0, "annulus: no endpoints");
         check(st.colorCounts[1] == 0 && st.colorCounts[2] == 0 && st.colorCounts[3] == 0 &&
                   st.colorCounts[0] >= 3,
               "annulus: all green, at least three coarse edges");
-        check(p.valences.interiorIrregular == 0 && p.valences.boundaryIrregular == 0,
+        check(valencesOf(*p).interiorIrregular == 0 && valencesOf(*p).boundaryIrregular == 0,
               "annulus: regular ring");
     }
     // Ellipse: a short segment with a purple cap at each end; the caps are
     // valence-3 vertices, and nothing else is worse than 3 or 5.
     {
         const double h = 0.2;
-        Pipeline p = runDomain("ellipse", {sampleEllipse({0, 0}, 1.0, 0.6, h / 8)}, h);
-        const TMeshStats& st = p.tm->stats();
-        check(axisShape(*p.ma).endpoints == 2, "ellipse: one branch, two endpoints");
+        auto p = runDomain("ellipse", {sampleEllipse({0, 0}, 1.0, 0.6, h / 8)}, h);
+        const TMeshStats& st = p->getTMesh().stats();
+        check(axisShape(p->getAxis()).endpoints == 2, "ellipse: one branch, two endpoints");
         check(st.colorCounts[3] == 2 && st.colorCounts[2] == 0, "ellipse: purple at both ends");
-        bool only35 = p.valences.interiorIrregular > 0;
-        for (const auto& kv : p.valences.interior) {
+        bool only35 = valencesOf(*p).interiorIrregular > 0;
+        for (const auto& kv : valencesOf(*p).interior) {
             if (kv.first != 4 && kv.first != 3 && kv.first != 5) only35 = false;
         }
-        check(only35 && p.valences.boundaryIrregular == 0,
+        check(only35 && valencesOf(*p).boundaryIrregular == 0,
               "ellipse: singularities of valence 3 or 5 only, none on the boundary",
-              histogram(p.valences.interior));
+              histogram(valencesOf(*p).interior));
     }
     // Rounded rectangle: a purple cap at each fillet centre.
     {
         const double h = 0.25;
-        Pipeline p = runDomain("rounded rectangle", {sampleRoundedRect(3.0, 1.5, 0.3, h / 8)}, h);
-        const TMeshStats& st = p.tm->stats();
+        auto p = runDomain("rounded rectangle", {sampleRoundedRect(3.0, 1.5, 0.3, h / 8)}, h);
+        const TMeshStats& st = p->getTMesh().stats();
         check(st.colorCounts[3] == 4 && st.colorCounts[2] == 0, "rounded rectangle: four purple caps",
               std::to_string(st.colorCounts[3]) + " purple, " + std::to_string(st.colorCounts[2]) + " blue");
     }
@@ -680,9 +745,9 @@ int runSelfTest() {
     // corner is left to Step 11, which this implementation does not have.
     {
         const double h = 0.25;
-        Pipeline p = runDomain("L-shape", {samplePolygon({{0, 0}, {2, 0}, {2, 1}, {1, 1}, {1, 2}, {0, 2}}, h / 8)}, h);
-        check(p.tm->stats().colorCounts[2] == 5, "L-shape: five blue corners",
-              std::to_string(p.tm->stats().colorCounts[2]));
+        auto p = runDomain("L-shape", {samplePolygon({{0, 0}, {2, 0}, {2, 1}, {1, 1}, {1, 2}, {0, 2}}, h / 8)}, h);
+        check(p->getTMesh().stats().colorCounts[2] == 5, "L-shape: five blue corners",
+              std::to_string(p->getTMesh().stats().colorCounts[2]));
     }
     // Noisy square: Step 4 prunes the branches the noise grows (Fig. 10),
     // leaving the clean square's four endpoints.
@@ -700,10 +765,10 @@ int runSelfTest() {
             else q[0] += noise(rng) * amplitude;
         }
         const int rawEndpoints = axisShape(MedialAxis(triangulateLoops({pts}))).endpoints;
-        Pipeline p = runDomain("noisy square", {pts}, h);
+        auto p = runDomain("noisy square", {pts}, h);
         std::cout << "  Raw axis endpoints: " << rawEndpoints << "\n";
-        check(axisShape(*p.ma).endpoints == 4, "noisy square: Step 4 leaves the four corner endpoints",
-              std::to_string(rawEndpoints) + " -> " + std::to_string(axisShape(*p.ma).endpoints));
+        check(axisShape(p->getAxis()).endpoints == 4, "noisy square: Step 4 leaves the four corner endpoints",
+              std::to_string(rawEndpoints) + " -> " + std::to_string(axisShape(p->getAxis()).endpoints));
     }
     return g_fails;
 }
@@ -713,7 +778,10 @@ int runSelfTest() {
 // ─── Main ───────────────────────────────────────────────────────────────────
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <mesh.obj> [--h size] | --selftest\n";
+        std::cerr << "Usage: " << argv[0]
+                  << " <mesh.obj> [--h size] [--mesh h] [--tmop sweeps] [--blocks-obj f] [--obj f]"
+                     " [--no-block-smoothing] [--block-subdivisions k] [--boundary-stages n]"
+                     " | --selftest\n";
         return 1;
     }
 
@@ -726,10 +794,34 @@ int main(int argc, char** argv) {
     }
 
     const std::string path = argv[1];
-    double h = 0.0;
-    for (int i = 2; i + 1 < argc; ++i) {
-        if (std::string(argv[i]) == "--h") h = std::stod(argv[i + 1]);
+    double h = 0.0, meshTarget = 0.0;
+    int sweeps = 0;
+    bool smoothBlocks = true;
+    int subdivisions = 0, stages = -1;
+    std::string blocksObj, obj;
+    for (int i = 2; i < argc; ++i) {
+        const std::string a = argv[i];
+        auto next = [&]() -> const char* {
+            if (i + 1 >= argc) {
+                std::cerr << a << " needs a value\n";
+                std::exit(1);
+            }
+            return argv[++i];
+        };
+        if (a == "--h") h = std::atof(next());
+        else if (a == "--mesh") meshTarget = std::atof(next());
+        else if (a == "--tmop") sweeps = std::atoi(next());
+        else if (a == "--blocks-obj") blocksObj = next();
+        else if (a == "--obj") obj = next();
+        else if (a == "--no-block-smoothing") smoothBlocks = false;
+        else if (a == "--block-subdivisions") subdivisions = std::atoi(next());
+        else if (a == "--boundary-stages") stages = std::atoi(next());
+        else {
+            std::cerr << "Unknown option " << a << "\n";
+            return 1;
+        }
     }
+    if (sweeps > 0 && meshTarget <= 0.0) meshTarget = 0.05;
     std::cout << "Loading mesh: " << path << "\n";
 
     auto originalMesh = std::make_shared<Mesh>(path);
@@ -737,18 +829,32 @@ int main(int argc, char** argv) {
               << originalMesh->vertices.size() << " vertices, "
               << originalMesh->boundaryEdges.size() << " boundary edges\n";
 
-    auto delaunayMesh = buildDelaunayMesh(originalMesh);
-    if (!delaunayMesh) {
-        std::cerr << RED "[FAIL]" RESET " Could not build Delaunay mesh.\n";
+    SKELETON::Options options;
+    options.targetSize = h;
+    if (sweeps > 0) options.tmop.maxSweeps = sweeps;
+    if (!smoothBlocks) options.blockSmoothing.maxSweeps = 0;
+    if (subdivisions > 0) options.blockSubdivisions = subdivisions;
+    if (stages >= 0) options.boundaryStages = stages;
+    SKELETON sk(originalMesh, options);
+    try {
+        sk.triangulate();
+    } catch (const std::exception& e) {
+        std::cerr << RED "[FAIL]" RESET " " << e.what() << "\n";
         return 1;
     }
-    std::cout << "  Delaunay mesh:  " << delaunayMesh->triangles.size() << " triangles, "
-              << delaunayMesh->vertices.size() << " vertices, "
-              << delaunayMesh->boundaryEdges.size() << " boundary edges\n";
+    std::cout << "  Delaunay mesh:  " << sk.getTriangulation().triangles.size() << " triangles, "
+              << sk.getTriangulation().vertices.size() << " vertices, "
+              << sk.getTriangulation().boundaryEdges.size() << " boundary edges; "
+              << sk.getStatus().boundaryLoops << " boundary loops, " << sk.getStatus().corners
+              << " corners\n";
 
-    Pipeline pipeline;
-    pipeline.ma = std::make_shared<MedialAxis>(delaunayMesh);
-    MedialAxis& ma = *pipeline.ma;
+    // ── Raw complex (Step 3), on a copy of the triangulation, before Step 4
+    // moves anything ──
+    const int cellsBefore = static_cast<int>(sk.getTriangulation().triangles.size());
+    {
+    auto rawAxis = std::make_shared<MedialAxis>(std::make_shared<Mesh>(sk.getTriangulation()));
+    const MedialAxis& ma = *rawAxis;
+    const std::shared_ptr<Mesh>& delaunayMesh = ma.mesh;
     std::cout << "  Dual cells:      " << ma.cells.size() << "\n";
     std::cout << "  Medial vertices: " << ma.medialVertices.size() << "\n";
     std::cout << "  Medial edges:    " << ma.medialEdges.size() << "\n";
@@ -868,23 +974,28 @@ int main(int argc, char** argv) {
                   << (outside ? "; the boundary sampling is too coarse for a faithful axis" : "")
                   << "\n";
     }
+    }
 
     // ── Step 4 ──
     std::cout << "\n── After simplification (Step 4) ──\n";
-    const size_t rawVertices = ma.medialVertices.size();
-    const int cellsBefore = static_cast<int>(ma.cells.size());
-    SimplifyOptions so;
-    so.targetSize = h;
-    ma.simplify(so);
-    std::cout << "  Medial vertices: " << rawVertices << " -> " << ma.medialVertices.size() << "\n";
-    std::cout << "  Medial edges:    " << ma.medialEdges.size() << "\n";
-    checkSimplification(ma, cellsBefore);
-    checkComplexIntegrity(ma, "simplified");
-    checkAxisConsistency(ma, "simplified");
+    sk.buildAxis();
+    {
+        const MedialAxis& ma = sk.getAxis();
+        std::cout << "  Medial vertices: " << sk.getStatus().rawMedialVertices << " -> "
+                  << ma.medialVertices.size() << "\n";
+        std::cout << "  Medial edges:    " << ma.medialEdges.size() << "\n";
+        checkSimplification(ma, cellsBefore);
+        checkComplexIntegrity(ma, "simplified");
+        checkAxisConsistency(ma, "simplified");
+    }
+
+    // ── Steps 5-10 ──
+    sk.buildTMesh();
+    if (sk.quantize()) sk.extractQuads();
+    const MedialAxis& ma = sk.getAxis();
 
     // ── Branches ──
     std::cout << "\n── Branches ──\n";
-    ma.createPolylines();
     check(ma.polyLineEdges.size() == ma.polyLines.size(),
           "polyLineEdges is parallel to polyLines");
 
@@ -950,11 +1061,56 @@ int main(int argc, char** argv) {
               std::to_string(badInterior) + " bad");
         check(badCycle == 0, "cycle flag matches closure", std::to_string(badCycle) + " bad");
     }
+    // ── Steps 5-10 ──
+    std::cout << "\n── Boundary map, T-mesh, quantization, quad mesh (Steps 5-10) ──\n";
+    checkSteps5to10(sk, "model");
 
-    // ── Steps 5-9 ──
-    std::cout << "\n── Boundary map, T-mesh, quantization (Steps 5-9) ──\n";
-    runSteps5to10(pipeline, h);
-    checkSteps5to9(pipeline, "model");
+    // ── Blocks ──
+    std::cout << "\n── Blocks (the Step 10 mesh's base complex) ──\n";
+    sk.buildBlocks();
+    checkBlocks(sk, "model");
+    if (sk.hasBlocks()) {
+        const BlockDecomposition& D = sk.getDecomposition();
+        const BoundaryFeatures features(*originalMesh);
+        const FeatureFrame frame(*originalMesh);
+        std::cout << std::fixed << std::setprecision(3) << "  Scores: regularity "
+                  << D.regularity(features) << ", angle " << D.angleQuality() << ", chord "
+                  << D.chordQuality() << ", alignment " << D.alignmentQuality(frame)
+                  << (D.covers() ? "" : " (NaN: the blocks do not cover)") << "\n"
+                  << std::defaultfloat << std::setprecision(6);
+        if (!blocksObj.empty()) D.writeEdgesOBJ(blocksObj);
+    }
+
+    // ── Mesh and smoothing ──
+    if (meshTarget > 0.0 && sk.hasBlocks()) {
+        std::cout << "\n── Mesh (BlockQuadMesh at " << meshTarget << ")"
+                  << (sweeps > 0 ? " and TMOP" : "") << " ──\n";
+        BlockQuadMesh::Options mo;
+        mo.targetEdgeLength = meshTarget;
+        if (sk.buildMesh(mo)) {
+            checkMesh(sk, "model");
+            if (sweeps > 0 && sk.smooth()) {
+                const mesh::TMOP::Report& tm = sk.getTMOPReport();
+                std::cout << std::fixed << std::setprecision(4) << "  TMOP: " << tm.sweeps
+                          << " sweeps, scaled Jacobian " << tm.minScaledJacobianBefore << " -> "
+                          << tm.minScaledJacobianAfter << " worst, " << tm.meanScaledJacobianBefore
+                          << " -> " << tm.meanScaledJacobianAfter << " mean, folds "
+                          << tm.invertedBefore << " -> " << tm.invertedAfter << "\n"
+                          << std::defaultfloat << std::setprecision(6);
+                std::cout << "        " << tm.untangleSweeps << " untangling sweeps, "
+                          << tm.frozenCorners << " frozen corners, nodes " << tm.freeNodes
+                          << " free / " << tm.slidingNodes << " sliding / " << tm.fixedNodes
+                          << " fixed" << (tm.converged ? "" : ", stopped on the sweep cap") << "\n";
+                for (const std::string &msg : tm.messages) std::cout << "        " << msg << "\n";
+            }
+            if (!obj.empty()) {
+                if (sk.hasSmoothedMesh()) sk.getSmoothedMesh().writeOBJ(obj);
+                else sk.getBlockMesh().writeOBJ(obj);
+            }
+        } else {
+            check(false, "model: the blocks mesh");
+        }
+    }
 
     // ── Summary ──
     std::cout << "\n";

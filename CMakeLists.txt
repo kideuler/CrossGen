@@ -255,6 +255,10 @@ add_library(PolyVector SHARED
     src/SKELETON/MedialAxisMap.cxx
     src/SKELETON/MedialAxisTMesh.hxx
     src/SKELETON/MedialAxisTMesh.cxx
+    src/SKELETON/BaseComplex.hxx
+    src/SKELETON/BaseComplex.cxx
+    src/SKELETON/SKELETON.hxx
+    src/SKELETON/SKELETON.cxx
     src/quantization/QuantTMesh.hxx
     src/quantization/QuantTMesh.cxx
     src/quantization/TMeshQuantizer.hxx

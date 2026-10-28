@@ -133,6 +133,12 @@ struct QuadExtraction {
 
     int collapsedFaces = 0;     // faces with a zero side sum
     int droppedQuads = 0;       // quads with two corners welded together
+    // Quads turned round to agree with their neighbours: a face placed folded
+    // came out wound the other way (see extract()).
+    int reorientedQuads = 0;
+    // Interior vertices of valence 2 removed, each pair of quads round one
+    // merged into one quad (see extract()).
+    int doublets = 0;
     int nonManifoldEdges = 0;   // mesh edges with more than two quads
     // Vertices where two fans of quads touch -- more than two boundary edges
     // meet there.
@@ -143,8 +149,12 @@ struct QuadExtraction {
     std::string error;
 };
 
-// Requires a quantized, consistent tmesh.
-QuadExtraction extractQuadMesh(const BlockQuant &bq);
+// Requires a quantized, consistent tmesh. `subdivisions` k > 1 cuts every
+// quad of that mesh k x k, its new vertices placed by the same Coons
+// interpolation of the T-mesh faces: the mesh SKELETON's BaseComplex traces
+// its block sides on, so that they follow the faces' geometry at h / k rather
+// than as chords at h.
+QuadExtraction extractQuadMesh(const BlockQuant &bq, int subdivisions = 1);
 
 // One side of a face as a curve carrying its quantization.
 //

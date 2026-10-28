@@ -44,9 +44,7 @@
 #include "ZIPLINE/QuadLayout.hxx"
 #include "ZIPLINE/SeparatrixTrace.hxx"
 #include "ZIPLINE/ZIPLINE.hxx"
-#include "SKELETON/MedialAxis.hxx"
-#include "SKELETON/MedialAxisMap.hxx"
-#include "SKELETON/MedialAxisTMesh.hxx"
+#include "SKELETON/SKELETON.hxx"
 #include "quantization/QuantTMeshConvert.hxx"
 #include "quantization/TMeshQuantizer.hxx"
 #include "OASIS/OASIS.hxx"
@@ -89,7 +87,7 @@ enum class Phase {
 //
 // Quantize and Quantized run the Campen et al. 2015 quantizer on that T-layout
 // (a QuadLayout's faces are its blocks, T-junctions and all, so this is the
-// same solve the SKELETONPhase stages below run, on the T-mesh a QuadLayout
+// same solve SKELETON's Step 9 runs (SKELETON::quantize()), on the T-mesh a QuadLayout
 // converts to directly). Split the same way, so the console reports the solve
 // before the picture that depends on it. They are a detour: the three phases
 // after them do not read them.
@@ -406,19 +404,47 @@ enum class OASISPhase {
     Field    = 2,
 };
 
-// The last two stages are the quantization of Campen et al. 2015: Quantize
-// turns the block decomposition into the T-mesh consistency system and
-// solves it for integer edge lengths, and Quantized draws the quad grid
-// those lengths prescribe. They are split so the console reports the solve
-// before the picture that depends on it.
+// SKELETON (mode 3, src/SKELETON/SKELETON.hxx) is the medial-axis quad mesher
+// of Cheny et al. as docs/medial_axis.md specifies it, one phase per stage of
+// the SKELETON class -- the one TestSKELETON runs:
+//
+//   Triangulation  Steps 1-2: dS's own vertices, constrained Delaunay
+//   MedialAxis     Steps 3-4: the polygonal dual complex, simplified; sharp
+//                  convex corners red, concave ones orange
+//   Map            Step 5: phi drawn as its medial radii, blue where it is
+//                  bijective, magenta on the polar sections
+//   TMesh          Steps 6-8: each zone tinted by the template its coarse edge
+//                  took (Fig. 17), the template walls, the downsampled axis
+//   Quantized      Steps 9-10: the T-mesh quantized with Prop. 1's
+//                  requirements, and the quad mesh at the target size h those
+//                  lengths prescribe -- where the paper ends
+//
+// and then the three phases every other mode is finished with:
+//
+//   Blocks     that mesh's base complex as the shared BlockDecomposition
+//              (SKELETON/BaseComplex.hxx): its singular vertices and the
+//              model's corners, and the grid lines through them, read off the
+//              Step 10 mesh refined 4 x 4 and smoothed by TMOP so that the
+//              sides are smooth curves (SKELETON::Options::blockSmoothing).
+//              Drawn as every mode draws its blocks -- light-blue sides, green
+//              macrovertices -- over that smoothed grid in grey, with any
+//              patch that did not come out as a block shaded, as ZIPLINE
+//              shades the components it refuses.
+//   Mesh       mesh/BlockQuadMesh on those blocks, on the dialog and target
+//              edge length every mode shares ('e' re-opens it).
+//   Smoothed   mesh::TMOP, the same dialog and solve, with mu at the element
+//              corners as for every transfinite grid on blocks ('c' re-opens
+//              it).
 enum class SKELETONPhase {
-    MeshOnly     = 0,
-    DelaunayMesh = 1,
-    MedialAxis   = 2,
-    Map          = 3,
-    TMesh        = 4,
-    Quantize     = 5,
-    Quantized    = 6,
+    MeshOnly      = 1,
+    Triangulation = 2,
+    MedialAxis    = 3,
+    Map           = 4,
+    TMesh         = 5,
+    Quantized     = 6,
+    Blocks        = 7,
+    Mesh          = 8,
+    Smoothed      = 9,
 };
 
 // ── Widget ────────────────────────────────────────────────────────────────────
@@ -772,6 +798,12 @@ private:
     void buildZIPLINEBlocks();
     bool promptZIPLINEMesh();
     void runZIPLINEMesh();
+    // SKELETON's stages up to Step 10, one per phase, and its last three
+    // phases as ZIPLINE's.
+    void runSKELETONStages();
+    void buildSKELETONBlocks();
+    bool promptSKELETONMesh();
+    void runSKELETONMesh();
 
     // rendering sub-routines called from paintGL
     void renderMBOAnimation();
@@ -853,7 +885,7 @@ private:
         return zipline_ && zipline_->hasBlockMesh() ? &zipline_->getBlockMesh() : nullptr;
     }
     // The simplified layout converted to a QuantTMesh and quantized -- the
-    // same Sec. 6 solve blockQuant_ below runs, on the block decomposition
+    // same Sec. 6 solve SKELETON's Step 9 runs, on the block decomposition
     // tracing left rather than the medial axis one. xIdeal is 1 everywhere,
     // for the same reason. A viewer-only detour, not a stage of ZIPLINE, and
     // cleared with it.
@@ -862,19 +894,30 @@ private:
     // Triangles of the model inside a component that is not a block, found
     // once when the blocks are built: the uncovered area, filled.
     std::vector<int> ziplineUncoveredTris_;
-    std::shared_ptr<Mesh>      delaunayMesh_;
-    std::shared_ptr<MedialAxis> medialAxis_;
-    // The Sec. 3 map phi from the boundary to the axis above; holds a
-    // shared_ptr to it, so the two are cleared together in reset().
-    std::optional<MedialAxisMap> medialAxisMap_;
-    // The Sec. 4 coarse block decomposition cut out by the map above.
-    std::optional<MedialAxisTMesh> medialAxisTMesh_;
-    // The T-mesh welded into a QuantTMesh and quantized (Step 9 of
-    // docs/medial_axis.md: target l(e) / h, valid through Prop. 1's
-    // requirements), and the quad mesh it prescribes (Step 10). Built from
-    // medialAxisTMesh_ and cleared with it.
-    std::optional<BlockQuant> blockQuant_;
-    TMeshQuantizer::Report quantReport_;
+    // SKELETON, every stage of it from the triangulation to the mesh on the
+    // blocks, the same class and Options TestSKELETON runs, so that a model
+    // comes out the same here as on the command line. Mode 3's phases run its
+    // stages one at a time; the accessors below read them, null until a stage
+    // has run. TMOP is not SKELETON's here: Stage 12 is the one dialog and
+    // solve every mode shares.
+    std::unique_ptr<SKELETON> skeleton_;
+    const MedialAxis *skeletonAxis() const {
+        return skeleton_ && skeleton_->hasAxis() ? &skeleton_->getAxis() : nullptr;
+    }
+    const MedialAxisMap *skeletonMap() const {
+        return skeleton_ && skeleton_->hasMap() ? &skeleton_->getMap() : nullptr;
+    }
+    const MedialAxisTMesh *skeletonTMesh() const {
+        return skeleton_ && skeleton_->hasTMesh() ? &skeleton_->getTMesh() : nullptr;
+    }
+    const BaseComplex *skeletonBlocks() const {
+        return skeleton_ && skeleton_->hasBlocks() ? &skeleton_->getBlocks() : nullptr;
+    }
+    const BlockQuadMesh *skeletonMesh() const {
+        return skeleton_ && skeleton_->hasBlockMesh() ? &skeleton_->getBlockMesh() : nullptr;
+    }
+    // Step 10's mesh as a mesh::QuadMesh, the form drawQuadMesh() draws.
+    // Built when the stage runs and cleared with skeleton_.
     std::optional<mesh::QuadMesh> skeletonQuads_;
     std::optional<OASIS>       oasis_;
     // UMBER runs on the DualMBO field held in dualMBOField_, so it needs no field of
@@ -1083,6 +1126,7 @@ private:
     bool blocksAttempted_      = false;
     bool umberMeshAttempted_   = false;
     bool ziplineMeshAttempted_   = false;
+    bool skeletonMeshAttempted_  = false;
     // One-shot discipline for the three MERIDIAN stages. Each is attempted once
     // per run and not retried: a failure leaves its optional empty, and keying
     // off the optional alone would run the whole stage again on every frame --
@@ -1284,6 +1328,8 @@ private:
     // ZIPLINE's, for the same reason again: its mesh is BlockQuadMesh's
     // transfinite grid, exactly UMBER's kind of mesh.
     TMOPSettings ziplineTmopSettings_ = [] { TMOPSettings t; t.corners = true; return t; }();
+    // And SKELETON's: BlockQuadMesh's grid on the Step 10 mesh's base complex.
+    TMOPSettings skeletonTmopSettings_ = [] { TMOPSettings t; t.corners = true; return t; }();
     // The copy above that the current mode's TMOP dialog and solve both use.
     TMOPSettings &tmopSettingsForMode();
 

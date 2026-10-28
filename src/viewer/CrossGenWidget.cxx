@@ -146,15 +146,17 @@ ORACLEPhase nextORACLEPhase(ORACLEPhase p) {
 
 SKELETONPhase nextSKELETONPhase(SKELETONPhase p) {
     switch (p) {
-        case SKELETONPhase::MeshOnly:     return SKELETONPhase::DelaunayMesh;
-        case SKELETONPhase::DelaunayMesh: return SKELETONPhase::MedialAxis;
-        case SKELETONPhase::MedialAxis:   return SKELETONPhase::Map;
-        case SKELETONPhase::Map:          return SKELETONPhase::TMesh;
-        case SKELETONPhase::TMesh:        return SKELETONPhase::Quantize;
-        case SKELETONPhase::Quantize:     return SKELETONPhase::Quantized;
-        case SKELETONPhase::Quantized:    return SKELETONPhase::Quantized;
+        case SKELETONPhase::MeshOnly:      return SKELETONPhase::Triangulation;
+        case SKELETONPhase::Triangulation: return SKELETONPhase::MedialAxis;
+        case SKELETONPhase::MedialAxis:    return SKELETONPhase::Map;
+        case SKELETONPhase::Map:           return SKELETONPhase::TMesh;
+        case SKELETONPhase::TMesh:         return SKELETONPhase::Quantized;
+        case SKELETONPhase::Quantized:     return SKELETONPhase::Blocks;
+        case SKELETONPhase::Blocks:        return SKELETONPhase::Mesh;
+        case SKELETONPhase::Mesh:          return SKELETONPhase::Smoothed;
+        case SKELETONPhase::Smoothed:      return SKELETONPhase::Smoothed;
     }
-    return SKELETONPhase::Quantized;
+    return SKELETONPhase::Smoothed;
 }
 
 const char *phaseName(Phase p) {
@@ -275,13 +277,15 @@ const char *oraclePhaseName(ORACLEPhase p) {
 
 const char *skeletonPhaseName(SKELETONPhase p) {
     switch (p) {
-        case SKELETONPhase::MeshOnly:     return "1) mesh";
-        case SKELETONPhase::DelaunayMesh: return "2) Delaunay re-triangulation";
-        case SKELETONPhase::MedialAxis:   return "3) Medial axis";
-        case SKELETONPhase::Map:          return "4) Boundary map";
-        case SKELETONPhase::TMesh:        return "5) Coarse block decomposition";
-        case SKELETONPhase::Quantize:     return "6) Quantization";
-        case SKELETONPhase::Quantized:    return "7) Quantized block decomposition";
+        case SKELETONPhase::MeshOnly:      return "1) mesh";
+        case SKELETONPhase::Triangulation: return "2) Delaunay triangulation (Steps 1-2)";
+        case SKELETONPhase::MedialAxis:    return "3) medial axis (Steps 3-4)";
+        case SKELETONPhase::Map:           return "4) boundary map (Step 5)";
+        case SKELETONPhase::TMesh:         return "5) T-mesh (Steps 6-8)";
+        case SKELETONPhase::Quantized:     return "6) quad mesh at h (Steps 9-10)";
+        case SKELETONPhase::Blocks:        return "7) block decomposition";
+        case SKELETONPhase::Mesh:          return "8) quad mesh";
+        case SKELETONPhase::Smoothed:      return "9) TMOP smoothing";
     }
     return "?";
 }
@@ -531,6 +535,15 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
             if (promptZIPLINEMesh()) {
                 runZIPLINEMesh();
                 ziplinePhase_ = ZIPLINEPhase::Mesh;
+            }
+        }
+        // And SKELETON's.
+        if (mode_ == Mode::SKELETON && skeletonPhase_ >= SKELETONPhase::Mesh && skeletonBlocks() &&
+            !skeletonBlocks()->decomposition().blocks.empty()) {
+            skeletonMeshAttempted_ = true;
+            if (promptSKELETONMesh()) {
+                runSKELETONMesh();
+                skeletonPhase_ = SKELETONPhase::Mesh;
             }
         }
         // And ORACLE's, by whichever mesher its kept method has.
@@ -926,13 +939,8 @@ void CrossGenWidget::doReset() {
     ziplineQuant_.reset();
     ziplineQuantReport_ = TMeshQuantizer::Report{};
     zipline_.reset();
-    delaunayMesh_.reset();
-    blockQuant_.reset();
-    quantReport_ = TMeshQuantizer::Report{};
     skeletonQuads_.reset();
-    medialAxisTMesh_.reset();
-    medialAxisMap_.reset();
-    medialAxis_.reset();
+    skeleton_.reset();
     oasis_.reset();
     oasisGuide_.reset();
     umber_.reset();
@@ -1026,6 +1034,7 @@ void CrossGenWidget::doReset() {
     umberAttempted_       = false;
     umberMeshAttempted_   = false;
     ziplineMeshAttempted_   = false;
+    skeletonMeshAttempted_  = false;
     polysquareAnnounced_  = false;
     polysquareAttempted_  = false;
     blocksAttempted_      = false;
@@ -4257,6 +4266,7 @@ CrossGenWidget::TMOPSettings &CrossGenWidget::tmopSettingsForMode() {
     if (mode_ == Mode::ATLAS) return atlasTmopSettings_;
     if (mode_ == Mode::UMBER) return umberTmopSettings_;
     if (mode_ == Mode::ZIPLINE) return ziplineTmopSettings_;
+    if (mode_ == Mode::SKELETON) return skeletonTmopSettings_;
     if (mode_ == Mode::ORACLE && oracle_ && oracle_->hasChoice()) {
         switch (oracle_->getChoice().method()) {
             case oracle::Method::ATLAS:    return atlasTmopSettings_;
@@ -4273,14 +4283,15 @@ bool CrossGenWidget::promptTMOP() {
     TMOPSettings &ts = tmopSettingsForMode();
     if (!haveFinishedMesh()) return false;
     const bool atlas = (mode_ == Mode::ATLAS);
-    const bool blockMode =
-        atlas || mode_ == Mode::UMBER || mode_ == Mode::ZIPLINE || mode_ == Mode::ORACLE;
+    const bool blockMode = atlas || mode_ == Mode::UMBER || mode_ == Mode::ZIPLINE ||
+                           mode_ == Mode::SKELETON || mode_ == Mode::ORACLE;
 
     QDialog dlg(this);
     dlg.setWindowTitle(atlas ? "ATLAS — TMOP smoothing"
                              : (mode_ == Mode::UMBER ? "UMBER — TMOP smoothing"
                                                      : (mode_ == Mode::ZIPLINE ? "ZIPLINE — TMOP smoothing"
                                                                                : "Stage 12 — TMOP smoothing")));
+    if (mode_ == Mode::SKELETON) dlg.setWindowTitle(QString::fromUtf8("SKELETON — TMOP smoothing"));
     if (mode_ == Mode::ORACLE && oracle_ && oracle_->hasChoice())
         dlg.setWindowTitle(QString::fromUtf8("ORACLE (%1) — TMOP smoothing")
                                .arg(QString::fromUtf8(oracle_->getChoice().name())));
@@ -4532,9 +4543,11 @@ void CrossGenWidget::runTMOP() {
     // ATLAS, UMBER and ZIPLINE keep their own settings; see
     // tmopSettingsForMode().
     const bool atlas = (mode_ == Mode::ATLAS);
-    // UMBER and ZIPLINE: the two that smooth a BlockQuadMesh. ORACLE is named
-    // with them, since its stages are not Stage 10's whichever method it kept.
-    const bool blockMesh = (mode_ == Mode::UMBER) || (mode_ == Mode::ZIPLINE) || (mode_ == Mode::ORACLE);
+    // UMBER, ZIPLINE and SKELETON: the three that smooth a BlockQuadMesh.
+    // ORACLE is named with them, since its stages are not Stage 10's whichever
+    // method it kept.
+    const bool blockMesh = (mode_ == Mode::UMBER) || (mode_ == Mode::ZIPLINE) ||
+                           (mode_ == Mode::SKELETON) || (mode_ == Mode::ORACLE);
     TMOPSettings &ts = tmopSettingsForMode();
     // The pipelines number this Stage 12 after their Stage 10; ATLAS's stages
     // stop at 6, UMBER's at its decomposition and ZIPLINE's at Sec. 4, so
@@ -4559,6 +4572,10 @@ void CrossGenWidget::runTMOP() {
     mopts.cornerAngle = ts.cornerAngle;
     mopts.fixAllFeatureNodes = ts.pinFeatures;
     mopts.curveSource = static_cast<mesh::QuadMesh::Options::CurveSource>(ts.curveSource);
+    // SKELETON's mesh is counter-clockwise by construction, so an element of
+    // negative area is folded, and has to reach TMOP folded rather than
+    // turned round (SKELETON::smooth() says why).
+    if (mode_ == Mode::SKELETON) mopts.keepOrientation = true;
 
     auto t0 = Clock::now();
     mesh::Pillow::Report pillowReport;
@@ -4699,6 +4716,7 @@ bool CrossGenWidget::haveFinishedMesh() const {
     if (mode_ == Mode::ATLAS) return atlasMesh_.has_value();
     if (mode_ == Mode::UMBER) return umberMesh_.has_value();
     if (mode_ == Mode::ZIPLINE) return ziplineMesh();
+    if (mode_ == Mode::SKELETON) return skeletonMesh();
     if (mode_ == Mode::ORACLE) return oracleMesh_ != nullptr;
     return quadMesh_.has_value();
 }
@@ -4707,6 +4725,7 @@ mesh::QuadMesh CrossGenWidget::finishedMesh(const mesh::QuadMesh::Options &o) co
     if (mode_ == Mode::ATLAS) return mesh::QuadMesh::from(*atlasMesh_, o);
     if (mode_ == Mode::UMBER) return mesh::QuadMesh::from(*umberMesh_, o);
     if (mode_ == Mode::ZIPLINE) return mesh::QuadMesh::from(*ziplineMesh(), o);
+    if (mode_ == Mode::SKELETON) return mesh::QuadMesh::from(*skeletonMesh(), o);
     // Stage 11's merged mesh where there is one, and ZIPLINE's open sides held.
     if (mode_ == Mode::ORACLE) return oracleMesh_->quadMesh(o);
     return diskFill_.has_value() ? mesh::QuadMesh::from(*diskFill_, o)
@@ -5842,6 +5861,21 @@ void CrossGenWidget::advancePhase() {
         skeletonPhase_ = nextSKELETONPhase(skeletonPhase_);
         if (skeletonPhase_ != old)
             std::cerr << "[Viewer] SKELETON Phase " << skeletonPhaseName(skeletonPhase_) << "\n";
+
+        // ZIPLINE's last two phases, for ZIPLINE's reasons: the mesh dialog
+        // on the way into Mesh, the TMOP one on the way into Smoothed and on
+        // every 'c' there.
+        if (old == SKELETONPhase::Blocks && skeletonPhase_ == SKELETONPhase::Mesh) {
+            if (!skeletonBlocks()) buildSKELETONBlocks();
+            if (skeletonBlocks() && !skeletonBlocks()->decomposition().blocks.empty()) {
+                skeletonMeshAttempted_ = true;
+                if (promptSKELETONMesh()) runSKELETONMesh();
+            }
+        }
+        if (skeletonPhase_ == SKELETONPhase::Smoothed && skeletonMesh()) {
+            tmopAttempted_ = true;
+            if (promptTMOP()) runTMOP();
+        }
     } else if (mode_ == Mode::UMBER) {
         UMBERPhase old = umberPhase_;
         umberPhase_ = nextUMBERPhase(umberPhase_);
@@ -6170,6 +6204,360 @@ void CrossGenWidget::runZIPLINEMesh() {
                "four-sided";
         console_.log(oss.str());
     }
+}
+
+// ── SKELETON ─────────────────────────────────────────────────────────────────
+//
+// The SKELETON class's stages up to Step 10, each run once on the way into its
+// phase and reported as it left them. A stage that refuses leaves the ones
+// after it unbuilt, and the phase draws what there is.
+void CrossGenWidget::runSKELETONStages() {
+    if (mode_ != Mode::SKELETON) return;
+
+    // ── Steps 1-2 ──
+    if (skeletonPhase_ >= SKELETONPhase::Triangulation && !skeleton_) {
+        skeleton_ = std::make_unique<SKELETON>(mesh_);
+        auto t0 = Clock::now();
+        try {
+            skeleton_->triangulate();
+        } catch (const std::exception &e) {
+            console_.log(std::string("[SKELETON] Steps 1-2 FAILED: ") + e.what());
+            return;
+        }
+        auto t1 = Clock::now();
+        const Mesh &tri = skeleton_->getTriangulation();
+        std::ostringstream oss;
+        oss << "[SKELETON] Delaunay triangulation of dS: " << tri.triangles.size()
+            << " triangles, " << tri.vertices.size() << " vertices, "
+            << skeleton_->getStatus().boundaryLoops << " boundary loop(s), "
+            << skeleton_->getStatus().corners << " corner(s): "
+            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+        bool multi = false;
+        for (size_t t = 1; t < mesh_->triangleMatId.size() && !multi; ++t)
+            multi = mesh_->triangleMatId[t] != mesh_->triangleMatId[0];
+        if (multi)
+            console_.log("[SKELETON] the material interfaces are not honoured: Steps 1-2 see dS "
+                         "only, and the model is meshed as one material");
+    }
+    if (!skeleton_ || !skeleton_->hasTriangulation()) return;
+
+    // ── Steps 3-4 ──
+    if (skeletonPhase_ >= SKELETONPhase::MedialAxis && !skeleton_->hasAxis()) {
+        auto t0 = Clock::now();
+        skeleton_->buildAxis();
+        auto t1 = Clock::now();
+        const MedialAxis &ma = skeleton_->getAxis();
+        const SKELETON::Status &status = skeleton_->getStatus();
+        {
+            std::ostringstream oss;
+            oss << "[SKELETON] Medial axis: " << status.rawMedialVertices << " -> "
+                << ma.medialVertices.size() << " vertices, " << status.rawMedialEdges << " -> "
+                << ma.medialEdges.size() << " edges, target size h "
+                << std::fixed << std::setprecision(3) << status.targetSize << ": "
+                << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+            console_.log(oss.str());
+        }
+        {
+            // Step 4 of docs/medial_axis.md: the topological noise pruned and
+            // flattened by moving boundary vertices within delta_max.
+            const auto &ss = ma.simplifyStats;
+            std::ostringstream simp;
+            simp << "[SKELETON] Simplification: " << ss.cocircularMerges
+                 << " cocircular merges, " << ss.endpointMerges << " endpoints pruned ("
+                 << ss.endpointsKept << " kept), " << ss.flattenedChains
+                 << " arcs flattened (" << ss.removedVertices << " boundary vertices removed), "
+                 << "largest move " << std::fixed << std::setprecision(4)
+                 << ss.maxDisplacement << " of delta_max " << ss.budget;
+            console_.log(simp.str());
+        }
+        const auto &st = ma.stats;
+        if (st.degenerateCells || st.centersOutsideDomain || st.edgesCrossingBoundary ||
+            st.nonManifoldBoundaryVertices) {
+            std::ostringstream warn;
+            warn << "[SKELETON] Sampling warnings: "
+                 << st.degenerateCells << " degenerate cells, "
+                 << st.centersOutsideDomain << " centers outside, "
+                 << st.edgesCrossingBoundary << " edges crossing the boundary, "
+                 << st.nonManifoldBoundaryVertices << " pinched boundary vertices";
+            console_.log(warn.str());
+        }
+    }
+
+    // ── Step 5 ──
+    if (skeletonPhase_ >= SKELETONPhase::Map && skeleton_->hasAxis() && !skeleton_->hasMap()) {
+        auto t0 = Clock::now();
+        skeleton_->buildMap();
+        auto t1 = Clock::now();
+        const auto &st = skeleton_->getMap().stats();
+        std::ostringstream oss;
+        oss << "[SKELETON] Map phi: " << st.fans << " boundary fans ("
+            << st.collapsedFans << " collapsed), "
+            << skeleton_->getMap().spokes().size() << " medial radii: "
+            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+        if (st.skippedVertices || st.fallbackProjections) {
+            std::ostringstream warn;
+            warn << "[SKELETON] Map warnings: " << st.skippedVertices
+                 << " boundary vertices skipped, " << st.fallbackProjections
+                 << " polar rays missed (closest-point fallback)";
+            console_.log(warn.str());
+        }
+        console_.log("[SKELETON] blue = bijective radii, magenta = polar "
+                     "sections (axis endpoints)");
+    }
+
+    // ── Steps 6-8 ──
+    if (skeletonPhase_ >= SKELETONPhase::TMesh && skeleton_->hasMap() && !skeleton_->hasTMesh()) {
+        auto t0 = Clock::now();
+        skeleton_->buildTMesh();
+        auto t1 = Clock::now();
+        const MedialAxisTMesh &tm = skeleton_->getTMesh();
+        const auto &st = tm.stats();
+        std::ostringstream oss;
+        oss << "[SKELETON] T-mesh: " << st.blocks << " faces from " << st.zones
+            << " zones (" << st.capZones << " caps) over " << st.coarseEdges
+            << " coarse edges, target size " << std::fixed << std::setprecision(3)
+            << tm.targetSize() << ": "
+            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+        {
+            std::ostringstream col;
+            col << "[SKELETON] templates: " << st.colorCounts[0] << " green (2 faces), "
+                << st.colorCounts[1] << " red (3), " << st.colorCounts[2]
+                << " blue (4), " << st.colorCounts[3] << " purple (3)";
+            console_.log(col.str());
+        }
+        {
+            std::ostringstream smp;
+            smp << "[SKELETON] downsampling: " << st.keptVertices << " axis vertices kept, "
+                << st.insertedVertices << " samples inserted, " << st.midpointCuts
+                << " polar sections cut at their midpoint, " << st.dissolvedVertices
+                << " valence-2 vertices dissolved";
+            console_.log(smp.str());
+        }
+        if (st.badFaces > 0 || st.refinements > 0) {
+            // Step 8.6: a folded or badly non-convex cell, with h already
+            // halved locally as often as that helped.
+            std::ostringstream bad;
+            bad << "[SKELETON] geometry check: " << st.badFaces << " bad faces after "
+                << st.refinements << " local refinements";
+            console_.log(bad.str());
+        }
+        if (st.skippedLoops || st.unpairedEdges) {
+            std::ostringstream warn;
+            warn << "[SKELETON] T-mesh warnings: " << st.skippedLoops
+                 << " loops skipped, " << st.unpairedEdges << " unpaired edges";
+            console_.log(warn.str());
+        }
+    }
+
+    // ── Steps 9-10 ──
+    //
+    // The faces carry no shared-edge identifiers, so the converter welds them
+    // geometrically first: corners become nodes, sides are split where another
+    // face's corner lands on them, and the T-junctions the red, blue and
+    // purple templates leave on the radii are recovered that way. Each edge
+    // then aims at l(e) / h quads, and lengths may drop to zero as long as no
+    // radius chain, boundary feature or boundary loop does -- the linear
+    // surrogates of Prop. 1 -- so the templates' slivers collapse rather than
+    // costing an element each. Step 10 cuts every edge into its quads, fills
+    // every face with a Coons grid and welds what the zero lengths collapse.
+    if (skeletonPhase_ >= SKELETONPhase::Quantized && skeleton_->hasTMesh() &&
+        !skeleton_->hasQuantization()) {
+        auto t0 = Clock::now();
+        const bool solved = skeleton_->quantize();
+        auto t1 = Clock::now();
+        const BlockQuant &bq = skeleton_->getQuantization();
+        {
+            std::ostringstream oss;
+            oss << "[SKELETON] T-mesh welded: " << bq.nodes.size() << " nodes, "
+                << bq.tmesh.edges.size() << " edges, " << bq.tmesh.faces.size()
+                << " faces, " << bq.tmesh.rows.size() << " constraints, "
+                << bq.requirements.size() << " validity requirements ("
+                << bq.radiusRequirements << " radius chains, " << bq.featureRequirements
+                << " features, " << bq.loopRequirements << " loops)";
+            console_.log(oss.str());
+        }
+        if (bq.skippedBlocks > 0) {
+            std::ostringstream skip;
+            skip << "[SKELETON] " << bq.skippedBlocks
+                 << " faces dropped as unusable cells: " << bq.skippedNonQuad
+                 << " not four-sided, " << bq.skippedUnlocatable
+                 << " with a corner off their outline, " << bq.skippedDegenerate
+                 << " with two sides on one curve, " << bq.skippedOverlapping
+                 << " overlapping a pair already in place";
+            console_.log(skip.str());
+        }
+        if (!bq.ok) {
+            console_.log("[SKELETON] Quantization aborted: " + bq.error);
+        } else {
+            const TMeshQuantizer::Report &qr = skeleton_->getQuantReport();
+            int collapsed = 0;
+            for (const auto &e : bq.tmesh.edges) collapsed += e.x == 0;
+            std::ostringstream qss;
+            qss << "[SKELETON] Quantized: " << qr.stage1Vectors << " stage-I strips, "
+                << qr.stage2Moves << "/" << qr.stage2Tried << " stage-II moves, objective "
+                << std::fixed << std::setprecision(3) << qr.objective << ", " << collapsed
+                << " edges collapsed: "
+                << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+            console_.log(qss.str());
+            if (qr.unmetRequirements > 0) {
+                std::ostringstream uss;
+                uss << "[SKELETON] WARNING: " << qr.unmetRequirements
+                    << " validity requirements no strip can meet";
+                console_.log(uss.str());
+            }
+            if (!solved) {
+                console_.log("[SKELETON] WARNING: quantization violates the consistency "
+                             "system Ax = 0");
+            }
+        }
+        if (solved && skeleton_->extractQuads()) {
+            const QuadExtraction &qe = skeleton_->getQuadMesh();
+            std::ostringstream mss;
+            mss << "[SKELETON] Quad mesh: " << qe.vertices.size() << " vertices, "
+                << qe.quads.size() << " quads, " << qe.collapsedFaces
+                << " faces collapsed, " << qe.droppedQuads
+                << " degenerate quads dropped, Euler characteristic "
+                << qe.eulerCharacteristic << ", " << qe.boundaryLoops << " boundary loops";
+            console_.log(mss.str());
+            if (!qe.ok) console_.log("[SKELETON] WARNING: quad mesh is not a manifold: " + qe.error);
+            std::vector<mesh::Quad> cells(qe.quads.begin(), qe.quads.end());
+            skeletonQuads_.emplace(qe.vertices, cells);
+        }
+    }
+}
+
+// The Step 10 mesh's base complex as the shared BlockDecomposition
+// (SKELETON/BaseComplex.hxx), then meshed and smoothed by the classes ZIPLINE
+// and UMBER use. A patch that did not come out as a block is shaded, and the
+// coverage the console prints is how much of the model is left once those are
+// taken out.
+void CrossGenWidget::buildSKELETONBlocks() {
+    smoothMesh_.reset();
+    skeletonMeshAttempted_ = false;
+    tmopAttempted_ = false;
+    if (!skeleton_ || !skeleton_->hasQuadMesh()) return;
+
+    auto t0 = Clock::now();
+    try {
+        // Discards any mesh on the old blocks with them.
+        skeleton_->buildBlocks();
+    } catch (const std::exception &e) {
+        console_.log(std::string("[Blocks] FAILED: ") + e.what());
+        return;
+    }
+    auto t1 = Clock::now();
+    if (!skeletonBlocks()) {
+        console_.log("[Blocks] Step 10 left no quad to read blocks off");
+        return;
+    }
+    const BaseComplex::Report &r = skeletonBlocks()->getReport();
+    const BlockDecomposition &D = skeletonBlocks()->decomposition();
+    {
+        std::ostringstream oss;
+        oss << "[Blocks] " << r.blocks << " block(s) of " << r.patches << " patch(es), "
+            << D.edges.size() << " macro edge(s), " << D.vertices.size()
+            << " macrovertex/-ices: "
+            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[Blocks] base complex of the Step 10 mesh, traced at "
+            << skeleton_->getOptions().blockSubdivisions << "x its resolution (" << r.quads
+            << " quads): " << r.interiorSingular << " interior and " << r.boundarySingular
+            << " boundary singular vertices, " << r.corners << " model corner(s) on a vertex";
+        if (r.missedCorners > 0)
+            oss << " (" << r.missedCorners << " with none: a side runs through them)";
+        oss << ", " << r.separatrices << " separatrices";
+        if (r.cuts > 0) oss << ", " << r.cuts << " cut(s) through patches that were not disks";
+        console_.log(oss.str());
+    }
+    if (skeleton_->getBlockSmoothingReport().ran) {
+        // The trace mesh smoothed before the blocks were read off it, so that
+        // their sides are smooth curves and not Step 10's per-face Coons grid
+        // lines (SKELETON::Options::blockSmoothing) -- with its boundary laid
+        // onto dS in stages first where a side crossed dS otherwise
+        // (Options::boundaryStages).
+        const mesh::TMOP::Report &sr = skeleton_->getBlockSmoothingReport();
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(3) << "[Blocks] trace mesh "
+            << SKELETON::name(skeleton_->blockGeometry()) << " first: "
+            << sr.sweeps << " TMOP sweep(s), folds " << sr.invertedBefore << " -> "
+            << sr.invertedAfter << ", worst scaled Jacobian " << sr.minScaledJacobianBefore
+            << " -> " << sr.minScaledJacobianAfter;
+        console_.log(oss.str());
+    }
+    if (r.snappedVertices > 0) {
+        std::ostringstream oss;
+        oss << std::setprecision(2) << "[Blocks] " << r.snappedVertices
+            << " boundary vertices moved onto dS, up to " << r.maxSnap
+            << " of the diagonal (Step 4's moves, and boundary edges quantized to zero)";
+        console_.log(oss.str());
+    }
+    if (r.chordSides > 0) {
+        std::ostringstream oss;
+        oss << "[Blocks] " << r.chordSides << " of " << r.boundarySides
+            << " side(s) on dS not found on it, left as chords";
+        console_.log(oss.str());
+    }
+    if (r.sidesCrossingBoundary > 0) {
+        // What laying the boundary onto dS could not mend: a hole the trace
+        // mesh has only a few vertices on, or a concave corner it rounds off.
+        std::ostringstream oss;
+        oss << "[Blocks] WARNING: " << r.sidesCrossingBoundary
+            << " interior side(s) cross dS (a hole with few vertices, or a concave corner)";
+        console_.log(oss.str());
+    }
+    std::ostringstream cov;
+    cov << std::fixed << std::setprecision(1) << "[Blocks] covering " << 100.0 * r.coverage
+        << "% of the model";
+    if (r.badPatches > 0)
+        cov << " -- the " << r.badPatches
+            << " shaded patch(es) are not blocks, and they get no elements";
+    console_.log(cov.str());
+    std::cerr << "[Viewer] " << cov.str() << "\n";
+}
+
+bool CrossGenWidget::promptSKELETONMesh() {
+    if (!skeletonBlocks()) return false;
+    return promptBlockQuadMesh(skeletonBlocks()->decomposition(),
+                               "SKELETON — quadrilateral mesh on the blocks");
+}
+
+// BlockQuadMesh at the dialog's settings, as ZIPLINE's Mesh phase runs it.
+void CrossGenWidget::runSKELETONMesh() {
+    if (!skeletonBlocks() || skeletonBlocks()->decomposition().blocks.empty()) {
+        blockPipeline("the mesh not built", "the Step 10 mesh left no block to mesh");
+        return;
+    }
+    skeletonMeshAttempted_ = true;
+    smoothMesh_.reset();
+    tmopAttempted_ = false;
+    pipelineBlocked_.clear();
+
+    BlockQuadMesh::Options mo;
+    mo.targetEdgeLength   = meshSettings_.target;
+    mo.minIntervals       = meshSettings_.minEdges;
+    mo.maxIntervals       = meshSettings_.maxEdges;
+    mo.smoothingPasses    = TORSION::Options().quadSmoothingPasses;
+    mo.smoothingThreshold = TORSION::Options().quadSmoothingThreshold;
+
+    auto t0 = Clock::now();
+    try {
+        skeleton_->buildMesh(mo);
+    } catch (const std::exception &e) {
+        blockPipeline("the mesh failed", e.what());
+        return;
+    }
+    auto t1 = Clock::now();
+    if (!skeletonMesh()) {
+        blockPipeline("the mesh not built", "there was no block to mesh");
+        return;
+    }
+    reportBlockQuadMesh(*skeletonMesh(), std::chrono::duration<double, std::milli>(t1 - t0).count());
 }
 
 // ── lazy computations ────────────────────────────────────────────────────────
@@ -6818,292 +7206,25 @@ void CrossGenWidget::runComputations() {
         if (promptTMOP()) runTMOP();
     }
 
-    // ── SKELETON: Delaunay re-triangulation ───────────────────────────────────
-    if (mode_ == Mode::SKELETON && skeletonPhase_ >= SKELETONPhase::DelaunayMesh && !delaunayMesh_) {
-        auto t0 = Clock::now();
-
-        // Build boundary loops
-        std::unordered_map<int, std::vector<int>> bAdj;
-        for (int beIdx : mesh_->boundaryEdges) {
-            int a = mesh_->edges[beIdx][0];
-            int b = mesh_->edges[beIdx][1];
-            bAdj[a].push_back(b);
-            bAdj[b].push_back(a);
-        }
-
-        std::unordered_set<int> visited;
-        std::vector<std::vector<int>> loops;
-        for (int bv : mesh_->boundaryVertices) {
-            if (visited.count(bv)) continue;
-            std::vector<int> loop;
-            int prev = -1, curr = bv;
-            while (true) {
-                visited.insert(curr);
-                loop.push_back(curr);
-                int next = -1;
-                for (int nb : bAdj[curr]) {
-                    if (nb != prev && !visited.count(nb)) { next = nb; break; }
-                }
-                if (next == -1) break;
-                prev = curr;
-                curr = next;
-            }
-            if (loop.size() >= 3) loops.push_back(std::move(loop));
-        }
-
-        if (loops.empty()) {
-            console_.log("[SKELETON] No boundary loops found!");
-        } else {
-            std::unordered_map<int, int> vertRemap;
-            std::vector<std::array<double, 2>> vertlist;
-
-            for (const auto &loop : loops) {
-                for (int vi : loop) {
-                    if (!vertRemap.count(vi)) {
-                        int newIdx = static_cast<int>(vertlist.size());
-                        vertRemap[vi] = newIdx;
-                        vertlist.push_back(mesh_->vertices[vi]);
-                    }
-                }
-            }
-
-            std::vector<std::vector<std::array<int, 2>>> segLoops;
-            std::vector<int> loopTypes;
-            for (size_t li = 0; li < loops.size(); ++li) {
-                const auto &loop = loops[li];
-                std::vector<std::array<int, 2>> segs;
-                for (size_t i = 0; i < loop.size(); ++i) {
-                    int a = vertRemap[loop[i]];
-                    int b = vertRemap[loop[(i + 1) % loop.size()]];
-                    segs.push_back({a, b});
-                }
-                segLoops.push_back(std::move(segs));
-                loopTypes.push_back(li == 0 ? 0 : 1);
-            }
-
-            triangle_wrapper::TriangleMesher2D::Options opts;
-            opts.just_delaunay = true;
-            triangle_wrapper::TriangleMesher2D mesher(opts);
-
-            triangle_wrapper::TriangleMesher2D::MeshInput input;
-            input.vertlist      = vertlist;
-            input.segment_loops = segLoops;
-            input.type          = loopTypes;
-            input.h             = 0.0;
-
-            auto output = mesher.triangulate(input);
-            delaunayMesh_ = std::make_shared<Mesh>(output.verts, output.triangles);
-
-            auto t1 = Clock::now();
-            std::ostringstream oss;
-            oss << "[SKELETON] Delaunay re-triangulation: "
-                << delaunayMesh_->triangles.size() << " triangles, "
-                << delaunayMesh_->vertices.size() << " vertices: "
-                << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
-            console_.log(oss.str());
-        }
-    }
-
-    // ── SKELETON: compute axis ────────────────────────────────────────────────
-    if (mode_ == Mode::SKELETON && skeletonPhase_ >= SKELETONPhase::MedialAxis &&
-        delaunayMesh_ && !medialAxis_) {
-        auto t0 = Clock::now();
-        medialAxis_ = std::make_shared<MedialAxis>(delaunayMesh_);
-        int rawV = static_cast<int>(medialAxis_->medialVertices.size());
-        int rawE = static_cast<int>(medialAxis_->medialEdges.size());
-        // Step 4 of docs/medial_axis.md: prune and flatten the topological
-        // noise by moving boundary vertices within delta_max, at the same
-        // default h the T-mesh below samples the axis at.
-        medialAxis_->simplify();
-        auto t1 = Clock::now();
-        std::ostringstream oss;
-        oss << "[SKELETON] Computed: " << rawV << " -> "
-            << medialAxis_->medialVertices.size() << " vertices, "
-            << rawE << " -> " << medialAxis_->medialEdges.size() << " edges: "
-            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
-        console_.log(oss.str());
-        {
-            const auto &ss = medialAxis_->simplifyStats;
-            std::ostringstream simp;
-            simp << "[SKELETON] Simplification: " << ss.cocircularMerges
-                 << " cocircular merges, " << ss.endpointMerges << " endpoints pruned ("
-                 << ss.endpointsKept << " kept), " << ss.flattenedChains
-                 << " arcs flattened (" << ss.removedVertices << " boundary vertices removed), "
-                 << "largest move " << std::fixed << std::setprecision(4)
-                 << ss.maxDisplacement << " of delta_max " << ss.budget;
-            console_.log(simp.str());
-        }
-
-        const auto &st = medialAxis_->stats;
-        if (st.degenerateCells || st.centersOutsideDomain || st.edgesCrossingBoundary ||
-            st.nonManifoldBoundaryVertices) {
-            std::ostringstream warn;
-            warn << "[SKELETON] Sampling warnings: "
-                 << st.degenerateCells << " degenerate cells, "
-                 << st.centersOutsideDomain << " centers outside, "
-                 << st.edgesCrossingBoundary << " edges crossing the boundary, "
-                 << st.nonManifoldBoundaryVertices << " pinched boundary vertices";
-            console_.log(warn.str());
-        }
-    }
-
-    // ── SKELETON: the boundary -> axis map (Sec. 3) ───────────────────────────
-    if (mode_ == Mode::SKELETON && skeletonPhase_ >= SKELETONPhase::Map &&
-        medialAxis_ && !medialAxisMap_.has_value()) {
-        auto t0 = Clock::now();
-        medialAxisMap_.emplace(medialAxis_);
-        auto t1 = Clock::now();
-
-        const auto &st = medialAxisMap_->stats();
-        std::ostringstream oss;
-        oss << "[SKELETON] Map phi: " << st.fans << " boundary fans ("
-            << st.collapsedFans << " collapsed), "
-            << medialAxisMap_->spokes().size() << " medial radii: "
-            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
-        console_.log(oss.str());
-        if (st.skippedVertices || st.fallbackProjections) {
-            std::ostringstream warn;
-            warn << "[SKELETON] Map warnings: " << st.skippedVertices
-                 << " boundary vertices skipped, " << st.fallbackProjections
-                 << " polar rays missed (closest-point fallback)";
-            console_.log(warn.str());
-        }
-        console_.log("[SKELETON] blue = bijective radii, magenta = polar "
-                     "sections (axis endpoints)");
-    }
-
-    // ── SKELETON: the coarse block decomposition (Sec. 4) ─────────────────────
-    if (mode_ == Mode::SKELETON && skeletonPhase_ >= SKELETONPhase::TMesh &&
-        medialAxisMap_.has_value() && !medialAxisTMesh_.has_value()) {
-        auto t0 = Clock::now();
-        medialAxisTMesh_.emplace(*medialAxisMap_);
-        auto t1 = Clock::now();
-
-        const auto &st = medialAxisTMesh_->stats();
-        std::ostringstream oss;
-        oss << "[SKELETON] T-mesh: " << st.blocks << " blocks from " << st.zones
-            << " zones (" << st.capZones << " caps) over " << st.coarseEdges
-            << " coarse edges, target size " << std::fixed << std::setprecision(3)
-            << medialAxisTMesh_->targetSize() << ": "
-            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
-        console_.log(oss.str());
-        {
-            std::ostringstream col;
-            col << "[SKELETON] templates: " << st.colorCounts[0] << " green (2 blocks), "
-                << st.colorCounts[1] << " red (3), " << st.colorCounts[2]
-                << " blue (4), " << st.colorCounts[3] << " purple (3)";
-            console_.log(col.str());
-        }
-        {
-            std::ostringstream smp;
-            smp << "[SKELETON] downsampling: " << st.keptVertices << " axis vertices kept, "
-                << st.insertedVertices << " samples inserted, " << st.midpointCuts
-                << " polar sections cut at their midpoint, " << st.dissolvedVertices
-                << " valence-2 vertices dissolved";
-            console_.log(smp.str());
-        }
-        if (st.badFaces > 0 || st.refinements > 0) {
-            // Step 8.6: a folded or badly non-convex cell, with h already
-            // halved locally as often as that helped.
-            std::ostringstream bad;
-            bad << "[SKELETON] geometry check: " << st.badFaces << " bad faces after "
-                << st.refinements << " local refinements";
-            console_.log(bad.str());
-        }
-        if (st.skippedLoops || st.unpairedEdges) {
-            std::ostringstream warn;
-            warn << "[SKELETON] Block warnings: " << st.skippedLoops
-                 << " loops skipped, " << st.unpairedEdges << " unpaired edges";
-            console_.log(warn.str());
-        }
-    }
-
-    // ── SKELETON: quantization and the quad mesh (Steps 9-10) ────────────────
+    // ── SKELETON: Steps 1-10, then the blocks and the mesh on them ──────────
     //
-    // The blocks carry no shared-edge identifiers, so the converter welds
-    // them geometrically first: corners become nodes, block sides are split
-    // where another block's corner lands on them, and the T-junctions the
-    // red, blue and purple templates leave on the radii are recovered that
-    // way. Each edge then aims at l(e) / h quads, and lengths may drop to
-    // zero as long as no radius chain, boundary feature or boundary loop
-    // does -- the linear surrogates of Prop. 1 -- so the templates' slivers
-    // collapse rather than costing an element each. Step 10 cuts every edge
-    // into its quads, fills every face with a Coons grid and welds what the
-    // zero lengths collapse.
-    if (mode_ == Mode::SKELETON && skeletonPhase_ >= SKELETONPhase::Quantize &&
-        medialAxisTMesh_.has_value() && !blockQuant_.has_value()) {
-        auto t0 = Clock::now();
-        blockQuant_.emplace(makeQuantTMesh(*medialAxisTMesh_, medialAxisTMesh_->targetSize()));
-        auto t1 = Clock::now();
-
-        const BlockQuant &bq = *blockQuant_;
-        std::ostringstream oss;
-        oss << "[SKELETON] T-mesh welded: " << bq.nodes.size() << " nodes, "
-            << bq.tmesh.edges.size() << " edges, " << bq.tmesh.faces.size()
-            << " faces, " << bq.tmesh.rows.size() << " constraints, "
-            << bq.requirements.size() << " validity requirements ("
-            << bq.radiusRequirements << " radius chains, " << bq.featureRequirements
-            << " features, " << bq.loopRequirements << " loops), from "
-            << medialAxisTMesh_->blocks.size() << " blocks: "
-            << formatMs(std::chrono::duration<double, std::milli>(t1 - t0).count());
-        console_.log(oss.str());
-        if (bq.skippedBlocks > 0) {
-            std::ostringstream skip;
-            skip << "[SKELETON] " << bq.skippedBlocks
-                 << " blocks dropped as unusable cells: " << bq.skippedNonQuad
-                 << " not four-sided, " << bq.skippedUnlocatable
-                 << " with a corner off their outline, " << bq.skippedDegenerate
-                 << " with two sides on one curve, " << bq.skippedOverlapping
-                 << " overlapping a pair already in place";
-            console_.log(skip.str());
-        }
-
-        if (!bq.ok) {
-            console_.log("[SKELETON] Quantization aborted: " + bq.error);
-        } else {
-            auto q0 = Clock::now();
-            TMeshQuantizer::Options qo;
-            qo.minLength = 0;
-            qo.requirements = blockQuant_->requirements;
-            qo.objective = TMeshQuantizer::Options::Objective::Absolute;
-            quantReport_ = TMeshQuantizer(blockQuant_->tmesh, qo).run();
-            auto q1 = Clock::now();
-
-            int collapsed = 0;
-            for (const auto &e : blockQuant_->tmesh.edges) collapsed += e.x == 0;
-            std::ostringstream qss;
-            qss << "[SKELETON] Quantized: " << quantReport_.stage1Vectors
-                << " stage-I strips, " << quantReport_.stage2Moves << "/"
-                << quantReport_.stage2Tried << " stage-II moves, objective "
-                << std::fixed << std::setprecision(3) << quantReport_.objective
-                << ", " << collapsed << " edges collapsed: "
-                << formatMs(std::chrono::duration<double, std::milli>(q1 - q0).count());
-            console_.log(qss.str());
-            if (quantReport_.unmetRequirements > 0) {
-                std::ostringstream uss;
-                uss << "[SKELETON] WARNING: " << quantReport_.unmetRequirements
-                    << " validity requirements no strip can meet";
-                console_.log(uss.str());
-            }
-            if (!quantReport_.consistent) {
-                console_.log("[SKELETON] WARNING: quantization violates the "
-                             "consistency system Ax = 0");
-            } else {
-                const QuadExtraction qe = extractQuadMesh(*blockQuant_);
-                std::ostringstream mss;
-                mss << "[SKELETON] Quad mesh: " << qe.vertices.size() << " vertices, "
-                    << qe.quads.size() << " quads, " << qe.collapsedFaces
-                    << " faces collapsed, " << qe.droppedQuads
-                    << " degenerate quads dropped, Euler characteristic "
-                    << qe.eulerCharacteristic << ", " << qe.boundaryLoops << " boundary loops";
-                console_.log(mss.str());
-                if (!qe.ok) {
-                    console_.log("[SKELETON] WARNING: quad mesh is not a manifold: " + qe.error);
-                }
-                std::vector<mesh::Quad> cells(qe.quads.begin(), qe.quads.end());
-                skeletonQuads_.emplace(qe.vertices, cells);
-            }
-        }
+    // The stages up to Step 10 one per phase (runSKELETONStages), and then the
+    // catch-ups ZIPLINE has for a phase reached without passing through
+    // advancePhase(), each marked as asked before its dialog opens.
+    runSKELETONStages();
+    if (mode_ == Mode::SKELETON && skeletonPhase_ >= SKELETONPhase::Blocks && skeleton_ &&
+        skeleton_->hasQuadMesh() && !skeleton_->getQuadMesh().quads.empty() && !skeletonBlocks()) {
+        buildSKELETONBlocks();
+    }
+    if (mode_ == Mode::SKELETON && skeletonPhase_ == SKELETONPhase::Mesh && skeletonBlocks() &&
+        !skeletonBlocks()->decomposition().blocks.empty() && !skeletonMeshAttempted_) {
+        skeletonMeshAttempted_ = true;
+        if (promptSKELETONMesh()) runSKELETONMesh();
+    }
+    if (mode_ == Mode::SKELETON && skeletonPhase_ == SKELETONPhase::Smoothed && skeletonMesh() &&
+        !tmopAttempted_) {
+        tmopAttempted_ = true;
+        if (promptTMOP()) runTMOP();
     }
 
     // ── PolyVector: solve crossfield ──────────────────────────────────────────
@@ -8038,33 +8159,85 @@ void CrossGenWidget::renderNormal() {
         renderORACLE();
     } else if (mode_ == Mode::SKELETON) {
         viewer::drawAxis(view_);
-        // The map and block phases draw over the boundary alone: the
-        // triangulation underneath would bury the radii / zone edges.
-        if (skeletonPhase_ < SKELETONPhase::Map) {
-            if (delaunayMesh_)
-                viewer::drawMesh(*delaunayMesh_);
-            else
-                viewer::drawMesh(*mesh_);
-        }
+        const MedialAxis *ma = skeletonAxis();
+        // The trace mesh's quads in no block, filled: the part of the model
+        // the decomposition leaves out, as ZIPLINE fills its refused
+        // components.
+        auto fillUncovered = [&]() {
+            const BaseComplex *bc = skeletonBlocks();
+            if (!bc || bc->getReport().badPatches == 0) return;
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            viewer::color4f(1.0f, 0.55f, 0.5f, 0.35f);
+            glBegin(GL_TRIANGLES);
+            for (size_t q = 0; q < bc->quads().size(); ++q) {
+                if (bc->quadInBlock()[q]) continue;
+                const auto &c = bc->quads()[q];
+                for (const int k : {0, 1, 2, 0, 2, 3})
+                    glVertex2d(bc->vertices()[c[k]][0], bc->vertices()[c[k]][1]);
+            }
+            glEnd();
+        };
 
-        if (medialAxis_) {
-            if (skeletonPhase_ >= SKELETONPhase::Quantized && skeletonQuads_.has_value()) {
-                // Step 10's quad mesh, drawn by the routine every other
-                // method's mesh is drawn with. A T-mesh face whose length
-                // collapsed to zero is gone from it, welded into its
-                // neighbours, so the mesh -- not the per-face grids -- is
-                // the thing to look at.
-                viewer::drawQuadMesh(*skeletonQuads_, nullptr, nullptr, 1.0f, 2.5f);
-            } else if (skeletonPhase_ >= SKELETONPhase::TMesh &&
-                       medialAxisTMesh_.has_value()) {
+        if (skeletonPhase_ >= SKELETONPhase::Blocks && skeletonBlocks()) {
+            if (skeletonPhase_ >= SKELETONPhase::Mesh && skeletonMesh()) {
+                fillUncovered();
+                if (skeletonPhase_ == SKELETONPhase::Smoothed && smoothMesh_.has_value())
+                    viewer::drawQuadMesh(*smoothMesh_, *skeletonMesh(), 1.0f, 2.5f);
+                else
+                    viewer::drawQuadMesh(*skeletonMesh(), 1.0f, 2.5f);
+            } else {
+                // The picture every mode's block phase draws -- light-blue
+                // sides, green macrovertices -- over the grid the blocks were
+                // read off, light, as background: the Step 10 mesh refined
+                // and smoothed, whose grid lines the sides are.
+                {
+                    const BaseComplex &bc = *skeletonBlocks();
+                    glEnable(GL_BLEND);
+                    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                    viewer::color4f(0.6f, 0.6f, 0.62f, 0.35f);
+                    viewer::lineWidth(1.0f);
+                    glBegin(GL_LINES);
+                    for (const auto &q : bc.quads()) {
+                        for (int k = 0; k < 4; ++k) {
+                            const Point &a = bc.vertices()[q[k]], &b = bc.vertices()[q[(k + 1) % 4]];
+                            glVertex2d(a[0], a[1]);
+                            glVertex2d(b[0], b[1]);
+                        }
+                    }
+                    glEnd();
+                }
+                viewer::drawBoundaryEdges(*mesh_);
+                fillUncovered();
+                viewer::drawBlockDecomposition(skeletonBlocks()->decomposition(),
+                                               0.12 * avgEdge_ * view_.zoom, 4.0f);
+            }
+        } else if (skeletonPhase_ >= SKELETONPhase::Quantized && skeletonQuads_.has_value()) {
+            // Step 10's quad mesh, drawn by the routine every other method's
+            // mesh is drawn with. A T-mesh face whose length collapsed to
+            // zero is gone from it, welded into its neighbours, so the mesh
+            // -- not the per-face grids -- is the thing to look at.
+            viewer::drawQuadMesh(*skeletonQuads_, nullptr, nullptr, 1.0f, 2.5f);
+        } else {
+            // The map and T-mesh phases draw over the boundary alone: the
+            // triangulation underneath would bury the radii / zone edges.
+            // The axis's own copy of the triangulation is the one drawn
+            // under it, since Step 4 moved its boundary vertices.
+            if (skeletonPhase_ < SKELETONPhase::Map) {
+                if (ma) viewer::drawMesh(*ma->mesh);
+                else if (skeleton_ && skeleton_->hasTriangulation())
+                    viewer::drawMesh(skeleton_->getTriangulation());
+                else viewer::drawMesh(*mesh_);
+            }
+            if (ma && skeletonPhase_ >= SKELETONPhase::TMesh && skeletonTMesh()) {
                 // The coarse block decomposition (Fig. 1-left / Fig. 3c):
                 // zones filled with a translucent tint of the class colour
                 // that picks their quad template, their walls over the fill,
                 // and the downsampled axis in full colour on top.
-                viewer::drawMedialTMesh(*medialAxisTMesh_, avgEdge_ / 4.0);
-                viewer::drawBoundaryEdges(*medialAxis_->mesh);
-            } else if (skeletonPhase_ == SKELETONPhase::Map && medialAxisMap_.has_value()) {
-                viewer::drawBoundaryEdges(*medialAxis_->mesh);
+                viewer::drawMedialTMesh(*skeletonTMesh(), avgEdge_ / 4.0);
+                viewer::drawBoundaryEdges(*ma->mesh);
+            } else if (ma && skeletonPhase_ == SKELETONPhase::Map && skeletonMap()) {
+                viewer::drawBoundaryEdges(*ma->mesh);
 
                 // The map phi drawn as its medial radii (Fig. 7/8 of the
                 // paper): each boundary point joined to its image on the
@@ -8074,27 +8247,25 @@ void CrossGenWidget::renderNormal() {
                 // medial vertex (a discrete axis endpoint).
                 viewer::lineWidth(1.0f);
                 glBegin(GL_LINES);
-                for (const auto &s : medialAxisMap_->spokes()) {
-                    if (s.collapsed)
+                for (const auto &sp : skeletonMap()->spokes()) {
+                    if (sp.collapsed)
                         viewer::color4f(0.9f, 0.25f, 0.9f, 0.85f);
                     else
                         viewer::color4f(0.35f, 0.55f, 0.95f, 0.55f);
-                    glVertex2d(s.boundary[0], s.boundary[1]);
-                    glVertex2d(s.medial[0], s.medial[1]);
+                    glVertex2d(sp.boundary[0], sp.boundary[1]);
+                    glVertex2d(sp.medial[0], sp.medial[1]);
                 }
                 glEnd();
 
-                viewer::drawMedialAxis(*medialAxis_, avgEdge_ / 6.0);
-            } else if (skeletonPhase_ >= SKELETONPhase::MedialAxis) {
-                double ballRadius_ma = avgEdge_ / 5.0;
-                viewer::drawMedialAxis(*medialAxis_, ballRadius_ma);
-                for (int i = 0; i < static_cast<int>(medialAxis_->interiorAngle.size()); ++i) {
-                    if (medialAxis_->isConcaveCorner(i)) {
-                        const Point &p = medialAxis_->mesh->vertices[i];
-                        viewer::drawDisk3D(p, ballRadius_ma, 0.95f, 0.5f, 0.1f);
-                    } else if (medialAxis_->isSharpCorner(i)) {
-                        const Point &p = medialAxis_->mesh->vertices[i];
-                        viewer::drawDisk3D(p, ballRadius_ma, 0.95f, 0.2f, 0.2f);
+                viewer::drawMedialAxis(*ma, avgEdge_ / 6.0);
+            } else if (ma && skeletonPhase_ >= SKELETONPhase::MedialAxis) {
+                const double ballRadius = avgEdge_ / 5.0;
+                viewer::drawMedialAxis(*ma, ballRadius);
+                for (int i = 0; i < static_cast<int>(ma->interiorAngle.size()); ++i) {
+                    if (ma->isConcaveCorner(i)) {
+                        viewer::drawDisk3D(ma->mesh->vertices[i], ballRadius, 0.95f, 0.5f, 0.1f);
+                    } else if (ma->isSharpCorner(i)) {
+                        viewer::drawDisk3D(ma->mesh->vertices[i], ballRadius, 0.95f, 0.2f, 0.2f);
                     }
                 }
             }
@@ -8281,6 +8452,17 @@ void CrossGenWidget::renderNormal() {
                        "press 'r' to restart\npress 'q' to quit").c_str());
     } else if (mode_ == Mode::ZIPLINE && ziplinePhase_ == ZIPLINEPhase::Smoothed) {
         renderOverlay((ziplineKeys + "press 'c' to smooth again at other TMOP settings\n"
+                       "press 'e' to mesh again at another target edge length\n"
+                       "press 'r' to restart\npress 'q' to quit").c_str());
+    } else if (mode_ == Mode::SKELETON && skeletonPhase_ == SKELETONPhase::Blocks) {
+        renderOverlay((meridianKeys + "press 'c' to mesh the blocks\n"
+                       "press 'r' to restart\npress 'q' to quit").c_str());
+    } else if (mode_ == Mode::SKELETON && skeletonPhase_ == SKELETONPhase::Mesh) {
+        renderOverlay((meridianKeys + "press 'c' to smooth the mesh with TMOP\n"
+                       "press 'e' to mesh again at another target edge length\n"
+                       "press 'r' to restart\npress 'q' to quit").c_str());
+    } else if (mode_ == Mode::SKELETON && skeletonPhase_ == SKELETONPhase::Smoothed) {
+        renderOverlay((meridianKeys + "press 'c' to smooth again at other TMOP settings\n"
                        "press 'e' to mesh again at another target edge length\n"
                        "press 'r' to restart\npress 'q' to quit").c_str());
     } else if (mode_ == Mode::UMBER && umberPhase_ == UMBERPhase::Decomposition) {
