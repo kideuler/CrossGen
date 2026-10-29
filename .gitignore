@@ -19,3 +19,5 @@ docs/*
 !assets/readme/*.png
 *.npz
 *.json
+*.ply
+*.pyc

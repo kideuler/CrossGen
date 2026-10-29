@@ -87,7 +87,12 @@ DEFAULT_DIRS = [os.path.join(REPO, "data", "meshes", "singlemat"),
                 os.path.join(REPO, "data", "meshes", "mambo")]
 N_FPS_COPIES = 5        # token sets per domain and size, as the release's NPZs store
 POS_DIM = 2             # Sec. 3.1 item 1
-KEY_DIM_DICT = {"sdf": 1, "sdf_near": 1, "sdf_global": 1}
+# Channels of every point feature and output key: the release's network/utils.py KEY_DIM_DICT
+# with the Sec. 3.1 item 1 edits. One table for both networks, as there: the Geom-AE reads the
+# sdf keys, SQ-VAE (sq_vae_2d.py) the fields, their unit gradients and the seven offsets,
+# every vector of them 2-d.
+KEY_DIM_DICT = {"sdf": 1, "sdf_near": 1, "sdf_global": 1, "dcdf": 1, "cdf": 1, "gdcdf": 2, "gcdf": 2,
+                "offset": 2, "offset1": 2, "offset2": 2, "offset3": 2, "offsetb": 2, "offsetc": 2, "offsetd": 2}
 GEOM_KEYS = ["sdf"]
 
 
