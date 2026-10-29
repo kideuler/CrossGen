@@ -15,7 +15,9 @@ the keyword errors are checked for being errors. How good a
 layout is, is not asserted here: that is the drivers' business, and their
 ctests'.
 """
+import os
 import sys
+import tempfile
 import time
 
 import numpy as np
@@ -142,6 +144,43 @@ def main(path):
               f"{name}: the smoothed mesh is the one the object holds")
         qa = q.alignment_quality()
         check(0.0 < qa <= 1.0, f"{name}: mesh alignment quality {qa:.3f}")
+
+    # ---- chart distance fields (the last method's blocks) ---------------------
+    # Structural, and the two values the definition fixes: at a chart corner
+    # DCDF is 1, CDF is 0 and the offset to the subchart's own corner is 0.
+    c = b.cdf(samples=3000, fps_min=64, fps_max=128, fps_copies=2, seed=7)
+    print(f"  {c}")
+    r = c.report
+    check(r["valid"] and r["inverted_faces"] == 0, f"cdf: consistent, unfolded ({r['faces']} faces)")
+    check(r["blocks"] == nb and r["subcharts"] == 4 * nb and len(c.subchart_abcd) == 4 * nb,
+          "cdf: one chart per block, four subcharts each")
+    F, T = c.faces, c.triangles
+    check(T.shape == (2 * len(F), 3) and set(np.unique(c.split)) <= {0, 1}, "cdf: two triangles per face")
+    check(np.all(c.half_edge_pairs != 0) and np.abs(c.half_edge_pairs).max() < len(c.coordinate_pairs),
+          "cdf: every half-edge has a coordinate pair")
+    f = c.fields()
+    check(f["dcdf"].min() >= 0 and f["dcdf"].max() <= 1 and f["cdf"].min() >= 0 and f["cdf"].max() <= 1,
+          "cdf: dcdf and cdf in [0, 1] at the samples")
+    check(np.allclose(np.linalg.norm(f["gcdf"], axis=1), 1, atol=1e-6), "cdf: unit gradients")
+    own = np.flatnonzero(c.subchart_abcd[c.face_subchart[np.arange(len(T)) // 2], 0] == T[:, 0])
+    at = c.fields(own, np.tile([1.0, 0.0, 0.0], (len(own), 1)))
+    check(len(own) > 0 and np.allclose(at["dcdf"], 1) and np.allclose(at["cdf"], 0) and
+          np.abs(at["offset"]).max() < 1e-12, f"cdf: dcdf 1, cdf 0, offset 0 at {len(own)} chart corners")
+    path = os.path.join(tempfile.mkdtemp(), "cdf.npz")
+    c.write(path, model="geom001", regularity=reg, num_methods=len(crossgen.methods))
+    z = np.load(path)
+    check(z["subdiv_vertex"].dtype == np.float32 and z["subdiv_vertex"].shape == (len(c.vertices), 3) and
+          not z["subdiv_vertex"][:, 2].any(), "cdf npz: subdiv_vertex (n, 3) float32 at z = 0")
+    check(z["edge_vertex_color"].dtype == np.int32 and z["edge_vertex_color"].shape == (4 * len(F), 1) and
+          z["subdiv_facet"].dtype == np.uint32 and int(z["is_checkerboard"][0, 0]) == 2 and
+          int(z["num_complex"][0, 0]) == nb, "cdf npz: the release's keys and dtypes")
+    check(z["fps_bary_coords_128"].shape == (2, 128, 3) and z["fps_point_tri_id_64"].shape == (2, 64, 1),
+          "cdf npz: token sets")
+    check(str(z["model"]) == "geom001" and float(z["regularity"]) == reg and int(z["num_methods"]) == 5,
+          "cdf npz: metadata")
+    expect(ValueError, lambda: c.write(path, subdiv_vertex=1), "metadata that would replace an array")
+    expect(TypeError, lambda: b.cdf(0.1), "a positional cdf() argument")
+    check(crossgen.options("cdf")["samples"] == 20000, "options('cdf')")
     print("all checks passed")
 
 

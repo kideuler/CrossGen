@@ -41,8 +41,10 @@
 
 #include "ShapeDNA/ShapeDNA.hxx"
 #include "mesh/BoundaryFeatures.hxx"
+#include "mesh/ChartDistanceField.hxx"
 #include "mesh/FeatureFrame.hxx"
 #include "mesh/Mesh.hxx"
+#include "mesh/NpzWriter.hxx"
 
 namespace pycg {
 namespace {
@@ -100,13 +102,23 @@ struct QuadMeshObject {
     std::shared_ptr<Grading> grading;
 };
 
+// SQuadGen's chart distance fields of one BlockDecomposition. Immutable once
+// made, so it needs none of QuadMesh's busy flag.
+struct CdfObject {
+    PyObject_HEAD
+    std::unique_ptr<const ChartDistanceField> cdf;
+    std::string method;
+};
+
 PyTypeObject MeshType = {PyVarObject_HEAD_INIT(nullptr, 0)};
 PyTypeObject BlocksType = {PyVarObject_HEAD_INIT(nullptr, 0)};
 PyTypeObject QuadMeshType = {PyVarObject_HEAD_INIT(nullptr, 0)};
+PyTypeObject CdfType = {PyVarObject_HEAD_INIT(nullptr, 0)};
 
 MeshObject *asMesh(PyObject *o) { return reinterpret_cast<MeshObject *>(o); }
 BlocksObject *asBlocks(PyObject *o) { return reinterpret_cast<BlocksObject *>(o); }
 QuadMeshObject *asQuad(PyObject *o) { return reinterpret_cast<QuadMeshObject *>(o); }
+CdfObject *asCdf(PyObject *o) { return reinterpret_cast<CdfObject *>(o); }
 
 // A filesystem path argument (str or os.PathLike) as a std::string.
 bool pathArg(PyObject *args, const char *fn, std::string &out) {
@@ -729,7 +741,43 @@ PyObject *Blocks_alignmentQuality(PyObject *self, PyObject *) {
     return PyFloat_FromDouble(q);
 }
 
+// BlockDecomposition.cdf(**options)
+PyObject *Blocks_cdf(PyObject *self, PyObject *args, PyObject *kwargs) {
+    if (PyTuple_GET_SIZE(args) != 0) {
+        PyErr_SetString(PyExc_TypeError, "cdf() takes keyword arguments only");
+        return nullptr;
+    }
+    ChartDistanceField::Options opts;
+    if (applyKwargs(kwargs, "cdf", {target(chartDistanceFieldOptionsTable(), opts)}) < 0) return nullptr;
+    // The fields are defined on charts that tile the model; a partial layout
+    // would give a field with holes in it that no loader expects.
+    if (!isValid(self)) {
+        PyErr_Format(PyExc_ValueError,
+                     "cdf(): the %s blocks are not a decomposition of the model (valid is False)",
+                     asBlocks(self)->method->name());
+        return nullptr;
+    }
+    const BlockDecomposition &D = decompOf(self);
+    std::unique_ptr<const ChartDistanceField> cdf;
+    if (!compute([&] { cdf = std::make_unique<const ChartDistanceField>(D, opts); })) return nullptr;
+
+    PyObject *o = CdfType.tp_alloc(&CdfType, 0);
+    if (!o) return nullptr;
+    new (&asCdf(o)->cdf) std::unique_ptr<const ChartDistanceField>(std::move(cdf));
+    new (&asCdf(o)->method) std::string(asBlocks(self)->method->name());
+    return o;
+}
+
 PyMethodDef blocksMethods[] = {
+    {"cdf", asCFunction(Blocks_cdf), METH_VARARGS | METH_KEYWORDS,
+     "cdf(**options) -> ChartDistanceField\n\n"
+     "SQuadGen's chart distance fields of the blocks (CDF and DCDF, the paper's\n"
+     "Sec. 5): every block cut by its two mid-lines into four subcharts, the\n"
+     "subchart coordinates by CDFGen's ring-averaged lengths, area samples and\n"
+     "farthest-point token sets, ready to write as the release's NPZ. Needs a\n"
+     "valid decomposition. The fields live on a BlockQuadMesh of the blocks at\n"
+     "target_edge_length (0: relative_edge_length times the bounding-box\n"
+     "diagonal); crossgen.options('cdf') lists every keyword."},
     {"mesh", asCFunction(Blocks_mesh), METH_VARARGS | METH_KEYWORDS,
      "mesh(h=0.05, **options) -> QuadMesh\n\n"
      "A quadrilateral mesh on the blocks at target edge length h, built by the\n"
@@ -986,6 +1034,253 @@ PyMethodDef quadMethods[] = {
 };
 
 // ===========================================================================
+// ChartDistanceField
+// ===========================================================================
+void Cdf_dealloc(PyObject *self) {
+    asCdf(self)->cdf.~unique_ptr();
+    asCdf(self)->method.~basic_string();
+    Py_TYPE(self)->tp_free(self);
+}
+
+const ChartDistanceField &cdfOf(PyObject *self) { return *asCdf(self)->cdf; }
+
+PyObject *Cdf_repr(PyObject *self) {
+    const ChartDistanceField::Report &r = cdfOf(self).getReport();
+    return PyUnicode_FromFormat(
+        "<crossgen.ChartDistanceField from %s: %d charts, %d subcharts, %d faces, %d samples%s>",
+        asCdf(self)->method.c_str(), r.blocks, r.subcharts, r.faces, r.samples,
+        r.invertedFaces > 0 ? ", folded" : "");
+}
+
+PyObject *Cdf_method(PyObject *self, void *) { return PyUnicode_FromString(asCdf(self)->method.c_str()); }
+PyObject *Cdf_report(PyObject *self, void *) {
+    return toDict({source(chartDistanceFieldReportTable(), cdfOf(self).getReport())});
+}
+PyObject *Cdf_vertices(PyObject *self, void *) { return pointArray(cdfOf(self).vertices()); }
+PyObject *Cdf_faces(PyObject *self, void *) { return indexArray(cdfOf(self).faces()); }
+PyObject *Cdf_quadFaces(PyObject *self, void *) { return indexArray(cdfOf(self).quadFaces()); }
+PyObject *Cdf_split(PyObject *self, void *) {
+    const std::vector<signed char> &s = cdfOf(self).split();
+    return indexArray(std::vector<int>(s.begin(), s.end()));
+}
+PyObject *Cdf_triangles(PyObject *self, void *) {
+    const ChartDistanceField &c = cdfOf(self);
+    std::vector<std::array<int, 3>> t(static_cast<size_t>(c.triangleCount()));
+    for (int i = 0; i < c.triangleCount(); ++i) t[i] = c.triangle(i);
+    return indexArray(t);
+}
+PyObject *Cdf_faceSubchart(PyObject *self, void *) { return indexArray(cdfOf(self).faceSubchart()); }
+PyObject *Cdf_subchartPatch(PyObject *self, void *) { return indexArray(cdfOf(self).subchartPatch()); }
+PyObject *Cdf_subchartBlock(PyObject *self, void *) { return indexArray(cdfOf(self).subchartBlock()); }
+PyObject *Cdf_patchVertex(PyObject *self, void *) { return indexArray(cdfOf(self).patchVertex()); }
+PyObject *Cdf_subchartABCD(PyObject *self, void *) { return indexArray(cdfOf(self).subchartABCD()); }
+PyObject *Cdf_subchartOthers(PyObject *self, void *) { return indexArray(cdfOf(self).subchartOthers()); }
+PyObject *Cdf_halfEdgePairs(PyObject *self, void *) { return indexArray(cdfOf(self).halfEdgePair()); }
+PyObject *Cdf_coordinatePairs(PyObject *self, void *) {
+    const std::vector<std::array<double, 2>> &p = cdfOf(self).coordinatePairs();
+    return doubleArray(p.empty() ? nullptr : p.front().data(), static_cast<Py_ssize_t>(p.size()), 2);
+}
+PyObject *Cdf_sampleTriangles(PyObject *self, void *) { return indexArray(cdfOf(self).sampleTriangles()); }
+PyObject *Cdf_sampleBary(PyObject *self, void *) {
+    const std::vector<std::array<double, 3>> &w = cdfOf(self).sampleBary();
+    return doubleArray(w.empty() ? nullptr : w.front().data(), static_cast<Py_ssize_t>(w.size()), 3);
+}
+PyObject *Cdf_tokenSizes(PyObject *self, void *) {
+    std::vector<int> n;
+    for (const auto &kv : cdfOf(self).tokenSets()) n.push_back(kv.first);
+    return indexArray(n);
+}
+
+PyGetSetDef cdfGetSet[] = {
+    {"method", Cdf_method, nullptr, "The method whose blocks these are.", nullptr},
+    {"report", Cdf_report, nullptr,
+     "Counts and checks, as a dict: valid is True when every split vertex, side\n"
+     "coordinate and half-edge pair came out consistent; inverted_faces counts the\n"
+     "folded split-mesh quads, which valid does not cover.",
+     nullptr},
+    {"vertices", Cdf_vertices, nullptr,
+     "(n, 2) float64: the split mesh's vertices (subdiv_vertex), the block mesh's\n"
+     "first.",
+     nullptr},
+    {"faces", Cdf_faces, nullptr, "(f, 4) int64: the split mesh's quads, counter-clockwise (subdiv_facet).",
+     nullptr},
+    {"quad_faces", Cdf_quadFaces, nullptr, "(q, 4) int64: the block mesh's quads (quad_facet).", nullptr},
+    {"split", Cdf_split, nullptr,
+     "(f,) int64: 1 when face f is cut along 1-3, 0 along 0-2 -- the diagonal through\n"
+     "its subchart's corner (quad_split).",
+     nullptr},
+    {"triangles", Cdf_triangles, nullptr,
+     "(2f, 3) int64: triangle 2i + k of face i, as the release's loader cuts it.", nullptr},
+    {"face_subchart", Cdf_faceSubchart, nullptr, "(f,) int64: each face's subchart (face2quad).", nullptr},
+    {"subchart_patch", Cdf_subchartPatch, nullptr,
+     "(s,) int64: each subchart's dual chart, one per corner vertex (quad2patch).", nullptr},
+    {"subchart_block", Cdf_subchartBlock, nullptr, "(s,) int64: each subchart's block.", nullptr},
+    {"patch_vertex", Cdf_patchVertex, nullptr, "(p,) int64: each dual chart's corner vertex.", nullptr},
+    {"subchart_abcd", Cdf_subchartABCD, nullptr,
+     "(s, 4) int64: corner, side mid-point, chart centre, side mid-point, in the\n"
+     "faces' turning order (offset_abcd_id).",
+     nullptr},
+    {"subchart_others", Cdf_subchartOthers, nullptr,
+     "(s, 3) int64: the chart's other three corners (offset_123_id).", nullptr},
+    {"half_edge_pairs", Cdf_halfEdgePairs, nullptr,
+     "(4f,) int64: half-edge 4i + k's signed index into coordinate_pairs\n"
+     "(edge_vertex_color).",
+     nullptr},
+    {"coordinate_pairs", Cdf_coordinatePairs, nullptr,
+     "(k, 2) float64: (start, end) subchart coordinates of each half-side edge,\n"
+     "row 0 unused (edge_color_store).",
+     nullptr},
+    {"sample_triangles", Cdf_sampleTriangles, nullptr, "(n,) int64: the area samples' triangles.", nullptr},
+    {"sample_bary", Cdf_sampleBary, nullptr, "(n, 3) float64: their barycentric weights.", nullptr},
+    {"token_sizes", Cdf_tokenSizes, nullptr, "(k,) int64: the token-set sizes, fps_min to fps_max.", nullptr},
+    {nullptr, nullptr, nullptr, nullptr, nullptr},
+};
+
+// ChartDistanceField.fields(triangles=None, bary=None)
+PyObject *Cdf_fields(PyObject *self, PyObject *args, PyObject *kwargs) {
+    static const char *kw[] = {"triangles", "bary", nullptr};
+    PyObject *triArg = Py_None, *baryArg = Py_None;
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "|OO:fields", const_cast<char **>(kw), &triArg, &baryArg))
+        return nullptr;
+    const ChartDistanceField &c = cdfOf(self);
+    std::vector<int> tri;
+    std::vector<std::array<double, 3>> bary;
+    if (triArg == Py_None && baryArg == Py_None) {
+        tri = c.sampleTriangles();
+        bary = c.sampleBary();
+    } else if (triArg == Py_None || baryArg == Py_None) {
+        PyErr_SetString(PyExc_TypeError, "fields(): give both triangles and bary, or neither");
+        return nullptr;
+    } else {
+        std::vector<long long> t;
+        std::vector<double> w;
+        Py_ssize_t nt = 0, nw = 0;
+        if (!readIndices(triArg, 0, "triangles", t, nt) || !readDoubles(baryArg, 3, "bary", w, nw)) return nullptr;
+        if (nt != nw) {
+            PyErr_SetString(PyExc_ValueError, "fields(): one row of bary per triangle");
+            return nullptr;
+        }
+        for (long long i : t) {
+            if (i < 0 || i >= c.triangleCount()) {
+                PyErr_Format(PyExc_IndexError, "fields(): triangle %lld out of range", i);
+                return nullptr;
+            }
+            tri.push_back(static_cast<int>(i));
+        }
+        for (Py_ssize_t i = 0; i < nw; ++i) bary.push_back({w[3 * i], w[3 * i + 1], w[3 * i + 2]});
+    }
+
+    const size_t n = tri.size();
+    std::vector<Point> xyz(n), gdcdf(n), gcdf(n);
+    std::vector<double> c0(n), c1(n), dcdf(n), cdf(n);
+    std::array<std::vector<Point>, 7> offsets;
+    for (auto &o : offsets) o.resize(n);
+    for (size_t i = 0; i < n; ++i) {
+        xyz[i] = c.pointAt(tri[i], bary[i]);
+        const ChartDistanceField::Fields f = c.evaluate(tri[i], xyz[i]);
+        c0[i] = f.c0, c1[i] = f.c1, dcdf[i] = f.dcdf, cdf[i] = f.cdf;
+        gdcdf[i] = f.gdcdf, gcdf[i] = f.gcdf;
+        for (int k = 0; k < 7; ++k) offsets[k][i] = f.offsets[k];
+    }
+    const std::pair<const char *, PyObject *> items[] = {
+        {"xyz", pointArray(xyz)},           {"c0", doubleArray(c0)},
+        {"c1", doubleArray(c1)},            {"dcdf", doubleArray(dcdf)},
+        {"gdcdf", pointArray(gdcdf)},       {"cdf", doubleArray(cdf)},
+        {"gcdf", pointArray(gcdf)},         {"offset", pointArray(offsets[0])},
+        {"offsetb", pointArray(offsets[1])}, {"offsetc", pointArray(offsets[2])},
+        {"offsetd", pointArray(offsets[3])}, {"offset1", pointArray(offsets[4])},
+        {"offset2", pointArray(offsets[5])}, {"offset3", pointArray(offsets[6])},
+    };
+    PyObject *d = PyDict_New();
+    bool ok = d != nullptr;
+    for (const auto &[key, value] : items) {
+        ok = ok && value && PyDict_SetItemString(d, key, value) == 0;
+        Py_XDECREF(value);
+    }
+    if (ok) return d;
+    Py_XDECREF(d);
+    return nullptr;
+}
+
+// ChartDistanceField.write(path, **metadata)
+PyObject *Cdf_write(PyObject *self, PyObject *args, PyObject *kwargs) {
+    std::string path;
+    if (!pathArg(args, "write", path)) return nullptr;
+
+    // The metadata, read while the GIL is held: each keyword a 0-d array
+    // beside the release's, a str as numpy <U, an int or bool as int64, a
+    // float as float64.
+    struct Meta {
+        std::string key, text;
+        int kind;   // 0 string, 1 integer, 2 float
+        long long i;
+        double x;
+    };
+    std::vector<Meta> meta;
+    NpzWriter probe;
+    cdfOf(self).addTo(probe);
+    PyObject *key, *value;
+    Py_ssize_t pos = 0;
+    while (kwargs && PyDict_Next(kwargs, &pos, &key, &value)) {
+        Meta m{PyUnicode_AsUTF8(key), "", 0, 0, 0.0};
+        if (probe.has(m.key)) {
+            PyErr_Format(PyExc_ValueError, "write(): '%s' is one of the field's own arrays", m.key.c_str());
+            return nullptr;
+        }
+        if (PyUnicode_Check(value)) {
+            const char *s = PyUnicode_AsUTF8(value);
+            if (!s) return nullptr;
+            m.text = s;
+        } else if (PyLong_Check(value) || (!PyFloat_Check(value) && PyIndex_Check(value))) {
+            PyObject *index = PyNumber_Index(value);
+            if (!index) return nullptr;
+            m.kind = 1;
+            m.i = PyLong_AsLongLong(index);
+            Py_DECREF(index);
+            if (m.i == -1 && PyErr_Occurred()) return nullptr;
+        } else if (PyFloat_Check(value) || PyNumber_Check(value)) {
+            m.kind = 2;
+            m.x = PyFloat_AsDouble(value);
+            if (m.x == -1.0 && PyErr_Occurred()) return nullptr;
+        } else {
+            PyErr_Format(PyExc_TypeError, "write(): metadata '%s' must be a str, int or float, not %s",
+                         m.key.c_str(), Py_TYPE(value)->tp_name);
+            return nullptr;
+        }
+        meta.push_back(std::move(m));
+    }
+
+    bool ok = false;
+    if (!compute([&] {
+            NpzWriter out = std::move(probe);
+            for (const Meta &m : meta) {
+                if (m.kind == 0) out.addString(m.key, m.text);
+                else if (m.kind == 1) out.addScalar(m.key, m.i);
+                else out.addScalar(m.key, m.x);
+            }
+            ok = out.write(path);
+        }))
+        return nullptr;
+    return writeResult(ok, path);
+}
+
+PyMethodDef cdfMethods[] = {
+    {"fields", asCFunction(Cdf_fields), METH_VARARGS | METH_KEYWORDS,
+     "fields(triangles=None, bary=None) -> dict\n\n"
+     "The fields at points given as (triangle, barycentric weights) on the split\n"
+     "mesh's triangles, by default the stored area samples: xyz, c0, c1, dcdf,\n"
+     "gdcdf, cdf, gcdf and the seven offsets (offset, offsetb, offsetc, offsetd,\n"
+     "offset1-3), as the release's loader computes them, in the model's frame."},
+    {"write", asCFunction(Cdf_write), METH_VARARGS | METH_KEYWORDS,
+     "write(path, **metadata)\n\n"
+     "The release's NPZ (CDFGen's keys, shapes and dtypes, so that\n"
+     "data_tools/test_load_new_format.py reads it unchanged), plus subchart_block,\n"
+     "patch_vertex and target_edge_length. Each keyword is stored beside them as a\n"
+     "0-d array: str as numpy str, int as int64, float as float64."},
+    {nullptr, nullptr, 0, nullptr},
+};
+
+// ===========================================================================
 // Module functions
 // ===========================================================================
 PyObject *crossgen_load(PyObject *, PyObject *args) {
@@ -1015,19 +1310,20 @@ PyObject *crossgen_options(PyObject *, PyObject *args, PyObject *kwargs) {
                                      &stage))
         return nullptr;
     const std::string n(name), s(stage);
-    if (n == "shape_dna" || n == "boundary_features") {
+    if (n == "shape_dna" || n == "boundary_features" || n == "cdf") {
         if (s != "method") {
             PyErr_Format(PyExc_ValueError, "crossgen.options(): '%s' has only the stage 'method'", name);
             return nullptr;
         }
         if (n == "shape_dna") return toDict({source(shapeDNAOptionsTable(), shapedna::ShapeDNA::Options())});
+        if (n == "cdf") return toDict({source(chartDistanceFieldOptionsTable(), ChartDistanceField::Options())});
         return toDict({source(boundaryFeaturesOptionsTable(), BoundaryFeatures::Options())});
     }
     for (const MeshMethod &mm : kMethods)
         if (n == mm.spec->name) return mm.spec->defaults(s);
     PyErr_Format(PyExc_ValueError,
                  "crossgen.options(): unknown method '%s' (expected one of crossgen.methods, "
-                 "'shape_dna' or 'boundary_features')",
+                 "'shape_dna', 'boundary_features' or 'cdf')",
                  name);
     return nullptr;
 }
@@ -1040,9 +1336,9 @@ PyMethodDef moduleMethods[] = {
     {"options", asCFunction(crossgen_options), METH_VARARGS | METH_KEYWORDS,
      "options(method, stage='method') -> dict\n\n"
      "The keywords a stage takes, with their defaults. method is one of\n"
-     "crossgen.methods, 'shape_dna' or 'boundary_features'; stage is 'method'\n"
-     "(Mesh.<method>()), 'mesh' (BlockDecomposition.mesh()) or 'smooth'\n"
-     "(QuadMesh.smooth())."},
+     "crossgen.methods, 'shape_dna', 'boundary_features' or 'cdf'\n"
+     "(BlockDecomposition.cdf()); stage is 'method' (Mesh.<method>()), 'mesh'\n"
+     "(BlockDecomposition.mesh()) or 'smooth' (QuadMesh.smooth())."},
     {nullptr, nullptr, 0, nullptr},
 };
 
@@ -1118,8 +1414,21 @@ int readyTypes() {
     QuadMeshType.tp_getset = quadGetSet;
     QuadMeshType.tp_methods = quadMethods;
 
+    CdfType.tp_name = "crossgen.ChartDistanceField";
+    CdfType.tp_basicsize = sizeof(CdfObject);
+    CdfType.tp_flags = Py_TPFLAGS_DEFAULT;
+    CdfType.tp_doc =
+        "SQuadGen's chart distance fields (CDF, DCDF) of a BlockDecomposition, made by\n"
+        "BlockDecomposition.cdf(): the split mesh, the subchart coordinates, area\n"
+        "samples and token sets. write(path) saves the release's NPZ; fields()\n"
+        "evaluates the fields as its loader would.";
+    CdfType.tp_dealloc = Cdf_dealloc;
+    CdfType.tp_repr = Cdf_repr;
+    CdfType.tp_getset = cdfGetSet;
+    CdfType.tp_methods = cdfMethods;
+
     if (PyType_Ready(&MeshType) < 0 || PyType_Ready(&BlocksType) < 0 ||
-        PyType_Ready(&QuadMeshType) < 0)
+        PyType_Ready(&QuadMeshType) < 0 || PyType_Ready(&CdfType) < 0)
         return -1;
     return 0;
 }
@@ -1145,6 +1454,7 @@ PyObject *createModule() {
     const bool ok = names && PyModule_AddObjectRef(m, "Mesh", reinterpret_cast<PyObject *>(&MeshType)) == 0 &&
                     PyModule_AddObjectRef(m, "BlockDecomposition", reinterpret_cast<PyObject *>(&BlocksType)) == 0 &&
                     PyModule_AddObjectRef(m, "QuadMesh", reinterpret_cast<PyObject *>(&QuadMeshType)) == 0 &&
+                    PyModule_AddObjectRef(m, "ChartDistanceField", reinterpret_cast<PyObject *>(&CdfType)) == 0 &&
                     PyModule_AddObjectRef(m, "methods", names) == 0 &&
                     PyModule_AddStringConstant(m, "__version__", "0.1.0") == 0;
     Py_XDECREF(names);

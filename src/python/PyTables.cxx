@@ -107,6 +107,31 @@ const Table<BlockQuadMesh::Report> &blockQuadMeshReportTable() {
     return t;
 }
 
+const Table<ChartDistanceField::Options> &chartDistanceFieldOptionsTable() {
+    using O = ChartDistanceField::Options;
+    static const Table<O> t{
+        OPT(targetEdgeLength), OPT(relativeEdgeLength), OPT(minIntervals),
+        OPT(smoothingPasses),  OPT(samples),            OPT(fpsMin),
+        OPT(fpsMax),           OPT(fpsCopies),          OPT(fpsOversample),
+        OPT(fpsMinCandidates), OPT(seed),
+    };
+    return t;
+}
+
+const Table<ChartDistanceField::Report> &chartDistanceFieldReportTable() {
+    using O = ChartDistanceField::Report;
+    static const Table<O> t{
+        REP(target),           REP(blocks),           REP(chords),
+        REP(quads),            REP(vertices),         REP(faces),
+        REP(subcharts),        REP(patches),          REP(coordinatePairs),
+        REP(boundaryLoops),    REP(invertedFaces),    REP(minTriangleArea),
+        REP(area),             REP(splitMismatches),  REP(coordinateMismatches),
+        REP(missingPairs),     REP(samples),          REP(tokenSets),
+        REP(seconds),          REP(valid),            REP(messages),
+    };
+    return t;
+}
+
 const Table<shapedna::ShapeDNA::Options> &shapeDNAOptionsTable() {
     using O = shapedna::ShapeDNA::Options;
     static const Table<O> t{
@@ -203,6 +228,8 @@ void buildSharedTables() {
     pillowReportTable();
     blockQuadMeshOptionsTable();
     blockQuadMeshReportTable();
+    chartDistanceFieldOptionsTable();
+    chartDistanceFieldReportTable();
     shapeDNAOptionsTable();
     shapeDNAReportTable();
     boundaryFeaturesOptionsTable();

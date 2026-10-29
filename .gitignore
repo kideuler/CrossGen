@@ -17,3 +17,5 @@ docs/*
 *.pt
 *.jsonl
 !assets/readme/*.png
+*.npz
+*.json

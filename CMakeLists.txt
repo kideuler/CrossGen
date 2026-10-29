@@ -129,6 +129,10 @@ add_library(PolyVector SHARED
     src/mesh/FeatureFrame.cxx
     src/mesh/BlockQuadMesh.hxx
     src/mesh/BlockQuadMesh.cxx
+    src/mesh/ChartDistanceField.hxx
+    src/mesh/ChartDistanceField.cxx
+    src/mesh/NpzWriter.hxx
+    src/mesh/NpzWriter.cxx
     src/ShapeDNA/Parallel.hxx
     src/ShapeDNA/SparseMatrix.hxx
     src/ShapeDNA/SparseMatrix.cxx
