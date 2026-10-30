@@ -59,6 +59,20 @@ Run
     python py/squadgen/geom_ae_2d.py                                  # train -> py/squadgen/runs/geom_ae_2d
     python py/squadgen/geom_ae_2d.py --out /tmp/smoke --steps 200     # smoke test
     python py/squadgen/geom_ae_2d.py --eval_only                      # plots from best.pt
+    python py/squadgen/geom_ae_2d.py --init py/squadgen/runs/geom_ae_2d/best.pt \
+        --out py/squadgen/runs/geom_ae_2d_more --steps 10000 --lr 1e-4   # more steps from a checkpoint
+
+Continuing (--init). A checkpoint holds the weights but no optimizer state, so a continuation is
+a new run that starts from them: a fresh AdamW with its own warm-up and cosine over --steps
+(step numbers start again at 1; the config records init and init_step). The network's shape and
+tau come from the checkpoint, since the weights fit only that network and predict SDF in units
+of that tau; every other flag is this run's. The loaded model is evaluated at step 0 and saved
+as the first best.pt, so best.pt never ends worse than the start. When --out has no token-set
+cache, the checkpoint directory's is copied (it is the first ten minutes to an hour of a large
+run). Keep --data, --val_frac and --seed as they were: otherwise the held-out families change
+and validation counts domains the start was trained on (logged as a note when they differ).
+The first run's cosine ended at min_lr, so a lower --lr (1e-4, 5e-5) continues more gently
+than starting over at 2e-4, which first undoes some of what the end of that cosine refined.
 
 Memory: on an 8 GB Apple M2, batch 8 with the default query counts takes ~3.3 GB of MPS
 memory at ~0.5 s/step; batch 12 needs 4.3 GB and batch 16 swapped (100 s/step).
@@ -83,6 +97,7 @@ import contextlib
 import glob
 import math
 import os
+import shutil
 import time
 import zlib
 
@@ -330,11 +345,19 @@ def _fps_job(job):
     return path, fps_sets(Domain(path), sizes, np.random.default_rng(zlib.crc32(os.path.basename(path).encode())))
 
 
+def obj_paths(dirs):
+    """The .obj files under dirs. Searched recursively, so a make_mesh_archive.py directory
+    (singlemat/, mambo/, deepcad/ inside it) can be passed whole; a set of normalised paths, so
+    a directory given beside its own parent counts each domain once."""
+    return sorted({os.path.normpath(p) for d in dirs
+                   for p in glob.glob(os.path.join(d, "**", "*.obj"), recursive=True)})
+
+
 def load_domains(dirs, n_tokens, cache_dir, workers):
     """Load every OBJ and attach its cached FPS token sets, computing them on first use.
     A cache entry is keyed by file name and face count. A regenerated mesh with a different
     face count gets new sets, because its triangle ids would point elsewhere."""
-    paths = sorted(p for d in dirs for p in glob.glob(os.path.join(d, "*.obj")))
+    paths = obj_paths(dirs)
     if not paths:
         raise SystemExit(f"no .obj files in {dirs}")
     names = [os.path.basename(p) for p in paths]
@@ -350,12 +373,23 @@ def load_domains(dirs, n_tokens, cache_dir, workers):
         print(f"computing FPS token sets for {len(todo)} domains ({workers} workers) ...", flush=True)
         t0 = time.time()
         jobs = [(p, sizes) for p in todo]
+        results = []
+        # imap, not map, so that a run over thousands of domains says how far it is; the cache is
+        # written only once all are done, so stopping part way loses them all.
+        pool = None
         if workers > 1:
             import multiprocessing as mp
-            with mp.get_context("spawn").Pool(workers) as pool:
-                results = pool.map(_fps_job, jobs, chunksize=4)
-        else:
-            results = [_fps_job(j) for j in jobs]
+            pool = mp.get_context("spawn").Pool(workers)
+        try:
+            for k, r in enumerate(pool.imap(_fps_job, jobs, chunksize=4) if pool else map(_fps_job, jobs), 1):
+                results.append(r)
+                if k % 500 == 0 and k < len(jobs):
+                    el = time.time() - t0
+                    print(f"  {k}/{len(jobs)} domains in {el:.0f} s, ~{el / k * (len(jobs) - k) / 60:.0f} min left",
+                          flush=True)
+        finally:
+            if pool:
+                pool.terminate()
         nf = {d.path: len(d.F) for d in domains}
         for p, out in results:
             name = os.path.basename(p)
@@ -721,6 +755,16 @@ def default_workers(dev):
     return min(8, max(2, (os.cpu_count() or 2) - 1)) if dev.startswith("cuda") else 2
 
 
+def default_fps_workers(dev):
+    """Processes for the one-off token-set cache when --fps_workers is not given. It is ~2 s of
+    numpy per domain (N_FPS_COPIES greedy FPS runs per size), so 10 k DeepCAD domains are an hour
+    on 6 processes -- the cap that suits an 8 GB M2, where each spawned worker also imports torch.
+    A CUDA box has the cores and memory to spare and its GPU idles until the cache is done, so it
+    gets every core it may use (the affinity mask: a container's share, not the host's count)."""
+    cores = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+    return cores if dev.startswith("cuda") else min(6, cores)
+
+
 def make_loader(dataset, cfg):
     w = cfg["workers"]
     return torch.utils.data.DataLoader(dataset, batch_size=cfg["batch"], num_workers=w, persistent_workers=w > 0,
@@ -747,7 +791,7 @@ def empty_cache(dev):
 # Config entries that are paths. A checkpoint stores them relative to the repository when they
 # are inside it, so that a model trained on another machine (a cloud GPU) finds its SQ-VAE and
 # the Geom-AE's token-set cache here, once its run directories are copied to the same places.
-PATH_KEYS = ("out", "data", "geom_ae", "vae", "latent_stats")
+PATH_KEYS = ("out", "data", "geom_ae", "vae", "latent_stats", "init")
 
 
 def to_repo(path):
@@ -939,16 +983,28 @@ def lr_at(step, cfg):
     return cfg["min_lr"] + (cfg["lr"] - cfg["min_lr"]) * 0.5 * (1 + math.cos(math.pi * t))
 
 
-def train(cfg, train_set, val_eval, train_eval, log):
+def train(cfg, train_set, val_eval, train_eval, log, init=None):
+    """init: a checkpoint dict to continue from (see Continuing in the module docstring)."""
     dev = cfg["device"]
     amp = amp_dtype(dev, cfg["amp"])
     torch.manual_seed(cfg["seed"])
     model = build_model(cfg).to(dev)
     log(f"device={dev}  amp={amp}  workers={cfg['workers']}  parameters={sum(p.numel() for p in model.parameters()):,}")
+    best = float("inf")
+    if init is not None:
+        model.load_state_dict({k[len("cond_vae."):]: v for k, v in init["model"].items() if k.startswith("cond_vae.")})
+        # The start is the best so far, so a continuation that only gets worse leaves best.pt as it began.
+        mv, mt = val_eval(model, dev), train_eval(model, dev)
+        log(f"  eval {0:6d}  val band_l1 {mv['band_l1']:.4f} iou {mv['iou']:.4f} bnd {mv['bnd']:.4f}"
+            f"  |  train band_l1 {mt['band_l1']:.4f} iou {mt['iou']:.4f} bnd {mt['bnd']:.4f}"
+            f"  (start: {cfg['init']}, step {init['step']} of its run)")
+        best = mv["band_l1"]
+        save(os.path.join(cfg["out"], "best.pt"), model, cfg, 0, {"val": mv, "train": mt})
+        empty_cache(dev)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["wd"])
     scaler = grad_scaler(dev, amp)
     loader = make_loader(DomainStream(train_set, cfg), cfg)
-    best, t0, run = float("inf"), time.time(), {}
+    t0, run = time.time(), {}
     for step, batch in enumerate(loader, 1):
         for g in opt.param_groups:
             g["lr"] = lr_at(step - 1, cfg)
@@ -977,7 +1033,7 @@ def train(cfg, train_set, val_eval, train_eval, log):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
-    ap.add_argument("--data", nargs="+", default=DEFAULT_DIRS, help="directories of .obj domains")
+    ap.add_argument("--data", nargs="+", default=DEFAULT_DIRS, help="directories of .obj domains, searched recursively")
     ap.add_argument("--out", default=os.path.join(REPO, "py", "squadgen", "runs", "geom_ae_2d"))
     ap.add_argument("--steps", type=int, default=20000)
     ap.add_argument("--batch", type=int, default=8)                  # release: 16 per GPU; 8 fits 8 GB
@@ -1007,6 +1063,8 @@ def main():
     ap.add_argument("--no_aug", action="store_true")
     ap.add_argument("--val_frac", type=float, default=0.1)
     ap.add_argument("--workers", type=int, help="DataLoader workers (default: 2 on MPS/CPU, up to 8 on CUDA)")
+    ap.add_argument("--fps_workers", type=int,
+                    help="processes for the one-off token-set cache (default: every core on CUDA, 6 elsewhere)")
     ap.add_argument("--device", default="auto", help="cuda, cuda:N, mps or cpu (default: the first there is)")
     ap.add_argument("--amp", choices=("auto", "bf16", "fp16", "none"), default="auto",
                     help="training autocast (auto: bf16 on CUDA that has it, else fp32)")
@@ -1014,10 +1072,18 @@ def main():
     ap.add_argument("--eval_every", type=int, default=1000)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--eval_only", action="store_true", help="evaluate and plot best.pt")
+    ap.add_argument("--init", help="continue from this Geom-AE checkpoint (best.pt / last.pt; see Continuing)")
     args = ap.parse_args()
+    init = None
+    if args.init:
+        args.init = args.init if os.path.exists(args.init) else from_repo(args.init)
+        init = torch.load(args.init, map_location="cpu", weights_only=False)
+        for k in ("depth", "dim", "latent_dim", "heads", "dim_head", "drop_path_rate", "n_tokens", "tau"):
+            setattr(args, k, init["config"][k])   # the network the weights fit, and the units they predict in
     dev = pick_device(args.device)
     cfg = dict(vars(args), num_latents=args.n_tokens, augment=not args.no_aug, device=dev,
-               workers=default_workers(dev) if args.workers is None else args.workers)
+               workers=default_workers(dev) if args.workers is None else args.workers,
+               init_step=init["step"] if init else None)
 
     os.makedirs(args.out, exist_ok=True)
     logf = open(os.path.join(args.out, "log.txt"), "a")
@@ -1028,19 +1094,35 @@ def main():
         logf.flush()
 
     log(f"=== {time.strftime('%Y-%m-%d %H:%M:%S')}  " + " ".join(f"{k}={v}" for k, v in sorted(cfg.items()) if k != "data"))
+    if init:
+        name = f"fps_cache_N{args.n_tokens}.npz"
+        src, dst = os.path.join(os.path.dirname(args.init), name), os.path.join(args.out, name)
+        if os.path.exists(src) and not os.path.exists(dst):
+            shutil.copyfile(src, dst)
+            log(f"token-set cache copied from {os.path.dirname(args.init)}")
     # The token-set cache is a one-off CPU job before any model exists, so it may use more
     # processes than the DataLoader, which shares memory with the model.
-    domains = load_domains(args.data, args.n_tokens, args.out, min(6, os.cpu_count() or 1))
+    domains = load_domains(args.data, args.n_tokens, args.out,
+                           args.fps_workers or default_fps_workers(dev))
     train_set, val_set = split_by_family(domains, args.val_frac, args.seed)
     log(f"{len(domains)} domains: {len(train_set)} train, {len(val_set)} val "
         f"({len({family(d.path) for d in val_set})} held-out families: "
         f"{' '.join(sorted({family(d.path) for d in val_set}))})")
+    if init:
+        # The split is a function of the domain names, --val_frac and --seed; compared by name, so the
+        # same domains passed as one parent directory or as its subdirectories count as the same.
+        ic = init["config"]
+        before = {os.path.basename(p) for p in obj_paths([from_repo(d) for d in ic["data"]])}
+        if (before != {os.path.basename(d.path) for d in domains}
+                or (ic["val_frac"], ic["seed"]) != (args.val_frac, args.seed)):
+            log("note: the domains, --val_frac or --seed differ from the checkpoint's run (or its --data is not "
+                "here), so the held-out families may differ: validation may count domains the start trained on")
     rng = np.random.default_rng(args.seed)
     val_eval = GridEval(val_set, cfg)
     train_eval = GridEval([train_set[i] for i in rng.choice(len(train_set), min(48, len(train_set)), replace=False)], cfg)
 
     if not args.eval_only:
-        train(cfg, train_set, val_eval, train_eval, log)
+        train(cfg, train_set, val_eval, train_eval, log, init)
     model, _ = load_geom_ae(os.path.join(args.out, "best.pt"), dev)
     step = torch.load(os.path.join(args.out, "best.pt"), map_location="cpu", weights_only=False)["step"]
     for name, ev in (("val", val_eval), ("train", train_eval)):
