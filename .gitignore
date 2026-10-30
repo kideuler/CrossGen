@@ -21,3 +21,4 @@ docs/*
 *.json
 *.ply
 *.pyc
+data/geometry/deepcad/*
