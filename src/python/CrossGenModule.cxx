@@ -540,9 +540,9 @@ const char *kBoundaryFeaturesDoc =
     "With report=True, returns (summary, report): each corner's position, angle in\n"
     "degrees, k, vertex and region, and each boundary loop's vertices.";
 
-// Filled in readyTypes(): the five methods, shape_dna, boundary_features,
-// feature_frame, the sentinel.
-PyMethodDef meshMethods[kNumMethods + 4];
+// Filled in readyTypes(): the five methods, oracle, shape_dna,
+// boundary_features, feature_frame, the sentinel.
+PyMethodDef meshMethods[kNumMethods + 5];
 
 // ===========================================================================
 // BlockDecomposition
@@ -1321,9 +1321,10 @@ PyObject *crossgen_options(PyObject *, PyObject *args, PyObject *kwargs) {
     }
     for (const MeshMethod &mm : kMethods)
         if (n == mm.spec->name) return mm.spec->defaults(s);
+    if (n == oracleSpec.name) return oracleSpec.defaults(s);
     PyErr_Format(PyExc_ValueError,
                  "crossgen.options(): unknown method '%s' (expected one of crossgen.methods, "
-                 "'shape_dna', 'boundary_features' or 'cdf')",
+                 "'oracle', 'shape_dna', 'boundary_features' or 'cdf')",
                  name);
     return nullptr;
 }
@@ -1336,7 +1337,7 @@ PyMethodDef moduleMethods[] = {
     {"options", asCFunction(crossgen_options), METH_VARARGS | METH_KEYWORDS,
      "options(method, stage='method') -> dict\n\n"
      "The keywords a stage takes, with their defaults. method is one of\n"
-     "crossgen.methods, 'shape_dna', 'boundary_features' or 'cdf'\n"
+     "crossgen.methods, 'oracle', 'shape_dna', 'boundary_features' or 'cdf'\n"
      "(BlockDecomposition.cdf()); stage is 'method' (Mesh.<method>()), 'mesh'\n"
      "(BlockDecomposition.mesh()) or 'smooth' (QuadMesh.smooth())."},
     {nullptr, nullptr, 0, nullptr},
@@ -1348,6 +1349,7 @@ const char *kModuleDoc =
     "    import crossgen\n"
     "    m = crossgen.load('data/meshes/singlemat/geom012.obj')\n"
     "    b = m.meridian()          # zipline, umber, meridian, torsion or atlas\n"
+    "    b = m.oracle()            # the selector's choice of those five\n"
     "    q = b.mesh(0.05)          # quad mesh at a target edge length\n"
     "    q.smooth(1000)            # TMOP, in place\n"
     "    e = m.shape_dna()         # numpy array of the Shape-DNA\n"
@@ -1381,6 +1383,8 @@ int readyTypes() {
     for (const MeshMethod &mm : kMethods)
         meshMethods[k++] = {mm.spec->name, asCFunction(mm.function), METH_VARARGS | METH_KEYWORDS,
                             mm.spec->doc};
+    meshMethods[k++] = {oracleSpec.name, asCFunction(Mesh_runMethod<&oracleSpec>),
+                        METH_VARARGS | METH_KEYWORDS, oracleSpec.doc};
     meshMethods[k++] = {"shape_dna", asCFunction(Mesh_shapeDNA), METH_VARARGS | METH_KEYWORDS,
                         kShapeDNADoc};
     meshMethods[k++] = {"boundary_features", asCFunction(Mesh_boundaryFeatures),
@@ -1396,8 +1400,9 @@ int readyTypes() {
     BlocksType.tp_doc =
         "A quad block decomposition of a Mesh, as one method found it: macrovertices,\n"
         "macro edges (polylines on the model) and four-sided blocks. Made by\n"
-        "Mesh.zipline(), .umber(), .meridian(), .torsion() and .atlas(); mesh() puts a\n"
-        "quad mesh on it with that method's mesher.";
+        "Mesh.zipline(), .umber(), .meridian(), .torsion() and .atlas(), or .oracle(),\n"
+        "the selector's choice of them; mesh() puts a quad mesh on it with that method's\n"
+        "mesher.";
     BlocksType.tp_dealloc = Blocks_dealloc;
     BlocksType.tp_repr = Blocks_repr;
     BlocksType.tp_getset = blocksGetSet;
@@ -1437,6 +1442,7 @@ PyObject *createModule() {
     try {
         buildSharedTables();
         for (const MeshMethod &mm : kMethods) mm.spec->buildTables();
+        oracleSpec.buildTables();
     } catch (const std::exception &e) {
         PyErr_Format(PyExc_ImportError, "crossgen: %s", e.what());
         return nullptr;

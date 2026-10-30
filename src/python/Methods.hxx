@@ -100,6 +100,9 @@ extern const MethodSpec umberSpec;
 extern const MethodSpec meridianSpec;
 extern const MethodSpec torsionSpec;
 extern const MethodSpec atlasSpec;
+// ORACLE's choice among the five (MethodORACLE.cxx): Mesh.oracle(), but not one
+// of crossgen.methods, which are the methods there are to choose from.
+extern const MethodSpec oracleSpec;
 
 // A ValueError for crossgen.options() given a stage `method` has no table for.
 PyObject *unknownStage(const char *method, const std::string &stage);

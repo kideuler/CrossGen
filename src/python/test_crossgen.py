@@ -145,6 +145,28 @@ def main(path):
         qa = q.alignment_quality()
         check(0.0 < qa <= 1.0, f"{name}: mesh alignment quality {qa:.3f}")
 
+    # ---- ORACLE: the selector's choice, which must be that method's own run ----
+    # Not one of crossgen.methods (they are what it chooses from). Its blocks
+    # are the kept method's m.<method>() blocks, which is what makes its
+    # report's `method` mean anything. A module built without ONNX Runtime has
+    # no selector, and says so by raising.
+    check("oracle" not in crossgen.methods and isinstance(crossgen.options("oracle"), dict),
+          "oracle: a Mesh method, not one of crossgen.methods")
+    try:
+        o = m.oracle()
+    except RuntimeError as e:
+        print(f"  skip oracle: {e}")
+    else:
+        kept = o.report["method"]
+        ref = getattr(m, kept)()
+        check(kept in crossgen.methods and o.report["runs"][0]["method"] == o.report["probe"],
+              f"oracle: probe {o.report['probe']} first, kept {kept} ({o.report['decision']})")
+        check(o.num_blocks == ref.num_blocks and o.coverage == ref.coverage and o.valid == ref.valid and
+              np.array_equal(o.vertices, ref.vertices) and np.array_equal(o.blocks, ref.blocks),
+              f"oracle: the same blocks as m.{kept}()")
+        q = o.mesh(0.05)
+        check(q.num_quads > 0, f"oracle: meshed by {kept}'s mesher, {q.num_quads} quads")
+
     # ---- chart distance fields (the last method's blocks) ---------------------
     # Structural, and the two values the definition fixes: at a chart corner
     # DCDF is 1, CDF is 0 and the offset to the subchart's own corner is 0.

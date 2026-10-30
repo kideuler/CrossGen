@@ -624,6 +624,7 @@ def main():
     ap.add_argument("--jobs", type=int, default=4, help="QuadExtraction processes at once")
     ap.add_argument("--keep", action="store_true", help="keep QuadExtraction's inputs and debug files per case")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--device", default="auto", help="cuda, cuda:N, mps or cpu (default: the first there is)")
     args = ap.parse_args()
 
     for b in ("QuadExtraction", "QuadQuality"):
@@ -639,7 +640,7 @@ def main():
         logf.write(s + "\n")
         logf.flush()
 
-    dev = gae.pick_device()
+    dev = gae.pick_device(args.device)
     model, geom, cfg = sqv.load_sq_vae(args.ckpt, dev)
     step = torch.load(args.ckpt, map_location="cpu", weights_only=False)["step"]
     rows = select_rows(args)

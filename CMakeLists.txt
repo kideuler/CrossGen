@@ -891,9 +891,13 @@ if (BUILD_PYTHON_MODULE)
         src/python/MethodUMBER.cxx
         src/python/MethodLayout.cxx
         src/python/MethodATLAS.cxx
+        src/python/MethodORACLE.cxx
         src/python/CrossGenModule.cxx
     )
-    target_link_libraries(crossgen PRIVATE PolyVector)
+    # CrossGenOracle for Mesh.oracle() (src/python/MethodORACLE.cxx). ONNX
+    # Runtime stays behind it: linked PRIVATE to that library, it reaches the
+    # module only as a dependency of the dylib, never through a header.
+    target_link_libraries(crossgen PRIVATE PolyVector CrossGenOracle)
     # Its own directory, so that PYTHONPATH can point at the module and at
     # nothing else of the build tree.
     set_target_properties(crossgen PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/python)

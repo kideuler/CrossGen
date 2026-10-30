@@ -61,8 +61,16 @@ Run
     python py/squadgen/geom_ae_2d.py --eval_only                      # plots from best.pt
 
 Memory: on an 8 GB Apple M2, batch 8 with the default query counts takes ~3.3 GB of MPS
-memory at ~0.5 s/step; batch 12 needs 4.3 GB and batch 16 swapped (100 s/step). bf16
-autocast was slower on MPS, so there is no AMP option.
+memory at ~0.5 s/step; batch 12 needs 4.3 GB and batch 16 swapped (100 s/step).
+
+Devices. --device picks one (default: CUDA, else MPS, else the CPU). On an NVIDIA GPU the
+forward pass runs under bf16 autocast (--amp auto; fp16 with loss scaling for a GPU without
+bf16), as the release trains, and float32 matmuls may use TF32; on MPS autocast was slower,
+so it stays fp32 there. The weights are fp32 either way and a checkpoint holds them on the
+CPU with paths relative to the repository, so one trained on a cloud GPU loads and runs on a
+Mac (or anywhere) as it is: copy the run directory to the same place under py/squadgen/runs.
+The helpers for all of this (pick_device, amp_dtype, train_step, make_loader, portable,
+from_repo) are shared by sq_vae_2d.py and sq_diffuse_2d.py.
 
 Outputs in --out: fps_cache_N{N}.npz (token sets), best.pt / last.pt (checkpoint: model
 under `cond_vae.`, config, step, metrics), recon_val.png / recon_train.png (decoded SDF
@@ -71,6 +79,7 @@ encode_obj().
 """
 
 import argparse
+import contextlib
 import glob
 import math
 import os
@@ -627,12 +636,149 @@ def build_model(cfg):
                          **{k: cfg[k] for k in MODEL_KEYS})
 
 
-def pick_device():
-    if torch.cuda.is_available():
-        return "cuda"
-    if torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
+def pick_device(pref=None):
+    """The device to run on: `pref` when given ('cuda', 'cuda:1', 'mps', 'cpu'), else the first
+    of CUDA, Apple MPS and the CPU that this machine has. On CUDA it also lets float32 matmuls
+    use TF32 (Ampere and later), several times faster at a precision these models do not
+    notice; MPS and the CPU have no such mode."""
+    if pref and pref != "auto":
+        dev = pref
+        if dev.startswith("cuda") and not torch.cuda.is_available():
+            raise SystemExit(f"--device {dev}: this machine has no CUDA device")
+        if dev == "mps" and not torch.backends.mps.is_available():
+            raise SystemExit("--device mps: this machine has no MPS device")
+    else:
+        dev = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+    if dev.startswith("cuda"):
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    return dev
+
+
+def device_type(dev):
+    return dev.split(":")[0]
+
+
+def amp_dtype(dev, mode):
+    """The autocast dtype of the training forward pass, or None for fp32. 'auto' is bf16 on a
+    CUDA device that has it (Ampere and later: A100, H100, RTX 30xx/40xx/50xx), as the release
+    trains (--mix_precision_dtype=bf16), and fp32 elsewhere: on MPS bf16 autocast measured
+    slower, and a T4 or V100 has no fast bf16, for which 'fp16' (with loss scaling) is the
+    choice. Only the arithmetic changes: the weights stay fp32, so whatever trained under
+    autocast runs in fp32 on any device. Evaluation always runs in fp32."""
+    if mode == "none":
+        return None
+    if mode == "auto":
+        return torch.bfloat16 if dev.startswith("cuda") and torch.cuda.is_bf16_supported() else None
+    return {"bf16": torch.bfloat16, "fp16": torch.float16}[mode]
+
+
+def autocast(dev, dtype):
+    return contextlib.nullcontext() if dtype is None else torch.autocast(device_type(dev), dtype=dtype)
+
+
+def grad_scaler(dev, dtype):
+    """fp16 needs its loss scaled so that small gradients do not underflow; bf16 and fp32 do
+    not, and a disabled scaler passes everything through."""
+    return torch.amp.GradScaler(device_type(dev), enabled=dtype == torch.float16)
+
+
+def train_step(model, opt, scaler, loss, clip):
+    """Backward, gradient clipping at `clip`, optimiser step; returns the gradient norm (inf on
+    an fp16 step the scaler skipped)."""
+    opt.zero_grad(set_to_none=True)
+    scaler.scale(loss).backward()
+    scaler.unscale_(opt)
+    gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+    scaler.step(opt)
+    scaler.update()
+    return gnorm
+
+
+def accumulate(run, terms):
+    """Sum the step's logged terms into `run` (key -> (sum, steps)) until the next log line. A
+    gradient norm that is not finite is counted instead of summed: fp16 steps the scaler skips
+    have one, and averaging it in would hide every other step's. Any other term is summed as it
+    is, so a loss that has gone NaN shows."""
+    for k, v in terms.items():
+        x = float(v.detach()) if torch.is_tensor(v) else float(v)
+        if k == "gnorm" and not math.isfinite(x):
+            run["nonfinite"] = run.get("nonfinite", 0) + 1
+            continue
+        s, n = run.get(k, (0.0, 0))
+        run[k] = (s + x, n + 1)
+
+
+def averages(run):
+    out = "  ".join(f"{k} {s / n:.4f}" for k, v in run.items() if k != "nonfinite" for s, n in [v])
+    return out + (f"  [{run['nonfinite']} step(s) with a non-finite gradient norm]" if run.get("nonfinite") else "")
+
+
+def default_workers(dev):
+    """DataLoader workers when --workers is not given. Each builds samples in numpy (~20 ms a
+    sample) and holds its own torch: two keep an M2 fed at batch 8 within 8 GB, while a GPU
+    takes a step in a fraction of that and needs more."""
+    return min(8, max(2, (os.cpu_count() or 2) - 1)) if dev.startswith("cuda") else 2
+
+
+def make_loader(dataset, cfg):
+    w = cfg["workers"]
+    return torch.utils.data.DataLoader(dataset, batch_size=cfg["batch"], num_workers=w, persistent_workers=w > 0,
+                                       prefetch_factor=4 if w > 0 else None,
+                                       pin_memory=cfg["device"].startswith("cuda"))
+
+
+def memory_note(dev):
+    """The device memory in use, for the step log ('' on the CPU)."""
+    if dev == "mps":
+        return f", mps {torch.mps.driver_allocated_memory() / 2 ** 30:.2f} GiB"
+    if dev.startswith("cuda"):
+        return f", cuda peak {torch.cuda.max_memory_allocated(dev) / 2 ** 30:.2f} GiB"
+    return ""
+
+
+def empty_cache(dev):
+    if dev == "mps":
+        torch.mps.empty_cache()
+    elif dev.startswith("cuda"):
+        torch.cuda.empty_cache()
+
+
+# Config entries that are paths. A checkpoint stores them relative to the repository when they
+# are inside it, so that a model trained on another machine (a cloud GPU) finds its SQ-VAE and
+# the Geom-AE's token-set cache here, once its run directories are copied to the same places.
+PATH_KEYS = ("out", "data", "geom_ae", "vae", "latent_stats")
+
+
+def to_repo(path):
+    a = os.path.abspath(path)
+    return os.path.relpath(a, REPO) if a.startswith(REPO + os.sep) else a
+
+
+def from_repo(path):
+    """A stored path on this machine: a relative one is the repository's; an absolute one that
+    is not here but runs through py/squadgen/ (another machine's checkout) is re-rooted at this
+    repository's py/squadgen/."""
+    if not os.path.isabs(path):
+        return os.path.join(REPO, path)
+    marker = os.sep + os.path.join("py", "squadgen") + os.sep
+    if not os.path.exists(path) and marker in path:
+        local = os.path.join(REPO, "py", "squadgen", path.split(marker, 1)[1])
+        if os.path.exists(local):
+            return local
+    return path
+
+
+def portable(cfg):
+    """cfg with its PATH_KEYS made repository-relative, as checkpoints store it."""
+    out = dict(cfg)
+    for k in PATH_KEYS:
+        v = out.get(k)
+        if isinstance(v, str):
+            out[k] = to_repo(v)
+        elif isinstance(v, (list, tuple)) and v and all(isinstance(x, str) for x in v):
+            out[k] = [to_repo(x) for x in v]
+    return out
 
 
 def to_dev(batch, dev):
@@ -758,7 +904,7 @@ def save(path, model, cfg, step, metrics):
     """main_ae.py's layout: the model under `cond_vae.`, as the Geom-AE half of
     KLAutoEncoderJoint."""
     sd = {f"cond_vae.{k}": v.detach().cpu() for k, v in model.state_dict().items()}
-    torch.save({"model": sd, "config": cfg, "step": step, "metrics": metrics}, path)
+    torch.save({"model": sd, "config": portable(cfg), "step": step, "metrics": metrics}, path)
 
 
 def load_geom_ae(path, device="cpu"):
@@ -794,32 +940,27 @@ def lr_at(step, cfg):
 
 
 def train(cfg, train_set, val_eval, train_eval, log):
-    dev = pick_device()
+    dev = cfg["device"]
+    amp = amp_dtype(dev, cfg["amp"])
     torch.manual_seed(cfg["seed"])
     model = build_model(cfg).to(dev)
-    log(f"device={dev}  parameters={sum(p.numel() for p in model.parameters()):,}")
+    log(f"device={dev}  amp={amp}  workers={cfg['workers']}  parameters={sum(p.numel() for p in model.parameters()):,}")
     opt = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["wd"])
-    loader = torch.utils.data.DataLoader(
-        DomainStream(train_set, cfg), batch_size=cfg["batch"], num_workers=cfg["workers"],
-        persistent_workers=cfg["workers"] > 0, prefetch_factor=4 if cfg["workers"] > 0 else None)
+    scaler = grad_scaler(dev, amp)
+    loader = make_loader(DomainStream(train_set, cfg), cfg)
     best, t0, run = float("inf"), time.time(), {}
     for step, batch in enumerate(loader, 1):
         for g in opt.param_groups:
             g["lr"] = lr_at(step - 1, cfg)
-        loss, terms = calc_loss(model, to_dev(batch, dev), cfg["kl_weight"], is_mode=cfg["posterior"] == "mean")
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["clip_grad"])
-        opt.step()
+        with autocast(dev, amp):
+            loss, terms = calc_loss(model, to_dev(batch, dev), cfg["kl_weight"], is_mode=cfg["posterior"] == "mean")
+        gnorm = train_step(model, opt, scaler, loss, cfg["clip_grad"])
         terms["loss"], terms["gnorm"] = loss, gnorm
-        for k, v in terms.items():
-            run[k] = run.get(k, 0.0) + v.detach().item()
+        accumulate(run, terms)
         if step % cfg["log_every"] == 0 or step == 1:
-            n = 1 if step == 1 else cfg["log_every"]
             el = time.time() - t0
-            log(f"step {step:6d}  lr {opt.param_groups[0]['lr']:.2e}  "
-                + "  ".join(f"{k} {v / n:.4f}" for k, v in run.items())
-                + f"  ({el / step * 1000:.0f} ms/step, {el / 60:.1f} min)")
+            log(f"step {step:6d}  lr {opt.param_groups[0]['lr']:.2e}  {averages(run)}"
+                + f"  ({el / step * 1000:.0f} ms/step, {el / 60:.1f} min{memory_note(dev)})")
             run = {}
         if step % cfg["eval_every"] == 0 or step == cfg["steps"]:
             mv, mt = val_eval(model, dev), train_eval(model, dev)
@@ -829,9 +970,9 @@ def train(cfg, train_set, val_eval, train_eval, log):
             if mv["band_l1"] < best:
                 best = mv["band_l1"]
                 save(os.path.join(cfg["out"], "best.pt"), model, cfg, step, {"val": mv, "train": mt})
+            empty_cache(dev)
         if step >= cfg["steps"]:
             break
-    return dev
 
 
 def main():
@@ -865,13 +1006,18 @@ def main():
     ap.add_argument("--clip_grad", type=float, default=1.0)
     ap.add_argument("--no_aug", action="store_true")
     ap.add_argument("--val_frac", type=float, default=0.1)
-    ap.add_argument("--workers", type=int, default=2)                # each holds torch + the corpus
+    ap.add_argument("--workers", type=int, help="DataLoader workers (default: 2 on MPS/CPU, up to 8 on CUDA)")
+    ap.add_argument("--device", default="auto", help="cuda, cuda:N, mps or cpu (default: the first there is)")
+    ap.add_argument("--amp", choices=("auto", "bf16", "fp16", "none"), default="auto",
+                    help="training autocast (auto: bf16 on CUDA that has it, else fp32)")
     ap.add_argument("--log_every", type=int, default=100)
     ap.add_argument("--eval_every", type=int, default=1000)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--eval_only", action="store_true", help="evaluate and plot best.pt")
     args = ap.parse_args()
-    cfg = dict(vars(args), num_latents=args.n_tokens, augment=not args.no_aug)
+    dev = pick_device(args.device)
+    cfg = dict(vars(args), num_latents=args.n_tokens, augment=not args.no_aug, device=dev,
+               workers=default_workers(dev) if args.workers is None else args.workers)
 
     os.makedirs(args.out, exist_ok=True)
     logf = open(os.path.join(args.out, "log.txt"), "a")
@@ -893,7 +1039,8 @@ def main():
     val_eval = GridEval(val_set, cfg)
     train_eval = GridEval([train_set[i] for i in rng.choice(len(train_set), min(48, len(train_set)), replace=False)], cfg)
 
-    dev = pick_device() if args.eval_only else train(cfg, train_set, val_eval, train_eval, log)
+    if not args.eval_only:
+        train(cfg, train_set, val_eval, train_eval, log)
     model, _ = load_geom_ae(os.path.join(args.out, "best.pt"), dev)
     step = torch.load(os.path.join(args.out, "best.pt"), map_location="cpu", weights_only=False)["step"]
     for name, ev in (("val", val_eval), ("train", train_eval)):

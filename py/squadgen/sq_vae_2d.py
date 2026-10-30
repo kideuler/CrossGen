@@ -62,7 +62,9 @@ from disk and nothing is cached, because the corpus (~2 GB) would not fit beside
 8 GB once per DataLoader worker.
 
 The release trainer needs CUDA and torchrun (Sec. 3.4, "Hardware"), so this script is a plain
-loop around calc_loss, as the guide suggests. It runs on CUDA, Apple MPS or the CPU.
+loop around calc_loss, as the guide suggests. It runs on CUDA, Apple MPS or the CPU (--device),
+under bf16 autocast on a CUDA GPU that has it (--amp; geom_ae_2d.amp_dtype says why not on MPS),
+and its checkpoints load on any of them: weights on the CPU, paths relative to the repository.
 
 Run
 ---
@@ -99,7 +101,8 @@ from geom_ae_2d import Attention, FeedForward, PointEmbed, PreNorm   # noqa: E40
 REPO = gae.REPO
 DEFAULT_DATA = os.path.join(REPO, "py", "squadgen", "data", "cdf")
 DEFAULT_GEOM = os.path.join(REPO, "py", "squadgen", "runs", "geom_ae_2d", "best.pt")
-METHODS = ("zipline", "umber", "meridian", "torsion", "atlas")
+# The manifest's method names: the five, and "oracle" (cdf_data.py: ORACLE's choice among them).
+METHODS = ("zipline", "umber", "meridian", "torsion", "atlas", "oracle")
 # The seven offsets in the order of the NPZ's corner ids: offset_abcd_id (own chart corner =
 # dual-chart centre, side mid-point, chart centre, side mid-point), then offset_123_id (the
 # chart's other three corners). Sec. 2.4.
@@ -525,7 +528,8 @@ def save(path, model, geom, cfg, gcfg, step, metrics):
     SQ-VAE under `latent_vae.`."""
     sd = {f"cond_vae.{k}": v.detach().cpu() for k, v in geom.state_dict().items()}
     sd.update({f"latent_vae.{k}": v.detach().cpu() for k, v in model.state_dict().items()})
-    torch.save({"model": sd, "config": cfg, "geom_config": gcfg, "step": step, "metrics": metrics}, path)
+    torch.save({"model": sd, "config": gae.portable(cfg), "geom_config": gae.portable(gcfg), "step": step,
+                "metrics": metrics}, path)
 
 
 def load_sq_vae(path, device="cpu"):
@@ -560,36 +564,32 @@ def decode_fields(model, z, xy, chunk=8192):
 
 
 def train(cfg, gcfg, geom, train_paths, val_eval, train_eval, log):
-    dev = gae.pick_device()
+    dev = cfg["device"]
+    amp = gae.amp_dtype(dev, cfg["amp"])
     torch.manual_seed(cfg["seed"])
     model = build_model(cfg).to(dev)
     geom = geom.to(dev)
-    log(f"device={dev}  SQ-VAE parameters={sum(p.numel() for p in model.parameters()):,}  "
-        f"(Geom-AE frozen: {sum(p.numel() for p in geom.parameters()):,})")
+    log(f"device={dev}  amp={amp}  workers={cfg['workers']}  SQ-VAE parameters="
+        f"{sum(p.numel() for p in model.parameters()):,}  (Geom-AE frozen: {sum(p.numel() for p in geom.parameters()):,})")
     opt = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["wd"])
-    loader = torch.utils.data.DataLoader(
-        LayoutStream(train_paths, cfg), batch_size=cfg["batch"], num_workers=cfg["workers"],
-        persistent_workers=cfg["workers"] > 0, prefetch_factor=4 if cfg["workers"] > 0 else None)
+    scaler = gae.grad_scaler(dev, amp)
+    loader = gae.make_loader(LayoutStream(train_paths, cfg), cfg)
     best, t0, run = float("inf"), time.time(), {}
     for step, batch in enumerate(loader, 1):
         for g in opt.param_groups:
             g["lr"] = gae.lr_at(step - 1, cfg)
-        loss, terms = calc_loss(model, geom, gae.to_dev(batch, dev), cfg["kl_weight"])
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["clip_grad"])
-        opt.step()
+        # The frozen Geom-AE runs under the same autocast, as the release runs both halves.
+        with gae.autocast(dev, amp):
+            loss, terms = calc_loss(model, geom, gae.to_dev(batch, dev), cfg["kl_weight"])
+        gnorm = gae.train_step(model, opt, scaler, loss, cfg["clip_grad"])
         # The log line keeps the two fields apart and folds the seven offsets into one mean.
         shown = {"loss": loss, "dcdf": terms["dcdf"], "cdf": terms["cdf"],
                  "offsets": sum(terms[k] for k in OFFSET_KEYS) / len(OFFSET_KEYS), "kl": terms["kl"], "gnorm": gnorm}
-        for k, v in shown.items():
-            run[k] = run.get(k, 0.0) + v.detach().item()
+        gae.accumulate(run, shown)
         if step % cfg["log_every"] == 0 or step == 1:
-            n = 1 if step == 1 else cfg["log_every"]
             el = time.time() - t0
-            log(f"step {step:6d}  lr {opt.param_groups[0]['lr']:.2e}  "
-                + "  ".join(f"{k} {v / n:.4f}" for k, v in run.items())
-                + f"  ({el / step * 1000:.0f} ms/step, {el / 60:.1f} min)")
+            log(f"step {step:6d}  lr {opt.param_groups[0]['lr']:.2e}  {gae.averages(run)}"
+                + f"  ({el / step * 1000:.0f} ms/step, {el / 60:.1f} min{gae.memory_note(dev)})")
             run = {}
         if step % cfg["eval_every"] == 0 or step == cfg["steps"]:
             mv, mt = val_eval(model, geom, dev), train_eval(model, geom, dev)
@@ -600,9 +600,9 @@ def train(cfg, gcfg, geom, train_paths, val_eval, train_eval, log):
             if mv["l1"] < best:
                 best = mv["l1"]
                 save(os.path.join(cfg["out"], "best.pt"), model, geom, cfg, gcfg, step, {"val": mv, "train": mt})
+            gae.empty_cache(dev)
         if step >= cfg["steps"]:
             break
-    return dev
 
 
 def main():
@@ -628,7 +628,10 @@ def main():
     ap.add_argument("--clip_grad", type=float, default=1.0)
     ap.add_argument("--no_aug", action="store_true")
     ap.add_argument("--wall", type=float, default=0.1, help="CDF wall threshold of the eval's wall IoU (QuadExtraction -t)")
-    ap.add_argument("--workers", type=int, default=2)                # each holds torch
+    ap.add_argument("--workers", type=int, help="DataLoader workers (default: 2 on MPS/CPU, up to 8 on CUDA)")
+    ap.add_argument("--device", default="auto", help="cuda, cuda:N, mps or cpu (default: the first there is)")
+    ap.add_argument("--amp", choices=("auto", "bf16", "fp16", "none"), default="auto",
+                    help="training autocast (auto: bf16 on CUDA that has it, else fp32)")
     ap.add_argument("--log_every", type=int, default=100)
     ap.add_argument("--eval_every", type=int, default=1000)
     ap.add_argument("--stats_samples", type=int, default=1024, help="samples for latent_stats.json")
@@ -641,8 +644,10 @@ def main():
     geom, gcfg = gae.load_geom_ae(args.geom_ae)
     # Token i of SQ-VAE reads the point Geom-AE token i was computed at, so N is the Geom-AE's
     # (Sec. 3.2, "Token alignment"), and sdf is truncated at its tau.
+    dev = gae.pick_device(args.device)
     cfg = dict(vars(args), n_tokens=gcfg["num_latents"], num_latents=gcfg["num_latents"], geom_dim=gcfg["dim"],
-               tau=gcfg["tau"], augment=not args.no_aug)
+               tau=gcfg["tau"], augment=not args.no_aug, device=dev,
+               workers=gae.default_workers(dev) if args.workers is None else args.workers)
 
     os.makedirs(args.out, exist_ok=True)
     logf = open(os.path.join(args.out, "log.txt"), "a")
@@ -664,7 +669,8 @@ def main():
                             cfg)
     train_paths = [r["npz"] for r in train_rows]
 
-    dev = gae.pick_device() if args.eval_only else train(cfg, gcfg, geom, train_paths, val_eval, train_eval, log)
+    if not args.eval_only:
+        train(cfg, gcfg, geom, train_paths, val_eval, train_eval, log)
     best = os.path.join(args.out, "best.pt")
     model, geom, _ = load_sq_vae(best, dev)
     step = torch.load(best, map_location="cpu", weights_only=False)["step"]

@@ -43,7 +43,9 @@ import numpy as np
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 CORPUS = [os.path.join(ROOT, "data", "meshes", d) for d in ("singlemat", "mambo")]
-METHODS = ("zipline", "umber", "meridian", "torsion", "atlas")
+# "oracle" is ORACLE, the selector's choice among the other five (Mesh.oracle()): one layout per
+# model, the kept method's own run, with which method it kept in `oracle_method`.
+METHODS = ("zipline", "umber", "meridian", "torsion", "atlas", "oracle")
 QUALITIES = ("regularity", "angle_quality", "chord_quality", "alignment_quality")
 
 
@@ -96,6 +98,8 @@ def run_task(args):
         b = getattr(m, args.method)()
         status.update(seconds_method=time.time() - t, num_blocks=b.num_blocks, coverage=b.coverage,
                       valid=b.valid)
+        if args.method == "oracle":
+            status.update(oracle_method=b.report["method"], oracle_decision=b.report["decision"])
         if not b.valid:
             status["status"] = "invalid"
             write_status(status_path, status)
@@ -119,7 +123,8 @@ def run_task(args):
             write_status(status_path, status)
             return 0
         os.makedirs(os.path.dirname(npz_path), exist_ok=True)
-        meta = {k: status[k] for k in ("model", "source", "family", "method", "split", "coverage") + QUALITIES}
+        meta = {k: status[k] for k in ("model", "source", "family", "method", "split", "coverage", "oracle_method")
+                + QUALITIES if k in status}
         c.write(npz_path + ".tmp.npz", **meta)
         os.replace(npz_path + ".tmp.npz", npz_path)
         status.update(status="ok", npz=os.path.relpath(npz_path, args.out), bytes=os.path.getsize(npz_path))
@@ -152,6 +157,9 @@ def run_manifest(args):
         charts = [r["charts"] for r in rs if r["status"] == "ok"]
         print(f"{m:10s} {n['ok']:5d} {n['invalid']:8d} {n['folded']:7d} {n['error']:6d} {n['running']:5d} "
               f"{np.median(charts) if charts else float('nan'):7.0f}")
+    kept = [r["oracle_method"] for r in rows if r["status"] == "ok" and r.get("oracle_method")]
+    if kept:
+        print("oracle kept: " + ", ".join(f"{m} {kept.count(m)}" for m in METHODS if m in kept))
     ok = [r for r in rows if r["status"] == "ok"]
     print(f"NPZ: {len(ok)} layouts ({sum(r['split'] == 'train' for r in ok)} train, "
           f"{sum(r['split'] == 'val' for r in ok)} val), {sum(r['bytes'] for r in ok) / 2**30:.2f} GiB")
