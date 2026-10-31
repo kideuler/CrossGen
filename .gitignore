@@ -18,7 +18,9 @@ docs/*
 *.jsonl
 !assets/readme/*.png
 *.npz
+*.npy
 *.json
 *.ply
 *.pyc
 data/geometry/deepcad/*
+*.egg-info

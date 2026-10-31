@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "squadgen2d"
+version = "0.2.0"
+description = "SQuadGen (Geom-AE, SQ-VAE, SQ-Diffuse) for planar CrossGen domains"
+requires-python = ">=3.8"
+# torch >= 2.4 for nn.RMSNorm. The crossgen module (cdf-data only) comes from the CrossGen CMake build, not pip.
+dependencies = ["numpy", "torch>=2.4", "matplotlib"]
+
+[project.scripts]
+squadgen2d = "squadgen2d.__main__:main"
+
+[tool.setuptools]
+# Only the package: data/ and runs/ beside it are training data and checkpoints.
+packages = ["squadgen2d"]

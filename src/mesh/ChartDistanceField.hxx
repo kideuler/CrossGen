@@ -87,7 +87,7 @@ class NpzWriter;
 // Poisson-subsampled sets, all as (triangle, barycentric) pairs on the split
 // mesh triangulated as in 4. Here the samples are uniform by area and the sets
 // are farthest-point samples of max(8n, 8192) area samples, the token sets
-// py/squadgen/geom_ae_2d.py trained the 2D Geom-AE on, so that a token of the
+// py/squadgen/squadgen2d/geom_ae.py trains the 2D Geom-AE on, so that a token of the
 // SQ-VAE sits where the Geom-AE expects one (guide Sec. 3.2, token alignment).
 // The draw is seeded and deterministic.
 //

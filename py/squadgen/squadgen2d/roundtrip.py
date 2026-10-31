@@ -1,9 +1,9 @@
 """
-roundtrip_2d.py -- the SQ-VAE round trip through QuadExtraction (docs/squadgen_2d.md Sec. 6 step 5).
+roundtrip.py -- the SQ-VAE round trip through QuadExtraction (docs/squadgen_2d.md Sec. 6 step 5).
 
 The guide calls this the key VAE test: encode a layout, decode its fields on a triangulation of
 Omega, run QuadExtraction on them, and get back the charts the layout had. Wall IoU and L1
-(sq_vae_2d.py's eval) only say how close the fields are; this says whether they are close in
+(sq_vae.py's eval) only say how close the fields are; this says whether they are close in
 the way extraction needs. A gap in a decoded wall is a small L1 error, but region growing leaks
 through it and two charts become one (Sec. 5.1 step 2).
 
@@ -47,9 +47,13 @@ USE_OPENMP=OFF); Homebrew GCC builds them as they are:
 
 Run
 ---
-    python py/squadgen/roundtrip_2d.py                         # val + 48 train layouts of best.pt
-    python py/squadgen/roundtrip_2d.py --models M9_3 B1_1      # just these domains
-    python py/squadgen/roundtrip_2d.py --split val --keep      # keep QuadExtraction's inputs and debug files
+    python -m squadgen2d roundtrip                             # val + 48 train layouts of best.pt
+    python -m squadgen2d roundtrip --models M9_3 B1_1          # just these domains
+    python -m squadgen2d roundtrip --split val --keep          # keep QuadExtraction's inputs and debug files
+    python -m squadgen2d roundtrip --ckpt py/squadgen/runs/sq_vae_2d_oracle/best.pt --data py/squadgen/data/cdf_oracle
+
+The split is the SQ-VAE's (the families its Geom-AE held out, recorded in the checkpoint), and the layouts come from the
+manifest and their NPZs, not a field pack: extraction needs each layout's split mesh.
 
 Outputs in --out (default: runs/sq_vae_2d/roundtrip):
 * roundtrip.csv: one row per layout, both extractions;
@@ -70,18 +74,19 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import time
 
 import numpy as np
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import geom_ae_2d as gae                                              # noqa: E402
-import sq_vae_2d as sqv                                               # noqa: E402
+from . import geometry as geo
+from . import training as tr
+from .domains import geom_ae_val_families
+from .layout import METHODS, Layout, layout_fields, read_manifest
+from .paths import DEFAULT_CDF, DEFAULT_SQ_VAE, REPO
+from .sq_vae import decode_fields, encode_layout, load_sq_vae
 
-REPO = gae.REPO
-DEFAULT_RUN = os.path.join(REPO, "py", "squadgen", "runs", "sq_vae_2d")
+DEFAULT_RUN = DEFAULT_SQ_VAE
 DEFAULT_QUADTOOLS = os.environ.get(
     "QUADTOOLS", os.path.join(os.path.dirname(REPO), "SQUADGEN", "QuadTools4SquadGen", "build"))
 # Mirrors infer_sqdiffuse.py's run_quad_postprocess (debug_script/extract_quad_from_cdf.sh).
@@ -108,8 +113,8 @@ def subdivide(V, T):
 def extraction_mesh(obj, h_rel):
     """The domain OBJ, counter-clockwise, without unused vertices, subdivided until its median
     edge is at most 1.5 h_rel x the bounding-box diagonal. Returns (V, T, levels)."""
-    V, T = gae.read_obj(obj)
-    flip = gae.signed_areas(V, T) < 0
+    V, T = geo.read_obj(obj)
+    flip = geo.signed_areas(V, T) < 0
     T[flip] = T[flip][:, ::-1]
     used, T = np.unique(T, return_inverse=True)
     V, T = V[used], T.reshape(-1, 3)
@@ -174,9 +179,9 @@ def locate(V, T, P, chunk=40000):
         valid = np.arange(k)[None] < cnt[:, None]
         cand = np.where(valid, tris[np.minimum(cand, len(tris) - 1)], 0)
         a, b, cc = A[cand, 0], A[cand, 1], A[cand, 2]
-        den = sqv.cross2(b - a, cc - a)
-        l1 = sqv.cross2(p[:, None] - a, cc - a) / den
-        l2 = sqv.cross2(b - a, p[:, None] - a) / den
+        den = geo.cross2(b - a, cc - a)
+        l1 = geo.cross2(p[:, None] - a, cc - a) / den
+        l2 = geo.cross2(b - a, p[:, None] - a) / den
         lam = np.stack([1 - l1 - l2, l1, l2], -1)
         score = np.where(valid & (den != 0), lam.min(-1), -np.inf)
         best = score.argmax(1)
@@ -189,8 +194,8 @@ def locate(V, T, P, chunk=40000):
         for i in np.nonzero(lost)[0]:
             t = np.argmin(((cen - P[i]) ** 2).sum(1))
             a, b, cc = A[t]
-            den = sqv.cross2(b - a, cc - a)
-            l1, l2 = sqv.cross2(P[i] - a, cc - a) / den, sqv.cross2(b - a, P[i] - a) / den
+            den = geo.cross2(b - a, cc - a)
+            l1, l2 = geo.cross2(P[i] - a, cc - a) / den, geo.cross2(b - a, P[i] - a) / den
             tri[i], bary[i] = t, (1 - l1 - l2, l1, l2)
             outside[i] = -min(bary[i])
     return tri, bary, np.maximum(outside, 0)
@@ -395,20 +400,20 @@ def score(res, true, n_true, area, V, T):
 
 def prepare(r, model, geom, cfg, dev, h_rel, work):
     """Both extraction inputs of one layout, and what scoring needs."""
-    L = sqv.Layout(r["npz"])
+    L = Layout(r["npz"])
     with np.load(r["npz"]) as z:
         chart_of_tri = z["subchart_block"][z["face2quad"].ravel()][np.arange(len(L.T)) // 2].astype(np.int64)
         n_true = int(z["subchart_block"].max()) + 1
     V, T, levels = extraction_mesh(r["path"], h_rel)
     P = (V[T].mean(1) - L.centre) * L.scale                            # centroids, SQ-VAE frame
     tri, bary, outside = locate(L.V, L.T, P)
-    gt = sqv.layout_fields(L, L.V, tri, bary)
-    z, _, _ = sqv.encode_layout(model, geom, cfg, r["npz"], dev)
-    dec = sqv.decode_fields(model, z, P)
+    gt = layout_fields(L, L.V, tri, bary)
+    z, _, _ = encode_layout(model, geom, cfg, r["npz"], dev)
+    dec = decode_fields(model, z, P)
     for kind, fields in (("gt", gt), ("dec", dec)):
         write_extraction_input(os.path.join(work, kind), V, T, fields, L.centre, L.scale)
     return {"V": V, "T": T, "levels": levels, "true": chart_of_tri[tri], "n_true": n_true,
-            "area": np.abs(gae.signed_areas(V, T)), "outside": float((outside > 1e-6).mean()), "work": work}
+            "area": np.abs(geo.signed_areas(V, T)), "outside": float((outside > 1e-6).mean()), "work": work}
 
 
 def finish(r, case, futs, out_dir, keep):
@@ -441,15 +446,18 @@ def finish(r, case, futs, out_dir, keep):
     return row
 
 
-def select_rows(args):
-    rows = sqv.read_manifest(args.data, args.methods)
+def select_rows(args, val_fams):
+    """The layouts to run: the SQ-VAE's val layouts and the 48 training layouts its train eval drew."""
+    rows = read_manifest(args.data, args.methods)
     for r in rows:
         r["path"] = os.path.join(REPO, r["path"])
+        if val_fams is not None:
+            r["split"] = "val" if r["family"] in val_fams else "train"
     out = []
     if "val" in args.split:
         out += [r for r in rows if r["split"] == "val"]
     if "train" in args.split:
-        # The 48 training layouts sq_vae_2d.py's train eval used (same seed, same draw).
+        # The 48 training layouts sq_vae.py's train eval used (same seed, same draw).
         train_rows = [r for r in rows if r["split"] == "train"]
         rng = np.random.default_rng(args.seed)
         out += [train_rows[i] for i in rng.choice(len(train_rows), min(args.train_n, len(train_rows)), replace=False)]
@@ -604,15 +612,15 @@ def shared_edges(T, pairs):
 # =============================================================================
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
-    ap.add_argument("--ckpt", default=os.path.join(DEFAULT_RUN, "best.pt"), help="sq_vae_2d.py checkpoint")
-    ap.add_argument("--data", default=sqv.DEFAULT_DATA, help="make_cdf_data.sh's output (manifest.csv + npz/)")
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="squadgen2d roundtrip", description=__doc__.split("\n")[1].strip())
+    ap.add_argument("--ckpt", default=os.path.join(DEFAULT_RUN, "best.pt"), help="sq_vae.py checkpoint")
+    ap.add_argument("--data", default=DEFAULT_CDF, help="a cdf-data output directory (manifest.csv + npz/)")
     ap.add_argument("--out", default=os.path.join(DEFAULT_RUN, "roundtrip"))
     ap.add_argument("--quadtools", default=DEFAULT_QUADTOOLS, help="QuadTools build dir (QuadExtraction, QuadQuality)")
     ap.add_argument("--split", nargs="+", default=["val", "train"], choices=["val", "train"])
-    ap.add_argument("--train_n", type=int, default=48, help="training layouts: sq_vae_2d.py's train-eval draw")
-    ap.add_argument("--methods", nargs="+", default=list(sqv.METHODS), choices=sqv.METHODS)
+    ap.add_argument("--train_n", type=int, default=48, help="training layouts: sq_vae.py's train-eval draw")
+    ap.add_argument("--methods", nargs="+", default=list(METHODS), choices=METHODS)
     ap.add_argument("--models", nargs="+", help="only these domains")
     ap.add_argument("--h_rel", type=float, default=0.002, help="extraction-mesh edge / bbox diagonal (release: 0.002)")
     ap.add_argument("--ringsize", type=int, default=RELEASE_FLAGS["ringsize"])
@@ -625,27 +633,27 @@ def main():
     ap.add_argument("--keep", action="store_true", help="keep QuadExtraction's inputs and debug files per case")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="auto", help="cuda, cuda:N, mps or cpu (default: the first there is)")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     for b in ("QuadExtraction", "QuadQuality"):
         if not os.access(os.path.join(args.quadtools, b), os.X_OK):
             raise SystemExit(f"no {b} in {args.quadtools}: build QuadTools (see this file's docstring) or pass --quadtools")
     flags = {"ringsize": args.ringsize, "a": args.angle, "div": args.div, "t": args.threshold,
              "s": args.subdiv, "r": args.smooth}
-    os.makedirs(args.out, exist_ok=True)
-    logf = open(os.path.join(args.out, "log.txt"), "a")
-
-    def log(s):
-        print(s, flush=True)
-        logf.write(s + "\n")
-        logf.flush()
-
-    dev = gae.pick_device(args.device)
-    model, geom, cfg = sqv.load_sq_vae(args.ckpt, dev)
-    step = torch.load(args.ckpt, map_location="cpu", weights_only=False)["step"]
-    rows = select_rows(args)
+    log = tr.RunLog(args.out)
+    dev = tr.pick_device(args.device)
+    model, geom, cfg = load_sq_vae(args.ckpt, dev)
+    ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+    step = ck["step"]
+    if cfg.get("val_families") is not None:
+        val_fams, how = set(cfg["val_families"]), "recorded in the SQ-VAE checkpoint"
+    else:
+        val_fams, how = geom_ae_val_families(ck["geom_config"])
+    rows = select_rows(args, val_fams)
     log(f"=== {time.strftime('%Y-%m-%d %H:%M:%S')}  {args.ckpt} (step {step})  {len(rows)} layouts  "
         f"h_rel={args.h_rel}  flags " + " ".join(f"{k}={v}" for k, v in flags.items()))
+    log(f"split: the Geom-AE's held-out families, {how}" if val_fams is not None
+        else f"split: the manifest's split column (the Geom-AE's held-out families: {how})")
     work_root = os.path.join(args.out, "_work")
     os.makedirs(work_root, exist_ok=True)
     pool = cf.ThreadPoolExecutor(args.jobs)
@@ -684,7 +692,8 @@ def main():
             plot_cases(rs, args, args.out, f"SQ-VAE round trip through QuadExtraction, {split} layouts, "
                                             f"best.pt (step {step})")
     log(f"done in {(time.time() - t0) / 60:.1f} min -> {args.out}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
