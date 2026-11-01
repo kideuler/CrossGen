@@ -203,6 +203,24 @@ def main(path):
     expect(ValueError, lambda: c.write(path, subdiv_vertex=1), "metadata that would replace an array")
     expect(TypeError, lambda: b.cdf(0.1), "a positional cdf() argument")
     check(crossgen.options("cdf")["samples"] == 20000, "options('cdf')")
+
+    # ---- QUARRY: the blocks back out of their fields ----------------------------
+    # The fields above at the centroids of their own split mesh, read back by QUARRY (Mesh.quarry): as many
+    # blocks as went in, covering, a chart for every triangle, and a mesh on them.
+    at = c.fields(np.arange(len(T)), np.full((len(T), 3), 1.0 / 3.0))
+    mq = crossgen.Mesh(c.vertices, T)
+    bq = mq.quarry(cdf=at["cdf"], dcdf=at["dcdf"], offsetc=at["offsetc"], offset=at["offset"])
+    print(f"  {bq}")
+    check(bq.method == "quarry" and bq.valid and bq.num_blocks == nb,
+          f"quarry: {nb} blocks back from their own fields, covering")
+    lab = bq.report["chart_labels"]
+    check(lab.shape == (len(T),) and lab.min() >= 0 and bq.report["failed_charts"] == 0,
+          "quarry: a chart for every triangle, every chart a block")
+    check(bq.mesh(0.05).num_quads > 0, "quarry: meshed by BlockQuadMesh")
+    expect(TypeError, lambda: mq.quarry(cdf=at["cdf"]), "quarry() without dcdf and the offsets")
+    expect(ValueError, lambda: mq.quarry(cdf=at["cdf"][:5], dcdf=at["dcdf"], offsetc=at["offsetc"],
+                                         offset=at["offset"]), "quarry() with a field one row per triangle short")
+    check("collapse_length" in crossgen.options("quarry"), "options('quarry')")
     print("all checks passed")
 
 

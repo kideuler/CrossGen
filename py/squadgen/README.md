@@ -37,22 +37,48 @@ Defaults are paths in this checkout, so commands can run from any directory.
 | `cdf-pack [DATA]` | a cdf-data directory → its presaved fields, `DATA/pack_N512/` | numpy |
 | `geom-ae` | OBJ domains → Geometry Autoencoder | torch |
 | `sq-vae` | field pack + frozen Geom-AE → SQ-VAE, `latent_stats.json` | torch |
-| `sq-diffuse` | field pack + frozen SQ-VAE → SQ-Diffuse | torch |
-| `roundtrip` | SQ-VAE → QuadExtraction on true vs decoded fields | QuadTools |
+| `sq-diffuse` | field pack at N + frozen SQ-VAE → SQ-Diffuse (N = 2048 latent tokens) | torch |
+| `roundtrip` | SQ-VAE → block extraction on true vs decoded fields | `crossgen` (QUARRY); QuadTools for `--extractor quadextraction` |
+| `quarry DIR` | one extraction input (`quarry_input.npz`) → QUARRY's blocks and mesh (`quarry_output.npz`) | `crossgen` |
 
 A full run on the ORACLE layouts:
 
 ```sh
 squadgen2d cdf-data run --methods oracle --out py/squadgen/data/cdf_oracle     # local: needs crossgen
-squadgen2d cdf-pack py/squadgen/data/cdf_oracle                                # 5 s, 1 GB
+squadgen2d cdf-pack py/squadgen/data/cdf_oracle                                # 5 s, 1 GB (sq-vae does it if not)
 squadgen2d geom-ae --out py/squadgen/runs/geom_ae_2d
 squadgen2d sq-vae --data py/squadgen/data/cdf_oracle --geom_ae py/squadgen/runs/geom_ae_2d/best.pt \
     --out py/squadgen/runs/sq_vae_2d_oracle
 squadgen2d sq-diffuse --vae py/squadgen/runs/sq_vae_2d_oracle/best.pt --data py/squadgen/data/cdf_oracle
+squadgen2d roundtrip --ckpt py/squadgen/runs/sq_vae_2d_oracle/best.pt                # -> runs/sq_vae_2d_oracle/roundtrip
 ```
 
+`roundtrip` extracts the blocks with QUARRY (`src/QUARRY`, CrossGen's C++ extractor) by default and with the release's
+QuadExtraction under `--extractor quadextraction`. QUARRY runs in a subprocess per extraction (`quarry.py`): torch and
+crossgen each bring an OpenMP runtime, and one process with both aborts as soon as crossgen's TMOP starts.
+
 `cdf-data` is the only step that needs CrossGen. Copy its output directory to a GPU box and build the pack there:
-packing needs only numpy.
+packing needs only numpy. `sq-vae` and `sq-diffuse` build the pack themselves when it is missing, so the NPZs and
+`manifest.csv` are all a box needs for training (see Cloud training below).
+
+## Latent tokens (`sq-diffuse --tokens`)
+
+SQ-Diffuse generates N = 2048 latent tokens by default, four times the 512 the Geom-AE and SQ-VAE were trained at.
+The SQ-VAE round trip (1090 held-out layouts, 2026-10-31) is limited by the 512 tokens, not by data. It recovers 78 %
+of held-out and 81 % of training layouts, every miss has a chart narrower than the token spacing, and every layout
+whose charts are all wider is recovered. Neither network has an index embedding, so both run at any N with the same
+weights. Decoding from 2048 tokens raised the estimated held-out recovery to 84.7 % (1024: 83.5 %) with no
+retraining. Generated layouts gain that only if SQ-Diffuse produces the denser latent, so it is trained at N:
+
+- `sq-diffuse` measures the latent statistics (`target_mu`, `target_std`) at N itself and writes them to its
+  `latent_stats.json`; the SQ-VAE's own file is for 512.
+- Its field pack is `DATA/pack_N2048`, ~6.2 MB a layout (~60 GiB for the 10 k-domain data, against 2.6 MB a layout
+  at 512). The NPZs hold token sets of 512 to 4096 points, so the 8192-point sets (4N) are drawn by the pack build
+  the way cdf-data draws its own, ~1 s a layout per core.
+- `--tokens 512` trains at the SQ-VAE's own N, as before; `--eval_only` takes N from the checkpoint.
+
+Training at 2048 on an 8 GB Mac swapped and went NaN in its first steps on MPS. It is a job for a CUDA GPU
+(`vast_sq_diffuse.sh`).
 
 ## One layout per domain (`cdf-data run --fallback`)
 
@@ -79,8 +105,43 @@ Training memory-maps them, so a sample is a few slices instead of rebuilding the
 - Augmentation moves the presaved points through the same random deformation as before, with no mesh: positions and
   corners are deformed, gradients turned by the Jacobian, and sdf is measured to the deformed boundary. cdf and dcdf
   do not change under a deformation. The result is within 6e-4 of the mesh version in the radius-1 frame.
-- A pack is rebuilt only when the manifest's layouts change (or with `--force`), and the trainers refuse a stale one.
-- `--tokens` must be the Geom-AE's N (512 by default).
+- A pack is rebuilt only when the manifest's layouts change (or with `--force`). `sq-vae` and `sq-diffuse` build a
+  missing pack and rebuild a stale one themselves, with the N they read and the Geom-AE's tau (`--pack_jobs`
+  processes). `sq-diffuse --eval_only` never builds one: without a current pack it reads its few layouts from the
+  NPZs.
+- `--tokens` is the N the networks read: the Geom-AE's for `sq-vae` (512), `sq-diffuse --tokens` for SQ-Diffuse
+  (2048). Token-set sizes the NPZs lack are drawn on each layout's split mesh, and a build that would not fit on the
+  disk is refused before it starts.
+
+## Cloud training (vast.ai)
+
+Three scripts at the repository root (gitignored, like every `*.sh`) run the trainers on a rented GPU and bring the
+models back. Each takes the `-p PORT USER@HOST` of vast.ai's Connect line, starts the run detached on the box
+(`nohup`, into `py/squadgen/runs/RUN` there), waits for it and downloads it to the same place here. Running the same
+command again reattaches to it. `-h` prints the usage, and the comment at the top of each script says the rest.
+
+```sh
+./vast_push.sh   -p 40123 root@ssh4.vast.ai [DATA_TAR [DEST]]                 # code (+ one data tar) only
+./vast_geom_ae.sh -p 40123 root@ssh4.vast.ai ~/meshes_np100 20000              # OBJ directory -> Geom-AE
+./vast_sq_vae.sh  -p 40123 root@ssh4.vast.ai py/squadgen/data/cdf_zipline_atlas 30000   # cdf-data dir -> SQ-VAE
+./vast_sq_diffuse.sh -p 40123 root@ssh4.vast.ai ~/Documents/2d_CDF_data 100000          # + SQ-VAE -> SQ-Diffuse
+```
+
+`vast_sq_vae.sh` sends the cdf-data directory without its pack (the box builds it) and the frozen Geom-AE
+(`--geom-ae`, default `py/squadgen/runs/geom_ae_2d_current/best.pt`) with the `log.txt` that holds its held-out
+families. Neither is sent again when the box has the same one. It brings back `best.pt`, `last.pt`,
+`latent_stats.json` (what SQ-Diffuse needs), the log and the plots. A directory too large for its tar to fit on
+this disk is streamed instead. A run that was cut off continues as a new run from its checkpoint:
+`-- --init py/squadgen/runs/<old run>/last.pt`. `sq-vae --init` works like `geom-ae --init`: the weights, network
+and frozen Geom-AE come from the checkpoint, with a fresh optimiser and schedule, and a step-0 eval saved as `best.pt`.
+
+`vast_sq_diffuse.sh` sends the cdf-data directory in the same way, along with the frozen SQ-VAE (`--vae`, default
+`py/squadgen/runs/sq_vae_2d_CDF_data_200000/best.pt`, with its `latent_stats.json` and `log.txt`) and the domain OBJs
+the evaluation conditions on. The OBJs go where the manifest's paths name them relative to the repository on the box,
+and only the ones the box lacks are sent. `--tokens` (default 2048) is passed to `sq-diffuse`. Before anything is
+sent, the script checks that the box has disk for the data, the OBJs and the field pack at that N (~60 GiB at 2048
+for the 10 k-domain data). The box builds the pack, trains, and runs the final evaluation. The script brings back
+`best.pt`, `last.pt`, `latent_stats.json`, `log.txt`, `samples.csv` and the sample plots.
 
 ## Train / validation split
 
@@ -109,4 +170,4 @@ from squadgen2d import geometry, layout, paths
 | `domains` | the Geom-AE's domains, families, split, FPS token-set cache |
 | `layout` | a CDF NPZ's split mesh and its fields (Appendix B) |
 | `layers` | network modules shared by the Geom-AE and SQ-VAE |
-| `cdf_data`, `cdf_pack`, `geom_ae`, `sq_vae`, `sq_diffuse`, `roundtrip` | the commands |
+| `cdf_data`, `cdf_pack`, `geom_ae`, `sq_vae`, `sq_diffuse`, `roundtrip`, `quarry` | the commands (`quarry` needs crossgen, never torch) |

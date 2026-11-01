@@ -540,9 +540,9 @@ const char *kBoundaryFeaturesDoc =
     "With report=True, returns (summary, report): each corner's position, angle in\n"
     "degrees, k, vertex and region, and each boundary loop's vertices.";
 
-// Filled in readyTypes(): the five methods, oracle, shape_dna,
+// Filled in readyTypes(): the five methods, oracle, quarry, shape_dna,
 // boundary_features, feature_frame, the sentinel.
-PyMethodDef meshMethods[kNumMethods + 5];
+PyMethodDef meshMethods[kNumMethods + 6];
 
 // ===========================================================================
 // BlockDecomposition
@@ -1322,9 +1322,10 @@ PyObject *crossgen_options(PyObject *, PyObject *args, PyObject *kwargs) {
     for (const MeshMethod &mm : kMethods)
         if (n == mm.spec->name) return mm.spec->defaults(s);
     if (n == oracleSpec.name) return oracleSpec.defaults(s);
+    if (n == quarrySpec.name) return quarrySpec.defaults(s);
     PyErr_Format(PyExc_ValueError,
                  "crossgen.options(): unknown method '%s' (expected one of crossgen.methods, "
-                 "'oracle', 'shape_dna', 'boundary_features' or 'cdf')",
+                 "'oracle', 'quarry', 'shape_dna', 'boundary_features' or 'cdf')",
                  name);
     return nullptr;
 }
@@ -1385,6 +1386,8 @@ int readyTypes() {
                             mm.spec->doc};
     meshMethods[k++] = {oracleSpec.name, asCFunction(Mesh_runMethod<&oracleSpec>),
                         METH_VARARGS | METH_KEYWORDS, oracleSpec.doc};
+    meshMethods[k++] = {quarrySpec.name, asCFunction(Mesh_runMethod<&quarrySpec>),
+                        METH_VARARGS | METH_KEYWORDS, quarrySpec.doc};
     meshMethods[k++] = {"shape_dna", asCFunction(Mesh_shapeDNA), METH_VARARGS | METH_KEYWORDS,
                         kShapeDNADoc};
     meshMethods[k++] = {"boundary_features", asCFunction(Mesh_boundaryFeatures),
@@ -1443,6 +1446,7 @@ PyObject *createModule() {
         buildSharedTables();
         for (const MeshMethod &mm : kMethods) mm.spec->buildTables();
         oracleSpec.buildTables();
+        quarrySpec.buildTables();
     } catch (const std::exception &e) {
         PyErr_Format(PyExc_ImportError, "crossgen: %s", e.what());
         return nullptr;

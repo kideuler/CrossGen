@@ -10,7 +10,8 @@ COMMANDS = {
     "geom-ae": ("geom_ae", "train / evaluate the Geometry Autoencoder"),
     "sq-vae": ("sq_vae", "train / evaluate the SQ-VAE on a field pack"),
     "sq-diffuse": ("sq_diffuse", "train / evaluate SQ-Diffuse"),
-    "roundtrip": ("roundtrip", "SQ-VAE round trip through QuadExtraction"),
+    "roundtrip": ("roundtrip", "SQ-VAE round trip through QUARRY (or the release's QuadExtraction)"),
+    "quarry": ("quarry", "QUARRY, the C++ block extractor, on one extraction input (needs the crossgen module)"),
 }
 
 

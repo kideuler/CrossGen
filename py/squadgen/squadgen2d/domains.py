@@ -52,15 +52,21 @@ def obj_paths(dirs):
                    for p in glob.glob(os.path.join(d, "**", "*.obj"), recursive=True)})
 
 
-def geom_ae_val_families(gcfg):
+def geom_ae_val_families(gcfg, ckpt=None):
     """The families a Geom-AE held out, from its config, and where they were found: recorded in the checkpoint
-    (since 2026-10-31), else the split its run logged ("N held-out families: ..." in log.txt beside it, the last run
-    of that directory), else drawn again from its --data, if those directories are here. (None, why) when none of
-    these is available."""
+    (since 2026-10-31), else the split its run logged ("N held-out families: ..." in a log.txt, the last run of that
+    log), else drawn again from its --data, if those directories are here. (None, why) when none of these is
+    available. The log looked for first is the one beside the checkpoint file `ckpt`, when given, and then the one in
+    the run directory its config names: a run directory copied to another machine or renamed (vast_sq_vae.sh uploads
+    best.pt with its log.txt) keeps the first, and the second is where the run was trained."""
     if gcfg.get("val_families") is not None:
         return set(gcfg["val_families"]), "recorded in the Geom-AE checkpoint"
-    log = os.path.join(from_repo(gcfg["out"]), "log.txt") if gcfg.get("out") else None
-    if log and os.path.exists(log):
+    logs = [os.path.join(os.path.dirname(os.path.abspath(ckpt)), "log.txt")] if ckpt else []
+    if gcfg.get("out"):
+        logs.append(os.path.join(from_repo(gcfg["out"]), "log.txt"))
+    for log in logs:
+        if not os.path.exists(log):
+            continue
         fams = None
         with open(log) as f:
             for line in f:
@@ -96,17 +102,12 @@ class Domain:
 
 
 def fps_sets(d, sizes, rng):
-    """N_FPS_COPIES token sets of each size for one domain: FPS on 8n (at least 8192) area samples. The release draws
-    them from 50 000 Poisson-disk samples (Sec. 2.4)."""
+    """N_FPS_COPIES token sets of each size for one domain (geometry.token_sets: FPS on 8n, at least 8192, area
+    samples)."""
     out = {}
     for n in sizes:
-        tris, barys = [], []
-        for _ in range(N_FPS_COPIES):
-            tri, bary = geo.sample_area(d.V, d.F, d.cdf, max(8 * n, 8192), rng)
-            sel = geo.farthest_point_sampling(geo.point_from_bary(d.V, d.F, tri, bary), n, rng)
-            tris.append(tri[sel])
-            barys.append(bary[sel])
-        out[n] = (np.stack(tris).astype(np.int32), np.stack(barys).astype(np.float32))
+        tri, bary = geo.token_sets(d.V, d.F, d.cdf, n, N_FPS_COPIES, rng)
+        out[n] = (tri.astype(np.int32), bary.astype(np.float32))
     return out
 
 
@@ -116,11 +117,12 @@ def _fps_job(job):
 
 
 def default_fps_workers(dev):
-    """Processes for the one-off token-set cache when --fps_workers is not given. It is ~2 s of numpy per domain
-    (N_FPS_COPIES greedy FPS runs per size), so 10 k DeepCAD domains are an hour on 6 processes -- the cap that suits
-    an 8 GB M2, where each spawned worker also imports torch. A CUDA box has the cores and memory to spare and its
-    GPU idles until the cache is done, so it gets every core it may use (the affinity mask: a container's share, not
-    the host's count)."""
+    """Processes for the one-off token-set cache when --fps_workers is not given. It was ~2 s of numpy per domain
+    (N_FPS_COPIES greedy FPS runs per size), so 10 k DeepCAD domains took an hour on 6 processes; since FPS visits
+    only the candidates near each pick (geometry.farthest_point_sampling, 2026-11-01) it is ~0.4 s, the same sets.
+    6 is the cap that suits an 8 GB M2, where each spawned worker also imports torch. A CUDA box has the cores and
+    memory to spare and its GPU idles until the cache is done, so it gets every core it may use (the affinity mask: a
+    container's share, not the host's count)."""
     cores = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
     return cores if dev.startswith("cuda") else min(6, cores)
 

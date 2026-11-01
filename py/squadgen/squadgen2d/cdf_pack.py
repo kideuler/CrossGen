@@ -11,10 +11,17 @@ few slices of them.
 
     python -m squadgen2d cdf-pack py/squadgen/data/cdf_oracle             # -> py/squadgen/data/cdf_oracle/pack_N512
     python -m squadgen2d cdf-pack py/squadgen/data/cdf --tokens 512 --jobs 8
+    python -m squadgen2d cdf-pack py/squadgen/data/cdf --tokens 2048      # SQ-Diffuse's N: 2048 + 8192 tokens
+
+N is the number of tokens the networks read: the Geom-AE's for SQ-VAE, and SQ-Diffuse's own --tokens, which may be
+larger (sq_diffuse.py, "Tokens"). cdf-data writes token sets of 512 to 4096 points. A size the NPZs do not hold --
+8192, the 4N of N = 2048 -- is drawn here, on each layout's split mesh, the way cdf-data draws its own
+(geometry.token_sets: FPS of 8n area samples), N_FPS_COPIES of them or as many as the NPZ's other size has.
 
 A pack needs only numpy, not the crossgen module, so it can be built wherever the NPZs are (on a cloud box after
-uploading them, say). It is rebuilt only when the manifest's layouts have changed (or with --force); the trainers
-refuse a pack that no longer matches the manifest beside it.
+uploading them, say). It is rebuilt only when the manifest's layouts have changed (or with --force). SQ-VAE and
+SQ-Diffuse build a missing pack themselves and rebuild one that no longer matches the manifest beside it.
+sq-diffuse --eval_only never builds one: without a current pack it reads its few layouts from the NPZs (NpzRecords).
 
 Augmentation. The fields of a deformed layout are those of the same points of the deformed mesh, and that is what
 make_sample() computes, from the points alone. A Deformation (geometry.py) is a smooth map W with a known Jacobian J,
@@ -52,10 +59,12 @@ import multiprocessing as mp
 import os
 import shutil
 import time
+import zlib
 
 import numpy as np
 
 from . import geometry as geo
+from .domains import N_FPS_COPIES
 from .layout import OFFSET_KEYS, Layout, layout_fields, read_manifest
 from .paths import DEFAULT_CDF
 
@@ -91,11 +100,26 @@ def _split(a, table):
     return {k: a[:, s] for k, s in table.items()}
 
 
+def drawn_token_sets(L, n, copies):
+    """`copies` token sets of n points on layout L's split mesh, for a size its NPZ has none of, drawn as cdf-data
+    draws the NPZ's own (geometry.token_sets). The generator is seeded from the NPZ's sample triangles and n, not the
+    file's path, so a rebuild, here or wherever the data has been copied to, draws the same sets. The barycentrics
+    are rounded to float32, as an NPZ stores them."""
+    rng = np.random.default_rng([zlib.crc32(np.ascontiguousarray(L.samples[0]).tobytes()), n])
+    tri, bary = geo.token_sets(L.V, L.T, np.cumsum(np.abs(geo.signed_areas(L.V, L.T))), n, copies, rng)
+    return tri, bary.astype(np.float32).astype(np.float64)
+
+
 def record_from_npz(path, n_tokens, tau):
     """One layout's pack arrays, from its NPZ: {"tok": {n: (copies, n, TOKEN_DIM)} for n = N, 4N, "query":
-    (samples, QUERY_DIM), "bnd": (edges, 2, 2), "tau": tau}, and the Layout they came from."""
+    (samples, QUERY_DIM), "bnd": (edges, 2, 2), "tau": tau}, and the Layout they came from. A size the NPZ has no
+    token sets of is drawn (drawn_token_sets), as many copies as its other size has."""
     sizes = (n_tokens, 4 * n_tokens)
     L = Layout(path, sizes)
+    copies = next((len(t) for t, _ in L.fps.values()), N_FPS_COPIES)
+    for n in sizes:
+        if n not in L.fps:
+            L.fps[n] = drawn_token_sets(L, n, copies)
     A, B = L.V[L.E[:, 0]], L.V[L.E[:, 1]]
     tok = {}
     for n in sizes:
@@ -235,21 +259,52 @@ class FieldPack:
                 f"and {len(have - want)} of the pack's are gone or changed")
 
 
-def open_pack(data, pack, n_tokens):
-    """The trainers' pack: `pack` if given, else DATA/pack_N{n_tokens}; it must exist, match the Geom-AE's token
-    count and be up to date with the manifest."""
-    path = pack or default_pack(data, n_tokens)
-    if not os.path.exists(os.path.join(path, "meta.json")):
+class NpzRecords:
+    """What the trainers read of a FieldPack -- rows, record(i) -- computed from the NPZs of a cdf-data directory
+    instead of read from presaved arrays: the same arrays (record_from_npz is what a pack build runs), at ~1 s a
+    layout at N = 2048. For evaluating a few layouts where no current pack is, as sq-diffuse --eval_only does: a whole
+    pack at that N is ~6 MB a layout. `rows` are the manifest's status-ok rows in file order, which are a pack's."""
+
+    def __init__(self, data, n_tokens, tau):
+        self.path = self.data = os.path.abspath(data)
+        self.n_tokens, self.tau = n_tokens, tau
+        self.rows = read_manifest(self.data)
+
+    def __len__(self):
+        return len(self.rows)
+
+    def record(self, i):
+        return record_from_npz(self.rows[i]["npz"], self.n_tokens, self.tau)[0]
+
+
+def open_pack(data, pack, n_tokens, tau=0.1, build_jobs=None, log=print):
+    """The trainers' pack: `pack` if given, else DATA/pack_N{n_tokens}; it must have the token count the run reads
+    and be up to date with the manifest. A missing or out-of-date pack is refused, unless build_jobs is given: then it
+    is built (or rebuilt) here with that many processes and the Geom-AE's tau, as the Geom-AE builds its own
+    token-set cache. SQ-VAE and SQ-Diffuse do that, so that a cloud box needs only the NPZs uploaded and the pack never
+    lags the manifest. A pack of another token count is refused either way: it is a directory someone named, not this
+    one's to replace."""
+    path = os.path.abspath(pack or default_pack(data, n_tokens))
+    if os.path.exists(os.path.join(path, "meta.json")):
+        p = FieldPack(path)
+        if p.n_tokens != n_tokens:
+            raise SystemExit(f"{path} has {p.n_tokens} tokens, this run reads {n_tokens}: build a pack with "
+                             f"--tokens {n_tokens}")
+        why = p.stale()
+        if not why:
+            return p
+        if build_jobs is None:
+            raise SystemExit(f"{path} is out of date ({why}): rebuild it with  python -m squadgen2d cdf-pack "
+                             f"{p.data}")
+        log(f"{path} is out of date ({why}): rebuilding it")
+        data = p.data   # the manifest stale() compared against, wherever --data points
+    elif build_jobs is None:
         raise SystemExit(f"no field pack at {path}: build it with  python -m squadgen2d cdf-pack {data} "
                          f"--tokens {n_tokens}")
-    p = FieldPack(path)
-    if p.n_tokens != n_tokens:
-        raise SystemExit(f"{path} has {p.n_tokens} tokens, the Geom-AE {n_tokens}: build a pack with --tokens "
-                         f"{n_tokens}")
-    why = p.stale()
-    if why:
-        raise SystemExit(f"{path} is out of date ({why}): rebuild it with  python -m squadgen2d cdf-pack {p.data}")
-    return p
+    else:
+        log(f"no field pack at {path}: building it")
+    build(os.path.abspath(data), path, n_tokens, tau, max(1, build_jobs), log)
+    return FieldPack(path)
 
 
 # =============================================================================
@@ -292,14 +347,14 @@ def build(data, out, n_tokens, tau, jobs, log=print):
     rows = read_manifest(data)
     sizes = (n_tokens, 4 * n_tokens)
     t0 = time.time()
-    counts, copies = [], None
+    counts, copies, drawn = [], None, {n: 0 for n in sizes}
     for r in rows:
         with np.load(r["npz"]) as z:
-            missing = [f"fps_point_tri_id_{n}" for n in sizes if f"fps_point_tri_id_{n}" not in z.files]
-            if missing:
-                raise SystemExit(f"{r['npz']} has no token sets of {' '.join(missing)}: --tokens must be one of the "
-                                 "sizes cdf_data.py drew (--fps-min .. --fps-max)")
-            c = z[f"fps_point_tri_id_{n_tokens}"].shape[0]
+            have = [n for n in sizes if f"fps_point_tri_id_{n}" in z.files]
+            for n in sizes:
+                drawn[n] += n not in have
+            # As record_from_npz draws a missing size: as many copies as the other has.
+            c = z[f"fps_point_tri_id_{have[0]}"].shape[0] if have else N_FPS_COPIES
             if copies is not None and c != copies:
                 raise SystemExit(f"{r['npz']} has {c} token sets per size, others {copies}")
             copies = c
@@ -308,7 +363,16 @@ def build(data, out, n_tokens, tau, jobs, log=print):
     q0 = q1 - np.asarray(counts)
     tmp = out.rstrip(os.sep) + ".tmp"
     shutil.rmtree(tmp, ignore_errors=True)
+    # The arrays are written in place, so a disk that fills part way leaves a broken build an hour in (at N = 2048
+    # the 10 k layout data needs ~60 GiB). The old pack is deleted only once the new one is whole, so it counts
+    # against the space too.
+    need = 4 * (len(rows) * copies * sum(sizes) * TOKEN_DIM + int(q1[-1]) * QUERY_DIM)
     os.makedirs(tmp)
+    free = shutil.disk_usage(tmp).free
+    if free < need + 2 ** 30:
+        os.rmdir(tmp)
+        raise SystemExit(f"a pack of {len(rows)} layouts at N = {n_tokens} needs ~{need / 2 ** 30:.1f} GiB and "
+                         f"{os.path.dirname(tmp)} has {free / 2 ** 30:.1f} GiB free")
     files = {}
     for name, shape in [(f"tok{n}", (len(rows), copies, n, TOKEN_DIM)) for n in sizes] + [
             ("query", (int(q1[-1]), QUERY_DIM))]:
@@ -317,6 +381,10 @@ def build(data, out, n_tokens, tau, jobs, log=print):
         del a
     log(f"packing {len(rows)} layouts of {data}: {copies} x ({n_tokens} + {4 * n_tokens}) tokens and "
         f"{int(np.median(counts))} samples each, {jobs} processes ...")
+    for n, k in drawn.items():
+        if k:
+            log(f"  {k} of the NPZs have no {n}-point token sets: drawing {copies} per layout (FPS of "
+                f"{max(8 * n, 8192)} area samples each, as cdf-data draws them)")
     jobs_ = [(i, r["npz"], int(q0[i]), n_tokens, tau) for i, r in enumerate(rows)]
     bnd, frames = [None] * len(rows), [None] * len(rows)
     pool = mp.get_context("spawn").Pool(jobs, _open_files, (files,)) if jobs > 1 else None
@@ -350,6 +418,7 @@ def build(data, out, n_tokens, tau, jobs, log=print):
     meta = {"format": FORMAT, "version": VERSION, "tokens": n_tokens, "sizes": list(sizes), "copies": copies,
             "tau": tau, "layouts": len(rows), "samples": int(q1[-1]),
             "data": os.path.relpath(os.path.abspath(data), os.path.abspath(out)),
+            "drawn": {str(n): k for n, k in drawn.items() if k},
             "manifest_sha1": manifest_digest(data), "created": time.strftime("%Y-%m-%d %H:%M:%S"),
             "token_fields": [list(x) for x in TOKEN_FIELDS], "query_fields": [list(x) for x in QUERY_FIELDS]}
     with open(os.path.join(tmp, "meta.json"), "w") as f:
@@ -364,7 +433,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="squadgen2d cdf-pack", description=__doc__.split("\n")[1].strip())
     ap.add_argument("data", nargs="?", default=DEFAULT_CDF, help="a cdf-data output directory (manifest.csv + npz/)")
     ap.add_argument("--out", help="the pack directory (default: DATA/pack_N<tokens>)")
-    ap.add_argument("--tokens", type=int, default=512, help="N, the Geom-AE's num_latents; 4N keys/values go too")
+    ap.add_argument("--tokens", type=int, default=512,
+                    help="N, the tokens the networks read (the Geom-AE's, or sq-diffuse --tokens); 4N keys/values too")
     ap.add_argument("--tau", type=float, default=0.1, help="the Geom-AE's SDF truncation (others recompute sdf)")
     ap.add_argument("--jobs", type=int, default=min(8, os.cpu_count() or 1))
     ap.add_argument("--force", action="store_true", help="rebuild even if the pack is up to date")

@@ -84,14 +84,70 @@ def sample_area(V, Fc, cdf, n, rng):
 
 
 def farthest_point_sampling(pts, n, rng):
-    """Greedy max-min selection (the release uses torch_cluster.fps)."""
+    """Greedy max-min selection (the release uses torch_cluster.fps): a random first point, then each time the
+    candidate farthest from the points chosen so far.
+
+    Only the candidates near each new pick are visited. A candidate's distance d to the chosen set can drop only for
+    a pick closer to it than sqrt(d), and no d exceeds the new pick's own, D, the largest there is. So the candidates
+    are bucketed on a grid of about n / 8 cells, each step updates the cells within sqrt(D) of the pick (one cell more
+    on each side, against rounding), and a running maximum per cell gives the next pick. The distances are computed
+    as the plain loop over every candidate computed them, so the picks are the same (ties aside, and continuous
+    random samples have none) and so is the generator's state after: checked against that loop on 88 sets of 512 to
+    8192 points (30 layouts, 12 corpus domains). It took ~6 s for 8192 points of 65 536 candidates, the 4N set of
+    N = 2048 tokens; this takes ~0.2 s."""
+    pts = np.asarray(pts, np.float64)
+    M = len(pts)
     chosen = np.empty(n, np.int64)
-    chosen[0] = rng.integers(len(pts))
-    d = np.full(len(pts), np.inf)
+    chosen[0] = rng.integers(M)
+    lo = pts.min(0)
+    ext = np.maximum(pts.max(0) - lo, 1e-300)
+    c = max(np.sqrt(8.0 * ext[0] * ext[1] / max(n, 1)), ext.max() / max(n, 1))
+    nx, ny = (ext // c).astype(np.int64) + 1
+    cell = (np.minimum(((pts[:, 1] - lo[1]) / c).astype(np.int64), ny - 1) * nx
+            + np.minimum(((pts[:, 0] - lo[0]) / c).astype(np.int64), nx - 1))
+    order = np.argsort(cell, kind="stable")
+    X, Y = pts[order, 0].copy(), pts[order, 1].copy()
+    # The non-empty cells in row-major order, each a run [start, end) of the sorted candidates; a row's cells are
+    # one run of them.
+    cells, start = np.unique(cell[order], return_index=True)
+    end = np.append(start[1:], M)
+    d = np.full(M, np.inf)
+    cmax = np.full(len(cells), np.inf)
+    j = int(np.flatnonzero(order == chosen[0])[0])
     for i in range(1, n):
-        d = np.minimum(d, ((pts - pts[chosen[i - 1]]) ** 2).sum(1))
-        chosen[i] = d.argmax()
+        px, py, D = X[j], Y[j], d[j]
+        if D < np.inf:
+            r = np.sqrt(D)
+            x0, x1 = max(int((px - r - lo[0]) / c) - 1, 0), min(int((px + r - lo[0]) / c) + 1, nx - 1)
+            y0, y1 = max(int((py - r - lo[1]) / c) - 1, 0), min(int((py + r - lo[1]) / c) + 1, ny - 1)
+        else:
+            x0, x1, y0, y1 = 0, nx - 1, 0, ny - 1
+        rows = np.arange(y0, y1 + 1) * nx
+        for a, b in zip(np.searchsorted(cells, rows + x0).tolist(), np.searchsorted(cells, rows + x1, "right").tolist()):
+            if a < b:
+                s, e = start[a], end[b - 1]
+                dx, dy = X[s:e] - px, Y[s:e] - py
+                seg = d[s:e]
+                np.minimum(seg, dx * dx + dy * dy, out=seg)
+                cmax[a:b] = np.maximum.reduceat(seg, start[a:b] - s)
+        k = int(cmax.argmax())
+        j = int(start[k] + d[start[k]:end[k]].argmax())
+        chosen[i] = order[j]
     return chosen
+
+
+def token_sets(V, Fc, cdf, n, copies, rng):
+    """`copies` token sets of n points of the mesh (V, Fc) as (triangle ids (copies, n), barycentrics (copies, n, 3)),
+    each the farthest-point sampling of max(8n, 8192) area samples: what cdf-data's C++ draws for the NPZs
+    (ChartDistanceField::sample), and the Geom-AE for its domains. The release draws them from 50 000 Poisson-disk
+    samples (Sec. 2.4)."""
+    tris, barys = [], []
+    for _ in range(copies):
+        tri, bary = sample_area(V, Fc, cdf, max(8 * n, 8192), rng)
+        sel = farthest_point_sampling(point_from_bary(V, Fc, tri, bary), n, rng)
+        tris.append(tri[sel])
+        barys.append(bary[sel])
+    return np.stack(tris), np.stack(barys)
 
 
 def _chunk(n_edges):

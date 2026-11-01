@@ -103,6 +103,9 @@ extern const MethodSpec atlasSpec;
 // ORACLE's choice among the five (MethodORACLE.cxx): Mesh.oracle(), but not one
 // of crossgen.methods, which are the methods there are to choose from.
 extern const MethodSpec oracleSpec;
+// QUARRY (MethodQUARRY.cxx): Mesh.quarry(), the blocks SQuadGen's chart distance fields describe. Not one of
+// crossgen.methods either: it reads a layout off fields a network made rather than making one from the domain.
+extern const MethodSpec quarrySpec;
 
 // A ValueError for crossgen.options() given a stage `method` has no table for.
 PyObject *unknownStage(const char *method, const std::string &stage);

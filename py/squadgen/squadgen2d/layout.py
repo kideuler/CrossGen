@@ -41,14 +41,16 @@ def read_manifest(data, methods=METHODS):
 class Layout:
     """One NPZ's split mesh as triangles, with the vertices in the Geom-AE's frame. Each triangle carries what its
     fields need: the coordinate pairs of its two quad edges (Sec. 2.2 step 5) and the vertex ids of the seven offset
-    targets. `centre`/`scale` map the frame back, x_obj = x / scale + centre, as domains.Domain does."""
+    targets. `centre`/`scale` map the frame back, x_obj = x / scale + centre, as domains.Domain does. `fps` holds the
+    token sets of those of `fps_sizes` that the NPZ has."""
 
     def __init__(self, path, fps_sizes=()):
         self.path = path
         with np.load(path) as z:
             a = {k: z[k] for k in NPZ_KEYS}
             self.fps = {n: (z[f"fps_point_tri_id_{n}"][..., 0].astype(np.int64),
-                            z[f"fps_bary_coords_{n}"].astype(np.float64)) for n in fps_sizes}
+                            z[f"fps_bary_coords_{n}"].astype(np.float64)) for n in fps_sizes
+                        if f"fps_point_tri_id_{n}" in z.files}
         Q = a["subdiv_facet"].astype(np.int64)
         split = a["quad_split"].ravel().astype(bool)
         T = Q[:, [0, 1, 2, 2, 3, 0]]

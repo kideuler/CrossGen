@@ -1,19 +1,25 @@
 """
-roundtrip.py -- the SQ-VAE round trip through QuadExtraction (docs/squadgen_2d.md Sec. 6 step 5).
+roundtrip.py -- the SQ-VAE round trip through block extraction (docs/squadgen_2d.md Sec. 6 step 5).
 
 The guide calls this the key VAE test: encode a layout, decode its fields on a triangulation of
-Omega, run QuadExtraction on them, and get back the charts the layout had. Wall IoU and L1
+Omega, extract a quad layout from them, and get back the charts the layout had. Wall IoU and L1
 (sq_vae.py's eval) only say how close the fields are; this says whether they are close in
-the way extraction needs. A gap in a decoded wall is a small L1 error, but region growing leaks
-through it and two charts become one (Sec. 5.1 step 2).
+the way extraction needs. A gap in a decoded wall is a small L1 error, but it can merge two
+charts or leave a polygon that is no quad.
 
-Every layout is extracted twice, from the same triangulation and with the same flags:
+Two extractors (--extractor):
+
+* quarry (the default): QUARRY, CrossGen's own C++ extractor (src/QUARRY, quarry.py), which
+  returns a BlockDecomposition -- sides on dOmega follow dOmega, sides between charts follow the
+  charts' common boundary -- meshed by BlockQuadMesh and smoothed by TMOP (--sweeps);
+* quadextraction: the release's QuadExtraction (QuadTools), with the release flags.
+
+Every layout is extracted twice, from the same triangulation and with the same extractor:
 
 * from its true fields: our C++ CDF (BlockDecomposition.cdf(), the NPZ's split mesh) evaluated
   at the triangle centroids with Appendix B's formulas. This is the control, the Sec. 6 step 1
   check on our own data. Where it fails, the layout cannot be recovered at this resolution
-  whatever SQ-VAE does: the usual cause is a sliver block narrower than `ringsize` rings
-  (Sec. 7, "Extraction mesh fine enough");
+  whatever SQ-VAE does: the usual cause is a sliver block a few triangles wide;
 * from its decoded fields: SQ-VAE's posterior mean decoded at the same centroids, as SQ-Diffuse's
   samples will be at inference (Sec. 4 steps 5-8).
 
@@ -21,49 +27,54 @@ The triangulation is the domain's own OBJ (the mesh every method was given), ref
 subdivision until its median edge is about h_rel x the bounding-box diagonal. It is independent
 of the layout, so no mesh edge lies along a true chart side unless dOmega puts it there. The
 release remeshes to 0.2 % of the diagonal (get_triangle_centers, Sec. 4 step 6), which is the
-default here. Subdivision keeps every polygon corner as a vertex, and corners are what -a reads.
+default here. Subdivision keeps every polygon corner as a vertex, and corners are what both
+extractors read.
 
-QuadExtraction's input is the release's (infer_sqdiffuse.py): a PLY of the triangulation at
-z = 0 in OBJ coordinates, and extract_mesh.npz with float32 cdf (F, 1), dcdf (F, 1), offset and
-offsetc (F, 3, the dual-chart and chart centre, z = 0) and invT (3, 4), face order as in the
-PLY. Offsets are mapped back from the SQ-VAE frame by the scale only, as de_norm_pca does. The
-flags default to the release's: --ringsize=8 -a 150 --div=0 -t 0.1 -s 3 -r 15. QuadExtraction
-runs with --debug=true for one file: cdf_final_clustered_face.ply, the chart (cluster) of every
-input triangle, as a colour per cluster. That is how the extracted charts are compared with the
-true ones. Non-quad polygons left after edge collapse are counted from non_quad_polygons.ply,
-and QuadQuality scores the output mesh.
+QUARRY's input is quarry_input.npz (V, T, and cdf, dcdf, offset, offsetc per triangle in OBJ
+units); it runs as a subprocess (quarry.py) because torch's OpenMP runtime and crossgen's cannot
+share a process once TMOP starts. QuadExtraction's input is the release's (infer_sqdiffuse.py):
+a PLY of the triangulation at z = 0 in OBJ coordinates, and extract_mesh.npz with float32 cdf
+(F, 1), dcdf (F, 1), offset and offsetc (F, 3, the dual-chart and chart centre, z = 0) and invT
+(3, 4), face order as in the PLY. Offsets are mapped back from the SQ-VAE frame by the scale
+only, as de_norm_pca does. Its flags default to the release's: --ringsize=8 -a 150 --div=0
+-t 0.1 -s 3 -r 15, and it runs with --debug=true for one file: cdf_final_clustered_face.ply, the
+chart (cluster) of every input triangle, as a colour per cluster. QuadQuality scores either
+output mesh when its binary is there.
 
 Scoring, per layout and per field source. A true chart is matched when some extracted chart
-covers it with area IoU > 0.5 (at most one can). The layout is recovered when every true chart
-is matched, nothing else was extracted, and every polygon is a quad. dec_vs_gt matches the
-decoded extraction against the true-field one instead, which separates SQ-VAE's errors from
-what extraction loses anyway.
+covers it with area IoU > 0.5 (at most one can). The layout is recovered (`ok`) when every true
+chart is matched, nothing else was extracted, and every polygon is a quad -- for QUARRY, every
+chart made a block and the blocks cover the domain. The mesh is `valid` when no element is
+inverted and none lies outside Omega. dec_vs_gt matches the decoded extraction against the
+true-field one instead, which separates SQ-VAE's errors from what extraction loses anyway.
 
-QuadTools must be built with the Appendix A patch (quadtools_2d.patch). On macOS, Apple clang
-rejects the release's sources (an MSVC default argument in EdgeCollapseInfo, and omp.h even with
-USE_OPENMP=OFF); Homebrew GCC builds them as they are:
+QuadTools (for --extractor quadextraction) must be built with the Appendix A patch
+(quadtools_2d.patch). On macOS, Apple clang rejects the release's sources (an MSVC default
+argument in EdgeCollapseInfo, and omp.h even with USE_OPENMP=OFF); Homebrew GCC builds them:
     cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc-16 -DCMAKE_CXX_COMPILER=g++-16
     cmake --build build -j8 --target QuadExtraction QuadQuality CDFGen
 
 Run
 ---
-    python -m squadgen2d roundtrip                             # val + 48 train layouts of best.pt
+    python -m squadgen2d roundtrip --ckpt py/squadgen/runs/sq_vae_2d_CDF_data_200000/best.pt
     python -m squadgen2d roundtrip --models M9_3 B1_1          # just these domains
-    python -m squadgen2d roundtrip --split val --keep          # keep QuadExtraction's inputs and debug files
-    python -m squadgen2d roundtrip --ckpt py/squadgen/runs/sq_vae_2d_oracle/best.pt --data py/squadgen/data/cdf_oracle
+    python -m squadgen2d roundtrip --split val --keep          # keep the extractor's inputs and outputs
+    python -m squadgen2d roundtrip --extractor quadextraction  # the release's extractor instead
 
-The split is the SQ-VAE's (the families its Geom-AE held out, recorded in the checkpoint), and the layouts come from the
-manifest and their NPZs, not a field pack: extraction needs each layout's split mesh.
+The split is the SQ-VAE's (the families its Geom-AE held out, recorded in the checkpoint), and the
+layouts come from the manifest and their NPZs, not a field pack: extraction needs each layout's
+split mesh. --data defaults to the checkpoint's own data directory when it exists here.
 
-Outputs in --out (default: runs/sq_vae_2d/roundtrip):
+Outputs in --out (default: roundtrip/ beside the checkpoint, roundtrip_quadextraction/ for the
+release's extractor):
 * roundtrip.csv: one row per layout, both extractions;
 * roundtrip_<split>.png: true charts, extraction from true fields, extraction from decoded fields;
 * cases/<split>/<model>__<method>/: gt_quad.ply, dec_quad.ply (the extracted meshes) and
   labels.npz (true, gt and dec chart of every extraction-mesh triangle);
 * log.txt.
 
-Other scripts (SQ-Diffuse inference) can import extraction_mesh, write_extraction_input and
-run_extraction.
+Other scripts (SQ-Diffuse inference) can import extraction_mesh, write_quarry_input/run_quarry
+and write_extraction_input/run_extraction.
 """
 
 import argparse
@@ -74,6 +85,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 
 import numpy as np
@@ -84,6 +96,7 @@ from . import training as tr
 from .domains import geom_ae_val_families
 from .layout import METHODS, Layout, layout_fields, read_manifest
 from .paths import DEFAULT_CDF, DEFAULT_SQ_VAE, REPO
+from .quarry import DEFAULT_SWEEPS
 from .sq_vae import decode_fields, encode_layout, load_sq_vae
 
 DEFAULT_RUN = DEFAULT_SQ_VAE
@@ -92,6 +105,8 @@ DEFAULT_QUADTOOLS = os.environ.get(
 # Mirrors infer_sqdiffuse.py's run_quad_postprocess (debug_script/extract_quad_from_cdf.sh).
 RELEASE_FLAGS = {"ringsize": 8, "a": 150.0, "div": 0, "t": 0.1, "s": 3, "r": 15}
 MATCH_IOU = 0.5
+EXTRACTORS = ("quarry", "quadextraction")
+EXTRACTOR_NAMES = {"quarry": "QUARRY", "quadextraction": "QuadExtraction"}
 
 
 # =============================================================================
@@ -343,6 +358,59 @@ def run_extraction(bin_dir, d, flags, timeout=900):
     return res
 
 
+def write_quarry_input(d, V, T, fields, scale, sweeps=DEFAULT_SWEEPS):
+    """QUARRY's input: d/quarry_input.npz with the mesh and the four fields per triangle, offsets
+    taken from the SQ-VAE frame back to OBJ units by 1/scale."""
+    os.makedirs(d, exist_ok=True)
+    np.savez(os.path.join(d, "quarry_input.npz"), V=V, T=T, cdf=np.asarray(fields["cdf"]).reshape(-1),
+             dcdf=np.asarray(fields["dcdf"]).reshape(-1), offset=fields["offset"][:, :2] / scale,
+             offsetc=fields["offsetc"][:, :2] / scale, sweeps=int(sweeps))
+
+
+def run_quarry(bin_dir, d, timeout=900):
+    """QUARRY on d/quarry_input.npz, as a subprocess (quarry.py) -> d/quarry_output.npz and the
+    mesh as d/quad.ply, then QuadQuality on it if bin_dir has one. Returns run_extraction's dict:
+    rc, seconds, the chart of every input triangle, `nonquad` (charts that made no block plus
+    unmatched sides: 0 exactly when the blocks cover), the mesh after TMOP and QuadQuality's
+    scores; plus covers, inverted and min_sj."""
+    t0 = time.time()
+    cmd = [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "quarry.py"), d]
+    # Two OpenMP threads for TMOP unless the caller set a number: --jobs extractions run at once, and every one
+    # starting a thread per core oversubscribes the machine (load 9 on 8 cores, 4.5 s a layout against 2.9).
+    env = dict(os.environ)
+    env.setdefault("OMP_NUM_THREADS", "2")
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+        rc, log = p.returncode, p.stdout + p.stderr
+    except subprocess.TimeoutExpired:
+        rc, log = -1, "timeout"
+    with open(os.path.join(d, "extraction.log"), "w") as f:
+        f.write(log)
+    res = {"rc": rc, "seconds": time.time() - t0, "labels": None, "nonquad": 0, "quad": None, "quality": {},
+           "covers": False, "inverted": -1, "min_sj": float("nan")}
+    out = os.path.join(d, "quarry_output.npz")
+    if rc != 0 or not os.path.exists(out):
+        return res
+    with np.load(out) as z:
+        lab = z["labels"].astype(np.int64)
+        res["labels"] = np.where(lab < 0, lab.max() + 1, lab)
+        res["nonquad"] = int(z["failed"])
+        res["covers"] = bool(z["covers"])
+        if "mesh_quads" in z.files:
+            QV, Q = z["mesh_vertices"], z["mesh_quads"]
+            res["quad"] = (QV, list(Q))
+            res["inverted"], res["min_sj"] = int(z["inverted"]), float(z["min_sj"])
+            write_ply(os.path.join(d, "quad.ply"), QV, Q)
+    qq = os.path.join(bin_dir, "QuadQuality") if bin_dir else None
+    if res["quad"] is not None and qq and os.access(qq, os.X_OK):
+        subprocess.run([qq, "-i", os.path.join(d, "quad.ply"), "-j", d], capture_output=True, timeout=timeout)
+        js = os.path.join(d, "quad_quadquality.json")
+        if os.path.exists(js):
+            with open(js) as f:
+                res["quality"] = json.load(f)[0]
+    return res
+
+
 # =============================================================================
 # 3. SCORING
 # =============================================================================
@@ -398,7 +466,7 @@ def score(res, true, n_true, area, V, T):
 # =============================================================================
 
 
-def prepare(r, model, geom, cfg, dev, h_rel, work):
+def prepare(r, model, geom, cfg, dev, h_rel, work, extractor="quarry", sweeps=DEFAULT_SWEEPS):
     """Both extraction inputs of one layout, and what scoring needs."""
     L = Layout(r["npz"])
     with np.load(r["npz"]) as z:
@@ -411,7 +479,10 @@ def prepare(r, model, geom, cfg, dev, h_rel, work):
     z, _, _ = encode_layout(model, geom, cfg, r["npz"], dev)
     dec = decode_fields(model, z, P)
     for kind, fields in (("gt", gt), ("dec", dec)):
-        write_extraction_input(os.path.join(work, kind), V, T, fields, L.centre, L.scale)
+        if extractor == "quarry":
+            write_quarry_input(os.path.join(work, kind), V, T, fields, L.scale, sweeps)
+        else:
+            write_extraction_input(os.path.join(work, kind), V, T, fields, L.centre, L.scale)
     return {"V": V, "T": T, "levels": levels, "true": chart_of_tri[tri], "n_true": n_true,
             "area": np.abs(geo.signed_areas(V, T)), "outside": float((outside > 1e-6).mean()), "work": work}
 
@@ -593,7 +664,8 @@ def plot_cases(rows, args, out, title, k=8):
             for sp in ax.spines.values():
                 sp.set_visible(False)
         row[0].set_ylabel(f"{r['model']} {r['method']}", fontsize=8, color="#1a1a19")
-    for ax, c in zip(axes[0], ("true layout", "QuadExtraction of true fields", "QuadExtraction of decoded fields")):
+    name = EXTRACTOR_NAMES[args.extractor]
+    for ax, c in zip(axes[0], ("true layout", f"{name} of true fields", f"{name} of decoded fields")):
         ax.set_title(c + "\n" + ax.get_title(), fontsize=8, color="#1a1a19")
     fig.suptitle(title, y=0.997, fontsize=9, color="#1a1a19")
     fig.tight_layout(rect=(0, 0, 1, 0.98))
@@ -615,9 +687,14 @@ def shared_edges(T, pairs):
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="squadgen2d roundtrip", description=__doc__.split("\n")[1].strip())
     ap.add_argument("--ckpt", default=os.path.join(DEFAULT_RUN, "best.pt"), help="sq_vae.py checkpoint")
-    ap.add_argument("--data", default=DEFAULT_CDF, help="a cdf-data output directory (manifest.csv + npz/)")
-    ap.add_argument("--out", default=os.path.join(DEFAULT_RUN, "roundtrip"))
-    ap.add_argument("--quadtools", default=DEFAULT_QUADTOOLS, help="QuadTools build dir (QuadExtraction, QuadQuality)")
+    ap.add_argument("--data", help="a cdf-data output directory (manifest.csv + npz/); default: the checkpoint's "
+                                   "own data directory if it is here, else " + os.path.relpath(DEFAULT_CDF, REPO))
+    ap.add_argument("--out", help="default: roundtrip/ (QUARRY) or roundtrip_quadextraction/ beside the checkpoint")
+    ap.add_argument("--extractor", default="quarry", choices=EXTRACTORS,
+                    help="QUARRY (CrossGen's C++ extractor) or the release's QuadExtraction")
+    ap.add_argument("--sweeps", type=int, default=DEFAULT_SWEEPS, help="QUARRY: TMOP sweeps on the block mesh")
+    ap.add_argument("--quadtools", default=DEFAULT_QUADTOOLS,
+                    help="QuadTools build dir (QuadExtraction; QuadQuality scores either extractor's mesh if there)")
     ap.add_argument("--split", nargs="+", default=["val", "train"], choices=["val", "train"])
     ap.add_argument("--train_n", type=int, default=48, help="training layouts: sq_vae.py's train-eval draw")
     ap.add_argument("--methods", nargs="+", default=list(METHODS), choices=METHODS)
@@ -629,20 +706,32 @@ def main(argv=None):
     ap.add_argument("--threshold", type=float, default=RELEASE_FLAGS["t"], help="QuadExtraction -t")
     ap.add_argument("--subdiv", type=int, default=RELEASE_FLAGS["s"], help="QuadExtraction -s")
     ap.add_argument("--smooth", type=int, default=RELEASE_FLAGS["r"], help="QuadExtraction -r")
-    ap.add_argument("--jobs", type=int, default=4, help="QuadExtraction processes at once")
-    ap.add_argument("--keep", action="store_true", help="keep QuadExtraction's inputs and debug files per case")
+    ap.add_argument("--jobs", type=int, default=4, help="extractions at once (each its own process)")
+    ap.add_argument("--keep", action="store_true", help="keep the extractor's inputs and outputs per case")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="auto", help="cuda, cuda:N, mps or cpu (default: the first there is)")
     args = ap.parse_args(argv)
 
-    for b in ("QuadExtraction", "QuadQuality"):
-        if not os.access(os.path.join(args.quadtools, b), os.X_OK):
-            raise SystemExit(f"no {b} in {args.quadtools}: build QuadTools (see this file's docstring) or pass --quadtools")
+    if args.extractor == "quadextraction":
+        for b in ("QuadExtraction", "QuadQuality"):
+            if not os.access(os.path.join(args.quadtools, b), os.X_OK):
+                raise SystemExit(f"no {b} in {args.quadtools}: build QuadTools (see this file's docstring) or pass "
+                                 "--quadtools")
+    elif subprocess.run([sys.executable, "-c", "import crossgen"], capture_output=True).returncode != 0:
+        raise SystemExit("QUARRY needs the crossgen module: build it (BUILD_PYTHON_MODULE=ON) and put build/python on "
+                         "PYTHONPATH, or configure with -DCROSSGEN_PYTHON_DEV_PTH=ON")
     flags = {"ringsize": args.ringsize, "a": args.angle, "div": args.div, "t": args.threshold,
              "s": args.subdiv, "r": args.smooth}
+    if args.out is None:
+        args.out = os.path.join(os.path.dirname(os.path.abspath(args.ckpt)),
+                                "roundtrip" if args.extractor == "quarry" else "roundtrip_quadextraction")
     log = tr.RunLog(args.out)
     dev = tr.pick_device(args.device)
     model, geom, cfg = load_sq_vae(args.ckpt, dev)
+    if args.data is None:
+        own = cfg.get("data")
+        own = own if own is None or os.path.isabs(own) else os.path.join(REPO, own)
+        args.data = own if own and os.path.exists(os.path.join(own, "manifest.csv")) else DEFAULT_CDF
     ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     step = ck["step"]
     if cfg.get("val_families") is not None:
@@ -650,8 +739,11 @@ def main(argv=None):
     else:
         val_fams, how = geom_ae_val_families(ck["geom_config"])
     rows = select_rows(args, val_fams)
-    log(f"=== {time.strftime('%Y-%m-%d %H:%M:%S')}  {args.ckpt} (step {step})  {len(rows)} layouts  "
-        f"h_rel={args.h_rel}  flags " + " ".join(f"{k}={v}" for k, v in flags.items()))
+    name = EXTRACTOR_NAMES[args.extractor]
+    log(f"=== {time.strftime('%Y-%m-%d %H:%M:%S')}  {args.ckpt} (step {step})  {len(rows)} layouts of {args.data}  "
+        f"h_rel={args.h_rel}  extractor {name}  "
+        + (f"TMOP sweeps {args.sweeps}" if args.extractor == "quarry" else
+           "flags " + " ".join(f"{k}={v}" for k, v in flags.items())))
     log(f"split: the Geom-AE's held-out families, {how}" if val_fams is not None
         else f"split: the manifest's split column (the Geom-AE's held-out families: {how})")
     work_root = os.path.join(args.out, "_work")
@@ -673,8 +765,11 @@ def main(argv=None):
 
     for i, r in enumerate(rows):
         work = os.path.join(work_root, f"{i:04d}")
-        case = prepare(r, model, geom, cfg, dev, args.h_rel, work)
-        futs = {k: pool.submit(run_extraction, args.quadtools, os.path.join(work, k), flags) for k in ("gt", "dec")}
+        case = prepare(r, model, geom, cfg, dev, args.h_rel, work, args.extractor, args.sweeps)
+        if args.extractor == "quarry":
+            futs = {k: pool.submit(run_quarry, args.quadtools, os.path.join(work, k)) for k in ("gt", "dec")}
+        else:
+            futs = {k: pool.submit(run_extraction, args.quadtools, os.path.join(work, k), flags) for k in ("gt", "dec")}
         pending.append((r, case, futs))
         drain(2 * args.jobs)
     drain(0)
@@ -689,7 +784,7 @@ def main(argv=None):
     for split in args.split:
         rs = [r for r in results if r["split"] == split]
         if rs:
-            plot_cases(rs, args, args.out, f"SQ-VAE round trip through QuadExtraction, {split} layouts, "
+            plot_cases(rs, args, args.out, f"SQ-VAE round trip through {name}, {split} layouts, "
                                             f"best.pt (step {step})")
     log(f"done in {(time.time() - t0) / 60:.1f} min -> {args.out}")
     return 0

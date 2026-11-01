@@ -39,7 +39,10 @@ What changes for 2D:
   on its add_noise output. sdf is measured to the deformed split mesh's own boundary (Appendix D).
 
 Data: a field pack (cdf_pack.py) of a cdf-data directory: every layout's fields at its token and query points,
-presaved, so that a training sample is a few array slices. Different methods give different layouts of one domain,
+presaved, so that a training sample is a few array slices. A pack that is missing or no longer matches the manifest
+is built first, with the Geom-AE's N and tau (--pack_jobs processes), as the Geom-AE builds its token-set cache, so
+the NPZs and manifest.csv are all a machine needs (vast_sq_vae.sh uploads nothing else). Different methods give
+different layouts of one domain,
 and since SQ-VAE reconstructs a given layout, each is an example of its own. The split is the frozen Geom-AE's: a
 layout is validation when its domain's family is one the Geom-AE held out (domains.geom_ae_val_families), so no
 network in the chain trained on a validation domain. The SQ-VAE checkpoint records the families, and SQ-Diffuse
@@ -48,12 +51,23 @@ cdf_data.py drew the way a Geom-AE trained on the same OBJ directories would.
 
 Run
 ---
-    python -m squadgen2d cdf-pack py/squadgen/data/cdf                        # once: presave the fields
     python -m squadgen2d sq-vae                                               # train -> py/squadgen/runs/sq_vae_2d
+    python -m squadgen2d cdf-pack py/squadgen/data/cdf                        # the pack on its own (sq-vae builds it)
     python -m squadgen2d sq-vae --data py/squadgen/data/cdf_oracle --geom_ae py/squadgen/runs/geom_ae_2d_current/best.pt \\
         --out py/squadgen/runs/sq_vae_2d_oracle2 --steps 30000
     python -m squadgen2d sq-vae --out /tmp/smoke --steps 200                  # smoke test
     python -m squadgen2d sq-vae --eval_only                                   # metrics, plots, latent stats of best.pt
+    python -m squadgen2d sq-vae --data py/squadgen/data/cdf_oracle --init py/squadgen/runs/sq_vae_2d_oracle/best.pt \\
+        --out py/squadgen/runs/sq_vae_2d_oracle_more --steps 10000 --lr 1e-4    # more steps from a checkpoint
+
+Continuing (--init), as the Geom-AE does. A checkpoint holds the weights but no optimizer state, so a continuation is
+a new run that starts from them: a fresh AdamW with its own warm-up and cosine over --steps (step numbers start
+again at 1; the config records init and init_step). The network's shape comes from the checkpoint, and so does the
+frozen Geom-AE: the one inside it, which these weights were trained against, whatever --geom_ae says. So does the
+split, when the checkpoint records its held-out families. --data may differ (more layouts, say): the split is by the
+Geom-AE's families, so it cannot leak a validation domain into training. The loaded model is evaluated at step 0
+and saved as the first best.pt, so best.pt never ends worse than the start. This is also how to carry on a cloud run
+that was cut off: its last best.pt or last.pt is the start.
 
 Outputs in --out:
 
@@ -77,8 +91,8 @@ import torch
 import torch.nn as nn
 
 from . import training as tr
-from .cdf_pack import QUERY_FIELDS, make_sample, open_pack, record_from_npz
-from .domains import geom_ae_val_families
+from .cdf_pack import QUERY_FIELDS, default_pack, make_sample, open_pack, record_from_npz
+from .domains import default_fps_workers, geom_ae_val_families
 from .geom_ae import build_model as build_geom
 from .geom_ae import load_geom_ae
 from .layers import KEY_DIM_DICT, Attention, FeedForward, PointEmbed, PreNorm, xavier_init
@@ -223,6 +237,9 @@ def geom_code(geom, batch):
 
 
 MODEL_KEYS = ("depth", "dim", "geom_dim", "num_latents", "latent_dim", "heads", "dim_head", "drop_path_rate")
+# The MODEL_KEYS that are SQ-VAE's own options (geom_dim and num_latents are the Geom-AE's): what --init takes from
+# the checkpoint, since its weights fit only that network.
+ARCH_KEYS = ("depth", "dim", "latent_dim", "heads", "dim_head", "drop_path_rate")
 
 
 def build_model(cfg):
@@ -239,8 +256,9 @@ def save(path, model, geom, cfg, gcfg, step, metrics):
 
 
 def load_sq_vae(path, device="cpu"):
-    """SQ-VAE and its frozen Geom-AE from one checkpoint: returns (model, geom, config)."""
-    ck = torch.load(path, map_location=device, weights_only=False)
+    """SQ-VAE and its frozen Geom-AE from one checkpoint (its path, or the dict torch.load returned): returns (model,
+    geom, config)."""
+    ck = path if isinstance(path, dict) else torch.load(path, map_location=device, weights_only=False)
     geom = build_geom(ck["geom_config"]).to(device)
     geom.load_state_dict({k[len("cond_vae."):]: v for k, v in ck["model"].items() if k.startswith("cond_vae.")})
     geom.requires_grad_(False)
@@ -407,7 +425,15 @@ def latent_stats(model, geom, pack, indices, cfg, dev, n):
 # =============================================================================
 
 
-def train(cfg, gcfg, geom, pack, train_idx, val_eval, train_eval, log):
+def eval_line(step, mv, mt):
+    return (f"  eval {step:6d}  val l1 {mv['l1']:.4f} cdf {mv['l1_cdf']:.4f} dcdf {mv['l1_dcdf']:.4f} "
+            f"wall_iou {mv['wall_iou']:.4f}  |  train l1 {mt['l1']:.4f} cdf {mt['l1_cdf']:.4f} "
+            f"dcdf {mt['l1_dcdf']:.4f} wall_iou {mt['wall_iou']:.4f}")
+
+
+def train(cfg, gcfg, geom, pack, train_idx, val_eval, train_eval, log, init=None):
+    """init: an SQ-VAE checkpoint dict to continue from (see Continuing in the module docstring); geom is then the
+    Geom-AE inside it."""
     dev = cfg["device"]
     amp = tr.amp_dtype(dev, cfg["amp"])
     torch.manual_seed(cfg["seed"])
@@ -415,10 +441,20 @@ def train(cfg, gcfg, geom, pack, train_idx, val_eval, train_eval, log):
     geom = geom.to(dev)
     log(f"device={dev}  amp={amp}  workers={cfg['workers']}  SQ-VAE parameters="
         f"{sum(p.numel() for p in model.parameters()):,}  (Geom-AE frozen: {sum(p.numel() for p in geom.parameters()):,})")
+    best = float("inf")
+    if init is not None:
+        model.load_state_dict({k[len("latent_vae."):]: v for k, v in init["model"].items()
+                               if k.startswith("latent_vae.")})
+        # The start is the best so far, so a continuation that only gets worse leaves best.pt as it began.
+        mv, mt = val_eval(model, geom, dev), train_eval(model, geom, dev)
+        log(eval_line(0, mv, mt) + f"  (start: {cfg['init']}, step {init['step']} of its run)")
+        best = mv["l1"]
+        save(os.path.join(cfg["out"], "best.pt"), model, geom, cfg, gcfg, 0, {"val": mv, "train": mt})
+        tr.empty_cache(dev)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["wd"])
     scaler = tr.grad_scaler(dev, amp)
     loader = tr.make_loader(LayoutStream(pack, train_idx, cfg), cfg)
-    best, t0, run = float("inf"), time.time(), {}
+    t0, run = time.time(), {}
     for step, batch in enumerate(loader, 1):
         for g in opt.param_groups:
             g["lr"] = tr.lr_at(step - 1, cfg)
@@ -437,9 +473,7 @@ def train(cfg, gcfg, geom, pack, train_idx, val_eval, train_eval, log):
             run = {}
         if step % cfg["eval_every"] == 0 or step == cfg["steps"]:
             mv, mt = val_eval(model, geom, dev), train_eval(model, geom, dev)
-            log(f"  eval {step:6d}  val l1 {mv['l1']:.4f} cdf {mv['l1_cdf']:.4f} dcdf {mv['l1_dcdf']:.4f} "
-                f"wall_iou {mv['wall_iou']:.4f}  |  train l1 {mt['l1']:.4f} cdf {mt['l1_cdf']:.4f} "
-                f"dcdf {mt['l1_dcdf']:.4f} wall_iou {mt['wall_iou']:.4f}")
+            log(eval_line(step, mv, mt))
             save(os.path.join(cfg["out"], "last.pt"), model, geom, cfg, gcfg, step, {"val": mv, "train": mt})
             if mv["l1"] < best:
                 best = mv["l1"]
@@ -453,7 +487,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="squadgen2d sq-vae", description=__doc__.split("\n")[1].strip())
     ap.add_argument("--data", default=DEFAULT_CDF, help="a cdf-data output directory (manifest.csv + npz/)")
     ap.add_argument("--pack", help="its field pack (default: DATA/pack_N<the Geom-AE's N>; see cdf-pack)")
-    ap.add_argument("--geom_ae", default=os.path.join(DEFAULT_GEOM_AE, "best.pt"), help="Geom-AE checkpoint, frozen")
+    ap.add_argument("--geom_ae", help="Geom-AE checkpoint, frozen (default: py/squadgen/runs/geom_ae_2d/best.pt; "
+                                      "with --init or --eval_only, the one inside the SQ-VAE checkpoint)")
     ap.add_argument("--out", default=DEFAULT_SQ_VAE)
     ap.add_argument("--methods", nargs="+", default=list(METHODS), choices=METHODS)
     ap.add_argument("--steps", type=int, default=20000)
@@ -474,36 +509,64 @@ def main(argv=None):
     ap.add_argument("--no_aug", action="store_true")
     ap.add_argument("--wall", type=float, default=0.1, help="CDF wall threshold of the eval's wall IoU (QuadExtraction -t)")
     ap.add_argument("--stats_samples", type=int, default=1024, help="samples for latent_stats.json")
+    ap.add_argument("--pack_jobs", type=int,
+                    help="processes when the pack has to be built (default: every core on CUDA, 6 elsewhere)")
     tr.add_device_args(ap)
     ap.add_argument("--eval_only", action="store_true", help="evaluate, plot and write latent stats of best.pt")
+    ap.add_argument("--init", help="continue from this SQ-VAE checkpoint (best.pt / last.pt; see Continuing)")
     args = ap.parse_args(argv)
 
     best = os.path.join(args.out, "best.pt")
-    if args.eval_only and os.path.exists(best):
-        # Evaluating a run (perhaps trained elsewhere and copied here): the Geom-AE inside it, and its split.
-        ck = torch.load(best, map_location="cpu", weights_only=False)
+    init, notes = None, []
+    if args.eval_only or args.init:
+        # Evaluating a run (perhaps trained elsewhere and copied here), or continuing one: the Geom-AE inside it,
+        # which its weights were trained against, and its split.
+        if args.eval_only:
+            src = best
+        else:
+            src = args.init = args.init if os.path.exists(args.init) else from_repo(args.init)
+        if not os.path.exists(src):
+            raise SystemExit(f"no SQ-VAE checkpoint {src}" + (": train one first, or pass --out" if args.eval_only
+                                                               else ""))
+        ck = torch.load(src, map_location="cpu", weights_only=False)
         gcfg, geom = ck["geom_config"], None
         recorded = ck["config"].get("val_families")
+        if args.geom_ae:
+            notes.append(f"note: --geom_ae {args.geom_ae} ignored: the Geom-AE is the one inside {src}")
+        args.geom_ae = ck["config"].get("geom_ae")
+        if args.init and not args.eval_only:
+            init = ck
+            _, geom, _ = load_sq_vae(ck)
+            for k in ARCH_KEYS:
+                setattr(args, k, ck["config"][k])   # the network the weights fit
     else:
+        args.geom_ae = args.geom_ae or os.path.join(DEFAULT_GEOM_AE, "best.pt")
         args.geom_ae = args.geom_ae if os.path.exists(args.geom_ae) else from_repo(args.geom_ae)
         if not os.path.exists(args.geom_ae):
             raise SystemExit(f"no Geom-AE checkpoint {args.geom_ae}: train one with  python -m squadgen2d geom-ae")
         geom, gcfg = load_geom_ae(args.geom_ae)
         recorded = None
+    dev = tr.pick_device(args.device)
     # Token i of SQ-VAE reads the point Geom-AE token i was computed at, so N is the Geom-AE's (Sec. 3.2, "Token
     # alignment"), and sdf is truncated at its tau.
-    pack = open_pack(args.data, args.pack, gcfg["num_latents"])
-    dev = tr.pick_device(args.device)
-    cfg = dict(vars(args), pack=pack.path, n_tokens=gcfg["num_latents"], num_latents=gcfg["num_latents"],
+    n = gcfg["num_latents"]
+    cfg = dict(vars(args), pack=os.path.abspath(args.pack or default_pack(args.data, n)), n_tokens=n, num_latents=n,
                geom_dim=gcfg["dim"], tau=gcfg["tau"], augment=not args.no_aug, device=dev,
-               workers=tr.default_workers(dev) if args.workers is None else args.workers)
+               workers=tr.default_workers(dev) if args.workers is None else args.workers,
+               init_step=init["step"] if init else None)
 
     log = tr.RunLog(args.out)
     log.header(cfg)
+    for s in notes:
+        log(s)
+    # Built here when it is missing or stale: a one-off CPU job before any model runs, so it may use more processes
+    # than the DataLoader, as the Geom-AE's token-set cache does.
+    pack = open_pack(args.data, args.pack, n, gcfg["tau"],
+                     args.pack_jobs or default_fps_workers(dev), log)
     if recorded is not None:
         val_fams, how = set(recorded), "recorded in the SQ-VAE checkpoint"
     else:
-        val_fams, how = geom_ae_val_families(gcfg)
+        val_fams, how = geom_ae_val_families(gcfg, None if init or args.eval_only else args.geom_ae)
     keep = [i for i, r in enumerate(pack.rows) if r["method"] in args.methods]
     tr_i, va_i = split_layouts([pack.rows[i] for i in keep], val_fams)
     train_idx, val_idx = [keep[i] for i in tr_i], [keep[i] for i in va_i]
@@ -524,9 +587,15 @@ def main(argv=None):
                                                                     replace=False)], cfg)
 
     if not args.eval_only:
-        train(cfg, gcfg, geom, pack, train_idx, val_eval, train_eval, log)
+        train(cfg, gcfg, geom, pack, train_idx, val_eval, train_eval, log, init)
     model, geom, _ = load_sq_vae(best, dev)
     step = torch.load(best, map_location="cpu", weights_only=False)["step"]
+    # SQ-Diffuse cannot train without these, and the plots below are the likelier part to fail, so they come first.
+    stats = latent_stats(model, geom, pack, train_idx, cfg, dev, args.stats_samples)
+    with open(os.path.join(args.out, "latent_stats.json"), "w") as f:
+        json.dump(dict(stats, step=step), f, indent=1)
+    log(f"latent stats over {stats['tokens']} tokens: |mu| max {np.abs(stats['target_mu']).max():.3f}, "
+        f"std {np.min(stats['target_std']):.3f}..{np.max(stats['target_std']):.3f} -> latent_stats.json")
     plots = all(os.path.exists(r["npz"]) for r in rows)
     for name, ev in (("val", val_eval), ("train", train_eval)):
         m, per, latents = ev(model, geom, dev, keep=True)
@@ -539,11 +608,6 @@ def main(argv=None):
                                  f"SQ-VAE 2D, best.pt (step {step}), {name} layouts: worst and best L1")
     if not plots:
         log(f"no plots: the pack's NPZs are not all in {pack.data} (the plots draw their split meshes)")
-    stats = latent_stats(model, geom, pack, train_idx, cfg, dev, args.stats_samples)
-    with open(os.path.join(args.out, "latent_stats.json"), "w") as f:
-        json.dump(dict(stats, step=step), f, indent=1)
-    log(f"latent stats over {stats['tokens']} tokens: |mu| max {np.abs(stats['target_mu']).max():.3f}, "
-        f"std {np.min(stats['target_std']):.3f}..{np.max(stats['target_std']):.3f} -> latent_stats.json")
     log(f"done: {args.out}")
     return 0
 

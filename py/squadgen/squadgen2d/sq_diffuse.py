@@ -23,6 +23,25 @@ release's, so the state dict loads into the edited release class. What is kept, 
 * No classifier-free guidance. The release's drop_prob only drops condition_global, which sqdiffuse.yaml leaves
   empty, so it does nothing (Sec. 1.3, "drop_prob").
 
+Tokens. N, the number of latent tokens SQ-Diffuse generates, is --tokens: 2048 by default, four times the 512 the
+Geom-AE and SQ-VAE were trained at. The SQ-VAE round trip (roundtrip.py, 1090 held-out layouts, 2026-10-31) showed
+512 to be what limits a decoded layout. 78 % of the held-out layouts come back, as do 81 % of the training layouts
+(the networks generalise; more data would not help). Every miss has a chart narrower than the token spacing
+sqrt(area / 512), and all 622 layouts whose charts are all wider than it come back. Neither network has an index
+embedding: a token is placed by its point alone, so both run at any N with the same weights (num_latents = N, token
+sets of N and 4N points). Decoding 160 held-out layouts from 2048 tokens, with no retraining, recovered 27 of 80 that
+512 lost and kept all 80 it had, an estimated 84.7 % of the held-out set (1024 tokens: 83.5 %), and cut the CDF's
+L1 by 39 %. A generated layout gains that only if SQ-Diffuse produces the denser latent, so it is trained at N:
+its targets are the SQ-VAE's posterior means at N tokens, and its condition is the Geom-AE's code at the same N
+points. Three things follow:
+* target_mu / target_std are measured at N here, the way sq_vae.py measures them at its own N (its
+  latent_stats.json is for that N), and written to --out as latent_stats.json;
+* the field pack is pack_N{N}, built here when it is missing (cdf_pack.py). cdf-data's NPZs hold token sets of 512
+  to 4096 points, so for N = 2048 the 8192-point sets are drawn there, the way cdf-data draws its own;
+* a domain is conditioned on fresh N- and 4N-point token sets of its OBJ (domain_condition), since the Geom-AE's
+  cache holds only the sizes it trained at.
+--tokens 512 trains at the SQ-VAE's own N, as before.
+
 Transport (Sec. 3.4, the release's transport/ with path ICPlan, prediction velocity, loss weight None): x_t = t x1 +
 (1 - t) x0 with x0 ~ N(0, I) at t = 0 and the data at t = 1, t ~ U(0, 1) per sample, and the network regresses the
 velocity x1 - x0 by MSE, averaged over tokens and channels. The data x1 are SQ-VAE posterior MEANS (is_mode = 1) of
@@ -46,7 +65,10 @@ OBJ exactly as inference will see it (geom_ae.encode_obj: Sec. 4 steps 1-3), and
 off its split mesh at the same points. The SQ-VAE's own reconstruction of every layout, scored the same way, is the
 ceiling: SQ-Diffuse produces latents, and the decoder can do no better than it does on the encoder's. Model selection
 uses the flow loss on held-out domains at fixed (t, x0) draws, which is deterministic; the sample IoU is logged beside
-it with a fixed-step Heun sampler, which keeps the training-time numbers comparable between evaluations.
+it with a fixed-step Heun sampler, which keeps the training-time numbers comparable between evaluations. Both use at
+most --eval_domains held-out domains (256, a seeded draw, with every layout of each; 0 takes them all): the 10 k
+layout data holds out 1090, and at N = 2048 their evaluation sets alone would hold ~5 GB, with every evaluation
+sampling all of them.
 
 Training follows the release (train_sqdiffuse.sh): AdamW (weight decay 0.01, torch's default), lr 1e-4, gradient
 clip 1, and on an NVIDIA GPU bf16 autocast (--amp, training.amp_dtype; fp32 on MPS, where it was slower). Only the SiT
@@ -54,34 +76,43 @@ runs under autocast. The frozen encoders that make its targets stay in fp32, unl
 by ~0.4 %, about the SQ-VAE's own posterior spread, and the decoder cannot absorb errors that size. The release holds
 the rate constant (--const_lr); the default here warms up and decays it by a half cosine, because the SQ-VAE run
 gained most of its wall IoU (0.70 -> 0.78) only as its rate decayed. The default size is Sec. 3.5's 12 blocks x 6
-heads x 64 (hidden 384), with the 512 tokens the Geom-AE and SQ-VAE were trained at.
+heads x 64 (hidden 384), at N = 2048 tokens (Tokens, above).
 
 Portability: the checkpoint records the SQ-VAE it was trained on by its path relative to the repository and by a hash
 of its weights (vae_fingerprint), and holds the SiT's weights on the CPU, so a model trained on a cloud GPU loads on a
 Mac once both run directories are copied to the same places under py/squadgen/runs; load_sq_diffuse() refuses an
 SQ-VAE whose weights differ.
 
-Memory: on an 8 GB Apple M2, batch 8 takes 4.6 GiB of MPS memory at ~1.15 s/step (SiT 0.95 s, the frozen Geom-AE and
-SQ-VAE encoder 0.2 s), so 20k steps take ~6.5 h plus ~1 min per evaluation. Batch 16 needs 7.5 GiB on its own and
-swapped (~160 s/step); in the full script it went NaN within 20 steps under that pressure, though the same steps alone
-stayed finite.
+Memory: on an 8 GB Apple M2 at N = 512, batch 8 takes 4.6 GiB of MPS memory at ~1.15 s/step (SiT 0.95 s, the frozen
+Geom-AE and SQ-VAE encoder 0.2 s), so 20k steps take ~6.5 h plus ~1 min per evaluation. Batch 16 needs 7.5 GiB on its
+own and swapped (~160 s/step); in the full script it went NaN within 20 steps under that pressure, though the same
+steps alone stayed finite. N = 2048 is four times the tokens and about six times the SiT's arithmetic (attention grows
+as N^2): a job for a cloud GPU (vast_sq_diffuse.sh at the repository root). Its pack is ~6.2 MB a layout (~60 GiB for
+the 10 355 layouts of the 10 k domains), against 2.6 MB at N = 512, and building it takes ~1 s a layout on one core.
 
-Data: the field pack of a cdf-data directory (cdf_pack.py), as sq_vae.py reads it, with the SQ-VAE's split (the
-families its Geom-AE held out, recorded in the SQ-VAE checkpoint). Samples are drawn uniformly over the training
-layouts and augmented as there. The evaluation also reads the layouts' NPZs and their domains' OBJs. Sec. 6 step 6
-asks first for an overfit: --overfit B13_1 trains and evaluates on that domain's layouts alone.
+Data: the field pack of a cdf-data directory (cdf_pack.py) at N tokens, as sq_vae.py reads it, with the SQ-VAE's split
+(the families its Geom-AE held out, recorded in the SQ-VAE checkpoint). A pack that is missing or out of date is built
+first (--pack_jobs processes), as sq-vae builds its own, so a cloud box needs only the NPZs and manifest.csv for
+training. Samples are drawn uniformly over the training layouts and augmented as there. The evaluation also reads the
+layouts' NPZs and their domains' OBJs. Sec. 6 step 6 asks first for an overfit: --overfit B13_1 trains and evaluates
+on that domain's layouts alone.
 
 Run
 ---
     python -m squadgen2d sq-diffuse                                          # train -> py/squadgen/runs/sq_diffuse_2d
+    python -m squadgen2d sq-diffuse --vae py/squadgen/runs/sq_vae_2d_CDF_data_200000/best.pt \\
+        --data ~/Documents/2d_CDF_data --steps 100000 --out py/squadgen/runs/sq_diffuse_2d_N2048
+    python -m squadgen2d sq-diffuse --tokens 512                             # at the SQ-VAE's own N, as before
     python -m squadgen2d sq-diffuse --overfit B13_1 --steps 3000 \\
         --out py/squadgen/runs/sq_diffuse_2d_overfit                         # Sec. 6 step 6: overfit one domain
     python -m squadgen2d sq-diffuse --eval_only                              # metrics and plots of best.pt
+    python -m squadgen2d sq-diffuse --eval_only --eval_domains 0             # ... on every held-out domain
 
 Outputs in --out:
 
-* best.pt / last.pt: the SiT state dict, its config (with target_mu / target_std and the SQ-VAE checkpoint it belongs
-  to), step and metrics;
+* best.pt / last.pt: the SiT state dict, its config (with N as `tokens`, target_mu / target_std and the SQ-VAE
+  checkpoint it belongs to), step and metrics;
+* latent_stats.json: target_mu / target_std at N, unless N is the SQ-VAE's own (then its latent_stats.json is used);
 * samples_val.png / samples_train.png: per domain, the closest true layout's CDF and n_gen decoded samples;
 * samples.csv: every final sample's wall IoU and closest layout;
 * log.txt.
@@ -105,17 +136,18 @@ import torch.nn.functional as F
 
 from . import geometry as geo
 from . import training as tr
-from .cdf_pack import make_sample, open_pack
-from .domains import Domain, geom_ae_val_families
+from .cdf_pack import FieldPack, NpzRecords, default_pack, make_sample, open_pack
+from .domains import Domain, default_fps_workers, geom_ae_val_families
 from .geom_ae import GEOM_KEYS
 from .geom_ae import make_sample as geom_sample
 from .layers import PointEmbed
 from .layout import METHODS, Layout, chart_sides, layout_fields
 from .paths import DEFAULT_CDF, DEFAULT_SQ_DIFFUSE, DEFAULT_SQ_VAE, REPO, from_repo, portable, to_repo
 from .roundtrip import extraction_mesh, locate
-from .sq_vae import FIELD_RAMP, LayoutStream, decode_fields, geom_code, load_sq_vae, split_layouts
+from .sq_vae import FIELD_RAMP, LayoutStream, decode_fields, geom_code, latent_stats, load_sq_vae, split_layouts
 
 DEFAULT_VAE = os.path.join(DEFAULT_SQ_VAE, "best.pt")
+DEFAULT_TOKENS = 2048   # N; see Tokens in the module docstring
 EVAL_POINTS = 4096
 # Taubin's lambda / mu as util.spatial_smoothing has them (Sec. 1.3, "Taubin weights").
 TAUBIN = (0.4507499669, -0.4720265626)
@@ -483,24 +515,26 @@ def fps_cache(gcfg):
 
 def domain_condition(geom, gcfg, obj, dev, seed=0, cache=None):
     """Sec. 4 steps 1-3 for one domain OBJ, as geom_ae.encode_obj does them: normalise, FPS N and 4N area samples,
-    sdf there, then the Geom-AE code from its posterior mean. Returns the SiT condition on `dev`, the Domain (its
-    frame: x_obj = x / scale + centre), and its boundary segments in that frame for the Taubin noise. The token sets
-    are the first of the ones the Geom-AE trained with when `cache` (fps_cache()) holds the domain, which every corpus
-    domain is; otherwise one set of each size is drawn. encode_obj draws five and keeps one, which cost 2 s a domain
-    and made the evaluation sets take minutes to build."""
+    sdf there, then the Geom-AE code from its posterior mean. N is the one `geom` is set to read (geom.num_latents:
+    SQ-Diffuse's N once load_sq_diffuse() has loaded it). Returns the SiT condition on `dev`, the Domain (its frame:
+    x_obj = x / scale + centre), and its boundary segments in that frame for the Taubin noise. The token sets are the
+    first of the ones the Geom-AE trained with when `cache` (fps_cache()) holds the domain at both sizes, as it holds
+    every corpus domain at the Geom-AE's own N; otherwise one set of each size is drawn (geometry.token_sets, ~0.25 s
+    at N = 2048). encode_obj draws five and keeps one, which cost 2 s a domain and made the evaluation sets take
+    minutes to build."""
     d = Domain(obj)
-    n = gcfg["num_latents"]
+    n = geom.num_latents
     key = os.path.basename(obj)
-    if cache is not None and f"{key}/nf" in cache.files and int(cache[f"{key}/nf"]) == len(d.F):
+    if (cache is not None and f"{key}/nf" in cache.files and int(cache[f"{key}/nf"]) == len(d.F)
+            and all(f"{key}/tri{m}" in cache.files for m in (n, 4 * n))):
         d.fps = {m: (cache[f"{key}/tri{m}"][:1], cache[f"{key}/bary{m}"][:1]) for m in (n, 4 * n)}
     else:
         rng = np.random.default_rng(seed)
         d.fps = {}
         for m in (n, 4 * n):
-            tri, bary = geo.sample_area(d.V, d.F, d.cdf, max(8 * m, 8192), rng)
-            sel = geo.farthest_point_sampling(geo.point_from_bary(d.V, d.F, tri, bary), m, rng)
-            d.fps[m] = (tri[sel][None], bary[sel][None].astype(np.float32))
-    s = geom_sample(d, dict(gcfg, n_query=1, n_near=1, n_global=1), np.random.default_rng(seed), False)
+            tri, bary = geo.token_sets(d.V, d.F, d.cdf, m, 1, rng)
+            d.fps[m] = (tri, bary.astype(np.float32))
+    s = geom_sample(d, dict(gcfg, n_tokens=n, n_query=1, n_near=1, n_global=1), np.random.default_rng(seed), False)
     b = tr.to_dev({k: v[None] for k, v in s.items() if "fps" in k}, dev)
     cond = {"code": geom_code(geom, b), "xyz": b[f"xyz_fps_{n}"], "sdf": b[f"sdf_fps_{n}"]}
     return cond, d, (d.V[d.E[:, 0]], d.V[d.E[:, 1]])
@@ -635,10 +669,15 @@ def plot_samples(ev, per, vae, dev, out, title, k=6, h_rel=0.004):
 # =============================================================================
 
 
-def load_vae(path, dev):
-    """SQ-VAE, its Geom-AE, both configs and the step, from sq_vae.py's checkpoint."""
+def load_vae(path, dev, tokens=None):
+    """SQ-VAE, its Geom-AE, both configs and the step, from sq_vae.py's checkpoint. With `tokens`, both networks read
+    that many tokens instead of the N they were trained at (Tokens in the module docstring), and the SQ-VAE's config
+    says so (n_tokens, num_latents), so that the samples made from it have token sets of that size."""
     vae, geom, vcfg = load_sq_vae(path, dev)
     ck = torch.load(path, map_location="cpu", weights_only=False)
+    if tokens:
+        vae.num_latents = geom.num_latents = tokens
+        vcfg = dict(vcfg, n_tokens=tokens, num_latents=tokens, trained_tokens=vcfg["num_latents"])
     return vae, geom, vcfg, ck["geom_config"], ck["step"]
 
 
@@ -663,14 +702,16 @@ def load_sq_diffuse(path, device="cpu", vae_path=None):
     """SQ-Diffuse with the frozen SQ-VAE and Geom-AE it was trained on: returns (sit, vae, geom, cfg, vae_cfg,
     geom_cfg). The SQ-VAE is the one the checkpoint records (its path relative to the repository), or vae_path;
     either way its weights must hash to the recorded vae_fingerprint, since a different SQ-VAE decodes the same latent
-    into a different layout."""
+    into a different layout. Both networks are set to read the N tokens SQ-Diffuse generates (cfg["tokens"]; a
+    checkpoint from before --tokens generated the SQ-VAE's own N), and so is vae_cfg; domain_condition() then draws
+    its token sets at that N."""
     ck = torch.load(path, map_location=device, weights_only=False)
     cfg = ck["config"]
     vae_path = vae_path or from_repo(cfg["vae"])
     if not os.path.exists(vae_path):
         raise SystemExit(f"{path} was trained on the SQ-VAE {cfg['vae']}, which is not at {vae_path}: copy that run "
                          "directory there (keep the layout under py/squadgen/runs), or pass its best.pt (--vae)")
-    vae, geom, vcfg, gcfg, vstep = load_vae(vae_path, device)
+    vae, geom, vcfg, gcfg, vstep = load_vae(vae_path, device, cfg.get("tokens"))
     want = cfg.get("vae_fingerprint")
     if want is not None and fingerprint(vae, geom) != want:
         raise SystemExit(f"{vae_path} is not the SQ-VAE {path} was trained on (step {cfg['vae_step']}, weights "
@@ -755,21 +796,63 @@ def final_eval(sit, vae, evals, cfg, step, log):
                 + ", ".join(f"{k} {v}" for k, v in sorted(closest.items(), key=lambda kv: -kv[1])))
             if noise == "taubin":
                 plot_samples(de, per, vae, dev, os.path.join(cfg["out"], f"samples_{name}.png"),
-                             f"SQ-Diffuse 2D, best.pt (step {step}), {name} domains: {cfg['n_gen']} samples each "
-                             f"(dopri5, Taubin-smoothed noise), worst and best")
+                             f"SQ-Diffuse 2D, best.pt (step {step}, N = {cfg['tokens']}), {name} domains: "
+                             f"{cfg['n_gen']} samples each (dopri5, Taubin-smoothed noise), worst and best")
     with open(os.path.join(cfg["out"], "samples.csv"), "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0]))
         w.writeheader()
         w.writerows(rows)
 
 
+def target_stats(args, vae, geom, vcfg, pack, train_idx, vstep, fp, dev, log):
+    """target_mu / target_std at the N the networks read (Tokens in the module docstring), and the file they are in:
+    --latent_stats if given; else this run's latent_stats.json, or the SQ-VAE's when N is its own, if either is for
+    this SQ-VAE at this N; else measured over the training layouts the way sq_vae.py measures its own (its seed,
+    batch, augmentation and sample count, so at the SQ-VAE's N it reproduces that file) and written to --out. A file
+    without num_latents is the SQ-VAE's, at the N it was trained at."""
+    n, own = vcfg["n_tokens"], vcfg.get("trained_tokens", vcfg["n_tokens"])
+    mine = os.path.join(args.out, "latent_stats.json")
+    beside = os.path.join(os.path.dirname(args.vae), "latent_stats.json")
+    for path in [args.latent_stats] if args.latent_stats else [mine] + ([beside] if n == own else []):
+        if not os.path.exists(path):
+            if path == args.latent_stats:
+                raise SystemExit(f"no {path}")
+            continue
+        with open(path) as f:
+            st = json.load(f)
+        why = (f"SQ-VAE step {st.get('step')}, not {vstep}" if st.get("step") != vstep
+               else f"N = {st.get('num_latents', own)}, not {n}" if st.get("num_latents", own) != n
+               else "an SQ-VAE with other weights" if st.get("vae_fingerprint", fp) != fp else None)
+        if why is None:
+            return st, path
+        if path == args.latent_stats:
+            raise SystemExit(f"{path} is for {why}")
+        log(f"{path} is for {why}: measuring them again")
+    t0 = time.time()
+    st = latent_stats(vae, geom, pack, train_idx, dict(vcfg, augment=vcfg.get("augment", True)), dev,
+                      vcfg.get("stats_samples", 1024))
+    st = dict(st, step=vstep, num_latents=n, vae_fingerprint=fp)
+    os.makedirs(args.out, exist_ok=True)
+    with open(mine, "w") as f:
+        json.dump(st, f, indent=1)
+    log(f"latent stats at N = {n} over {st['tokens']} tokens in {time.time() - t0:.0f} s: |mu| max "
+        f"{np.abs(st['target_mu']).max():.3f}, std {np.min(st['target_std']):.3f}..{np.max(st['target_std']):.3f} "
+        f"-> {mine}")
+    return st, mine
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="squadgen2d sq-diffuse", description=__doc__.split("\n")[1].strip())
     ap.add_argument("--vae", help="sq_vae.py checkpoint (SQ-VAE + Geom-AE), frozen (default: the one --out's best.pt "
                                   f"was trained on with --eval_only, else {to_repo(DEFAULT_VAE)})")
-    ap.add_argument("--latent_stats", help="target_mu / target_std (default: latent_stats.json beside --vae)")
+    ap.add_argument("--tokens", type=int, help=f"N, the latent tokens generated (default {DEFAULT_TOKENS}; with "
+                                               "--eval_only, best.pt's); see Tokens")
+    ap.add_argument("--latent_stats", help="target_mu / target_std at N (default: measured here, or latent_stats.json "
+                                           "beside --vae when N is the SQ-VAE's own)")
     ap.add_argument("--data", default=DEFAULT_CDF, help="a cdf-data output directory (manifest.csv + npz/)")
-    ap.add_argument("--pack", help="its field pack (default: DATA/pack_N<the Geom-AE's N>; see cdf-pack)")
+    ap.add_argument("--pack", help="its field pack (default: DATA/pack_N<N>, built when missing; see cdf-pack)")
+    ap.add_argument("--pack_jobs", type=int,
+                    help="processes when the pack has to be built (default: every core on CUDA, 6 elsewhere)")
     ap.add_argument("--out", default=DEFAULT_SQ_DIFFUSE)
     ap.add_argument("--methods", nargs="+", default=list(METHODS), choices=METHODS)
     ap.add_argument("--overfit", nargs="+", metavar="MODEL",
@@ -789,43 +872,74 @@ def main(argv=None):
     ap.add_argument("--no_aug", action="store_true")
     ap.add_argument("--wall", type=float, default=0.1, help="CDF wall threshold of the sample IoU (QuadExtraction -t)")
     ap.add_argument("--eval_steps", type=int, default=12, help="Heun steps of the training-time sample IoU")
+    ap.add_argument("--eval_domains", type=int, default=256,
+                    help="held-out domains the evaluations use, a seeded draw (0: all of them)")
     ap.add_argument("--n_gen", type=int, default=3, help="samples per domain in the final evaluation")
     ap.add_argument("--atol", type=float, default=1e-6)              # release sample_ode
     ap.add_argument("--rtol", type=float, default=1e-3)
     tr.add_device_args(ap)
     ap.add_argument("--eval_only", action="store_true", help="evaluate and plot best.pt")
     args = ap.parse_args(argv)
+    if args.tokens is not None and args.tokens < 1:
+        raise SystemExit(f"--tokens must be positive, not {args.tokens}")
 
     best = os.path.join(args.out, "best.pt")
+    trained = None
+    if args.eval_only:
+        if not os.path.exists(best):
+            raise SystemExit(f"no {best}: train one first, or pass --out")
+        # Evaluating a run (perhaps trained elsewhere and copied here): its SQ-VAE, N and latent statistics.
+        trained = torch.load(best, map_location="cpu", weights_only=False)["config"]
     if args.vae is None:
-        # Evaluating a run (perhaps trained elsewhere and copied here): the SQ-VAE it records.
-        recorded = (torch.load(best, map_location="cpu", weights_only=False)["config"]["vae"]
-                    if args.eval_only and os.path.exists(best) else None)
-        args.vae = from_repo(recorded) if recorded else DEFAULT_VAE
+        args.vae = from_repo(trained["vae"]) if trained else DEFAULT_VAE
     if not os.path.exists(args.vae):
         raise SystemExit(f"no SQ-VAE checkpoint {args.vae}: train one with  python -m squadgen2d sq-vae, or pass --vae")
-    stats_path = args.latent_stats or os.path.join(os.path.dirname(args.vae), "latent_stats.json")
-    if not os.path.exists(stats_path):
-        raise SystemExit(f"no {stats_path}: write it with  python -m squadgen2d sq-vae --eval_only --out "
-                         f"{os.path.dirname(args.vae)}")
     dev = tr.pick_device(args.device)
-    vae, geom, vcfg, gcfg, vstep = load_vae(args.vae, dev)
-    with open(stats_path) as f:
-        stats = json.load(f)
-    if stats.get("step") != vstep:
-        raise SystemExit(f"{stats_path} is for SQ-VAE step {stats.get('step')}, {args.vae} is step {vstep}: "
-                         "rerun sq-vae --eval_only")
-    pack = open_pack(args.data, args.pack, vcfg["n_tokens"])
-    cfg = dict(vars(args), pack=pack.path, device=dev, augment=not args.no_aug, vae=os.path.abspath(args.vae),
-               vae_step=vstep, vae_fingerprint=fingerprint(vae, geom), in_channels=vcfg["latent_dim"],
-               in_channels_cond=gcfg["dim"], qk_norm=1, target_mu=stats["target_mu"], target_std=stats["target_std"],
+    # A run from before --tokens generated the SQ-VAE's own N: tokens None loads the networks as they were trained.
+    vae, geom, vcfg, gcfg, vstep = load_vae(args.vae, dev, trained.get("tokens") if trained
+                                            else args.tokens or DEFAULT_TOKENS)
+    n, own = vcfg["n_tokens"], vcfg.get("trained_tokens", vcfg["n_tokens"])
+    fp = fingerprint(vae, geom)
+    pack_path = os.path.abspath(args.pack or default_pack(args.data, n))
+    cfg = dict(vars(args), tokens=n, pack=pack_path, device=dev, augment=not args.no_aug,
+               vae=os.path.abspath(args.vae), vae_step=vstep, vae_tokens=own, vae_fingerprint=fp,
+               in_channels=vcfg["latent_dim"], in_channels_cond=gcfg["dim"], qk_norm=1,
                workers=tr.default_workers(dev) if args.workers is None else args.workers)
 
     log = tr.RunLog(args.out)
-    log.header(cfg, skip=("target_mu", "target_std"))
+    log.header(cfg)
+    if trained and args.tokens and args.tokens != n:
+        log(f"note: --tokens {args.tokens} ignored: {best} generates {n} tokens")
+    log(f"N = {n} tokens" + ("" if n == own else f": the SQ-VAE and Geom-AE were trained at {own} and read {n} here"))
+    if dev == "mps" and n > own and not args.eval_only:
+        log(f"warning: training at N = {n} on MPS. On an 8 GB M2 (2026-11-01) N = 2048 swapped (577 s for one step) "
+            "and its weights went NaN within two steps, where the CPU stayed finite: a job for a CUDA GPU "
+            "(vast_sq_diffuse.sh), or --tokens 512")
+    if args.eval_only:
+        # Evaluating needs a few layouts' samples, not a pack: at N = 2048 a whole one is ~6 MB a layout, which a
+        # laptop may not have the disk for. Without a current one the samples come from the NPZs, the same arrays.
+        p = FieldPack(pack_path) if os.path.exists(os.path.join(pack_path, "meta.json")) else None
+        pack = p if p is not None and p.n_tokens == n and p.stale() is None else NpzRecords(args.data, n, vcfg["tau"])
+        if pack is not p:
+            log(f"no current field pack at {pack_path}: the evaluation reads its layouts from the NPZs")
+    else:
+        pack = open_pack(args.data, args.pack, n, vcfg["tau"], args.pack_jobs or default_fps_workers(dev), log)
     for r in pack.rows:
         r["path"] = os.path.join(REPO, r["path"])
     keep = [i for i, r in enumerate(pack.rows) if r["method"] in args.methods]
+    # The SQ-VAE's split, so that SQ-Diffuse validates on the same held-out families; the latent statistics are
+    # over its training layouts, an overfit's too.
+    if vcfg.get("val_families") is not None:
+        val_fams, how = set(vcfg["val_families"]), "recorded in the SQ-VAE checkpoint"
+    else:
+        val_fams, how = geom_ae_val_families(gcfg)
+    tr_i, va_i = split_layouts([pack.rows[i] for i in keep], val_fams)
+    train_idx, val_idx = [keep[i] for i in tr_i], [keep[i] for i in va_i]
+    if trained:
+        stats, cfg["latent_stats"] = trained, trained.get("latent_stats")
+    else:
+        stats, cfg["latent_stats"] = target_stats(args, vae, geom, vcfg, pack, train_idx, vstep, fp, dev, log)
+    cfg.update(target_mu=stats["target_mu"], target_std=stats["target_std"])
     if args.overfit:
         idx = [i for i in keep if pack.rows[i]["model"] in args.overfit]
         if not idx:
@@ -833,23 +947,25 @@ def main(argv=None):
         train_idx, sets = idx, [("overfit", idx, idx)]
         log(f"overfit: {len(idx)} layouts of {' '.join(sorted({pack.rows[i]['model'] for i in idx}))}")
     else:
-        # The SQ-VAE's split, so that SQ-Diffuse validates on the same held-out families.
-        if vcfg.get("val_families") is not None:
-            val_fams, how = set(vcfg["val_families"]), "recorded in the SQ-VAE checkpoint"
-        else:
-            val_fams, how = geom_ae_val_families(gcfg)
-        tr_i, va_i = split_layouts([pack.rows[i] for i in keep], val_fams)
-        train_idx, val_idx = [keep[i] for i in tr_i], [keep[i] for i in va_i]
         log(f"split: the manifest's split column (the Geom-AE's held-out families: {how})" if val_fams is None
             else f"split: the held-out families, {how}")
+        log(f"{len(keep)} layouts of {len({pack.rows[i]['model'] for i in keep})} domains: {len(train_idx)} train, "
+            f"{len(val_idx)} val ({len({pack.rows[i]['model'] for i in val_idx})} domains)")
+        # At most eval_domains of the held-out domains, with all their layouts, drawn by a generator of their own so
+        # that the training draw below stays the one sq_vae.py made.
+        names = sorted({pack.rows[i]["model"] for i in val_idx})
+        if 0 < args.eval_domains < len(names):
+            names = set(np.asarray(names)[np.random.default_rng([args.seed, 1]).choice(
+                len(names), args.eval_domains, replace=False)])
+            val_idx = [i for i in val_idx if pack.rows[i]["model"] in names]
+            log(f"evaluating on {len(names)} held-out domains, a seeded draw ({len(val_idx)} layouts; "
+                "--eval_domains 0 for every one)")
         # The 48 training layouts sq_vae.py's train eval used (same seed, same draw), and for the sample IoU every
         # training layout of their domains.
         rng = np.random.default_rng(args.seed)
         drawn = [train_idx[i] for i in rng.choice(len(train_idx), min(48, len(train_idx)), replace=False)]
         names = {pack.rows[i]["model"] for i in drawn}
         sets = [("val", val_idx, val_idx), ("train", drawn, [i for i in train_idx if pack.rows[i]["model"] in names])]
-        log(f"{len(keep)} layouts of {len({pack.rows[i]['model'] for i in keep})} domains: {len(train_idx)} train, "
-            f"{len(val_idx)} val ({len({pack.rows[i]['model'] for i in val_idx})} domains)")
 
     t0 = time.time()
     evals = [(name, LossEval(pack, lidx, vae, geom, vcfg, dev), DomainEval(pack, didx, vae, geom, vcfg, gcfg, cfg, dev))
@@ -860,7 +976,8 @@ def main(argv=None):
     torch.manual_seed(args.seed)
     sit = build_model(cfg).to(dev)
     log(f"device={dev}  SiT parameters={sum(p.numel() for p in sit.parameters()):,}  hidden {args.n_heads * args.d_head}"
-        f"  (frozen: SQ-VAE {sum(p.numel() for p in vae.parameters()):,}, Geom-AE {sum(p.numel() for p in geom.parameters()):,})")
+        f"  N {n}  (frozen: SQ-VAE {sum(p.numel() for p in vae.parameters()):,}, Geom-AE "
+        f"{sum(p.numel() for p in geom.parameters()):,})")
     if not args.eval_only:
         train(cfg, sit, vae, geom, vcfg, pack, train_idx, evals, log)
     sit, vae, geom, _, _, _ = load_sq_diffuse(best, dev, args.vae)

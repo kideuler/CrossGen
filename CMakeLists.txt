@@ -263,6 +263,10 @@ add_library(PolyVector SHARED
     src/SKELETON/BaseComplex.cxx
     src/SKELETON/SKELETON.hxx
     src/SKELETON/SKELETON.cxx
+    src/QUARRY/Basins.hxx
+    src/QUARRY/Basins.cxx
+    src/QUARRY/QUARRY.hxx
+    src/QUARRY/QUARRY.cxx
     src/quantization/QuantTMesh.hxx
     src/quantization/QuantTMesh.cxx
     src/quantization/TMeshQuantizer.hxx
@@ -296,6 +300,11 @@ target_link_libraries(TestCutMesh PRIVATE PolyVector)
 # SKELETON: test medial axis construction and phi-inverse mapping
 add_executable(TestSKELETON src/utils/TestSKELETON.cxx)
 target_link_libraries(TestSKELETON PRIVATE PolyVector)
+
+# QUARRY: the blocks SQuadGen's chart distance fields describe (src/QUARRY), run on the true fields of ZIPLINE's
+# layouts -- the round trip of docs/squadgen_2d.md Sec. 6 step 1 with no network in it.
+add_executable(TestQUARRY src/utils/TestQUARRY.cxx)
+target_link_libraries(TestQUARRY PRIVATE PolyVector)
 
 # Test the QGP T-mesh quantizer and its converters
 add_executable(TestQuantization src/utils/TestQuantization.cxx)
@@ -536,6 +545,11 @@ add_test(NAME ZIPLINE_SelfTest COMMAND TestZIPLINE --selftest)
 # L-shape and a noisy square, each taken through Steps 2-10 to a quad mesh and
 # checked against what the guide expects of it.
 add_test(NAME SKELETON_SelfTest COMMAND TestSKELETON --selftest)
+
+# QUARRY on synthetic domains (a rectangle, an L, a square round a square hole, a disk, a plate with a round hole),
+# each on the true chart distance fields of its ZIPLINE layout and on the same fields with smooth noise added, as a
+# decoder leaves them: every chart recovered, the blocks covering, BlockQuadMesh's mesh valid.
+add_test(NAME QUARRY_SelfTest COMMAND TestQUARRY --selftest)
 
 # Discrete Ricci flow (Shepherd et al. Sec. 3.2.1) against prescribed cone sets
 # with far more curvature to move than anything in data/meshes asks for, which
@@ -892,6 +906,7 @@ if (BUILD_PYTHON_MODULE)
         src/python/MethodLayout.cxx
         src/python/MethodATLAS.cxx
         src/python/MethodORACLE.cxx
+        src/python/MethodQUARRY.cxx
         src/python/CrossGenModule.cxx
     )
     # CrossGenOracle for Mesh.oracle() (src/python/MethodORACLE.cxx). ONNX
