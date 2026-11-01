@@ -24,3 +24,6 @@ docs/*
 *.pyc
 data/geometry/deepcad/*
 *.egg-info
+*.txt
+*.log
+*.out
