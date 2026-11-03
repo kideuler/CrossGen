@@ -24,7 +24,8 @@ optional target (the mesh's target edge length; default 0.01 x the bounding-box 
 quarry_output.npz: labels (F,) the chart of every triangle (-1 none); covers (the decomposition covers the domain:
 every chart a quad, every side shared or on dS); vertices (n, 2), blocks (B, 4), edge_points (P, 2) and edge_start
 (E + 1,) the macro edges as polylines; failed (charts that made no block); and, when the blocks cover, the mesh after
-TMOP -- mesh_vertices, mesh_quads, inverted, min_sj -- and before it, inverted_raw and min_sj_raw; report (JSON).
+TMOP -- mesh_vertices, mesh_quads, inverted, min_sj -- and before it, inverted_raw and min_sj_raw; report (JSON:
+QUARRY's report, plus the four block qualities when the blocks cover).
 """
 
 import json
@@ -36,6 +37,7 @@ import numpy as np
 
 DEFAULT_SWEEPS = 300
 DEFAULT_TARGET_REL = 0.01
+QUALITIES = ("regularity", "angle_quality", "chord_quality", "alignment_quality")
 
 
 def extract(V, T, cdf, dcdf, offset, offsetc, target=None, sweeps=DEFAULT_SWEEPS, **options):
@@ -56,6 +58,10 @@ def extract(V, T, cdf, dcdf, offset, offsetc, target=None, sweeps=DEFAULT_SWEEPS
     out["edge_start"] = np.cumsum([0] + [len(p) for p in pts])
     rep = {k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in r.items()
            if k not in ("chart_labels", "dual_labels")}
+    if b.valid:
+        # The block qualities cdf-data records for every training layout (cdf_data.QUALITIES), so that a generated
+        # layout and the data's compare on the same scale.
+        rep.update({q: float(getattr(b, q)()) for q in QUALITIES})
     if b.valid and len(out["blocks"]):
         if target is None:
             target = DEFAULT_TARGET_REL * float(np.linalg.norm(np.ptp(np.asarray(V, float), 0)))

@@ -116,14 +116,55 @@ def _fps_job(job):
     return path, fps_sets(Domain(path), sizes, np.random.default_rng(zlib.crc32(os.path.basename(path).encode())))
 
 
-def default_fps_workers(dev):
-    """Processes for the one-off token-set cache when --fps_workers is not given. It was ~2 s of numpy per domain
-    (N_FPS_COPIES greedy FPS runs per size), so 10 k DeepCAD domains took an hour on 6 processes; since FPS visits
-    only the candidates near each pick (geometry.farthest_point_sampling, 2026-11-01) it is ~0.4 s, the same sets.
-    6 is the cap that suits an 8 GB M2, where each spawned worker also imports torch. A CUDA box has the cores and
-    memory to spare and its GPU idles until the cache is done, so it gets every core it may use (the affinity mask: a
-    container's share, not the host's count)."""
+def usable_cores():
+    """The cores this process may keep busy: the affinity mask, cut down to the container's CPU quota (cgroup v2
+    cpu.max, or v1's cfs quota) where one is set. A vast.ai container (2026-11-01) sees all 256 of the host's cores
+    in its affinity mask and is given 30.7 of them by cpu.max; counting the mask started 256 workers there."""
     cores = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+    for quota_file, period_file in [("/sys/fs/cgroup/cpu.max", None),
+                                    ("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "/sys/fs/cgroup/cpu/cpu.cfs_period_us")]:
+        try:
+            with open(quota_file) as f:
+                fields = f.read().split()
+            if period_file:
+                with open(period_file) as f:
+                    fields.append(f.read().strip())
+            quota, period = fields[0], fields[1]
+            if quota not in ("max", "-1"):
+                return max(1, min(cores, int(int(quota) / int(period))))
+        except (OSError, ValueError, IndexError):
+            continue
+    return cores
+
+
+def worker_pool(n, initializer=None, initargs=()):
+    """A spawn Pool of n numpy workers, each with one BLAS/OpenMP thread. The workers' jobs are per-domain loops
+    that gain nothing from BLAS threads, while OpenBLAS starts one per core in every process that imports numpy:
+    on the vast.ai box above, 256 workers x 64 threads ran into the container's 7680-task limit (pids.max) and the
+    pool's fork failed with EAGAIN. Spawned children read the variables when they import numpy, so they are set
+    only while the pool starts them, and this process keeps its own."""
+    import multiprocessing as mp
+    keys = ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS")
+    saved = {k: os.environ.get(k) for k in keys}
+    os.environ.update({k: "1" for k in keys})
+    try:
+        return mp.get_context("spawn").Pool(n, initializer, initargs)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def default_fps_workers(dev):
+    """Processes for the one-off token-set cache, and the field pack, when --fps_workers / --pack_jobs is not
+    given. It was ~2 s of numpy per domain (N_FPS_COPIES greedy FPS runs per size), so 10 k DeepCAD domains took an
+    hour on 6 processes; since FPS visits only the candidates near each pick (geometry.farthest_point_sampling,
+    2026-11-01) it is ~0.4 s, the same sets. 6 is the cap that suits an 8 GB M2, where each spawned worker also
+    imports torch. A CUDA box has the cores and memory to spare and its GPU idles until the cache is done, so it
+    gets every core it may use (usable_cores: a container's share, not the host's count)."""
+    cores = usable_cores()
     return cores if dev.startswith("cuda") else min(6, cores)
 
 
@@ -152,8 +193,7 @@ def load_domains(dirs, n_tokens, cache_dir, workers):
         # all are done, so stopping part way loses them all.
         pool = None
         if workers > 1:
-            import multiprocessing as mp
-            pool = mp.get_context("spawn").Pool(workers)
+            pool = worker_pool(workers)
         try:
             for k, r in enumerate(pool.imap(_fps_job, jobs, chunksize=4) if pool else map(_fps_job, jobs), 1):
                 results.append(r)

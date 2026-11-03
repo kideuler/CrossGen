@@ -55,7 +55,6 @@ import argparse
 import csv
 import hashlib
 import json
-import multiprocessing as mp
 import os
 import shutil
 import time
@@ -64,7 +63,7 @@ import zlib
 import numpy as np
 
 from . import geometry as geo
-from .domains import N_FPS_COPIES
+from .domains import N_FPS_COPIES, worker_pool
 from .layout import OFFSET_KEYS, Layout, layout_fields, read_manifest
 from .paths import DEFAULT_CDF
 
@@ -387,7 +386,7 @@ def build(data, out, n_tokens, tau, jobs, log=print):
                 f"{max(8 * n, 8192)} area samples each, as cdf-data draws them)")
     jobs_ = [(i, r["npz"], int(q0[i]), n_tokens, tau) for i, r in enumerate(rows)]
     bnd, frames = [None] * len(rows), [None] * len(rows)
-    pool = mp.get_context("spawn").Pool(jobs, _open_files, (files,)) if jobs > 1 else None
+    pool = worker_pool(jobs, _open_files, (files,)) if jobs > 1 else None
     if pool is None:
         _open_files(files)
     try:

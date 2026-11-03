@@ -10,6 +10,7 @@ The pipeline, one command per stage (python -m squadgen2d <command>, or `squadge
     sq-vae       field pack + frozen Geom-AE -> SQ-VAE (sq_vae.py)
     sq-diffuse   field pack + frozen SQ-VAE -> SQ-Diffuse (sq_diffuse.py)
     roundtrip    SQ-VAE -> block extraction on true vs decoded fields (roundtrip.py)
+    generate     domain OBJs + trained SQ-Diffuse -> generated block layouts, through QUARRY (generate.py)
     quarry       QUARRY, CrossGen's C++ block extractor, on one extraction input (quarry.py; needs crossgen)
 
 The library modules under them:

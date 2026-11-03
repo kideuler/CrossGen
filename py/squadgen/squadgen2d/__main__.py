@@ -11,6 +11,7 @@ COMMANDS = {
     "sq-vae": ("sq_vae", "train / evaluate the SQ-VAE on a field pack"),
     "sq-diffuse": ("sq_diffuse", "train / evaluate SQ-Diffuse"),
     "roundtrip": ("roundtrip", "SQ-VAE round trip through QUARRY (or the release's QuadExtraction)"),
+    "generate": ("generate", "block layouts of domain OBJs from a trained SQ-Diffuse (inference, through QUARRY)"),
     "quarry": ("quarry", "QUARRY, the C++ block extractor, on one extraction input (needs the crossgen module)"),
 }
 

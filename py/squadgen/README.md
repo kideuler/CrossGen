@@ -40,6 +40,7 @@ Defaults are paths in this checkout, so commands can run from any directory.
 | `sq-diffuse` | field pack at N + frozen SQ-VAE → SQ-Diffuse (N = 2048 latent tokens) | torch |
 | `roundtrip` | SQ-VAE → block extraction on true vs decoded fields | `crossgen` (QUARRY); QuadTools for `--extractor quadextraction` |
 | `quarry DIR` | one extraction input (`quarry_input.npz`) → QUARRY's blocks and mesh (`quarry_output.npz`) | `crossgen` |
+| `generate OBJ...` | domain OBJs + trained SQ-Diffuse → generated block layouts and meshes (inference) | torch; `crossgen` (QUARRY) |
 
 A full run on the ORACLE layouts:
 
@@ -56,6 +57,23 @@ squadgen2d roundtrip --ckpt py/squadgen/runs/sq_vae_2d_oracle/best.pt           
 `roundtrip` extracts the blocks with QUARRY (`src/QUARRY`, CrossGen's C++ extractor) by default and with the release's
 QuadExtraction under `--extractor quadextraction`. QUARRY runs in a subprocess per extraction (`quarry.py`): torch and
 crossgen each bring an OpenMP runtime, and one process with both aborts as soon as crossgen's TMOP starts.
+
+## Generating layouts (`generate`)
+
+`generate` is the inference of the paper's Sec. 4 for any planar domain OBJ: the frozen Geom-AE's code of the domain, a
+latent from SQ-Diffuse (dopri5 from Taubin-smoothed noise), the SQ-VAE's fields on the OBJ refined to 0.2 % of its
+diagonal, and QUARRY's blocks, meshed and smoothed. Each domain gets `--samples` seeds (default 4) and keeps the best
+one whose blocks cover the domain with an untangled mesh, highest alignment quality first. With `--data`, the CDF data
+the model was trained on, every domain's data layout is drawn beside its samples and scored the same way:
+
+```sh
+squadgen2d generate data/meshes/singlemat/geom002.obj                            # best_models/best.pt -> runs/generate
+squadgen2d generate data/meshes/singlemat/*.obj --data ~/Documents/2d_CDF_data --out py/squadgen/runs/generate/singlemat
+```
+
+It writes `samples.csv` (every sample: valid, blocks, the four block qualities), `domains.csv` (the kept sample against
+the data layout), each kept mesh as `<model>/quad.ply`, and `generate.png`, a row per domain. A sample at N = 2048 takes
+~15 s on an 8 GB M2's MPS (~42 s on its CPU): only training at N = 2048 needs a CUDA box.
 
 `cdf-data` is the only step that needs CrossGen. Copy its output directory to a GPU box and build the pack there:
 packing needs only numpy. `sq-vae` and `sq-diffuse` build the pack themselves when it is missing, so the NPZs and
@@ -170,4 +188,4 @@ from squadgen2d import geometry, layout, paths
 | `domains` | the Geom-AE's domains, families, split, FPS token-set cache |
 | `layout` | a CDF NPZ's split mesh and its fields (Appendix B) |
 | `layers` | network modules shared by the Geom-AE and SQ-VAE |
-| `cdf_data`, `cdf_pack`, `geom_ae`, `sq_vae`, `sq_diffuse`, `roundtrip`, `quarry` | the commands (`quarry` needs crossgen, never torch) |
+| `cdf_data`, `cdf_pack`, `geom_ae`, `sq_vae`, `sq_diffuse`, `roundtrip`, `generate`, `quarry` | the commands (`quarry` needs crossgen, never torch) |
