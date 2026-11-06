@@ -16,6 +16,8 @@ bool ZIPLINE::run(Stage last) {
     startField();
     finishField();
     if (last == Stage::Field) return true;
+    buildConformalField();
+    if (last == Stage::Conformal) return true;
     startTrace();
     finishTrace();
     if (last == Stage::Trace) return true;
@@ -37,7 +39,15 @@ void ZIPLINE::discardFrom(Stage from) {
     if (from <= Stage::Blocks) blocks.reset();
     if (from <= Stage::Simplified) simplification.reset();
     if (from <= Stage::Layout) layout.reset();
-    if (from <= Stage::Trace) trace.reset();
+    if (from <= Stage::Trace) {
+        trace.reset();
+        status.conformalTraced = false;
+    }
+    if (from <= Stage::Conformal) {
+        conformal.reset();
+        conformalTried = false;
+        status.conformalFailure.clear();
+    }
     if (from <= Stage::Field) {
         field.reset();
         fieldDone = false;
@@ -130,8 +140,55 @@ void ZIPLINE::finishField() {
 // ---------------------------------------------------------------------------
 void ZIPLINE::startTrace() {
     if (!fieldDone) finishField();
+    if (!conformalTried) buildConformalField();
     discardFrom(Stage::Trace);
-    trace = std::make_unique<SeparatrixTrace>(field, true, options.trace, interfaces.get());
+    if (hasConformalField()) {
+        trace = std::make_unique<SeparatrixTrace>(conformal->crossField(), true, options.trace,
+                                                  interfaces.get(), conformal);
+        status.conformalTraced = true;
+    } else {
+        // The first field: Viertel's tracing alone (Options::trace says why).
+        SeparatrixTrace::Settings viertel = options.trace;
+        viertel.captureAtSingularities = false;
+        viertel.stopAtCrossings = true;
+        trace = std::make_unique<SeparatrixTrace>(field, true, viertel, interfaces.get());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 1b. The pattern is read off the first field exactly as a trace of it
+// would read it -- FieldTracer with the same settings, singularities in the
+// boundary triangles included, each at the point of its triangle where the
+// interpolated representation vector vanishes -- so the second field has the
+// singularities the first one would have been traced from, and only the field
+// round them changes.
+//
+// Declined, with the reason kept in Status::conformalFailure, on a
+// multi-material model (ConformalField's header says why) and wherever
+// ConformalField cannot build -- a pattern failing Poincare-Hopf above all,
+// which is a singularity the first field dropped or a corner it turned the
+// other way, and leaves the Neumann problem without a solution. The trace
+// then follows the first field, as before Stage 1b existed.
+// ---------------------------------------------------------------------------
+void ZIPLINE::buildConformalField() {
+    if (!fieldDone) finishField();
+    discardFrom(Stage::Conformal);
+    conformalTried = true;
+    if (!options.secondField) return;
+    if (interfaces) {
+        status.conformalFailure = "multi-material model: traced on the first field";
+        return;
+    }
+    const FieldTracer first(field, true, options.trace.singularitiesAtBoundary);
+    std::vector<ConformalField::Singular> pattern;
+    for (const Singularity &s : first.getSingularities())
+        pattern.push_back(ConformalField::Singular{s.coordinates, s.triangleIndex, s.d});
+    if (first.droppedSingularityCount() > 0) {
+        status.conformalFailure = "the first field has singular triangles with no ports";
+        return;
+    }
+    conformal = std::make_shared<ConformalField>(mesh, std::move(pattern), options.conformal, field.get());
+    if (!conformal->valid()) status.conformalFailure = conformal->getReport().failure;
 }
 
 bool ZIPLINE::stepTrace() {

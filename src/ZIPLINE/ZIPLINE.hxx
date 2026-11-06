@@ -2,8 +2,10 @@
 #define __ZIPLINE_HXX__
 
 #include <memory>
+#include <string>
 
 #include "MERIDIAN/Interfaces.hxx"
+#include "ZIPLINE/ConformalField.hxx"
 #include "ZIPLINE/LayoutBlocks.hxx"
 #include "ZIPLINE/PartitionSimplify.hxx"
 #include "ZIPLINE/QuadLayout.hxx"
@@ -24,8 +26,17 @@
 //                                 loops unsplit (multi-material models only)
 //   Stage 1   CrossField          the P1 MBO cross field (baseline B1), aligned
 //                                 to the interfaces
+//   Stage 1b  ConformalField      the corrected field of docs/
+//                                 quad_layout_pipeline.md Sec. 6: Stage 1's
+//                                 singularity pattern kept, its field replaced
+//                                 by the conformal one with exactly those
+//                                 singularities (two linear problems, P2 Sec. 5)
 //   Stage 2   SeparatrixTrace     singularities, their ports, the separatrices
-//                                 traced out of them (paper Sec. 3)
+//                                 traced out of them (paper Sec. 3); on the
+//                                 corrected field also joined to a singular
+//                                 point whose critical patch they enter, one
+//                                 copy of each such connection kept (docs/
+//                                 quad_layout_pipeline.md Secs. 7.5 and 8)
 //   Stage 3   QuadLayout          the T-layout the separatrices cut the model into
 //   Stage 4   PartitionSimplify   chord collapses (Sec. 4), then StemExtension
 //                                 (spec Sec. 12), then Sec. 4 again
@@ -67,7 +78,7 @@
 // MERIDIAN's.
 class ZIPLINE {
 public:
-    enum class Stage { Interfaces, Field, Trace, Layout, Simplified, Blocks, Mesh, Smoothed };
+    enum class Stage { Interfaces, Field, Conformal, Trace, Layout, Simplified, Blocks, Mesh, Smoothed };
 
     struct Options {
         // ---- Stage 0b ----
@@ -91,8 +102,31 @@ public:
         // vertex. Never 0: initialize() takes 0 to mean "seed from the clock".
         unsigned fieldSeed = 12345;
 
+        // ---- Stage 1b ----
+        // Trace the corrected field (ConformalField) instead of the MBO one:
+        // the MBO's singularity pattern, its field rebuilt as the conformal
+        // field with exactly those singularities. Falls back to the MBO field,
+        // with the reason in Status::conformalFailure, on a multi-material
+        // model (the corrected field knows no interfaces) and wherever the
+        // pattern fails Poincare-Hopf (the Neumann problem has no solution).
+        bool secondField = true;
+        ConformalField::Options conformal;
+
         // ---- Stages 2 and 4 ----
-        SeparatrixTrace::Settings trace;
+        // Viertel's tracing, with docs/quad_layout_pipeline.md Sec. 7.5's
+        // capture by critical patches and Sec. 8's reduction on top of it
+        // (SeparatrixTrace::Settings::captureAtSingularities has the
+        // measurements). Applied only when the trace follows Stage 1b's
+        // corrected field: the capture trusts a separatrix to arrive along
+        // a port when it arrives at all, which the first field's cores do not
+        // let it do -- on the multi-material corpus, traced on the first
+        // field, it took T-junctions left from 43 to 151 and three layouts
+        // unsound.
+        SeparatrixTrace::Settings trace = [] {
+            SeparatrixTrace::Settings t;
+            t.captureAtSingularities = true;
+            return t;
+        }();
         // Off: the layout goes on to the blocks exactly as it was traced.
         bool simplify = true;
         PartitionSimplify::Settings simplification;
@@ -127,6 +161,10 @@ public:
         int fieldSteps = 0;
         bool fieldConverged = false;   // under the tolerance, not out of steps
         double fieldError = 0.0;
+        // Stage 1b: whether the trace follows the corrected field, and if it
+        // was asked for and does not, why not.
+        bool conformalTraced = false;
+        std::string conformalFailure;
     };
 
     explicit ZIPLINE(std::shared_ptr<Mesh> mesh);
@@ -144,6 +182,7 @@ public:
     // drawing. True once the field is done (converged or out of steps).
     bool stepField(int steps);
     void finishField();
+    void buildConformalField();               // Stage 1b
     void startTrace();                        // Stage 2: ports, nothing grown
     // One round of growth. True once every separatrix has stopped.
     bool stepTrace();
@@ -163,6 +202,8 @@ public:
     bool hasInterfaces() const { return interfaces != nullptr; }
     bool hasField() const { return field != nullptr; }
     bool fieldFinished() const { return fieldDone; }
+    // Stage 1b ran and built a field (it may have run and declined).
+    bool hasConformalField() const { return conformal && conformal->valid(); }
     bool hasTrace() const { return trace != nullptr; }
     bool traceFinished() const { return trace && trace->finishedTracing; }
     bool hasLayout() const { return layout != nullptr; }
@@ -173,6 +214,14 @@ public:
 
     const Interfaces &getInterfaces() const { return *interfaces; }
     const CrossField &getField() const { return *field; }
+    // Stage 1b's object, built or not (its report says which, and why).
+    // Null until the stage has run, and when it was not asked for.
+    const ConformalField *getConformalField() const { return conformal.get(); }
+    // The field the separatrices follow: Stage 1b's when it built, Stage 1's
+    // otherwise. Only meaningful once the trace exists.
+    const CrossField &getTraceField() const {
+        return (trace && status.conformalTraced) ? *conformal->crossField() : *field;
+    }
     const SeparatrixTrace &getTrace() const { return *trace; }
     // The layout as traced, before Sec. 4.
     const QuadLayout &getLayout() const { return *layout; }
@@ -203,10 +252,12 @@ private:
 
     bool interfacesFound = false;
     bool fieldDone = false;
+    bool conformalTried = false;
     // Each holds on to the one before it, so they are declared in stage order
     // and destroyed in reverse.
     std::unique_ptr<Interfaces> interfaces;
     std::shared_ptr<CrossField> field;
+    std::shared_ptr<ConformalField> conformal;
     std::unique_ptr<SeparatrixTrace> trace;
     std::unique_ptr<QuadLayout> layout;
     std::unique_ptr<PartitionSimplify> simplification;

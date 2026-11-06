@@ -1,5 +1,7 @@
 #include "ZIPLINE/FieldTracer.hxx"
 
+#include "ZIPLINE/ConformalField.hxx"
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -43,6 +45,110 @@ FieldTracer::FieldTracer(std::shared_ptr<CrossField> cf, bool useExactCenters,
     vertexSnap = 1e-9 * avgEdge;
 
     buildSingularities(useExactCenters, boundaryTriangles, absorbAt);
+}
+
+FieldTracer::FieldTracer(std::shared_ptr<CrossField> cf,
+                         std::shared_ptr<const ConformalField> conformal)
+    : crossField(std::move(cf)), conformal_(std::move(conformal)) {
+    mesh = &conformal_->getMesh();
+
+    // The regular part only: the singular one is added wherever the field is
+    // read, from centres_.
+    vertexTheta = conformal_->regularAngles();
+    vertexTheta.resize(mesh->vertices.size(), 0.0);
+
+    double total = 0.0;
+    for (const auto &e : mesh->edges) total += normP(mesh->vertices[e[1]] - mesh->vertices[e[0]]);
+    if (!mesh->edges.empty()) avgEdge = total / static_cast<double>(mesh->edges.size());
+    vertexSnap = 1e-9 * avgEdge;
+
+    centres_.clear();
+    for (const auto &s : conformal_->singularities())
+        centres_.push_back({{s.pos[0], s.pos[1], 0.25 * s.d}});
+    buildConformalSingularities();
+}
+
+double FieldTracer::singularPart(const Point &p) const {
+    double s = 0.0;
+    for (const auto &c : centres_) s += c[2] * std::atan2(p[1] - c[1], p[0] - c[0]);
+    return s;
+}
+
+double FieldTracer::nearestSingularity(const Point &p) const {
+    double best = std::numeric_limits<double>::max();
+    for (const auto &c : centres_) best = std::min(best, std::hypot(p[0] - c[0], p[1] - c[1]));
+    return best;
+}
+
+double FieldTracer::angleAt(int f, const Point &p, double ref) const {
+    const Triangle &tri = mesh->triangles[f];
+    const std::array<double, 3> b = barycentric(f, p);
+    const double t0 = vertexTheta[tri[0]];
+    const double t1 = liftNear(t0, vertexTheta[tri[1]]);
+    const double t2 = liftNear(t0, vertexTheta[tri[2]]);
+    double a = b[0] * t0 + b[1] * t1 + b[2] * t2;
+    if (conformal_) a += singularPart(p);
+    return liftNear(ref, a);
+}
+
+// ---------------------------------------------------------------------------
+// buildConformalSingularities()  --  the pattern, with the closed-form ports
+//
+// C = theta - d omega / 4 is the field less the singularity's own term, which
+// on the corrected field is a smooth function -- the regular part plus every
+// other singularity's term -- and so is simply evaluated at the centre. The
+// ports are then beta = 4 C / (4 - d) and its rotations by 2 pi / (4 - d),
+// exactly as buildSingularities() makes them from its three-corner estimate of
+// C, so the sweep sees the same kind of singularity either way.
+// ---------------------------------------------------------------------------
+void FieldTracer::buildConformalSingularities() {
+    singularityOf.assign(mesh->triangles.size(), -1);
+    singularities.clear();
+    indexSum4 = 0;
+    multipleSingularities = 0;
+    droppedSingularities = 0;
+    absorbedSingularities = 0;
+    absorbedIndex4 = 0;
+    absorbedAt.clear();
+
+    const auto &pattern = conformal_->singularities();
+    for (size_t j = 0; j < pattern.size(); ++j) {
+        const auto &q = pattern[j];
+        if (q.d == 0 || q.triangle < 0) continue;
+        indexSum4 += q.d;
+        if (std::abs(q.d) >= 2) ++multipleSingularities;
+        const int nPorts = 4 - q.d;
+        if (nPorts < 2 || nPorts > 8) { ++droppedSingularities; continue; }
+        if (singularityOf[q.triangle] >= 0) { ++droppedSingularities; continue; }   // merged upstream
+
+        Singularity s;
+        s.triangleIndex = q.triangle;
+        s.d = q.d;
+        s.singularityIndex = 0.25 * q.d;
+        s.coordinates = q.pos;
+        s.barycentric = barycentric(q.triangle, q.pos);
+
+        const Triangle &tri = mesh->triangles[q.triangle];
+        const double r0 = vertexTheta[tri[0]];
+        const double r1 = liftNear(r0, vertexTheta[tri[1]]);
+        const double r2 = liftNear(r0, vertexTheta[tri[2]]);
+        double C = s.barycentric[0] * r0 + s.barycentric[1] * r1 + s.barycentric[2] * r2;
+        for (size_t i = 0; i < centres_.size(); ++i) {
+            if (i == j) continue;
+            C += centres_[i][2] * std::atan2(q.pos[1] - centres_[i][1], q.pos[0] - centres_[i][0]);
+        }
+        s.portResidual = 0.0;
+
+        const double beta = 4.0 * C / static_cast<double>(nPorts);
+        const double sector = 2.0 * M_PI / static_cast<double>(nPorts);
+        const double beta0 = wrap_2pi(beta) - sector * std::floor(wrap_2pi(beta) / sector);
+        s.portAngles.resize(nPorts);
+        for (int k = 0; k < nPorts; ++k) s.portAngles[k] = beta0 + k * sector;
+        s.portSeparatrixIds.assign(nPorts, -1);
+
+        singularityOf[q.triangle] = static_cast<int>(singularities.size());
+        singularities.push_back(std::move(s));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -213,6 +319,7 @@ void FieldTracer::buildSingularities(bool useExactCenters, bool boundaryTriangle
 // Field readings
 // ---------------------------------------------------------------------------
 double FieldTracer::vertexAngle(int v, double ref) const {
+    if (conformal_) return liftNear(ref, vertexTheta[v] + singularPart(mesh->vertices[v]));
     return liftNear(ref, vertexTheta[v]);
 }
 
@@ -221,6 +328,10 @@ double FieldTracer::edgeAngle(int e, double t, double ref) const {
     const int b = mesh->edges[e][1];
     const double ta = vertexTheta[a];
     const double tb = liftNear(ta, vertexTheta[b]);  // the principal matching of this edge
+    if (conformal_) {
+        const Point p = mesh->vertices[a] * (1.0 - t) + mesh->vertices[b] * t;
+        return liftNear(ref, ta * (1.0 - t) + tb * t + singularPart(p));
+    }
     return liftNear(ref, ta * (1.0 - t) + tb * t);
 }
 
@@ -416,6 +527,26 @@ FieldTracer::Status FieldTracer::leaveVertex(Walker &w) const {
         // vertex id is left set for the caller to record where.
         return Status::Boundary;
     }
+    // Along the boundary: a direction lying on a boundary edge out of this
+    // vertex, to rounding. A boundary-aligned field's streamline that runs
+    // exactly along dS *is* dS, and has arrived. Taking it into the wedge
+    // beside that edge instead runs it down the boundary to the next corner,
+    // which is what a reflex corner's separatrix did on the corrected field of
+    // a plus-shaped model (geom018), where the field is the constant cross:
+    // it reached the opposite reflex corner exactly, along the extension of
+    // that corner's own edge, and carried on along the edge. On a first field
+    // no direction ever lies on an edge to 1e-7, so nothing changes there.
+    if (mesh->isBoundaryVertex[v] && bestMargin < 1e-7) {
+        const Triangle &tri = mesh->triangles[best];
+        int i0 = -1;
+        for (int i = 0; i < 3; ++i) if (tri[i] == v) i0 = i;
+        for (const int k : {i0, (i0 + 2) % 3}) {          // the two local edges at v
+            if (i0 < 0 || mesh->triangleAdjacency[best][k] >= 0) continue;
+            const int other = (k == i0) ? tri[(i0 + 1) % 3] : tri[(i0 + 2) % 3];
+            const Point e = mesh->vertices[other] - mesh->vertices[v];
+            if (dotP(e, d) > 0.0 && std::fabs(cross2(e, d)) <= 1e-7 * normP(e)) return Status::Boundary;
+        }
+    }
 
     w.entryEdge = -1;
     w.pos = mesh->vertices[v];
@@ -445,6 +576,7 @@ FieldTracer::Status FieldTracer::advance(Walker &w, std::vector<TracePoint> &pat
 
     const int sing = singularityOf[w.tri];
     if (sing >= 0) return sweepSingular(w, sing, path, cut);
+    if (conformal_) return advanceConformal(w, path);
 
     const int f = w.tri;
     const std::array<double, 3> entryBary = barycentric(f, w.pos);
@@ -499,6 +631,100 @@ FieldTracer::Status FieldTracer::advance(Walker &w, std::vector<TracePoint> &pat
     tp.theta = wrap_pi(thetaExit);
     path.push_back(tp);
 
+    return st;
+}
+
+// ---------------------------------------------------------------------------
+// advanceConformal()  --  one regular triangle of the corrected field
+//
+// The same iterated midpoint rule as advance(), with the direction read at the
+// midpoint of the chord rather than averaged from its two ends (the two agree
+// on an affine angle, which this no longer is), and the chord cut into
+// sub-steps where the singular part turns fast. A sub-step ends inside the
+// triangle, and the next starts from there with nothing to exclude; the last
+// one ends on the triangle's boundary and is handed across exactly as advance()
+// hands it.
+// ---------------------------------------------------------------------------
+FieldTracer::Status FieldTracer::advanceConformal(Walker &w, std::vector<TracePoint> &path) const {
+    const int f = w.tri;
+    Point P = w.pos;
+    int exclude = w.entryEdge;
+    double theta = angleAt(f, P, w.dir);
+    bool first = true;
+
+    for (int sub = 0; sub < 256; ++sub) {
+        const double cap =
+            std::max(conformalSubStep * nearestSingularity(P), 1e-3 * avgEdge);
+
+        // The chord the walk would take along `dir`: to the exit, or `cap`
+        // along it if the exit is further.
+        Point hit{0.0, 0.0};
+        int edge = -1;
+        double along = 0.0;
+        double dir = theta;
+        if (!exitOfRay(f, P, dirOf(dir), exclude, hit, edge, along)) {
+            // Grazing the entry edge: what got the walk across it is the one
+            // direction known to point in (see advance()).
+            if (!first || !exitOfRay(f, P, dirOf(w.crossDir), exclude, hit, edge, along))
+                return Status::Stuck;
+            dir = w.crossDir;
+        }
+        auto endOf = [&](const Point &h, double d, bool &exits) {
+            const double s = normP(h - P);
+            exits = s <= cap;
+            return exits ? h : P + dirOf(d) * cap;
+        };
+        bool exits = false;
+        Point Q = endOf(hit, dir, exits);
+        for (int iter = 0; iter < 6; ++iter) {
+            const double mid = angleAt(f, (P + Q) * 0.5, dir);
+            if (std::fabs(mid - dir) < 1e-13) break;
+            Point h2{0.0, 0.0};
+            int e2 = -1;
+            double a2 = 0.0;
+            if (!exitOfRay(f, P, dirOf(mid), exclude, h2, e2, a2)) break;
+            dir = mid;
+            hit = h2;
+            edge = e2;
+            along = a2;
+            Q = endOf(hit, dir, exits);
+        }
+
+        if (exits) {
+            const double out = angleAt(f, hit, dir);
+            const Status st = crossEdge(w, f, edge, along, hit, out, dir);
+            TracePoint tp;
+            tp.global_pos = (st == Status::Stuck) ? hit : w.pos;
+            tp.face_id = f;
+            tp.theta = wrap_pi(out);
+            path.push_back(tp);
+            return st;
+        }
+
+        TracePoint tp;
+        tp.global_pos = Q;
+        tp.face_id = f;
+        theta = angleAt(f, Q, dir);
+        tp.theta = wrap_pi(theta);
+        path.push_back(tp);
+        P = Q;
+        exclude = -1;
+        first = false;
+    }
+
+    // Out of sub-steps, which a regular triangle should never need: finish on
+    // a straight chord.
+    Point hit{0.0, 0.0};
+    int edge = -1;
+    double along = 0.0;
+    if (!exitOfRay(f, P, dirOf(theta), exclude, hit, edge, along)) return Status::Stuck;
+    const double out = angleAt(f, hit, theta);
+    const Status st = crossEdge(w, f, edge, along, hit, out, theta);
+    TracePoint tp;
+    tp.global_pos = (st == Status::Stuck) ? hit : w.pos;
+    tp.face_id = f;
+    tp.theta = wrap_pi(out);
+    path.push_back(tp);
     return st;
 }
 

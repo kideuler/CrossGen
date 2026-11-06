@@ -35,6 +35,13 @@ const Table<ZIPLINE::Options> &optionsTable() {
         OPT(fieldMaxSteps),
         OPT(fieldTolerance),
         OPT(fieldSeed),
+        OPT(secondField),
+        OPT(conformal.alignHoles),
+        OPT(conformal.cancelDipoles),
+        OPT(conformal.dipoleRadius),
+        OPT(conformal.relocateCornerSingularities),
+        OPT(conformal.cornerRelocation),
+        OPT(conformal.relocationRadius),
         OPT(trace.maxStepsPerSeparatrix),
         OPT(trace.cutAtSingularities),
         OPT(trace.singularityCutRadius),
@@ -48,6 +55,15 @@ const Table<ZIPLINE::Options> &optionsTable() {
         OPT(trace.resumeAfterTruncation),
         OPT(trace.singularitiesAtBoundary),
         OPT(trace.respectInterfaces),
+        OPT(trace.captureAtSingularities),
+        OPT(trace.captureRadius),
+        OPT(trace.captureMisfit),
+        OPT(trace.stopAtCrossings),
+        OPT(trace.reduceSeparatrices),
+        OPT(trace.cutLimitCycles),
+        OPT(trace.orthogonalTolerance),
+        OPT(trace.maxLengthDiagonals),
+        OPT(trace.seedUntouchedHoles),
         OPT(simplify),
         OPT(simplification.zipAngle),
         OPT(simplification.zipLengthOfPatch),
@@ -73,7 +89,8 @@ const Table<ZIPLINE::Options> &optionsTable() {
 
 const Table<ZIPLINE::Status> &statusTable() {
     using O = ZIPLINE::Status;
-    static const Table<O> t{REP(fieldSteps), REP(fieldConverged), REP(fieldError)};
+    static const Table<O> t{REP(fieldSteps), REP(fieldConverged), REP(fieldError),
+                            REP(conformalTraced), REP(conformalFailure)};
     return t;
 }
 
@@ -189,7 +206,9 @@ const MethodSpec ziplineSpec = {
     "zipline",
     "zipline(**options) -> BlockDecomposition\n\n"
     "ZIPLINE (Viertel, Osting and Staten, IMR 2019): a cross field, the\n"
-    "separatrix partition traced from its singularities, the Sec. 4\n"
+    "corrected field with its singularities (docs/quad_layout_pipeline.md\n"
+    "Sec. 6, `second_field`), the separatrix partition traced from them with\n"
+    "critical-patch capture and Sec. 8's reduction, the Sec. 4\n"
     "simplification, and the four-sided components as blocks. Faces with a\n"
     "T-junction on a side are not blocks, so read the result by `coverage`.\n\n"
     "Keywords are the fields of ZIPLINE::Options in snake_case\n"

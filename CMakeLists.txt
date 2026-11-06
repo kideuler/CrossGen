@@ -237,6 +237,8 @@ add_library(PolyVector SHARED
     src/UMBER/BlockLayout.cxx
     src/ZIPLINE/FieldTracer.hxx
     src/ZIPLINE/FieldTracer.cxx
+    src/ZIPLINE/ConformalField.hxx
+    src/ZIPLINE/ConformalField.cxx
     src/ZIPLINE/SeparatrixTrace.hxx
     src/ZIPLINE/SeparatrixTrace.cxx
     src/ZIPLINE/QuadLayout.hxx

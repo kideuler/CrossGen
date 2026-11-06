@@ -38,6 +38,24 @@
 //   --no-disk-pin           leave disk inclusions' centres free in the field
 //   --seed n, --field-tol t the MBO field's random start and its stopping
 //                           tolerance (ZIPLINE::Options; 0 seeds from the clock)
+//   --first-field           trace the MBO field itself, not Stage 1b's corrected
+//                           field (ZIPLINE::Options::secondField off)
+//   --viertel               Viertel's rules only (no capture); the default is
+//                           his rules plus docs/quad_layout_pipeline.md Sec.
+//                           7.5's critical-patch capture and Sec. 8's reduction
+//                           on the corrected field (--capture-stop, explicitly)
+//   --capture               Secs. 7-9 as written: capture, no stopping at
+//                           crossings, Sec. 8's reduction, Sec. 9's cut
+//   --capture-stop          capture, keeping Viertel's stopping rules too
+//   --no-hole-seeds         leave a hole nothing touches unseeded (an annulus
+//                           then has one face that is not a disc)
+//   --capture-radius r, --capture-misfit f, --no-reduce, --no-cycles
+//                           SeparatrixTrace::Settings for the above
+//   --no-align-holes, --no-dipoles, --no-relocate, --relocate f
+//                           Stage 1b without its hole correction, its dipole
+//                           cancellation or its valence-2 corner repair, or
+//                           with the repair moving the singularity f of the way
+//                           in (ConformalField::Options)
 //   --dump <prefix>         <prefix>_<model>_{layout,blocks,mesh}.obj and
 //                           _tj.txt: the simplified layout, the blocks, the mesh
 //                           and the T-junctions, for looking at
@@ -69,6 +87,7 @@
 #include "ZIPLINE/PartitionSimplify.hxx"
 #include "ZIPLINE/QuadLayout.hxx"
 #include "ZIPLINE/SeparatrixTrace.hxx"
+#include "ZIPLINE/TriangleLocator.hxx"
 #include "ZIPLINE/ZIPLINE.hxx"
 
 static const char *reasonName(TerminationReason r) {
@@ -81,6 +100,9 @@ static const char *reasonName(TerminationReason r) {
         case TerminationReason::LIMIT_CYCLE:        return "limit-cycle";
         case TerminationReason::STUCK:              return "STUCK";
         case TerminationReason::TANGENTIAL:         return "tangential";
+        case TerminationReason::AT_SINGULARITY:     return "at-a-singular-point";
+        case TerminationReason::REDUNDANT:          return "redundant";
+        case TerminationReason::CUT_LIMIT_CYCLE:    return "cut-limit-cycle";
     }
     return "?";
 }
@@ -285,6 +307,30 @@ static Outcome processMesh(const std::string &path, bool writeVtu, bool verbose,
                   << mesh->vertices.size() << " vertices\n";
         std::cout << "  cross field   " << trace.singularities.size() << " singularities, error "
                   << crossField.error << "\n";
+        if (const ConformalField *cf = zipline.getConformalField()) {
+            const ConformalField::Report &c = cf->getReport();
+            if (c.built) {
+                std::cout << std::setprecision(3) << "  second field  traced on: " << c.singularities
+                          << " singularities (" << c.dipolesCancelled << " dipole(s) cancelled, " << c.merged
+                          << " merged, " << c.relocated << " moved off a corner), " << c.corners << " corners (" << c.cornersReread
+                          << " re-read off the first field), " << c.holes << " hole(s); load sum "
+                          << std::scientific << c.loadSum << ", CR mismatch " << c.maxMidpointMismatch
+                          << ", anchor tangency " << c.anchorTangency << std::defaultfloat
+                          << std::setprecision(3) << "; vertex spread " << c.vertexSpread * 180.0 / M_PI
+                          << " deg, regular turn " << c.maxRegularTurnPerEdge * 180.0 / M_PI << " deg/edge";
+                if (c.holes) {
+                    std::cout << "; hole offsets";
+                    for (const double d : c.holeOffsets) std::cout << " " << d * 180.0 / M_PI;
+                    std::cout << " deg (spread " << c.holeSpread * 180.0 / M_PI << "), after "
+                              << c.holeTangency * 180.0 / M_PI << " deg";
+                }
+                std::cout << std::setprecision(6) << "\n";
+            } else {
+                std::cout << "  second field  NOT built: " << c.failure << "; traced on the first\n";
+            }
+        } else if (!zipline.getStatus().conformalFailure.empty()) {
+            std::cout << "  second field  not used: " << zipline.getStatus().conformalFailure << "\n";
+        }
         std::cout << "  Poincare-Hopf sum d " << tr.interiorIndexSum4 << " + sum(2 - q) "
                   << tr.boundaryIndexSum4 << " = " << (tr.interiorIndexSum4 + tr.boundaryIndexSum4)
                   << " against 4 chi = " << 4 * tr.eulerCharacteristic
@@ -294,11 +340,11 @@ static Outcome processMesh(const std::string &path, bool writeVtu, bool verbose,
         if (tr.multipleSingularities) std::cout << "; " << tr.multipleSingularities << " with |d| >= 2";
         if (tr.droppedSingularities) std::cout << "; " << tr.droppedSingularities << " without ports";
         std::cout << "\n";
-        int byReason[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        int byReason[11] = {0};
         for (const auto &s : trace.separatrices) byReason[static_cast<int>(s.termination_reason)]++;
         std::cout << "  separatrices  " << trace.separatrices.size() << " (";
         bool first = true;
-        for (int i = 0; i < 8; ++i) {
+        for (int i = 0; i < 11; ++i) {
             if (!byReason[i]) continue;
             if (!first) std::cout << ", ";
             std::cout << byReason[i] << " " << reasonName(static_cast<TerminationReason>(i));
@@ -307,7 +353,16 @@ static Outcome processMesh(const std::string &path, bool writeVtu, bool verbose,
         std::cout << "); " << tr.heteroclinicJoins << " join(s), " << tr.cornerJoins
                   << " at a corner, " << tr.resumed << " resumed, "
                   << tr.crossingsRetracted << " crossing(s) retracted, "
-                  << tr.tangentialBoundaryExits << " tangential landing(s)\n";
+                  << tr.tangentialBoundaryExits << " tangential landing(s)"
+                  << (tr.holeSeeds ? ", " + std::to_string(tr.holeSeeds) + " seeded from untouched holes" : std::string())
+                  << "\n";
+        if (trace.getSettings().captureAtSingularities)
+            std::cout << "  capture       " << tr.captures << " capture(s) into a critical patch, "
+                      << tr.connections << " kept as connections, " << tr.released << " undone ("
+                      << tr.lenses << " for a lens); "
+                      << tr.redundant << " copies removed (" << tr.reciprocal << " the true other copy); "
+                      << tr.limitCycles << " limit cycle(s), " << tr.limitCyclesCut << " cut; "
+                      << tr.slotAuditFailures << " singular point(s) failing the slot audit\n";
         if (interfaces) {
             const Interfaces::Report &ir = interfaces->getReport();
             std::cout << "  interfaces    " << ir.materials << " materials, " << ir.interfaceEdges
@@ -916,6 +971,8 @@ void zipCollapse() {
           "leaves and meets each singularity along its separatrix, and never turns sharply");
 }
 
+std::shared_ptr<Mesh> polarDisk(int nr, int na, double R);
+
 // The ZIPLINE class, which TestZIPLINE and the viewer both run. The viewer's
 // way through it -- the field two MBO steps at a time, the trace a round at a
 // time -- has to arrive at exactly the field, layout and blocks run() does, and
@@ -956,6 +1013,28 @@ void ziplineClass() {
               a.getBlocks().getReport().straddlingBlocks == 0,
           "the network found and honoured: no block in two materials");
 
+    // One material: the corrected field and the capture are in play, and
+    // the reduction can restart separatrices after the trace has stopped --
+    // stepping must still land exactly where run() does.
+    {
+        const auto disk = polarDisk(10, 40, 1.0);
+        ZIPLINE p(disk, o), q(disk, o);
+        p.run(ZIPLINE::Stage::Blocks);
+        q.findInterfaces();
+        q.startField();
+        while (!q.stepField(3)) {}
+        q.startTrace();
+        while (!q.stepTrace()) {}
+        q.buildLayout();
+        q.simplifyLayout();
+        q.buildBlocks();
+        check(p.getStatus().conformalTraced && q.getStatus().conformalTraced && same(p, q) &&
+                  p.getTrace().getReport().connections == q.getTrace().getReport().connections,
+              "on the corrected field, with capture: stepping gives exactly what run() gives (" +
+                  std::to_string(p.getTrace().getReport().connections) + " connections, " +
+                  std::to_string(p.getBlocks().getReport().blocks) + " blocks)");
+    }
+
     // Running a stage again discards the stages after it and nothing before.
     check(a.buildMesh() && a.smooth() && a.hasSmoothedMesh(), "meshed and smoothed");
     BlockQuadMesh::Options coarse;
@@ -967,7 +1046,185 @@ void ziplineClass() {
           "re-meshing coarser keeps the blocks and drops the smoothed mesh");
 }
 
+// ---------------------------------------------------------------------------
+// The corrected field (ConformalField, docs/quad_layout_pipeline.md Sec. 6) and
+// the tracing of Secs. 7-8 on it, against what the doc says they must give.
+// ---------------------------------------------------------------------------
+
+// A disk of radius R as rings round a centre vertex: `na` vertices on every
+// ring (a multiple of 4 keeps the axes on mesh lines), `nr` rings.
+std::shared_ptr<Mesh> polarDisk(int nr, int na, double R) {
+    std::vector<Point> V{Point{0.0, 0.0}};
+    std::vector<Triangle> T;
+    for (int r = 1; r <= nr; ++r)
+        for (int a = 0; a < na; ++a) {
+            const double phi = 2.0 * M_PI * (a + 0.5 * (r % 2)) / na;
+            V.push_back(Point{R * r / nr * std::cos(phi), R * r / nr * std::sin(phi)});
+        }
+    auto id = [&](int r, int a) { return r == 0 ? 0 : 1 + (r - 1) * na + ((a % na) + na) % na; };
+    for (int a = 0; a < na; ++a) T.push_back({0, id(1, a), id(1, a + 1)});
+    for (int r = 1; r < nr; ++r)
+        for (int a = 0; a < na; ++a) {
+            // Ring r + 1 is offset half a step from ring r, alternately.
+            const int a0 = id(r, a), a1 = id(r, a + 1);
+            const int b0 = (r % 2) ? id(r + 1, a + 1) : id(r + 1, a), b1 = (r % 2) ? id(r + 1, a) : id(r + 1, a - 1);
+            if (r % 2) {
+                T.push_back({a0, b0, a1});
+                T.push_back({a0, b1, b0});
+            } else {
+                T.push_back({a0, id(r + 1, a), a1});
+                T.push_back({a1, id(r + 1, a), id(r + 1, a + 1)});
+            }
+            (void)b1;
+        }
+    // Every triangle counter-clockwise.
+    for (Triangle &t : T)
+        if (cross2(V[t[1]] - V[t[0]], V[t[2]] - V[t[0]]) < 0.0) std::swap(t[1], t[2]);
+    return std::make_shared<Mesh>(V, T);
+}
+
+// The square [-1, 1]^2 less the disk of radius r0: rings from the circle out
+// to the square along rays, `na` a multiple of 8 so the four corners are on
+// rays.
+std::shared_ptr<Mesh> squareLessDisk(int nr, int na, double r0) {
+    std::vector<Point> V;
+    for (int r = 0; r <= nr; ++r)
+        for (int a = 0; a < na; ++a) {
+            const double phi = 2.0 * M_PI * a / na;
+            const Point d{std::cos(phi), std::sin(phi)};
+            const double outer = 1.0 / std::max(std::fabs(d[0]), std::fabs(d[1]));
+            const double rr = r0 + (outer - r0) * r / nr;
+            V.push_back(d * rr);
+        }
+    std::vector<Triangle> T;
+    auto id = [&](int r, int a) { return r * na + ((a % na) + na) % na; };
+    for (int r = 0; r < nr; ++r)
+        for (int a = 0; a < na; ++a) {
+            const int p = id(r, a), q = id(r, a + 1), u = id(r + 1, a), w = id(r + 1, a + 1);
+            if ((r + a) % 2) { T.push_back({p, q, w}); T.push_back({p, w, u}); }
+            else { T.push_back({p, q, u}); T.push_back({q, w, u}); }
+        }
+    for (Triangle &t : T)
+        if (cross2(V[t[1]] - V[t[0]], V[t[2]] - V[t[0]]) < 0.0) std::swap(t[1], t[2]);
+    return std::make_shared<Mesh>(V, T);
+}
+
+std::vector<ConformalField::Singular> patternAt(const Mesh &m, const std::vector<std::pair<Point, int>> &pts) {
+    TriangleLocator loc(m);
+    std::vector<ConformalField::Singular> out;
+    for (const auto &[p, d] : pts) out.push_back(ConformalField::Singular{p, loc.locate(p), d});
+    return out;
+}
+
+void conformalField() {
+    std::cout << "the corrected field (Sec. 6): square less a disk, four valence-5 (Sec. 6.8)\n";
+    const auto m = squareLessDisk(18, 96, 0.4);
+    auto ring = [&](double beta) {
+        std::vector<std::pair<Point, int>> pts;
+        for (int k = 0; k < 4; ++k) {
+            // Off the diagonals by beta, and a hair off the mesh's rays so
+            // that none sits on an edge.
+            const double phi = M_PI_4 + k * M_PI_2 + beta + 0.003;
+            pts.push_back({Point{0.92 * std::cos(phi), 0.92 * std::sin(phi)}, -1});
+        }
+        return patternAt(*m, pts);
+    };
+    ConformalField::Options raw;
+    raw.alignHoles = false;
+    const ConformalField sym(m, ring(0.0), raw);
+    const ConformalField::Report &r = sym.getReport();
+    check(r.built && r.poincareHopf && r.holes == 1 && r.corners == 4,
+          "built: Poincare-Hopf holds with the four corners at +1/4 (" + (r.built ? std::string("ok") : r.failure) + ")");
+    if (!r.built) return;
+    check(r.loadSum < 1e-10 && r.maxMidpointMismatch < 1e-10 && r.anchorTangency < 1e-10,
+          "the right-hand side sums to zero, Crouzeix-Raviart theta is consistent at every midpoint, and "
+          "the outer loop is tangent, all to rounding (Secs. 6.3, 6.5)");
+    check(r.holeOffsets.size() == 1 && std::fabs(r.holeOffsets[0]) < 0.5 * M_PI / 180.0 && r.holeSpread < 1e-9,
+          "symmetric: the hole is tangent too (offset " + std::to_string(r.holeOffsets[0] * 180.0 / M_PI) +
+              " deg), and the offset is one constant along it");
+    const ConformalField turned(m, ring(20.0 * M_PI / 180.0), raw);
+    const double off = turned.valid() ? turned.getReport().holeOffsets[0] : 0.0;
+    check(turned.valid() && std::fabs(off) > 5.0 * M_PI / 180.0 && turned.getReport().holeSpread < 1e-9,
+          "turned 20 degrees off the diagonals: the hole is " + std::to_string(off * 180.0 / M_PI) +
+              " deg off tangent, a constant offset (Sec. 6.8's mechanism)");
+    const ConformalField aligned(m, ring(20.0 * M_PI / 180.0));
+    check(aligned.valid() && aligned.getReport().holeTangency < 2.0 * M_PI / 180.0,
+          "with Options::alignHoles the offset is gone (" +
+              std::to_string(aligned.getReport().holeTangency * 180.0 / M_PI) + " deg left on the vertices)");
+
+    // The closed-form ports (Sec. 7.3) are where the field is radial.
+    const FieldTracer tracer(aligned.crossField(),
+                             std::make_shared<ConformalField>(m, ring(20.0 * M_PI / 180.0)));
+    double worst = 0.0;
+    for (const Singularity &s : tracer.getSingularities())
+        for (const double port : s.portAngles) {
+            const Point q = s.coordinates + Point{std::cos(port), std::sin(port)} * 0.01;
+            TriangleLocator loc(*m);
+            const int f = loc.locate(q);
+            if (f < 0) continue;
+            const double th = tracer.angleAt(f, q, port);
+            worst = std::max(worst, std::fabs(th - port));
+        }
+    check(tracer.getSingularities().size() == 4 && worst < 0.02,
+          "the field is radial along every closed-form port (worst " + std::to_string(worst * 180.0 / M_PI) + " deg)");
+
+    std::cout << "Sec. 8.1's example: a disk with four valence-3 -- 12 traced, 8 kept, 5 patches\n";
+    {
+        const auto d = polarDisk(16, 64, 1.0);
+        std::vector<std::pair<Point, int>> pts;
+        for (int k = 0; k < 4; ++k) {
+            const double phi = k * M_PI_2 + 0.013;
+            pts.push_back({Point{0.5 * std::cos(phi), 0.5 * std::sin(phi)}, 1});
+        }
+        auto cf = std::make_shared<ConformalField>(d, patternAt(*d, pts));
+        check(cf->valid() && cf->getReport().corners == 0, "built on a smooth boundary with no corners");
+        if (!cf->valid()) return;
+        SeparatrixTrace::Settings st;
+        st.captureAtSingularities = true;
+        st.stopAtCrossings = false;
+        SeparatrixTrace trace(cf->crossField(), true, st, nullptr, cf);
+        trace.run();
+        int kept = 0, redundant = 0, boundary = 0;
+        for (const Separatrix &s : trace.separatrices) {
+            kept += s.termination_reason == TerminationReason::AT_SINGULARITY;
+            redundant += s.termination_reason == TerminationReason::REDUNDANT;
+            boundary += s.termination_reason == TerminationReason::EXIT_BOUNDARY;
+        }
+        const auto &tr = trace.getReport();
+        check(trace.separatrices.size() == 12 && kept == 4 && redundant == 4 && boundary == 4 &&
+                  tr.reciprocal == 4 && tr.slotAuditFailures == 0,
+              "four connections each traced from both ends, one copy of each removed, four to dS (" +
+                  std::to_string(kept) + " / " + std::to_string(redundant) + " / " + std::to_string(boundary) + ")");
+        QuadLayout layout(trace);
+        layout.build();
+        const auto &lr = layout.getReport();
+        check(lr.faces == 5 && lr.quadFaces == 5 && lr.tJunctions == 0 && lr.arcCrossings == 0,
+              "five four-sided patches, a centre and four round it (" + std::to_string(lr.faces) + ")");
+        const LayoutBlocks lb(layout, *d);
+        check(lb.getReport().blocks == 5 && lb.coverage() > 1.0 - 1e-12 && checkBlocks(lb).empty(),
+              "five blocks covering the disk");
+    }
+
+    std::cout << "the L-shape on the corrected field: the constant cross, traced on mesh lines\n";
+    {
+        const auto m = grid(10, [](double x, double y) { return x < 0.5 || y < 0.5; });
+        ZIPLINE::Options o;
+        o.fieldMaxSteps = 200;
+        ZIPLINE z(m, o);
+        z.run(ZIPLINE::Stage::Blocks);
+        const ConformalField *cf = z.getConformalField();
+        check(cf && cf->valid() && cf->getReport().singularities == 0 && z.getStatus().conformalTraced &&
+                  cf->getReport().maxRegularTurnPerEdge < 1e-9,
+              "no singularity, and the regular part constant: the field is the constant cross");
+        const auto &lr = z.getLayout().getReport();
+        check(z.getTrace().separatrices.size() == 2 && lr.faces == 3 && lr.arcCrossings == 0 &&
+                  z.getBlocks().getReport().blocks == 3 && z.getBlocks().coverage() > 1.0 - 1e-12,
+              "the reflex corner's two separatrices run straight down the grid to dS: three blocks");
+    }
+}
+
 int run() {
+    conformalField();
     ziplineClass();
     zipCollapse();
     singularityModel();
@@ -1012,6 +1269,28 @@ int main(int argc, char **argv) {
         else if (a == "--shifted-untangler") gFlags.zipline.tmop.untangler = mesh::TMOP::UntangleShifted;
         else if (a == "--no-interfaces") gFlags.zipline.materialInterfaces = false;
         else if (a == "--no-disk-pin") gFlags.zipline.pinDiskCenters = false;
+        else if (a == "--first-field") gFlags.zipline.secondField = false;
+        else if (a == "--capture") {
+            gFlags.zipline.trace.captureAtSingularities = true;
+            gFlags.zipline.trace.stopAtCrossings = false;
+        }
+        else if (a == "--capture-stop") {        // capture, with Viertel's stops kept
+            gFlags.zipline.trace.captureAtSingularities = true;
+            gFlags.zipline.trace.stopAtCrossings = true;
+        }
+        else if (a == "--viertel") {
+            gFlags.zipline.trace.captureAtSingularities = false;
+            gFlags.zipline.trace.stopAtCrossings = true;
+        }
+        else if (a == "--capture-radius") gFlags.zipline.trace.captureRadius = std::atof(next());
+        else if (a == "--capture-misfit") gFlags.zipline.trace.captureMisfit = std::atof(next());
+        else if (a == "--no-reduce") gFlags.zipline.trace.reduceSeparatrices = false;
+        else if (a == "--no-cycles") gFlags.zipline.trace.cutLimitCycles = false;
+        else if (a == "--no-hole-seeds") gFlags.zipline.trace.seedUntouchedHoles = false;
+        else if (a == "--no-align-holes") gFlags.zipline.conformal.alignHoles = false;
+        else if (a == "--no-dipoles") gFlags.zipline.conformal.cancelDipoles = false;
+        else if (a == "--no-relocate") gFlags.zipline.conformal.relocateCornerSingularities = false;
+        else if (a == "--relocate") gFlags.zipline.conformal.cornerRelocation = std::atof(next());
         else if (a == "--seed") gFlags.zipline.fieldSeed = static_cast<unsigned>(std::atol(next()));
         else if (a == "--field-tol") gFlags.zipline.fieldTolerance = std::atof(next());
         else if (a == "--mesh") gFlags.meshTarget = std::atof(next());

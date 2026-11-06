@@ -8,6 +8,7 @@
 #include "ZIPLINE/FieldTracer.hxx"
 
 class Interfaces;
+class ConformalField;
 
 // ---------------------------------------------------------------------------
 // The separatrices of a cross field, traced until the stopping conditions of
@@ -60,7 +61,11 @@ enum class TerminationReason {
     HETEROCLINIC,       // met another separatrix head-on and was joined to it
     LIMIT_CYCLE,        // ran past the step budget without ever meeting anything
     STUCK,              // the walk could not be continued; a bug or a broken mesh
-    TANGENTIAL          // met another separatrix running the same way, at a shallow angle
+    TANGENTIAL,         // met another separatrix running the same way, at a shallow angle
+    // Settings::captureAtSingularities (docs/quad_layout_pipeline.md Secs. 7-9):
+    AT_SINGULARITY,     // entered a singular point's critical patch and was joined to it
+    REDUNDANT,          // the other copy of a separatrix traced from both ends: removed
+    CUT_LIMIT_CYCLE     // a limit cycle, cut at its first orthogonal crossing: a T-junction
 };
 
 enum class SeparatrixOrigin { Singularity, BoundaryCorner, InterfaceNode };
@@ -82,6 +87,16 @@ struct Separatrix {
     // Where it stopped, when it left through the boundary.
     int endBoundaryEdge = -1;    // global mesh edge id, -1 if it left at a vertex
     int endBoundaryVertex = -1;
+
+    // AT_SINGULARITY: the singular point it was joined to -- an interior
+    // singularity, a corner of dS or an interface node, by `endKind`, indexed
+    // as origin_singularity_id is -- the port of that point it came in along
+    // (Sec. 7.6's arrival slot), and how far off that port's direction it
+    // arrived, in radians.
+    SeparatrixOrigin endKind = SeparatrixOrigin::Singularity;
+    int endSingularity = -1;
+    int endPort = -1;
+    double arrivalMisfit = 0.0;
 };
 
 // Two separatrices meeting transversally, recorded as they are traced so the
@@ -289,6 +304,95 @@ public:
         // separatrix crossing an interface is a node on it. Off traces as if
         // the model had one material, which is the ablation.
         bool respectInterfaces = true;
+
+        // ---- the tracing of docs/quad_layout_pipeline.md Secs. 7-9 ----------
+        //
+        // Jezdimirovic et al.'s rules instead of Viertel's (P1 Sec. 5, P2
+        // Sec. 6.1). Viertel stops a separatrix where it meets what is
+        // already there -- a second crossing, a near miss of a singularity
+        // -- and leaves a T-junction, because on a field that misses its
+        // targets by a fraction of an edge that is what keeps the partition
+        // finite. On the corrected field (ConformalField) the targets are
+        // where the field says they are, and the near miss can be taken for
+        // what it is in the continuum, a connection:
+        //
+        //   * Sec. 7.5 rule 2: a separatrix entering the *critical patch* of a
+        //     singular point -- a disk of captureRadius local mean edges round
+        //     an interior singularity, a corner of dS that emits, or an
+        //     interface node -- is joined to that point by a straight last
+        //     segment (P1 Fig. 13), arriving along the port of it nearest its
+        //     arrival (the slot of Sec. 7.6).
+        //   * Sec. 7.1: separatrices do *not* stop on one another
+        //     (stopAtCrossings off). Every crossing is recorded and nothing
+        //     else is done with it.
+        //   * Sec. 8 (P1 Algorithm 1 with the slot test of Sec. 8.7c): a
+        //     connection between two singular points is traced from both
+        //     ends; one copy is kept -- the smaller arrival misfit, Sec. 8.7d
+        //     -- and the other removed. A capture whose slot is already
+        //     taken, or whose own copy is a connection to somewhere else, is
+        //     undone and the separatrix traced on past the point: P1 Sec. 10's
+        //     re-propagation (Sec. 12.4 here).
+        //   * Sec. 9: what is left crossing one separatrix twice, or reaching
+        //     dS far from square, or running out of length, is a limit cycle
+        //     and is cut at its first square crossing -- a T-junction, which
+        //     Sec. 4 of Viertel and StemExtension then deal with as before.
+        //
+        // The critical patch trades two failures against each other (Sec.
+        // 7.2): too small and a near miss runs on, too large and a separatrix
+        // that should pass a point is captured by it.
+        //
+        // Off here, so SeparatrixTrace on its own traces as Viertel does; on in
+        // ZIPLINE::Options, which applies it only when the trace follows the
+        // corrected field. Measured over data/meshes/singlemat (h = 0.05,
+        // TMOP 200 sweeps), with Viertel's stops kept (stopAtCrossings) and
+        // captureRadius at each value, against Viertel alone on the same
+        // corrected field:
+        //
+        //   radius   cover%  full  T-jct  raw T  blocks  folded  TMOP worst  < 0.3
+        //   off      99.50    30    14     438    1300     0       0.817       0
+        //   0.5      99.67    31    10     144    1280     0       0.817       0
+        //   0.75     99.67    31    10      52    1288     1       0.818       0
+        //   1.0      99.60    30    12      26    1266     1       0.814       1
+        //   1.5      99.72    31     8      24    1171     1       0.820       1
+        //
+        // ("folded": models with an inverted element before TMOP.) Half an
+        // edge is the largest patch that folds nothing: at a full edge the
+        // last segment of a capture bends a connection into its point over a
+        // whole element, and that hook, a side of two blocks, is where the
+        // transfinite grid turns over (geom015). Without Viertel's stops --
+        // P2 as written -- the same radius covers 98.8% and leaves one model
+        // unsound: what the patch misses winds on and is cut as a limit cycle
+        // where nothing can remove the T-junction (geom026, a hole ringed by
+        // closed trajectories).
+        bool captureAtSingularities = false;
+        double captureRadius = 0.5;
+        // A capture stands only when the separatrix was running back along a
+        // port of the point -- within this fraction of the half-gap between
+        // that port and the direction beside it (buildTargets() has the
+        // numbers). Further off, it is passing the point and is traced on.
+        double captureMisfit = 0.5;
+        // Viertel's stopping rules 2 and 3, the joins and the tangential stop.
+        // Off is Sec. 7.1: every separatrix runs to dS, to a critical patch,
+        // or out of length.
+        bool stopAtCrossings = true;
+        // Sec. 8's reduction and Sec. 9's limit-cycle cut, with capture on.
+        bool reduceSeparatrices = true;
+        bool cutLimitCycles = true;
+        // Sec. 9.3: within this of square is a crossing a limit cycle may be
+        // cut at, and an arrival on dS that is not a limit cycle (the doc's
+        // 15-20 degrees).
+        double orthogonalTolerance = M_PI / 9.0;
+        // With stopAtCrossings off nothing else stops a separatrix winding
+        // onto a cycle, so it gets a length as well as a step budget: this
+        // many bounding-box diagonals (Sec. 14: "a few times").
+        double maxLengthDiagonals = 4.0;
+
+        // A hole no separatrix touches once tracing stops -- an annulus with
+        // no corner above all, which has no singularity to trace from (docs/
+        // quad_layout_pipeline.md Sec. 6.9) -- is cut by four streamlines
+        // square to it (seedUntouchedHoles()). Off leaves the face round it a
+        // face that is not a disc, and no blocks.
+        bool seedUntouchedHoles = true;
     };
 
     // What the trace did that is not visible in the separatrices themselves.
@@ -324,6 +428,28 @@ public:
         // Crossings shallower than tangentialAngle: a separatrix running
         // alongside an interface rather than across it.
         int interfaceGrazes = 0;
+
+        // Settings::captureAtSingularities. Captures made (counting each
+        // re-made one again), kept as connections, and undone (re-propagated);
+        // copies removed, of which `reciprocal` were the true other copy
+        // (Sec. 8.7c: start slot of one = arrival slot of the other) and the
+        // rest a capture whose other copy had run on elsewhere; limit cycles
+        // cut, and ones Sec. 9 found but could not cut (no square crossing).
+        int captures = 0;
+        int connections = 0;
+        int released = 0;
+        int redundant = 0;
+        int reciprocal = 0;
+        int limitCycles = 0;
+        int limitCyclesCut = 0;
+        // Captures undone because, with a connection already kept between
+        // the same two points, they made a loop round nothing (Sec. 8.2).
+        int lenses = 0;
+        // Sec. 8.6 step 4: singular points with a slot used by no separatrix
+        // or by two, after the reduction. Zero is the check.
+        int slotAuditFailures = 0;
+        // Settings::seedUntouchedHoles: streamlines launched from holes.
+        int holeSeeds = 0;
     };
 
     // `useActualSingularityCoordinates` is passed through to FieldTracer: solve
@@ -332,8 +458,14 @@ public:
     // `interfaces` is the material interface network of the model, or null.
     // It is read, not kept beyond the object's life, and must outlive it: the
     // layout built on this trace reads the branches off it too.
+    // `conformal`, when given, is the corrected field of docs/
+    // quad_layout_pipeline.md Sec. 6 (ConformalField) and is what is traced:
+    // its singularities, its closed-form ports, its exact singular part. `cf`
+    // is then that field as a CrossField. Ignored with interfaces, which the
+    // corrected field does not know.
     SeparatrixTrace(std::shared_ptr<CrossField> cf, bool useActualSingularityCoordinates,
-                    const Settings &settings, const Interfaces *interfaces = nullptr);
+                    const Settings &settings, const Interfaces *interfaces = nullptr,
+                    std::shared_ptr<const ConformalField> conformal = nullptr);
     explicit SeparatrixTrace(std::shared_ptr<CrossField> cf,
                              bool useActualSingularityCoordinates = true)
         : SeparatrixTrace(std::move(cf), useActualSingularityCoordinates, Settings()) {}
@@ -392,7 +524,9 @@ private:
 
     // Register the segments a step just added and act on what they crossed.
     // Returns false when the separatrix was terminated part way through them.
-    bool registerNewSegments(Separatrix &sep, int firstNewIndex);
+    // `stopRules` false records the crossings and applies none of Viertel's
+    // stopping rules to them (a capture's last segment).
+    bool registerNewSegments(Separatrix &sep, int firstNewIndex, bool stopRules = true);
 
     // A separatrix that has just reached the boundary: if it arrived tangentially
     // and a corner of the model is within reach, move its last point onto that
@@ -408,6 +542,47 @@ private:
 
     void terminateAt(Separatrix &sep, int segIndex, const Point &at, TerminationReason why,
                      int onSep, int onSeg);
+
+    // ---- Settings::captureAtSingularities --------------------------------
+    // A singular point a separatrix can be joined to: its position, the
+    // radius of its critical patch, what it is, and its ports -- the
+    // directions its own separatrices leave in, and which they are.
+    struct Target {
+        Point pos{0.0, 0.0};
+        double radius = 0.0;
+        SeparatrixOrigin kind = SeparatrixOrigin::Singularity;
+        int index = -1;              // into singularities / boundaryCorners / interfaceNodes
+        int triangle = -1;           // the singular triangle; -1 for a mesh vertex
+        int vertex = -1;             // the mesh vertex of a corner or a node
+        std::vector<double> portDirs;
+        std::vector<int> portSeps;
+        double maxMisfit = M_PI;     // Settings::captureMisfit, in radians, for this point
+        std::vector<double> sideDirs; // the ports and, at a vertex, the walls of its wedge
+    };
+    void buildTargets();
+    // The first place along the segments from `firstNew` on where separatrix
+    // k enters a critical patch it may be captured by, and the patch: false
+    // when there is none. On success `seg` is the segment and `t` the
+    // parameter along it.
+    bool findCapture(int k, int firstNew, int &seg, double &t, int &target) const;
+    // The straight approach from `from` (in triangle `tri`) to a target, as
+    // trace points one per triangle crossed; false if it leaves the mesh.
+    bool approach(int tri, const Point &from, const Target &g, std::vector<TracePoint> &out,
+                  const Point *via = nullptr) const;
+    // Join separatrix k to target g at segment `seg`, parameter t.
+    bool capture(int k, int seg, double t, int target, int firstNew);
+    // Once nothing is running: keep one copy of each connection, undo the
+    // captures that cannot stand, and say whether anything was restarted.
+    bool resolveCaptures();
+    // Sec. 9, after the reduction.
+    void cutLimitCycles();
+    // Remove the segments of separatrix k from `fromSeg` on: from the
+    // triangle buckets and from the crossings, then cut the path back.
+    void dropSegments(int k, int fromSeg);
+    // The port of target g nearest direction `dir` (leaving the target), and
+    // how far off it is.
+    int nearestPort(const Target &g, double dir, double &misfit) const;
+    int targetOf(SeparatrixOrigin kind, int index) const;
 
     // One triangle of separatrix k, and what it ran into. Returns whether it
     // is still live.
@@ -437,6 +612,28 @@ private:
     std::vector<double> cutRadius;                   // per singularity, in model units
     std::vector<std::vector<SegRef>> segmentsOfTriangle;
     std::vector<std::unordered_map<int, int>> crossCount;  // per separatrix: other id -> times met
+
+    // Settings::captureAtSingularities
+    std::vector<Target> targets;
+    std::vector<std::vector<int>> targetsOfTriangle;   // triangle -> targets whose patch reaches it
+    std::vector<int> originTarget;                     // per separatrix
+    std::vector<char> leftOrigin;                      // ... has been outside its origin's patch
+    std::vector<std::vector<int>> excludedTargets;     // ... released from these
+    struct Resume { int tri = -1; Point pos{0.0, 0.0}; double dir = 0.0; int seg = -1; };
+    std::vector<Resume> captureResume;                 // ... where a capture can be undone to
+    double maxLength = 0.0;
+    bool capturesResolved = false;
+    int resolvePasses = 0;
+    std::vector<char> connectionKept_;                 // ... kept as a connection by a resolution
+    // Restart whatever had stopped on separatrix `host` -- a T-junction on it,
+    // a join with it -- now that it is gone; true if anything was.
+    bool resumeStoppedOn(int host);
+    // Settings::seedUntouchedHoles; how many it launched.
+    int seedUntouchedHoles();
+    bool holesSeeded = false;
+    // Whether a closed curve winds round a hole of the model, or round a
+    // singularity other than targets skipA and skipB.
+    bool enclosesSomething(const std::vector<Point> &loop, int skipA, int skipB) const;
 };
 
 #endif // __SEPARATRIX_TRACE_HXX__

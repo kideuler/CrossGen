@@ -7,6 +7,8 @@
 
 #include "crossfield/CrossField.hxx"
 
+class ConformalField;
+
 // ---------------------------------------------------------------------------
 // Streamline tracing for a cross field carried as one unit complex number per
 // vertex, u_v = e^{4 i theta_v}.
@@ -52,6 +54,41 @@
 // singularity, shared by every streamline crossing that triangle, which is what
 // makes two of them unable to cross tangentially there (Prop. 1 and the
 // paragraph after it).
+//
+// ### On the corrected field (ConformalField)
+//
+// The second constructor traces the field of docs/quad_layout_pipeline.md
+// Sec. 6 instead: per vertex only its *regular* part theta_h, which is smooth,
+// and the singularities analytically, so that the angle at a point x of a
+// triangle is
+//
+//     theta(x) = P1 interpolant of theta_h at x + sum_j k_j arg(x - X_j).
+//
+// Three things change, and nothing else does.
+//
+//   * The singularities are the pattern's, not found: each sits exactly at its
+//     X_j, in the triangle holding it, and its ports are the closed form of
+//     Sec. 7.3, phi_m = (theta_0 + m pi/2) / (1 - k) with theta_0 the field at
+//     X_j less its own term -- the quantity C below, evaluated where it is
+//     wanted instead of fitted from three corners of a core the first field
+//     never resolved (portResidual is zero).
+//
+//   * Every reading of the field adds the singular part at the point it is
+//     read: the edge hand-off (edgeAngle), the vertex snap (vertexAngle), the
+//     interior of a triangle. Read on an edge it still uses the edge's two
+//     endpoints and the point itself and nothing else, so both banks of an
+//     edge agree on it exactly and the pi/4 margin of the hand-off survives.
+//
+//   * The angle is no longer affine on a triangle, so a regular triangle is
+//     crossed in sub-steps, each the same iterated midpoint rule, no longer
+//     than conformalSubStep times the distance to the nearest singularity:
+//     one step a triangle far from every X_j, several in the ring round one,
+//     where a streamline passing a singularity turns fastest -- which is
+//     exactly the streamline whose near miss decides whether two separatrices
+//     meet (Sec. 7.4's "why second order matters").
+//
+// The singular triangle itself is still crossed by the hyperbola sweep, whose
+// model, theta = theta_0 + k phi, is now the field there to first order.
 // ---------------------------------------------------------------------------
 
 // A point of a traced streamline. Consecutive points bound a segment lying
@@ -136,6 +173,21 @@ public:
     explicit FieldTracer(std::shared_ptr<CrossField> cf, bool useExactCenters = true,
                          bool boundaryTriangles = true, std::vector<char> absorbAt = {});
 
+    // On the corrected field (see the header): its regular part per vertex,
+    // its singularities analytically. `cf` is the same field as a CrossField
+    // (ConformalField::crossField()), kept for whoever reads getCrossField().
+    FieldTracer(std::shared_ptr<CrossField> cf, std::shared_ptr<const ConformalField> conformal);
+
+    // The corrected field this traces, or null on a first field.
+    const ConformalField *getConformal() const { return conformal_.get(); }
+
+    // The cross angle at p in triangle f (any triangle, singular or not), on
+    // the branch nearest `ref`: the interpolant of the vertex angles, plus on
+    // the corrected field its singular part. In a singular triangle of a
+    // first field this is the interpolant of an inconsistent lift and means
+    // little; the sweep is what reads the field there.
+    double angleAt(int f, const Point &p, double ref) const;
+
     const Mesh &getMesh() const { return *mesh; }
     std::shared_ptr<CrossField> getCrossField() const { return crossField; }
 
@@ -200,7 +252,21 @@ public:
     // without ever letting two streamlines cross tangentially.
     int sweepSamplesPerSector = 24;
 
+    // On the corrected field: the longest sub-step inside a regular triangle,
+    // as a fraction of the distance to the nearest singularity. A quarter
+    // keeps the turn of the field over one sub-step under k/4 radians however
+    // near the singularity the streamline passes.
+    double conformalSubStep = 0.25;
+
 private:
+    // The corrected field's crossing of one regular triangle (see the header).
+    Status advanceConformal(Walker &w, std::vector<TracePoint> &path) const;
+    void buildConformalSingularities();
+    // sum_j k_j arg(p - X_j) over the corrected field's singularities, and
+    // the distance from p to the nearest one.
+    double singularPart(const Point &p) const;
+    double nearestSingularity(const Point &p) const;
+
     // The three vertex angles of a non-singular triangle, lifted to agree
     // pairwise to within pi/4 and then shifted as a block so that the
     // interpolant at `at` is the branch nearest `ref`.
@@ -239,6 +305,10 @@ private:
 
     double avgEdge = 1.0;
     double vertexSnap = 1e-9;          // distance below which a point is taken to be a vertex
+
+    std::shared_ptr<const ConformalField> conformal_;
+    // The corrected field's singularities as (x, y, k), for the sums.
+    std::vector<std::array<double, 3>> centres_;
 };
 
 #endif // __FIELD_TRACER_HXX__

@@ -261,8 +261,28 @@ void QuadLayout::collectNodes() {
                 break;
             }
 
+            case TerminationReason::AT_SINGULARITY: {
+                // Joined to a singular point (docs/quad_layout_pipeline.md Sec.
+                // 7.5): it ends on that point's own node.
+                int nd = -1;
+                const int j = sep.endSingularity;
+                if (sep.endKind == SeparatrixOrigin::Singularity && j >= 0 &&
+                    j < static_cast<int>(nodeOfSingularity.size()))
+                    nd = nodeOfSingularity[j];
+                else if (sep.endKind == SeparatrixOrigin::BoundaryCorner && j >= 0 &&
+                         j < static_cast<int>(nodeOfCorner.size()))
+                    nd = nodeOfCorner[j];
+                else if (sep.endKind == SeparatrixOrigin::InterfaceNode && j >= 0 &&
+                         j < static_cast<int>(nodeOfInterface.size()))
+                    nd = nodeOfInterface[j];
+                if (nd < 0) nd = addNode(endPos, NodeKind::Dangling, sep.id);
+                splitsOfSeparatrix[sep.id].push_back(Split{endP, nd});
+                break;
+            }
+
             case TerminationReason::CUT_AT_SINGULARITY:
             case TerminationReason::CROSSED_TWICE:
+            case TerminationReason::CUT_LIMIT_CYCLE:
             case TerminationReason::TANGENTIAL: {
                 const int nd = addNode(endPos, NodeKind::TJunction, sep.id);
                 splitsOfSeparatrix[sep.id].push_back(Split{endP, nd});
@@ -725,6 +745,33 @@ void QuadLayout::checkEmbedding() {
                     // product of ~1e-19, which an absolute 1e-30 lets through,
                     // and the parameters that come out of it are noise that
                     // can land inside both -- a crossing that is not there.
+                    // Two arcs touching at a point with no node there: an
+                    // interior point of one on the other. The crossing test
+                    // below takes open segments and cannot see it, and the
+                    // face walk then runs through it as if the two were apart
+                    // -- which is how a crossing the tracing missed at a mesh
+                    // vertex came out as one twelve-cornered face that was not
+                    // a disc and no complaint (geom027 on the corrected field).
+                    auto onSegment = [&](const Point &p, const Point &a, const Point &b) {
+                        const Point d = b - a;
+                        const double dd = dotP(d, d);
+                        const double t = dd > 0.0 ? std::min(1.0, std::max(0.0, dotP(p - a, d) / dd)) : 0.0;
+                        return normP(p - (a + d * t)) <= tol;
+                    };
+                    // A point within the tolerance of its own arc's end node
+                    // is that node -- a separatrix's last two points can
+                    // straddle the node a hair apart (geom017) -- and is where
+                    // the arcs meeting there are allowed to be.
+                    auto interiorOf = [&](const Arc &arc, size_t k) {
+                        return k + 1 < arc.pts.size() && normP(arc.pts[k] - arc.pts.front()) > tol &&
+                               normP(arc.pts[k] - arc.pts.back()) > tol;
+                    };
+                    if ((interiorOf(arcs[i], x) && onSegment(p1, q0, q1)) ||
+                        (interiorOf(arcs[j], y) && onSegment(q1, p0, p1))) {
+                        ++report_.arcCrossings;
+                        x = ni;
+                        break;
+                    }
                     if (std::fabs(den) <= 1e-12 * normP(r) * normP(s)) continue;
                     const Point w = q0 - p0;
                     const double t = cross2(w, s) / den;

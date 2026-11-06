@@ -7318,6 +7318,18 @@ void CrossGenWidget::runComputations() {
                 << ", error " << st.fieldError;
             console_.log(fin.str());
         }
+        if (const ConformalField *cf = zipline_->getConformalField(); cf && cf->valid()) {
+            const ConformalField::Report &c = cf->getReport();
+            std::ostringstream cs;
+            cs << "[Second field] the corrected field of docs/quad_layout_pipeline.md Sec. 6: "
+               << c.singularities << " singularities (" << c.relocated << " moved off a corner, "
+               << c.dipolesCancelled << " dipole(s) cancelled), " << c.holes << " hole(s)";
+            for (const double d : c.holeOffsets) cs << " " << std::lround(d * 1800.0 / M_PI) / 10.0;
+            if (c.holes) cs << " deg off tangent before alignment";
+            console_.log(cs.str());
+        } else if (!zipline_->getStatus().conformalFailure.empty()) {
+            console_.log("[Second field] not used: " + zipline_->getStatus().conformalFailure);
+        }
         const SeparatrixTrace &trace = *ziplineTrace();
         std::ostringstream oss;
         oss << "[Separatrices] Initialized " << trace.separatrices.size()
@@ -8378,10 +8390,15 @@ void CrossGenWidget::renderNormal() {
         // rest of the pipeline to produce.
         if (ziplinePhase_ >= ZIPLINEPhase::CrossField && ziplinePhase_ < ZIPLINEPhase::Quantized &&
             ziplineField()) {
+            // From the separatrices on, the field they follow: Stage 1b's
+            // corrected field when it was built (ZIPLINE::getTraceField).
+            const CrossField &shown = (ziplinePhase_ >= ZIPLINEPhase::Separatrices && ziplineTrace())
+                                          ? zipline_->getTraceField()
+                                          : *ziplineField();
             if (ziplinePhase_ >= ZIPLINEPhase::Stepping && zipline_->getStatus().fieldSteps > 0)
-                viewer::drawVertexCrossFieldUK(*mesh_, *ziplineField(), scale_);
+                viewer::drawVertexCrossFieldUK(*mesh_, shown, scale_);
             else
-                viewer::drawVertexCrossField(*mesh_, *ziplineField(), scale_);
+                viewer::drawVertexCrossField(*mesh_, shown, scale_);
 
             if (ziplinePhase_ < ZIPLINEPhase::Separatrices) {
                 double ballRadius = 0.5 * avgEdge_;
