@@ -13,6 +13,7 @@ COMMANDS = {
     "roundtrip": ("roundtrip", "SQ-VAE round trip through QUARRY (or the release's QuadExtraction)"),
     "generate": ("generate", "block layouts of domain OBJs from a trained SQ-Diffuse (inference, through QUARRY)"),
     "quarry": ("quarry", "QUARRY, the C++ block extractor, on one extraction input (needs the crossgen module)"),
+    "export-onnx": ("export_onnx", "a trained SQ-Diffuse and its SQ-VAE and Geom-AE as ONNX graphs, for src/SQUADGEN"),
 }
 
 

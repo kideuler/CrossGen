@@ -604,4 +604,59 @@ void drawQuadMesh(const BlockQuadMesh &bm, float lineWidth, float blockLineWidth
 void drawQuadMesh(const mesh::QuadMesh &sm, const BlockQuadMesh &bm, float lineWidth,
                   float blockLineWidth, bool materialFill = false);
 
+// ── SQuadGen (mode 0) ────────────────────────────────────────────────────────
+//
+// What its phases draw: values at the tokens, the decoded fields on a fine
+// triangulation, QUARRY's charts, and how far the ODE has come.
+
+// The sequential ramp the [0, 1] fields are filled with, squadgen2d's
+// FIELD_RAMP (sq_vae.py, the dataviz skill's blue): light to dark on the white
+// background and dark to light on the dark one, so that a larger value always
+// stands further from the surface it is drawn on. A wall of the CDF (0) is
+// then the colour nearest the background and a chart centre the farthest.
+// Already right for either background, so it is drawn raw, not through
+// adaptForLight.
+void sequentialColor(double t, float &r, float &g, float &b);
+
+// Every triangle of (V, T) filled by values[t] through sequentialColor,
+// clamped to [0, 1]; `alpha` below 1 lets what is under it show. Drawn from
+// vertex arrays: SQuadGen's extraction mesh is 10^5 triangles.
+void drawTriangleField(const std::vector<Point> &V, const std::vector<Triangle> &T,
+                       const std::vector<float> &values, float alpha = 1.0f);
+
+// Every triangle with a label >= 0 tinted by the categorical colour
+// colourOf[label] indexes (a palette of six, squadgen2d roundtrip's
+// REGION_FILLS), at `alpha`: QUARRY's charts, coloured so that no two that
+// touch share a colour. `shade` triangles (labels of charts that made no
+// block) are filled red instead.
+void drawLabelFill(const std::vector<Point> &V, const std::vector<Triangle> &T,
+                   const std::vector<int> &labels, const std::vector<int> &colourOf,
+                   const std::vector<char> &shade, float alpha);
+// A colour of that palette per label, greedily, from which labels touch:
+// labels[t] for every triangle and the triangles' edge neighbours.
+std::vector<int> colourLabels(const Mesh &m, const std::vector<int> &labels);
+
+// The diverging ramp the latent is drawn on: a neutral grey at 0 and blue and
+// red at -1 and +1, stepped for each background (drawScalarField's, adapted
+// for the white one, is darker half-way than at its ends). Drawn raw.
+void tokenDivergingColor(double t, float &r, float &g, float &b);
+
+// A disk of radius `radius` at every point, coloured by values[i * stride +
+// channel]: on tokenDivergingColor at +-vmax when `diverging`, on
+// sequentialColor over [0, vmax] otherwise.
+void drawTokenDisks(const std::vector<Point> &P, const std::vector<float> &values, int stride,
+                    int channel, bool diverging, double vmax, double radius);
+
+// Points as round dots of `size` pixels.
+void drawPointSet(const std::vector<Point> &P, float size, float r, float g, float b);
+
+// The colour key of either ramp above, at the bottom of the window `x` pixels
+// from its left edge, labelled in fixed point.
+void drawRampLegend(int fbw, int fbh, double vmin, double vmax, const char *title,
+                    bool diverging, float x = 20.0f);
+
+// A thin bar along the bottom of the window filled to `fraction`, with a label
+// above its right end: how far an ODE solve has come in t.
+void drawProgressBar(int fbw, int fbh, double fraction, const char *label);
+
 } // namespace viewer

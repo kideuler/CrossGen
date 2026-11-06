@@ -12,6 +12,7 @@ The pipeline, one command per stage (python -m squadgen2d <command>, or `squadge
     roundtrip    SQ-VAE -> block extraction on true vs decoded fields (roundtrip.py)
     generate     domain OBJs + trained SQ-Diffuse -> generated block layouts, through QUARRY (generate.py)
     quarry       QUARRY, CrossGen's C++ block extractor, on one extraction input (quarry.py; needs crossgen)
+    export-onnx  a trained SQ-Diffuse with its SQ-VAE and Geom-AE as ONNX graphs, for C++ inference (export_onnx.py)
 
 The library modules under them:
 

@@ -27,3 +27,4 @@ data/geometry/deepcad/*
 *.txt
 *.log
 *.out
+best_models/onnx/

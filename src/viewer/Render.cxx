@@ -2899,4 +2899,291 @@ void drawSeparatrixLegend(int fbw, int fbh) {
     }
 }
 
+// ============================================================================
+// SQuadGen (mode 0)
+// ============================================================================
+
+namespace {
+
+// squadgen2d's FIELD_RAMP (sq_vae.py), light to dark.
+constexpr float kFieldRamp[5][3] = {
+    {0.804f, 0.886f, 0.984f},   // #cde2fb
+    {0.525f, 0.714f, 0.937f},   // #86b6ef
+    {0.224f, 0.529f, 0.898f},   // #3987e5
+    {0.110f, 0.361f, 0.671f},   // #1c5cab
+    {0.051f, 0.212f, 0.420f},   // #0d366b
+};
+
+// roundtrip.py's REGION_FILLS: six soft tints, for charts.
+constexpr float kRegionFills[6][3] = {
+    {0.663f, 0.788f, 0.937f},   // #a9c9ef
+    {0.961f, 0.702f, 0.604f},   // #f5b39a
+    {0.592f, 0.851f, 0.757f},   // #97d9c1
+    {0.965f, 0.835f, 0.561f},   // #f6d58f
+    {0.953f, 0.769f, 0.839f},   // #f3c4d6
+    {0.561f, 0.796f, 0.561f},   // #8fcb8f
+};
+
+void fillArrays(const std::vector<float> &xy, const std::vector<float> &rgba) {
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glEnableClientState(GL_COLOR_ARRAY);
+    glVertexPointer(2, GL_FLOAT, 0, xy.data());
+    glColorPointer(4, GL_FLOAT, 0, rgba.data());
+    glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(xy.size() / 2));
+    glDisableClientState(GL_COLOR_ARRAY);
+    glDisableClientState(GL_VERTEX_ARRAY);
+}
+
+} // namespace
+
+// The diverging ramp of the latent on the tokens, stepped for each
+// background rather than adapted from the dark one: drawScalarField's ramp put
+// through adaptForLight is darker half-way than at either end on white, which
+// a field of mostly small values -- the noise -- shows as murk. A neutral grey
+// midpoint and two hues, the lightness monotonic in |t| either way.
+void tokenDivergingColor(double t, float &r, float &g, float &b) {
+    t = std::clamp(t, -1.0, 1.0);
+    const bool light = lightBackground();
+    static const float kMidLight[3] = {0.80f, 0.80f, 0.79f};
+    static const float kNegLight[3] = {0.11f, 0.36f, 0.78f};
+    static const float kPosLight[3] = {0.80f, 0.19f, 0.17f};
+    static const float kMidDark[3] = {0.220f, 0.220f, 0.208f};   // #383835
+    static const float kNegDark[3] = {0.224f, 0.529f, 0.898f};   // #3987e5
+    static const float kPosDark[3] = {0.902f, 0.404f, 0.404f};   // #e66767
+    const float *mid = light ? kMidLight : kMidDark;
+    const float *end = t < 0.0 ? (light ? kNegLight : kNegDark) : (light ? kPosLight : kPosDark);
+    const float a = static_cast<float>(std::fabs(t));
+    r = mid[0] + a * (end[0] - mid[0]);
+    g = mid[1] + a * (end[1] - mid[1]);
+    b = mid[2] + a * (end[2] - mid[2]);
+}
+
+void sequentialColor(double t, float &r, float &g, float &b) {
+    t = std::clamp(t, 0.0, 1.0);
+    if (!lightBackground()) t = 1.0 - t;
+    const double x = 4.0 * t;
+    const int i = std::min(3, static_cast<int>(x));
+    const float f = static_cast<float>(x - i);
+    r = kFieldRamp[i][0] + f * (kFieldRamp[i + 1][0] - kFieldRamp[i][0]);
+    g = kFieldRamp[i][1] + f * (kFieldRamp[i + 1][1] - kFieldRamp[i][1]);
+    b = kFieldRamp[i][2] + f * (kFieldRamp[i + 1][2] - kFieldRamp[i][2]);
+}
+
+void drawTriangleField(const std::vector<Point> &V, const std::vector<Triangle> &T,
+                       const std::vector<float> &values, float alpha) {
+    if (values.size() != T.size() || T.empty()) return;
+    std::vector<float> xy, rgba;
+    xy.reserve(6 * T.size());
+    rgba.reserve(12 * T.size());
+    for (std::size_t t = 0; t < T.size(); ++t) {
+        float r, g, b;
+        sequentialColor(values[t], r, g, b);
+        for (int k = 0; k < 3; ++k) {
+            const Point &p = V[T[t][k]];
+            xy.push_back(static_cast<float>(p[0]));
+            xy.push_back(static_cast<float>(p[1]));
+            rgba.insert(rgba.end(), {r, g, b, alpha});
+        }
+    }
+    if (alpha < 1.0f) {
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    }
+    fillArrays(xy, rgba);
+}
+
+std::vector<int> colourLabels(const Mesh &m, const std::vector<int> &labels) {
+    int n = 0;
+    for (const int l : labels) n = std::max(n, l + 1);
+    std::vector<std::unordered_set<int>> touches(n);
+    for (std::size_t t = 0; t < m.triangles.size() && t < labels.size(); ++t) {
+        if (labels[t] < 0) continue;
+        for (int k = 0; k < 3; ++k) {
+            const int u = m.triangleAdjacency[t][k];
+            if (u >= 0 && labels[u] >= 0 && labels[u] != labels[t]) touches[labels[t]].insert(labels[u]);
+        }
+    }
+    // Most-connected first, each the first palette colour none of its coloured neighbours has.
+    std::vector<int> order(n), colour(n, -1);
+    for (int i = 0; i < n; ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(),
+                     [&](int a, int b) { return touches[a].size() > touches[b].size(); });
+    for (const int c : order) {
+        std::vector<char> used(6, 0);
+        for (const int u : touches[c])
+            if (colour[u] >= 0) used[colour[u] % 6] = 1;
+        int pick = 0;
+        while (pick < 6 && used[pick]) ++pick;
+        colour[c] = pick < 6 ? pick : c % 6;
+    }
+    return colour;
+}
+
+void drawLabelFill(const std::vector<Point> &V, const std::vector<Triangle> &T,
+                   const std::vector<int> &labels, const std::vector<int> &colourOf,
+                   const std::vector<char> &shade, float alpha) {
+    if (labels.size() != T.size()) return;
+    std::vector<float> xy, rgba;
+    xy.reserve(6 * T.size());
+    rgba.reserve(12 * T.size());
+    const bool light = lightBackground();
+    for (std::size_t t = 0; t < T.size(); ++t) {
+        const int l = labels[t];
+        if (l < 0) continue;
+        float r, g, b;
+        if (l < static_cast<int>(shade.size()) && shade[l]) {
+            r = 0.95f, g = 0.30f, b = 0.28f;
+        } else {
+            const float *c = kRegionFills[(l < static_cast<int>(colourOf.size()) ? colourOf[l] : l) % 6];
+            // On the dark background the tints are dimmed toward it, so that the light block sides drawn over
+            // them stay the brightest thing on screen.
+            const float k = light ? 1.0f : 0.55f;
+            r = c[0] * k, g = c[1] * k, b = c[2] * k;
+        }
+        for (int k = 0; k < 3; ++k) {
+            const Point &p = V[T[t][k]];
+            xy.push_back(static_cast<float>(p[0]));
+            xy.push_back(static_cast<float>(p[1]));
+            rgba.insert(rgba.end(), {r, g, b, alpha});
+        }
+    }
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    fillArrays(xy, rgba);
+}
+
+void drawTokenDisks(const std::vector<Point> &P, const std::vector<float> &values, int stride,
+                    int channel, bool diverging, double vmax, double radius) {
+    if (stride <= 0 || values.size() < P.size() * static_cast<std::size_t>(stride)) return;
+    if (!(vmax > 0.0)) vmax = 1.0;
+    constexpr int kSegments = 10;
+    double cs[kSegments + 1], sn[kSegments + 1];
+    for (int k = 0; k <= kSegments; ++k) {
+        cs[k] = radius * std::cos(2.0 * M_PI * k / kSegments);
+        sn[k] = radius * std::sin(2.0 * M_PI * k / kSegments);
+    }
+    std::vector<float> xy, rgba;
+    xy.reserve(6 * kSegments * P.size());
+    rgba.reserve(12 * kSegments * P.size());
+    for (std::size_t i = 0; i < P.size(); ++i) {
+        const double v = values[i * stride + channel];
+        float r, g, b;
+        if (diverging)
+            tokenDivergingColor(v / vmax, r, g, b);
+        else
+            sequentialColor(v / vmax, r, g, b);
+        for (int k = 0; k < kSegments; ++k) {
+            const float pts[6] = {static_cast<float>(P[i][0]), static_cast<float>(P[i][1]),
+                                  static_cast<float>(P[i][0] + cs[k]), static_cast<float>(P[i][1] + sn[k]),
+                                  static_cast<float>(P[i][0] + cs[k + 1]), static_cast<float>(P[i][1] + sn[k + 1])};
+            xy.insert(xy.end(), pts, pts + 6);
+            for (int j = 0; j < 3; ++j) rgba.insert(rgba.end(), {r, g, b, 1.0f});
+        }
+    }
+    fillArrays(xy, rgba);
+}
+
+void drawPointSet(const std::vector<Point> &P, float size, float r, float g, float b) {
+    glEnable(GL_POINT_SMOOTH);
+    viewer::pointSize(size);
+    viewer::color3f(r, g, b);
+    glBegin(GL_POINTS);
+    for (const Point &p : P) glVertex2d(p[0], p[1]);
+    glEnd();
+    viewer::pointSize(1.0f);
+}
+
+void drawRampLegend(int fbw, int fbh, double vmin, double vmax, const char *title, bool diverging, float x) {
+    const float barW = 220.0f * renderScale();
+    const float barH = 18.0f * renderScale();
+    const float x0 = x * renderScale();
+    const float y0 = static_cast<float>(fbh) - 80.0f * renderScale();
+
+    glMatrixMode(GL_PROJECTION);
+    glPushMatrix();
+    glLoadIdentity();
+    glOrtho(0, fbw, fbh, 0, -1, 1);
+    glMatrixMode(GL_MODELVIEW);
+    glPushMatrix();
+    glLoadIdentity();
+    const int steps = 64;
+    glBegin(GL_QUAD_STRIP);
+    for (int i = 0; i <= steps; ++i) {
+        const double t = static_cast<double>(i) / steps;
+        float r, g, b;
+        if (diverging)
+            tokenDivergingColor(2.0 * t - 1.0, r, g, b);
+        else
+            sequentialColor(t, r, g, b);
+        viewer::color3fRaw(r, g, b);
+        const float x = x0 + barW * static_cast<float>(t);
+        glVertex2f(x, y0);
+        glVertex2f(x, y0 + barH);
+    }
+    glEnd();
+    viewer::color3f(0.55f, 0.55f, 0.55f);
+    viewer::lineWidth(1.0f);
+    glBegin(GL_LINE_LOOP);
+    glVertex2f(x0, y0);
+    glVertex2f(x0 + barW, y0);
+    glVertex2f(x0 + barW, y0 + barH);
+    glVertex2f(x0, y0 + barH);
+    glEnd();
+    glMatrixMode(GL_PROJECTION);
+    glPopMatrix();
+    glMatrixMode(GL_MODELVIEW);
+    glPopMatrix();
+
+    auto label = [](double v) {
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(std::fabs(v) < 10.0 ? 1 : 0) << v;
+        return oss.str();
+    };
+    const float below = y0 + barH + 6.0f * renderScale();
+    drawTextOverlay(fbw, fbh, title, x0, y0 - 22.0f * renderScale(), 0.8f, 0.8f, 0.8f);
+    drawTextOverlay(fbw, fbh, label(vmin).c_str(), x0, below, 0.8f, 0.8f, 0.8f);
+    const std::string hi = label(vmax);
+    drawTextOverlay(fbw, fbh, hi.c_str(), x0 + barW - 12.0f * textScale() * static_cast<float>(hi.size()), below,
+                    0.8f, 0.8f, 0.8f);
+    if (diverging)
+        drawTextOverlay(fbw, fbh, "0", x0 + 0.5f * barW - 6.0f * textScale(), below, 0.8f, 0.8f, 0.8f);
+}
+
+void drawProgressBar(int fbw, int fbh, double fraction, const char *label) {
+    fraction = std::clamp(fraction, 0.0, 1.0);
+    const float s = renderScale();
+    const float x0 = 20.0f * s, x1 = static_cast<float>(fbw) - 20.0f * s;
+    const float y1 = static_cast<float>(fbh) - 12.0f * s, y0 = y1 - 8.0f * s;
+    glMatrixMode(GL_PROJECTION);
+    glPushMatrix();
+    glLoadIdentity();
+    glOrtho(0, fbw, fbh, 0, -1, 1);
+    glMatrixMode(GL_MODELVIEW);
+    glPushMatrix();
+    glLoadIdentity();
+    viewer::color3f(0.25f, 0.25f, 0.27f);
+    glBegin(GL_QUADS);
+    glVertex2f(x0, y0);
+    glVertex2f(x1, y0);
+    glVertex2f(x1, y1);
+    glVertex2f(x0, y1);
+    glEnd();
+    viewer::color3f(0.42f, 0.74f, 1.0f);
+    const float xf = x0 + static_cast<float>(fraction) * (x1 - x0);
+    glBegin(GL_QUADS);
+    glVertex2f(x0, y0);
+    glVertex2f(xf, y0);
+    glVertex2f(xf, y1);
+    glVertex2f(x0, y1);
+    glEnd();
+    glMatrixMode(GL_PROJECTION);
+    glPopMatrix();
+    glMatrixMode(GL_MODELVIEW);
+    glPopMatrix();
+    if (label && *label) {
+        const float w = 12.0f * textScale() * static_cast<float>(std::string(label).size());
+        drawTextOverlay(fbw, fbh, label, std::max(x0, x1 - w), y0 - 22.0f * s, 0.85f, 0.85f, 0.85f);
+    }
+}
+
 } // namespace viewer

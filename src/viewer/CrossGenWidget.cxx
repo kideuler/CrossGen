@@ -8,6 +8,7 @@
 #include "viewer/Render.hxx"
 
 #include <QCheckBox>
+#include <QCloseEvent>
 #include <QComboBox>
 #include <QDialog>
 #include <QDialogButtonBox>
@@ -144,6 +145,20 @@ ORACLEPhase nextORACLEPhase(ORACLEPhase p) {
     return ORACLEPhase::Smoothed;
 }
 
+SQUADGENPhase nextSQUADGENPhase(SQUADGENPhase p) {
+    switch (p) {
+        case SQUADGENPhase::MeshOnly:  return SQUADGENPhase::Tokens;
+        case SQUADGENPhase::Tokens:    return SQUADGENPhase::Noise;
+        case SQUADGENPhase::Noise:     return SQUADGENPhase::Diffusion;
+        case SQUADGENPhase::Diffusion: return SQUADGENPhase::Fields;
+        case SQUADGENPhase::Fields:    return SQUADGENPhase::Blocks;
+        case SQUADGENPhase::Blocks:    return SQUADGENPhase::Mesh;
+        case SQUADGENPhase::Mesh:      return SQUADGENPhase::Smoothed;
+        case SQUADGENPhase::Smoothed:  return SQUADGENPhase::Smoothed;
+    }
+    return SQUADGENPhase::Smoothed;
+}
+
 SKELETONPhase nextSKELETONPhase(SKELETONPhase p) {
     switch (p) {
         case SKELETONPhase::MeshOnly:      return SKELETONPhase::Triangulation;
@@ -275,6 +290,21 @@ const char *oraclePhaseName(ORACLEPhase p) {
     return "?";
 }
 
+// The section numbers are docs/squadgen_2d.md's Sec. 4 inference steps.
+const char *squadgenPhaseName(SQUADGENPhase p) {
+    switch (p) {
+        case SQUADGENPhase::MeshOnly:  return "1) mesh";
+        case SQUADGENPhase::Tokens:    return "2) tokens and geometry code (Sec. 4 steps 1-3)";
+        case SQUADGENPhase::Noise:     return "3) initial noise (Appendix C)";
+        case SQUADGENPhase::Diffusion: return "4) diffusion, the SQ-Diffuse ODE (Sec. 4 step 4)";
+        case SQUADGENPhase::Fields:    return "5) decoded CDF (Sec. 4 steps 5-7)";
+        case SQUADGENPhase::Blocks:    return "6) QUARRY blocks (Sec. 4 step 8)";
+        case SQUADGENPhase::Mesh:      return "7) quadrilateral mesh";
+        case SQUADGENPhase::Smoothed:  return "8) TMOP smoothing (mesh::TMOP)";
+    }
+    return "?";
+}
+
 const char *skeletonPhaseName(SKELETONPhase p) {
     switch (p) {
         case SKELETONPhase::MeshOnly:      return "1) mesh";
@@ -310,6 +340,7 @@ const char *modeName(Mode m) {
         case Mode::MERIDIAN:   return "MERIDIAN";
         case Mode::ATLAS:      return "ATLAS";
         case Mode::ORACLE:     return "ORACLE";
+        case Mode::SQUADGEN:   return "SQuadGen";
     }
     return "?";
 }
@@ -318,7 +349,7 @@ const char *modeName(Mode m) {
 // mode does not mean chasing three copies of it.
 const char *kModeMenu =
     "press '1' for PolyVector, '2' for ZIPLINE, '3' for SKELETON, '4' for TORSION, "
-    "'5' for OASIS, '6' for UMBER, '7' for MERIDIAN, '8' for ATLAS, '9' for ORACLE";
+    "'5' for OASIS, '6' for UMBER, '7' for MERIDIAN, '8' for ATLAS, '9' for ORACLE, '0' for SQuadGen";
 
 } // anonymous namespace
 
@@ -472,6 +503,12 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
         break;
 
     case Qt::Key_N:
+        // SQuadGen: another sample, the next seed's noise.
+        if (mode_ == Mode::SQUADGEN && squadgenPhase_ >= SQUADGENPhase::Noise && squadgen_ &&
+            squadgen_->hasCondition()) {
+            nextSQUADGENSample();
+            break;
+        }
         // The connectivity dialog of Stages 5 to 7. It used to sit on 'c' at
         // the Patches phase, which was the last one; Stage 10 is now, and 'c'
         // there re-opens the mesh dialog. Which pairs of cones are meant to be
@@ -555,6 +592,15 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
                 oraclePhase_ = ORACLEPhase::Mesh;
             }
         }
+        // And SQuadGen's, on QUARRY's blocks.
+        if (mode_ == Mode::SQUADGEN && squadgenPhase_ >= SQUADGENPhase::Mesh && squadgen_ &&
+            squadgen_->hasBlocks() && !squadgen_->decomposition().blocks.empty()) {
+            squadgenMeshAttempted_ = true;
+            if (promptSQUADGENMesh()) {
+                runSQUADGENMesh();
+                squadgenPhase_ = SQUADGENPhase::Mesh;
+            }
+        }
         break;
 
     case Qt::Key_I:
@@ -603,6 +649,16 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
 
     case Qt::Key_BracketLeft:
     case Qt::Key_BracketRight:
+        // SQuadGen: which of the latent's channels the tokens are coloured by.
+        if (mode_ == Mode::SQUADGEN && squadgenNets_ &&
+            (squadgenPhase_ == SQUADGENPhase::Noise || squadgenPhase_ == SQUADGENPhase::Diffusion)) {
+            const int C = squadgenNets_->description().latentDim;
+            squadgenChannel_ = (squadgenChannel_ + (event->key() == Qt::Key_BracketRight ? 1 : C - 1)) % C;
+            console_.log("[SQuadGen] tokens coloured by latent channel " + std::to_string(squadgenChannel_) + " of " +
+                         std::to_string(C));
+            update();
+            break;
+        }
         // The per-material mode's regions, one at a time on the right: each has
         // its own psi_0 and its own Psi, in a plane of its own, and there is no
         // one picture of them that is not a gallery of unrelated scales.
@@ -645,6 +701,26 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
         break;
 
     case Qt::Key_P:
+        // SQuadGen: the latent on the left of the Diffusion phase, the field
+        // of the Fields phase, and what lies under QUARRY's blocks.
+        if (mode_ == Mode::SQUADGEN && squadgen_) {
+            if (squadgenPhase_ == SQUADGENPhase::Diffusion) {
+                squadgenShowPredicted_ = !squadgenShowPredicted_;
+                console_.log(squadgenShowPredicted_
+                                 ? "[SQuadGen] left: the latent the flow predicts at t = 1, x_t + (1 - t) v"
+                                 : "[SQuadGen] left: the latent x_t where the ODE is");
+            } else if (squadgenPhase_ == SQUADGENPhase::Fields) {
+                squadgenShowDCDF_ = !squadgenShowDCDF_;
+                console_.log(squadgenShowDCDF_ ? "[SQuadGen] the DCDF: 1 at a layout vertex, 0 on the mid-lines"
+                                               : "[SQuadGen] the CDF: 1 at a chart's centre, 0 on its sides");
+            } else if (squadgenPhase_ == SQUADGENPhase::Blocks) {
+                squadgenShowCDFUnder_ = !squadgenShowCDFUnder_;
+                console_.log(squadgenShowCDFUnder_ ? "[SQuadGen] the decoded CDF under the blocks"
+                                                   : "[SQuadGen] QUARRY's charts under the blocks");
+            }
+            update();
+            break;
+        }
         // The per-material mode's right panel swaps the same pairs the traced
         // route's does, for the region shown there.
         if (perMaterialView() && materialLayout_ &&
@@ -861,6 +937,19 @@ void CrossGenWidget::keyPressEvent(QKeyEvent *event) {
         }
         break;
 
+    case Qt::Key_0:
+        // Straight to Stage 1: SQuadGen's first stage is its first picture,
+        // and it reads the model as loaded, materials ignored -- the networks
+        // know none. The next frame announces the networks being read.
+        if (mode_ == Mode::Unselected && phase_ == Phase::MeshOnly) {
+            mode_ = Mode::SQUADGEN;
+            squadgenPhase_ = SQUADGENPhase::Tokens;
+            std::cerr << "[Viewer] Selected mode: " << modeName(mode_) << ", phase "
+                      << squadgenPhaseName(squadgenPhase_) << "\n";
+            console_.log("Selected mode: SQuadGen (the layout a trained SQ-Diffuse generates, through QUARRY)");
+        }
+        break;
+
     default:
         QOpenGLWidget::keyPressEvent(event);
         break;
@@ -972,6 +1061,20 @@ void CrossGenWidget::doReset() {
     oracleMesh_.reset();
     oracle_.reset();
     oracleMultiMaterial_ = false;
+    // SQuadGen's: the sampling thread first, since it reads the stages. The
+    // networks stay loaded.
+    stopSQUADGENWorker();
+    squadgenLive_.reset();
+    squadgenStop_.reset();
+    squadgenMesh_.reset();
+    squadgen_.reset();
+    squadgenPreview_ = squadgen::Model();
+    squadgenPreviewPoints_.clear();
+    squadgenTokens_.clear();
+    squadgenContext_.clear();
+    squadgenChartColour_.clear();
+    squadgenChartFailed_.clear();
+    squadgenShowPredicted_ = squadgenShowDCDF_ = squadgenShowCDFUnder_ = false;
     // Stage 0c replaced the mesh every later stage was written on, so the reset
     // has to put the loaded one back before anything is built on it again.
     if (inputMesh_) mesh_ = inputMesh_;
@@ -1018,6 +1121,7 @@ void CrossGenWidget::doReset() {
     pipePhase_ = PipelinePhase::MeshOnly;
     atlasPhase_ = ATLASPhase::MeshOnly;
     oraclePhase_ = ORACLEPhase::MeshOnly;
+    squadgenPhase_ = SQUADGENPhase::MeshOnly;
     // oasisLambda_ deliberately survives a reset so it can be reused as the
     // dialog's default on the next run.
 
@@ -1070,6 +1174,9 @@ void CrossGenWidget::doReset() {
     oracleAnnounced_       = false;
     oracleAttempted_       = false;
     oracleMeshAttempted_   = false;
+    squadgenAnnounced_ = squadgenAttempted_ = squadgenNoiseAttempted_ = squadgenSamplingStarted_ = false;
+    squadgenDecodeAnnounced_ = squadgenDecodeAttempted_ = false;
+    squadgenQuarryAnnounced_ = squadgenQuarryAttempted_ = squadgenMeshAttempted_ = false;
 
     view_.cx    = 0.5 * (bounds_.minx + bounds_.maxx);
     view_.cy    = 0.5 * (bounds_.miny + bounds_.maxy);
@@ -4267,6 +4374,7 @@ CrossGenWidget::TMOPSettings &CrossGenWidget::tmopSettingsForMode() {
     if (mode_ == Mode::UMBER) return umberTmopSettings_;
     if (mode_ == Mode::ZIPLINE) return ziplineTmopSettings_;
     if (mode_ == Mode::SKELETON) return skeletonTmopSettings_;
+    if (mode_ == Mode::SQUADGEN) return squadgenTmopSettings_;
     if (mode_ == Mode::ORACLE && oracle_ && oracle_->hasChoice()) {
         switch (oracle_->getChoice().method()) {
             case oracle::Method::ATLAS:    return atlasTmopSettings_;
@@ -4284,7 +4392,7 @@ bool CrossGenWidget::promptTMOP() {
     if (!haveFinishedMesh()) return false;
     const bool atlas = (mode_ == Mode::ATLAS);
     const bool blockMode = atlas || mode_ == Mode::UMBER || mode_ == Mode::ZIPLINE ||
-                           mode_ == Mode::SKELETON || mode_ == Mode::ORACLE;
+                           mode_ == Mode::SKELETON || mode_ == Mode::ORACLE || mode_ == Mode::SQUADGEN;
 
     QDialog dlg(this);
     dlg.setWindowTitle(atlas ? "ATLAS — TMOP smoothing"
@@ -4292,6 +4400,7 @@ bool CrossGenWidget::promptTMOP() {
                                                      : (mode_ == Mode::ZIPLINE ? "ZIPLINE — TMOP smoothing"
                                                                                : "Stage 12 — TMOP smoothing")));
     if (mode_ == Mode::SKELETON) dlg.setWindowTitle(QString::fromUtf8("SKELETON — TMOP smoothing"));
+    if (mode_ == Mode::SQUADGEN) dlg.setWindowTitle(QString::fromUtf8("SQuadGen — TMOP smoothing"));
     if (mode_ == Mode::ORACLE && oracle_ && oracle_->hasChoice())
         dlg.setWindowTitle(QString::fromUtf8("ORACLE (%1) — TMOP smoothing")
                                .arg(QString::fromUtf8(oracle_->getChoice().name())));
@@ -4547,7 +4656,8 @@ void CrossGenWidget::runTMOP() {
     // ORACLE is named with them, since its stages are not Stage 10's whichever
     // method it kept.
     const bool blockMesh = (mode_ == Mode::UMBER) || (mode_ == Mode::ZIPLINE) ||
-                           (mode_ == Mode::SKELETON) || (mode_ == Mode::ORACLE);
+                           (mode_ == Mode::SKELETON) || (mode_ == Mode::ORACLE) ||
+                           (mode_ == Mode::SQUADGEN);
     TMOPSettings &ts = tmopSettingsForMode();
     // The pipelines number this Stage 12 after their Stage 10; ATLAS's stages
     // stop at 6, UMBER's at its decomposition and ZIPLINE's at Sec. 4, so
@@ -4718,6 +4828,7 @@ bool CrossGenWidget::haveFinishedMesh() const {
     if (mode_ == Mode::ZIPLINE) return ziplineMesh();
     if (mode_ == Mode::SKELETON) return skeletonMesh();
     if (mode_ == Mode::ORACLE) return oracleMesh_ != nullptr;
+    if (mode_ == Mode::SQUADGEN) return squadgenMesh_.has_value();
     return quadMesh_.has_value();
 }
 
@@ -4728,6 +4839,7 @@ mesh::QuadMesh CrossGenWidget::finishedMesh(const mesh::QuadMesh::Options &o) co
     if (mode_ == Mode::SKELETON) return mesh::QuadMesh::from(*skeletonMesh(), o);
     // Stage 11's merged mesh where there is one, and ZIPLINE's open sides held.
     if (mode_ == Mode::ORACLE) return oracleMesh_->quadMesh(o);
+    if (mode_ == Mode::SQUADGEN) return mesh::QuadMesh::from(*squadgenMesh_, o);
     return diskFill_.has_value() ? mesh::QuadMesh::from(*diskFill_, o)
                                  : mesh::QuadMesh::from(*quadMesh_, o);
 }
@@ -5516,6 +5628,509 @@ void CrossGenWidget::renderORACLE() {
     viewer::drawMesh(*mesh_);
 }
 
+// ── SQuadGen (mode 0) ────────────────────────────────────────────────────────
+//
+// src/SQUADGEN's five stages, a phase each, then the mesh and smoothing every
+// block mode ends with. The library does the work; the viewer decides when
+// each stage runs, runs Stage 3 on a thread of its own, and draws.
+
+namespace {
+
+std::string squadgenSeconds(double s) {
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(s < 10.0 ? 1 : 0) << s << " s";
+    return oss.str();
+}
+
+double squadgenSince(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+
+}  // namespace
+
+CrossGenWidget::~CrossGenWidget() { stopSQUADGENWorker(); }
+
+void CrossGenWidget::closeEvent(QCloseEvent *event) {
+    stopSQUADGENWorker();
+    QOpenGLWidget::closeEvent(event);
+}
+
+std::vector<Point> CrossGenWidget::squadgenModelPoints(const std::vector<Point> &framePoints) const {
+    std::vector<Point> out;
+    out.reserve(framePoints.size());
+    for (const Point &p : framePoints) out.push_back(squadgen_->frame().fromFrame(p));
+    return out;
+}
+
+// Stage 1, and the networks the first time.
+void CrossGenWidget::runSQUADGENCondition() {
+    squadgenAttempted_ = true;
+    pipelineBlocked_.clear();
+    try {
+        if (!squadgenNets_) {
+            const auto t0 = Clock::now();
+            squadgenNets_ = std::make_shared<const squadgen::Networks>(squadgen::Networks::defaultDirectory());
+            const squadgen::Networks::Description &d = squadgenNets_->description();
+            std::ostringstream oss;
+            oss << "[SQuadGen] networks: " << d.model << ", step " << d.step << ", N = " << d.tokens
+                << " tokens of " << d.latentDim << " channels, read in "
+                << squadgenSeconds(std::chrono::duration<double>(Clock::now() - t0).count());
+            console_.log(oss.str());
+            std::cerr << "[Viewer] " << oss.str() << " from " << d.directory << "\n";
+        }
+        // The token sets with seed 0: one pair per model, as generate draws them with its first seed; the dialog's
+        // seed is the noise's.
+        SQUADGEN::Options o;
+        o.seed = 0;
+        squadgen_ = std::make_unique<SQUADGEN>(squadgenNets_, squadgen::modelOf(*mesh_), o);
+        squadgen_->condition();
+    } catch (const std::exception &e) {
+        squadgen_.reset();
+        blockPipeline("SQuadGen could not start", e.what());
+        return;
+    }
+    const SQUADGEN::Report &r = squadgen_->getReport();
+    const squadgen::Frame &f = squadgen_->frame();
+    squadgenTokens_ = squadgenModelPoints(squadgen_->tokens());
+    squadgenContext_ = squadgenModelPoints(squadgen_->contextPoints());
+    // A disk per token, nearly tiling the model: the token spacing, sqrt(area / N), is about a diameter.
+    const double area = squadgen_->domain().area() / (f.scale * f.scale);
+    squadgenDiskRadius_ = 0.42 * std::sqrt(area / std::max(1, r.tokens));
+    // The live prediction is decoded on the model's own triangles, split as the extraction mesh is but to 0.01 of
+    // the diagonal: enough to read the layout from, and a fifth of a second a decode on the corpus' models.
+    squadgenPreview_ = squadgen::extractionMesh(squadgen::modelOf(*mesh_), 0.01);
+    squadgenPreviewPoints_ = squadgen::centroidsInFrame(squadgenPreview_, f);
+    {
+        std::ostringstream oss;
+        oss << "[SQuadGen] frame: centroid (" << std::setprecision(4) << f.centre[0] << ", " << f.centre[1]
+            << ") at the origin, scale " << f.scale << "; " << r.tokens << " tokens and " << r.contextPoints
+            << " key/value points, farthest-point samples of the area, " << r.segments << " edges of dS";
+        console_.log(oss.str());
+    }
+    console_.log("[SQuadGen] the truncated SDF at each point, the Geom-AE's code at the tokens and the SiT's "
+                 "conditioning from it: " + squadgenSeconds(r.conditionSeconds) +
+                 ". Disks: the tokens; dots: the key/value points. Press 'c' for the noise");
+}
+
+// The sampling dialog: what the noise and the ODE are. Every setting survives a reset.
+bool CrossGenWidget::promptSQUADGENSampling() {
+    SquadgenSettings &ss = squadgenSettings_;
+    QDialog dlg(this);
+    dlg.setWindowTitle(QString::fromUtf8("SQuadGen — sampling"));
+
+    auto *seedBox = new QSpinBox(&dlg);
+    seedBox->setRange(0, 999999);
+    seedBox->setValue(static_cast<int>(ss.seed));
+    seedBox->setToolTip("The seed of the white noise. 'n' later draws the next one.\n"
+                        "squadgen::Random, not torch's generator: the same number gives\n"
+                        "another sample than python -m squadgen2d generate's.");
+    auto *noiseBox = new QComboBox(&dlg);
+    noiseBox->addItem("Taubin-smoothed (the release's inference)");
+    noiseBox->addItem("white (as trained)");
+    noiseBox->setCurrentIndex(ss.taubin ? 0 : 1);
+    auto *methodBox = new QComboBox(&dlg);
+    methodBox->addItem("dopri5, adaptive (the release's)");
+    methodBox->addItem("Heun, fixed steps");
+    methodBox->addItem("Euler, fixed steps");
+    methodBox->setCurrentIndex(ss.method);
+    auto *stepsBox = new QSpinBox(&dlg);
+    stepsBox->setRange(1, 1000);
+    stepsBox->setValue(ss.steps);
+    stepsBox->setToolTip("Steps of Heun (two evaluations each) or Euler (one).");
+    auto *atolBox = new QSpinBox(&dlg);
+    atolBox->setRange(-12, -1);
+    atolBox->setPrefix("1e");
+    atolBox->setValue(ss.atolExp);
+    auto *rtolBox = new QSpinBox(&dlg);
+    rtolBox->setRange(-9, -1);
+    rtolBox->setPrefix("1e");
+    rtolBox->setValue(ss.rtolExp);
+    auto *hRelBox = new QDoubleSpinBox(&dlg);
+    hRelBox->setRange(0.0005, 0.05);
+    hRelBox->setDecimals(4);
+    hRelBox->setSingleStep(0.0005);
+    hRelBox->setValue(ss.hRel);
+    hRelBox->setToolTip("The extraction mesh the final latent is decoded on and QUARRY reads:\n"
+                        "the model split until its median edge is about this fraction of\n"
+                        "the diagonal. 0.002 is the release's and squadgen2d's.");
+    auto *previewBox = new QCheckBox("decode the predicted latent after every step", &dlg);
+    previewBox->setChecked(ss.preview);
+    previewBox->setToolTip("The right half of the diffusion phase: about half a second a step,\n"
+                           "on the sampling thread.");
+    auto updateEnabled = [methodBox, stepsBox, atolBox, rtolBox]() {
+        const bool adaptive = methodBox->currentIndex() == 0;
+        stepsBox->setEnabled(!adaptive);
+        atolBox->setEnabled(adaptive);
+        rtolBox->setEnabled(adaptive);
+    };
+    QObject::connect(methodBox, QOverload<int>::of(&QComboBox::currentIndexChanged), &dlg, updateEnabled);
+    updateEnabled();
+
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    buttons->button(QDialogButtonBox::Ok)->setText("Draw the noise");
+    QObject::connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    QObject::connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    auto *form = new QFormLayout(&dlg);
+    form->addRow("seed", seedBox);
+    form->addRow("initial noise", noiseBox);
+    form->addRow("ODE solver", methodBox);
+    form->addRow("fixed steps", stepsBox);
+    form->addRow("dopri5 atol", atolBox);
+    form->addRow("dopri5 rtol", rtolBox);
+    form->addRow("extraction mesh h_rel", hRelBox);
+    form->addRow(previewBox);
+    form->addRow(new QLabel("About 0.6 s an evaluation on the CPU at N = 2048: dopri5 takes\n"
+                            "100-150 of them, Heun 2 a step. Cancelling keeps the last settings.",
+                            &dlg));
+    form->addRow(buttons);
+    if (dlg.exec() != QDialog::Accepted) return false;
+    ss.seed = static_cast<unsigned>(seedBox->value());
+    ss.taubin = noiseBox->currentIndex() == 0;
+    ss.method = methodBox->currentIndex();
+    ss.steps = stepsBox->value();
+    ss.atolExp = atolBox->value();
+    ss.rtolExp = rtolBox->value();
+    ss.hRel = hRelBox->value();
+    ss.preview = previewBox->isChecked();
+    return true;
+}
+
+// Stage 2 at the dialog's settings; everything after it is gone with it.
+void CrossGenWidget::runSQUADGENNoise() {
+    squadgenNoiseAttempted_ = true;
+    if (!squadgen_ || !squadgen_->hasCondition()) return;
+    stopSQUADGENWorker();
+    squadgenLive_.reset();
+    squadgenSamplingStarted_ = false;
+    squadgenDecodeAnnounced_ = squadgenDecodeAttempted_ = false;
+    squadgenQuarryAnnounced_ = squadgenQuarryAttempted_ = false;
+    squadgenMesh_.reset();
+    squadgenMeshAttempted_ = false;
+    smoothMesh_.reset();
+    tmopAttempted_ = false;
+    pipelineBlocked_.clear();
+
+    const SquadgenSettings &ss = squadgenSettings_;
+    SQUADGEN::Options &o = squadgen_->options();
+    o.taubin = ss.taubin;
+    o.sampler.method = static_cast<squadgen::Sampler::Method>(ss.method);
+    o.sampler.steps = ss.steps;
+    o.sampler.atol = std::pow(10.0, ss.atolExp);
+    o.sampler.rtol = std::pow(10.0, ss.rtolExp);
+    o.hRel = ss.hRel;
+    try {
+        squadgen_->noise(ss.seed);
+    } catch (const std::exception &e) {
+        blockPipeline("the noise failed", e.what());
+        return;
+    }
+    const SQUADGEN::Report &r = squadgen_->getReport();
+    std::ostringstream oss;
+    oss << "[SQuadGen] seed " << ss.seed << ": white noise per token and channel";
+    if (ss.taubin)
+        oss << ", Taubin-smoothed over each token's 32 nearest (" << r.blockedPairs << " pairs across dS blocked)";
+    oss << ", std " << std::fixed << std::setprecision(2) << r.noiseStd << ". Press 'c' to integrate it";
+    console_.log(oss.str());
+    std::cerr << "[Viewer] " << oss.str() << "\n";
+}
+
+// Stage 3 on a thread of its own. The observer turns every accepted step into
+// what the paint shows: the latent, the latent the flow predicts at t = 1,
+// and -- off the GUI thread, since it is half a second -- that prediction
+// decoded on the preview triangles.
+void CrossGenWidget::startSQUADGENSampling() {
+    squadgenSamplingStarted_ = true;
+    if (!squadgen_ || !squadgen_->hasNoise()) return;
+    stopSQUADGENWorker();
+    pipelineBlocked_.clear();
+    squadgenLive_ = std::make_shared<SquadgenLive>();
+    squadgenStop_ = std::make_shared<std::atomic<bool>>(false);
+    squadgenLive_->x = squadgenLive_->predicted = squadgen_->initialNoise();
+
+    const squadgen::Sampler::Options &so = squadgen_->options().sampler;
+    {
+        std::ostringstream oss;
+        oss << "[SQuadGen] the ODE from t = 0 to 1 by " << squadgen::Sampler::name(so.method);
+        if (so.method == squadgen::Sampler::Method::Dopri5)
+            oss << " (atol " << so.atol << ", rtol " << so.rtol << ")";
+        else
+            oss << " (" << so.steps << " steps)";
+        oss << ", on a thread of its own; right: the CDF of the latent it predicts at t = 1";
+        console_.log(oss.str());
+    }
+    std::shared_ptr<SquadgenLive> live = squadgenLive_;
+    std::shared_ptr<std::atomic<bool>> stop = squadgenStop_;
+    SQUADGEN *g = squadgen_.get();
+    const std::vector<float> points = squadgenSettings_.preview ? squadgenPreviewPoints_ : std::vector<float>();
+    squadgenWorker_ = std::thread([g, live, stop, points]() {
+        const auto t0 = std::chrono::steady_clock::now();
+        try {
+            const bool finished = g->sample(
+                [&](const squadgen::Sampler::Progress &p) {
+                    std::vector<float> predicted(p.x->size());
+                    const float rest = static_cast<float>(1.0 - p.t);
+                    for (size_t i = 0; i < predicted.size(); ++i) predicted[i] = (*p.x)[i] + rest * (*p.v)[i];
+                    std::vector<float> cdf;
+                    if (!points.empty() && !stop->load()) cdf = g->decodeAt(predicted, points).cdf;
+                    std::lock_guard<std::mutex> lock(live->m);
+                    live->t = p.t;
+                    live->h = p.h;
+                    live->steps = p.steps;
+                    live->rejected = p.rejected;
+                    live->evaluations = p.evaluations;
+                    live->x = *p.x;
+                    live->predicted = std::move(predicted);
+                    if (!cdf.empty()) {
+                        live->previewCDF = std::move(cdf);
+                        live->previewT = p.t;
+                    }
+                    live->seconds = squadgenSince(t0);
+                    return !stop->load();
+                },
+                stop.get());
+            std::lock_guard<std::mutex> lock(live->m);
+            live->finished = finished;
+            live->seconds = squadgenSince(t0);
+            live->done = true;
+        } catch (const std::exception &e) {
+            std::lock_guard<std::mutex> lock(live->m);
+            live->error = e.what();
+            live->done = true;
+        }
+    });
+}
+
+void CrossGenWidget::pollSQUADGENSampling() {
+    if (!squadgenLive_ || !squadgenWorker_.joinable()) return;
+    {
+        std::lock_guard<std::mutex> lock(squadgenLive_->m);
+        if (!squadgenLive_->done) return;
+    }
+    squadgenWorker_.join();
+    const SquadgenLive &L = *squadgenLive_;
+    if (!L.error.empty()) {
+        blockPipeline("the diffusion failed", L.error);
+        return;
+    }
+    if (!L.finished) {
+        std::ostringstream oss;
+        oss << "[SQuadGen] the diffusion was stopped at t = " << std::fixed << std::setprecision(3) << L.t;
+        console_.log(oss.str());
+        return;
+    }
+    const SQUADGEN::Report &r = squadgen_->getReport();
+    std::ostringstream oss;
+    oss << "[SQuadGen] t = 1 after " << r.steps << " steps";
+    if (r.rejected) oss << " (" << r.rejected << " rejected)";
+    oss << ", " << r.evaluations << " evaluations, " << squadgenSeconds(L.seconds)
+        << ": the latent SQ-Diffuse generated. Press 'c' to decode it on the extraction mesh";
+    console_.log(oss.str());
+    std::cerr << "[Viewer] " << oss.str() << "\n";
+}
+
+void CrossGenWidget::stopSQUADGENWorker() {
+    if (squadgenStop_) squadgenStop_->store(true);
+    if (squadgenWorker_.joinable()) squadgenWorker_.join();
+}
+
+// Stage 4.
+void CrossGenWidget::runSQUADGENDecode() {
+    squadgenDecodeAttempted_ = true;
+    if (!squadgen_ || !squadgen_->hasLatent()) {
+        blockPipeline("nothing decoded", "the diffusion has not reached t = 1");
+        return;
+    }
+    pipelineBlocked_.clear();
+    try {
+        squadgen_->decode();
+    } catch (const std::exception &e) {
+        blockPipeline("the decoder failed", e.what());
+        return;
+    }
+    const SQUADGEN::Report &r = squadgen_->getReport();
+    std::ostringstream oss;
+    oss << "[SQuadGen] the latent decoded at the " << r.triangles << " centroids of the extraction mesh (the model "
+        << "split " << r.levels << " times, h_rel " << squadgen_->options().hRel << "), "
+        << squadgenSeconds(r.decodeSeconds) << ": the CDF, 1 at a chart's centre and 0 on its sides";
+    console_.log(oss.str());
+    console_.log("[SQuadGen] press 'p' for the DCDF, 'c' for the blocks QUARRY reads off them");
+}
+
+// Stage 5, and what of it the picture needs: a colour per chart, and which
+// made no block.
+void CrossGenWidget::runSQUADGENQuarry() {
+    squadgenQuarryAttempted_ = true;
+    if (!squadgen_ || !squadgen_->hasFields()) {
+        blockPipeline("QUARRY not run", "there are no decoded fields");
+        return;
+    }
+    pipelineBlocked_.clear();
+    try {
+        squadgen_->extract();
+    } catch (const std::exception &e) {
+        blockPipeline("QUARRY failed", e.what());
+        return;
+    }
+    const QUARRY &q = squadgen_->quarry();
+    const QUARRY::Report &qr = q.getReport();
+    const SQUADGEN::Report &r = squadgen_->getReport();
+    squadgenChartColour_ = viewer::colourLabels(*squadgen_->extractionMesh(), q.chartLabels());
+    const std::vector<QUARRY::ChartStatus> &status = q.chartStatus();
+    squadgenChartFailed_.assign(status.size(), 0);
+    std::string firstProblem;
+    for (size_t c = 0; c < status.size(); ++c) {
+        squadgenChartFailed_[c] = !status[c].block && !status[c].dissolved;
+        if (squadgenChartFailed_[c] && firstProblem.empty()) firstProblem = status[c].problem;
+    }
+    {
+        std::ostringstream oss;
+        oss << "[QUARRY] " << qr.charts.regions << " charts from the CDF, " << qr.duals.regions
+            << " layout vertices from the DCDF; " << qr.junctions << " junctions, " << qr.collapsedArcs
+            << " arcs collapsed, " << qr.addedCorners << " corners taken on dS, " << qr.dissolvedCharts
+            << " charts dissolved, " << squadgenSeconds(r.extractSeconds);
+        console_.log(oss.str());
+    }
+    {
+        std::ostringstream oss;
+        oss << "[QUARRY] " << r.blocks << " blocks covering " << std::fixed << std::setprecision(1)
+            << 100.0 * r.coverage << "% of the model "
+            << (r.valid ? "-- a decomposition of it [PASS]"
+                        : "-- not a decomposition of it [FAIL]: " + std::to_string(qr.failedCharts) +
+                              " charts made no block" +
+                              (firstProblem.empty() ? std::string() : " (" + firstProblem + ")"));
+        console_.log(oss.str());
+        std::cerr << "[Viewer] " << oss.str() << "\n";
+    }
+    console_.log(std::string("[SQuadGen] block sides in light blue, macrovertices in green, each chart a tint") +
+                 (r.valid ? "" : ", the ones that made no block red") +
+                 (r.blocks > 0 ? ". Press 'c' to mesh them" : ". Press 'n' for another sample"));
+}
+
+void CrossGenWidget::nextSQUADGENSample() {
+    stopSQUADGENWorker();
+    ++squadgenSettings_.seed;
+    squadgenPhase_ = SQUADGENPhase::Noise;
+    std::cerr << "[Viewer] SQuadGen Phase " << squadgenPhaseName(squadgenPhase_) << ", seed "
+              << squadgenSettings_.seed << "\n";
+    runSQUADGENNoise();
+}
+
+bool CrossGenWidget::promptSQUADGENMesh() {
+    if (!squadgen_ || !squadgen_->hasBlocks() || squadgen_->decomposition().blocks.empty()) return false;
+    return promptBlockQuadMesh(squadgen_->decomposition(), "SQuadGen — quadrilateral mesh on QUARRY's blocks");
+}
+
+// BlockQuadMesh at the dialog's settings, as quarry.py meshes QUARRY's blocks
+// (BlockQuadMesh's own defaults past the target), reported as every block
+// mode's mesh is.
+void CrossGenWidget::runSQUADGENMesh() {
+    if (!squadgen_ || !squadgen_->hasBlocks() || squadgen_->decomposition().blocks.empty()) {
+        blockPipeline("the mesh not built", "QUARRY made no block to mesh");
+        return;
+    }
+    squadgenMeshAttempted_ = true;
+    squadgenMesh_.reset();
+    smoothMesh_.reset();
+    tmopAttempted_ = false;
+    pipelineBlocked_.clear();
+    BlockQuadMesh::Options mo;
+    mo.targetEdgeLength = meshSettings_.target;
+    mo.minIntervals = meshSettings_.minEdges;
+    mo.maxIntervals = meshSettings_.maxEdges;
+    const auto t0 = Clock::now();
+    try {
+        squadgenMesh_.emplace(squadgen_->decomposition(), mo);
+    } catch (const std::exception &e) {
+        squadgenMesh_.reset();
+        blockPipeline("the mesh failed", e.what());
+        return;
+    }
+    reportBlockQuadMesh(*squadgenMesh_, std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+}
+
+// What SQuadGen mode draws, phase by phase.
+void CrossGenWidget::renderSQUADGEN() {
+    if (squadgenPhase_ >= SQUADGENPhase::Mesh && squadgenMesh_) {
+        viewer::drawAxis(view_);
+        if (squadgenPhase_ == SQUADGENPhase::Smoothed && smoothMesh_.has_value())
+            viewer::drawQuadMesh(*smoothMesh_, *squadgenMesh_, 1.0f, 2.5f);
+        else
+            viewer::drawQuadMesh(*squadgenMesh_, 1.0f, 2.5f);
+        return;
+    }
+    if (!squadgen_ || !squadgen_->hasCondition() || squadgenPhase_ < SQUADGENPhase::Tokens) {
+        viewer::drawAxis(view_);
+        viewer::drawMesh(*mesh_);
+        return;
+    }
+    const SQUADGEN &g = *squadgen_;
+    const int C = g.networks().description().latentDim;
+
+    // Stage 5: the charts (or the CDF) under the blocks.
+    if (squadgenPhase_ >= SQUADGENPhase::Blocks && g.hasBlocks()) {
+        viewer::drawAxis(view_);
+        const squadgen::Model &em = g.extractionModel();
+        if (squadgenShowCDFUnder_)
+            viewer::drawTriangleField(em.vertices, em.triangles, g.fields().cdf);
+        else
+            viewer::drawLabelFill(em.vertices, em.triangles, g.quarry().chartLabels(), squadgenChartColour_,
+                                  squadgenChartFailed_, 0.8f);
+        viewer::drawBoundaryEdges(*mesh_);
+        viewer::drawBlockDecomposition(g.decomposition(), 0.30 * avgEdge_, 3.0f);
+        return;
+    }
+    // Stage 4: a field per extraction triangle.
+    if (squadgenPhase_ >= SQUADGENPhase::Fields && g.hasFields()) {
+        viewer::drawAxis(view_);
+        const squadgen::Model &em = g.extractionModel();
+        viewer::drawTriangleField(em.vertices, em.triangles, squadgenShowDCDF_ ? g.fields().dcdf : g.fields().cdf);
+        viewer::drawBoundaryEdges(*mesh_);
+        return;
+    }
+    // Stage 3, live: the latent on the tokens left, the prediction decoded right.
+    if (squadgenPhase_ >= SQUADGENPhase::Diffusion && squadgenLive_) {
+        std::vector<float> latent, cdf;
+        {
+            std::lock_guard<std::mutex> lock(squadgenLive_->m);
+            latent = squadgenShowPredicted_ ? squadgenLive_->predicted : squadgenLive_->x;
+            cdf = squadgenLive_->previewCDF;
+        }
+        const int w = fbw(), halfW = w / 2;
+        applyHalfOrtho(0, halfW, view_);
+        {
+            viewer::ViewState left = view_;
+            left.fbw = halfW;
+            left.fbh = fbh();
+            viewer::drawAxis(left);
+        }
+        viewer::drawTokenDisks(squadgenTokens_, latent, C, squadgenChannel_, true, 2.5, squadgenDiskRadius_);
+        viewer::drawBoundaryEdges(*mesh_);
+        applyHalfOrtho(halfW, w - halfW, view_);
+        if (!cdf.empty())
+            viewer::drawTriangleField(squadgenPreview_.vertices, squadgenPreview_.triangles, cdf);
+        else
+            viewer::drawMesh(*mesh_);
+        viewer::drawBoundaryEdges(*mesh_);
+        drawSplitDivider(halfW);
+        return;
+    }
+    // Stage 2: one channel of the initial latent.
+    if (squadgenPhase_ >= SQUADGENPhase::Noise && g.hasNoise()) {
+        viewer::drawAxis(view_);
+        viewer::drawTokenDisks(squadgenTokens_, g.initialNoise(), C, squadgenChannel_, true, 2.5,
+                               squadgenDiskRadius_);
+        viewer::drawBoundaryEdges(*mesh_);
+        return;
+    }
+    // Stage 1: the key/value points, and the tokens by how deep inside they are.
+    viewer::drawAxis(view_);
+    viewer::drawPointSet(squadgenContext_, 2.0f, 0.55f, 0.55f, 0.58f);
+    std::vector<float> depth(g.tokenSDF().size());
+    for (size_t i = 0; i < depth.size(); ++i) depth[i] = -g.tokenSDF()[i];
+    viewer::drawTokenDisks(squadgenTokens_, depth, 1, 0, false, 1.0, squadgenDiskRadius_);
+    viewer::drawBoundaryEdges(*mesh_);
+}
+
 // ── Stage 0c: the circular inclusions, taken out before anything is built ────
 //
 // Called from the mode keys and nowhere else. Every stage of either pipeline is
@@ -5975,6 +6590,70 @@ void CrossGenWidget::advancePhase() {
             }
         }
         if (oraclePhase_ == ORACLEPhase::Smoothed && oracleMesh_) {
+            tmopAttempted_ = true;
+            if (promptTMOP()) runTMOP();
+        }
+    } else if (mode_ == Mode::SQUADGEN) {
+        // Nothing to step through without the networks: the reason is on
+        // screen (blockPipeline), and 'r' is the way out.
+        if (squadgenAttempted_ && !squadgen_) {
+            console_.log("[SQuadGen] " + (pipelineBlocked_.empty() ? std::string("it could not start")
+                                                                   : pipelineBlocked_));
+            return;
+        }
+        // Stage 3 runs on its own thread, and nothing after it exists until it
+        // reaches t = 1: 'c' waits for it rather than entering a phase with no
+        // input.
+        if (squadgenPhase_ == SQUADGENPhase::Diffusion) {
+            pollSQUADGENSampling();
+            if (squadgenWorker_.joinable()) {
+                double t = 0.0;
+                {
+                    std::lock_guard<std::mutex> lock(squadgenLive_->m);
+                    t = squadgenLive_->t;
+                }
+                std::ostringstream oss;
+                oss << "[SQuadGen] still sampling (t = " << std::fixed << std::setprecision(2) << t
+                    << "); 'c' once it reaches t = 1, 'n' to stop it and draw the next seed";
+                console_.log(oss.str());
+                return;
+            }
+            if (!squadgen_ || !squadgen_->hasLatent()) {
+                console_.log("[SQuadGen] the diffusion did not reach t = 1: press 'n' to draw another sample");
+                return;
+            }
+        }
+        SQUADGENPhase old = squadgenPhase_;
+        squadgenPhase_ = nextSQUADGENPhase(squadgenPhase_);
+        if (squadgenPhase_ != old)
+            std::cerr << "[Viewer] SQuadGen Phase " << squadgenPhaseName(squadgenPhase_) << "\n";
+
+        // The sampling dialog on the way into the noise, which is the first
+        // stage it decides; Stage 1 first if 'c' came before the frame that
+        // runs it. Cancelling keeps whatever was last used.
+        if (old == SQUADGENPhase::Tokens && squadgenPhase_ == SQUADGENPhase::Noise) {
+            if (!squadgenAttempted_) runSQUADGENCondition();
+            if (squadgen_) {
+                // Marked as asked before the dialog opens: it paints, and the
+                // catch-up in runComputations() would draw the noise under it
+                // at the settings it is about to change.
+                squadgenNoiseAttempted_ = true;
+                promptSQUADGENSampling();
+                runSQUADGENNoise();
+            }
+        }
+        // The last two phases as every block mode has them.
+        if (old == SQUADGENPhase::Blocks && squadgenPhase_ == SQUADGENPhase::Mesh) {
+            if (!squadgenQuarryAttempted_) {
+                if (!squadgenDecodeAttempted_) runSQUADGENDecode();
+                runSQUADGENQuarry();
+            }
+            if (squadgen_ && squadgen_->hasBlocks() && !squadgen_->decomposition().blocks.empty()) {
+                squadgenMeshAttempted_ = true;
+                if (promptSQUADGENMesh()) runSQUADGENMesh();
+            }
+        }
+        if (squadgenPhase_ == SQUADGENPhase::Smoothed && squadgenMesh_) {
             tmopAttempted_ = true;
             if (promptTMOP()) runTMOP();
         }
@@ -7206,6 +7885,59 @@ void CrossGenWidget::runComputations() {
         if (promptTMOP()) runTMOP();
     }
 
+    // ── SQuadGen: Stages 1-5, then the mesh on QUARRY's blocks ─────────────
+    //
+    // Stage 1 (and the networks, the first time), 4 and 5 block and are
+    // announced a frame ahead; Stage 3 is started once on its thread and
+    // polled every frame. The two dialogs are asked for again here in case the
+    // phase was entered before its input existed.
+    if (mode_ == Mode::SQUADGEN) {
+        if (squadgenPhase_ >= SQUADGENPhase::Tokens && !squadgenAttempted_) {
+            if (!squadgenAnnounced_) {
+                console_.log(squadgenNets_ ? "[SQuadGen] Stage 1: the tokens, their SDF, the Geom-AE's code and the "
+                                             "SiT's conditioning; this blocks..."
+                                           : "[SQuadGen] reading the networks (" + squadgen::Networks::defaultDirectory() +
+                                                 "), then Stage 1; this blocks for a few seconds...");
+                squadgenAnnounced_ = true;
+            } else {
+                runSQUADGENCondition();
+            }
+        }
+        if (squadgenPhase_ >= SQUADGENPhase::Noise && squadgen_ && !squadgenNoiseAttempted_) runSQUADGENNoise();
+        if (squadgenPhase_ >= SQUADGENPhase::Diffusion && squadgen_ && squadgen_->hasNoise() &&
+            !squadgenSamplingStarted_)
+            startSQUADGENSampling();
+        pollSQUADGENSampling();
+        if (squadgenPhase_ >= SQUADGENPhase::Fields && squadgen_ && squadgen_->hasLatent() &&
+            !squadgenWorker_.joinable() && !squadgenDecodeAttempted_) {
+            if (!squadgenDecodeAnnounced_) {
+                console_.log("[SQuadGen] Stage 4: the latent decoded at every centroid of the extraction mesh; this "
+                             "blocks...");
+                squadgenDecodeAnnounced_ = true;
+            } else {
+                runSQUADGENDecode();
+            }
+        }
+        if (squadgenPhase_ >= SQUADGENPhase::Blocks && squadgen_ && squadgen_->hasFields() &&
+            !squadgenQuarryAttempted_) {
+            if (!squadgenQuarryAnnounced_) {
+                console_.log("[SQuadGen] Stage 5: QUARRY reading the blocks off the fields; this blocks...");
+                squadgenQuarryAnnounced_ = true;
+            } else {
+                runSQUADGENQuarry();
+            }
+        }
+        if (squadgenPhase_ == SQUADGENPhase::Mesh && squadgen_ && squadgen_->hasBlocks() &&
+            !squadgen_->decomposition().blocks.empty() && !squadgenMeshAttempted_) {
+            squadgenMeshAttempted_ = true;
+            if (promptSQUADGENMesh()) runSQUADGENMesh();
+        }
+        if (squadgenPhase_ == SQUADGENPhase::Smoothed && squadgenMesh_ && !tmopAttempted_) {
+            tmopAttempted_ = true;
+            if (promptTMOP()) runTMOP();
+        }
+    }
+
     // ── SKELETON: Steps 1-10, then the blocks and the mesh on them ──────────
     //
     // The stages up to Step 10 one per phase (runSKELETONStages), and then the
@@ -8157,6 +8889,8 @@ void CrossGenWidget::renderNormal() {
     } else if (mode_ == Mode::ORACLE) {
         viewer::drawAxis(view_);
         renderORACLE();
+    } else if (mode_ == Mode::SQUADGEN) {
+        renderSQUADGEN();
     } else if (mode_ == Mode::SKELETON) {
         viewer::drawAxis(view_);
         const MedialAxis *ma = skeletonAxis();
@@ -8358,6 +9092,13 @@ void CrossGenWidget::renderNormal() {
              ? std::string("press 'm' to fill the elements by material\n")
              : std::string());
 
+    // SQuadGen's: whatever refused, and another sample from the noise on.
+    const std::string squadgenKeys =
+        (pipelineBlocked_.empty() ? std::string() : pipelineBlocked_ + "\n") +
+        ((mode_ == Mode::SQUADGEN && squadgenPhase_ >= SQUADGENPhase::Noise && squadgen_)
+             ? std::string("press 'n' for another sample (the next seed)\n")
+             : std::string());
+
     // ZIPLINE's: whatever refused, and the material fill.
     const std::string ziplineKeys =
         (pipelineBlocked_.empty() ? std::string() : pipelineBlocked_ + "\n") +
@@ -8373,7 +9114,7 @@ void CrossGenWidget::renderNormal() {
                       "press '3' for SKELETON mode\npress '4' for TORSION mode\n"
                       "press '5' for OASIS mode\npress '6' for UMBER mode\n"
                       "press '7' for MERIDIAN mode\npress '8' for ATLAS mode\n"
-                      "press '9' for ORACLE mode\n"
+                      "press '9' for ORACLE mode\npress '0' for SQuadGen mode\n"
                       "right-drag to pan, scroll to zoom\n"
                       "press 'r' to restart\npress 'q' to quit");
     } else if (mode_ == Mode::ATLAS && atlasPhase_ == ATLASPhase::Smoothed) {
@@ -8409,6 +9150,42 @@ void CrossGenWidget::renderNormal() {
         renderOverlay((oracleKeys +
                        (oracle_ && oracle_->hasChoice() ? "press 'c' to mesh the blocks\n" : "") +
                        "press 'r' to restart\npress 'q' to quit").c_str());
+    } else if (mode_ == Mode::SQUADGEN) {
+        std::string keys;
+        switch (squadgenPhase_) {
+            case SQUADGENPhase::Noise:
+                keys = "press '[' / ']' for the previous / next latent channel\npress 'c' to start the diffusion\n";
+                break;
+            case SQUADGENPhase::Diffusion:
+                keys = std::string("press '[' / ']' for the previous / next latent channel\n") +
+                       (squadgenShowPredicted_ ? "press 'p' to show the latent x_t on the left\n"
+                                               : "press 'p' to show the predicted latent on the left\n") +
+                       (squadgenWorker_.joinable() ? "" : "press 'c' to decode the latent on the extraction mesh\n");
+                break;
+            case SQUADGENPhase::Fields:
+                keys = std::string(squadgenShowDCDF_ ? "press 'p' for the CDF\n" : "press 'p' for the DCDF\n") +
+                       "press 'c' for QUARRY's blocks\n";
+                break;
+            case SQUADGENPhase::Blocks:
+                keys = std::string(squadgenShowCDFUnder_ ? "press 'p' for QUARRY's charts under the blocks\n"
+                                                         : "press 'p' for the CDF under the blocks\n") +
+                       (squadgen_ && squadgen_->hasBlocks() && !squadgen_->decomposition().blocks.empty()
+                            ? "press 'c' to mesh the blocks\n"
+                            : "");
+                break;
+            case SQUADGENPhase::Mesh:
+                keys = "press 'c' to smooth the mesh with TMOP\npress 'e' to mesh again at another target edge "
+                       "length\n";
+                break;
+            case SQUADGENPhase::Smoothed:
+                keys = "press 'c' to smooth again at other TMOP settings\npress 'e' to mesh again at another target "
+                       "edge length\n";
+                break;
+            default:
+                keys = "press 'c' to continue\n";
+                break;
+        }
+        renderOverlay((squadgenKeys + keys + "press 'r' to restart\npress 'q' to quit").c_str());
     } else if (mode_ == Mode::OASIS) {
         renderOverlay("press 'c' to change lambda / orientation\n"
                       "press 'r' to restart\npress 'q' to quit");
@@ -8498,6 +9275,44 @@ void CrossGenWidget::drawLegends() {
         else if ((atlasPhase_ == ATLASPhase::Carrier && atlasCarrier_) ||
                  (atlasPhase_ == ATLASPhase::Search && atlas_ && atlas_->hasCover()))
             viewer::drawATLASLegend(fbw(), fbh(), false);
+        return;
+    }
+    // SQuadGen: the ramp of whatever is on the tokens or the triangles, and
+    // during the diffusion how far t has come.
+    if (mode_ == Mode::SQUADGEN && squadgen_ && squadgenNets_) {
+        const std::string channel = "latent channel " + std::to_string(squadgenChannel_) + " of " +
+                                    std::to_string(squadgenNets_->description().latentDim) + " (normalised)";
+        if (squadgenPhase_ == SQUADGENPhase::Tokens && squadgen_->hasCondition()) {
+            viewer::drawRampLegend(fbw(), fbh(), 0.0, 1.0, "token depth, -sdf / tau", false);
+        } else if (squadgenPhase_ == SQUADGENPhase::Noise && squadgen_->hasNoise()) {
+            viewer::drawRampLegend(fbw(), fbh(), -2.5, 2.5, ("initial noise, " + channel).c_str(), true);
+        } else if (squadgenPhase_ == SQUADGENPhase::Diffusion && squadgenLive_) {
+            double t = 0.0, seconds = 0.0, previewT = -1.0;
+            int steps = 0, evaluations = 0, rejected = 0;
+            {
+                std::lock_guard<std::mutex> lock(squadgenLive_->m);
+                t = squadgenLive_->t;
+                seconds = squadgenLive_->seconds;
+                previewT = squadgenLive_->previewT;
+                steps = squadgenLive_->steps;
+                evaluations = squadgenLive_->evaluations;
+                rejected = squadgenLive_->rejected;
+            }
+            viewer::drawRampLegend(fbw(), fbh(), -2.5, 2.5,
+                                   ((squadgenShowPredicted_ ? "predicted latent, " : "x_t, ") + channel).c_str(), true);
+            if (previewT >= 0.0)
+                viewer::drawRampLegend(fbw(), fbh(), 0.0, 1.0, "CDF of the predicted latent", false,
+                                       static_cast<float>(fbw() / 2) / viewer::renderScale() + 20.0f);
+            std::ostringstream oss;
+            oss << "t = " << std::fixed << std::setprecision(3) << t << "   step " << steps;
+            if (rejected) oss << " (" << rejected << " rejected)";
+            oss << "   " << evaluations << " evaluations   " << std::setprecision(0) << seconds << " s";
+            viewer::drawProgressBar(fbw(), fbh(), t, oss.str().c_str());
+        } else if (squadgenPhase_ == SQUADGENPhase::Fields && squadgen_->hasFields()) {
+            viewer::drawRampLegend(fbw(), fbh(), 0.0, 1.0, squadgenShowDCDF_ ? "decoded DCDF" : "decoded CDF", false);
+        } else if (squadgenPhase_ == SQUADGENPhase::Blocks && squadgen_->hasBlocks() && squadgenShowCDFUnder_) {
+            viewer::drawRampLegend(fbw(), fbh(), 0.0, 1.0, "decoded CDF", false);
+        }
         return;
     }
     if (mode_ == Mode::OASIS && oasisPhase_ == OASISPhase::Field && oasis_.has_value()) {
@@ -8607,6 +9422,7 @@ QString CrossGenWidget::nextFigurePath(const char *extension) const {
     case Mode::UMBER:      phase = umberPhaseName(umberPhase_);          break;
     case Mode::ATLAS:      phase = atlasPhaseName(atlasPhase_);          break;
     case Mode::ORACLE:     phase = oraclePhaseName(oraclePhase_);        break;
+    case Mode::SQUADGEN:   phase = squadgenPhaseName(squadgenPhase_);    break;
     case Mode::PolyVector:
     case Mode::Unselected:  phase = phaseName(phase_);                   break;
     }

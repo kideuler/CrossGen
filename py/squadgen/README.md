@@ -41,6 +41,7 @@ Defaults are paths in this checkout, so commands can run from any directory.
 | `roundtrip` | SQ-VAE → block extraction on true vs decoded fields | `crossgen` (QUARRY); QuadTools for `--extractor quadextraction` |
 | `quarry DIR` | one extraction input (`quarry_input.npz`) → QUARRY's blocks and mesh (`quarry_output.npz`) | `crossgen` |
 | `generate OBJ...` | domain OBJs + trained SQ-Diffuse → generated block layouts and meshes (inference) | torch; `crossgen` (QUARRY) |
+| `export-onnx` | trained SQ-Diffuse + its SQ-VAE and Geom-AE → five ONNX graphs and a reference case, for C++ inference (`src/SQUADGEN`) | torch, onnx (onnxruntime to check them here, optional) |
 
 A full run on the ORACLE layouts:
 
@@ -78,6 +79,27 @@ the data layout), each kept mesh as `<model>/quad.ply`, and `generate.png`, a ro
 `cdf-data` is the only step that needs CrossGen. Copy its output directory to a GPU box and build the pack there:
 packing needs only numpy. `sq-vae` and `sq-diffuse` build the pack themselves when it is missing, so the NPZs and
 `manifest.csv` are all a box needs for training (see Cloud training below).
+
+## C++ inference (`export-onnx`, `src/SQUADGEN`)
+
+`export-onnx` writes the three networks of inference as five ONNX graphs (`best_models/best.pt` → `best_models/onnx/`
+by default), cut where nothing downstream needs recomputing: the Geom-AE's code (`geom_code`), the SiT's per-block
+conditioning, once a domain (`sit_condition`), one velocity evaluation of the ODE (`sit_velocity`), and the SQ-VAE
+decoder's trunk (`vae_tokens`, once a latent) and per-point query (`vae_query`, the four fields QUARRY reads). Every
+file carries `squadgen.*` metadata (N, widths, tau, `target_mu`/`target_std`, the checkpoint and step, one export id
+for the five), and `reference/` holds one domain's Sec. 4 in torch, stage by stage (geom005, seed 0 by default):
+
+```sh
+squadgen2d export-onnx                                        # best_models/best.pt -> best_models/onnx (~250 MB)
+squadgen2d export-onnx --model py/squadgen/runs/<run>/best.pt --out /tmp/sqd_onnx
+```
+
+The C++ side is `src/SQUADGEN` (CrossGen's `CrossGenSquadGen` library, ONNX Runtime linked PRIVATE): the frame, token
+sets, truncated SDF, Taubin noise, dopri5 and extraction mesh ported from this package, then QUARRY. `TestSQUADGEN
+<mesh.obj> [--samples k]` generates as `generate` does; `TestSQUADGEN --check best_models/onnx/reference` (ctest
+`SQUADGEN_Parity`) compares every stage with the reference. The viewer's mode `0` runs it phase by phase, the diffusion
+drawn live. On the M2's CPU a velocity is ~0.6 s, so a dopri5 sample is ~90 s; the seeds are `squadgen::Random`'s,
+not numpy's and torch's, so a seed there is another sample than the same seed here.
 
 ## Latent tokens (`sq-diffuse --tokens`)
 
@@ -188,4 +210,4 @@ from squadgen2d import geometry, layout, paths
 | `domains` | the Geom-AE's domains, families, split, FPS token-set cache |
 | `layout` | a CDF NPZ's split mesh and its fields (Appendix B) |
 | `layers` | network modules shared by the Geom-AE and SQ-VAE |
-| `cdf_data`, `cdf_pack`, `geom_ae`, `sq_vae`, `sq_diffuse`, `roundtrip`, `generate`, `quarry` | the commands (`quarry` needs crossgen, never torch) |
+| `cdf_data`, `cdf_pack`, `geom_ae`, `sq_vae`, `sq_diffuse`, `roundtrip`, `generate`, `quarry`, `export_onnx` | the commands (`quarry` needs crossgen, never torch) |

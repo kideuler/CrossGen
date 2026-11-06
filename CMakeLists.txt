@@ -377,14 +377,15 @@ target_link_libraries(TestATLAS PRIVATE PolyVector)
 # ORACLE (src/ORACLE): a block decomposition chosen from among the five methods
 # above by the selector py/train_classifier.py exports (py/selector.onnx) --
 # ZIPLINE run first as the probe, then the best-ranked other method, the
-# better of the two kept. A library of its own because it is the one place
-# that links ONNX Runtime, and links it PRIVATE, so the runtime's headers reach
-# src/ORACLE/Selector.cxx and nothing else, as OpenCASCADE's reach src/geom.
+# better of the two kept. A library of its own because it is one of the two
+# places that link ONNX Runtime (SQUADGEN, below, is the other), and links it
+# PRIVATE, so the runtime's headers reach src/ORACLE/Selector.cxx and nothing
+# else, as OpenCASCADE's reach src/geom.
 # Without ONNX Runtime (Homebrew: `brew install onnxruntime`) ORACLE still
 # builds, and says it cannot read a selector; CROSSGEN_ENABLE_ONNXRUNTIME=OFF
 # builds it that way on purpose. The runtime's own CMake package is not used:
 # it names abseil, protobuf and re2 targets it does not find for its users.
-option(CROSSGEN_ENABLE_ONNXRUNTIME "Read ORACLE's selector (py/selector.onnx) with ONNX Runtime" ON)
+option(CROSSGEN_ENABLE_ONNXRUNTIME "Run ORACLE's selector (py/selector.onnx) and SQUADGEN's networks (best_models/onnx) with ONNX Runtime" ON)
 set(CROSSGEN_ONNXRUNTIME_FOUND OFF)
 if (CROSSGEN_ENABLE_ONNXRUNTIME)
     set(ONNXRUNTIME_HINTS "")
@@ -430,6 +431,40 @@ endif()
 # kept, and optionally a mesh on them by the kept method's own mesher.
 add_executable(TestORACLE src/utils/TestORACLE.cxx)
 target_link_libraries(TestORACLE PRIVATE CrossGenOracle)
+
+# SQUADGEN (src/SQUADGEN): SQuadGen's inference (docs/squadgen_2d.md Sec. 4)
+# without Python -- the Geom-AE, the SiT and the SQ-VAE decoder as the ONNX
+# graphs `python -m squadgen2d export-onnx` writes (best_models/onnx), the token
+# sets, Taubin noise and dopri5 around them, and QUARRY on the decoded fields.
+# A library of its own for ORACLE's reason: it links ONNX Runtime PRIVATE, so
+# the runtime's headers reach src/SQUADGEN/Networks.cxx and nothing else. A
+# build without the runtime still builds it, and it says it cannot run the
+# networks. The graphs read when nothing names them are the source tree's
+# best_models/onnx; $CROSSGEN_SQUADGEN names another directory.
+add_library(CrossGenSquadGen SHARED
+    src/SQUADGEN/Networks.hxx
+    src/SQUADGEN/Networks.cxx
+    src/SQUADGEN/Domain.hxx
+    src/SQUADGEN/Domain.cxx
+    src/SQUADGEN/Sampler.hxx
+    src/SQUADGEN/Sampler.cxx
+    src/SQUADGEN/SQUADGEN.hxx
+    src/SQUADGEN/SQUADGEN.cxx
+)
+target_link_libraries(CrossGenSquadGen PUBLIC PolyVector)
+target_compile_definitions(CrossGenSquadGen PRIVATE
+    CROSSGEN_SQUADGEN_DEFAULT="${CMAKE_CURRENT_SOURCE_DIR}/best_models/onnx")
+if (CROSSGEN_ONNXRUNTIME_FOUND)
+    target_include_directories(CrossGenSquadGen PRIVATE "${ONNXRUNTIME_INCLUDE_DIR}")
+    target_link_libraries(CrossGenSquadGen PRIVATE "${ONNXRUNTIME_LIBRARY}")
+    target_compile_definitions(CrossGenSquadGen PRIVATE CROSSGEN_HAVE_ONNXRUNTIME)
+endif()
+
+# Generate block layouts of models with SQUADGEN, the best of --samples seeds
+# kept as `python -m squadgen2d generate` keeps it; --check compares every stage
+# with the reference case export-onnx writes.
+add_executable(TestSQUADGEN src/utils/TestSQUADGEN.cxx)
+target_link_libraries(TestSQUADGEN PRIVATE CrossGenSquadGen)
 
 # copy all meshes to build directory for easy access, keeping the material
 # subdirectory layout (singlemat/, multimat/, ...) intact
@@ -779,6 +814,14 @@ add_test(NAME ORACLE_singlemat_geom029
          COMMAND TestORACLE ${CMAKE_CURRENT_SOURCE_DIR}/data/meshes/singlemat/geom029.obj --mesh 0.05)
 set_tests_properties(ORACLE_singlemat_geom029 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 2400)
 
+# SQUADGEN against the reference case `python -m squadgen2d export-onnx` wrote
+# beside the graphs: the frame, the SDF, every graph, Taubin's smoothing, the
+# dopri5 latent, the decoded fields, the extraction mesh and QUARRY's blocks,
+# each against torch's. Skipped (77) without ONNX Runtime or the export.
+add_test(NAME SQUADGEN_Parity
+         COMMAND TestSQUADGEN --check ${CMAKE_CURRENT_SOURCE_DIR}/best_models/onnx/reference)
+set_tests_properties(SQUADGEN_Parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 2400)
+
 # The Shape-DNA module against closed forms (src/ShapeDNA): exact reference
 # integrals for P1-P3, the dense eigensolver against Eigen's, the Cholesky's
 # solves, the rectangle and disk spectra (and the convergence orders 2, 4, 6),
@@ -846,6 +889,7 @@ if (BUILD_OPENGL_VIEWER)
     target_link_libraries(Viewer PRIVATE
         PolyVector
         CrossGenOracle
+        CrossGenSquadGen
         OpenGL::GL
         Qt6::Core
         Qt6::Widgets

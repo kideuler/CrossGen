@@ -5,9 +5,12 @@
 #include <QPoint>
 #include <QString>
 
+#include <atomic>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 
 #include "viewer/ViewerTypes.hxx"
 #include "viewer/Render.hxx"
@@ -58,6 +61,7 @@
 #include "TORSION/TutteEmbedding.hxx"
 #include "TORSION/MaterialLayout.hxx"
 #include "ORACLE/ORACLE.hxx"
+#include "SQUADGEN/SQUADGEN.hxx"
 
 // ── Enumerations mirroring the original viewer state machine ──────────────────
 
@@ -72,6 +76,7 @@ enum class Mode {
     MERIDIAN    = 7,
     ATLAS       = 8,
     ORACLE      = 9,
+    SQUADGEN    = 10,   // key '0'
 };
 
 enum class Phase {
@@ -397,6 +402,60 @@ enum class ORACLEPhase {
     Smoothed = 4,
 };
 
+// SQuadGen (mode 0, src/SQUADGEN/SQUADGEN.hxx): the layout a trained
+// SQ-Diffuse generates for the model, through the ONNX graphs `python -m
+// squadgen2d export-onnx` writes (best_models/onnx, or $CROSSGEN_SQUADGEN),
+// one phase per stage of the SQUADGEN class -- the one TestSQUADGEN runs:
+//
+//   Tokens     Stage 1, Sec. 4 steps 1-3: the N token points the Geom-AE's
+//              code is computed at, farthest-point samples of the model's
+//              area in the networks' frame, each a disk coloured by the
+//              truncated SDF it is given (the colour of the background at dS,
+//              the far end of the ramp tau or more inside), and the 4N
+//              key/value points as dots. The code and the SiT's conditioning
+//              are made from them and drawn as nothing: 256 numbers a token
+//              have no picture.
+//   Noise      Stage 2, Appendix C: the initial latent -- white noise, Taubin-
+//              smoothed over the tokens with pairs across dS blocked -- as one
+//              of its channels on the tokens ('[' and ']' step through them),
+//              on the diverging ramp at +-2.5, about the spread a normalised
+//              data latent has, so that the noise reads muted and the latent
+//              it becomes does not. The sampling dialog opens on the way in:
+//              the seed, the noise, the solver.
+//   Diffusion  Stage 3, the ODE, on a worker thread and drawn while it runs.
+//              Split screen: the latent x_t on the tokens on the left, and on
+//              the right the CDF of the latent the flow predicts at t = 1 from
+//              where it is, x_t + (1 - t) v -- decoded on the model's own
+//              triangles after every accepted step, so the layout is seen
+//              coming out of the noise. A bar along the bottom is t. 'p' puts
+//              that predicted latent on the left in place of x_t.
+//   Fields     Stage 4: the final latent decoded at every centroid of the
+//              extraction mesh (h_rel 0.002 of the diagonal), the CDF filled
+//              per triangle ('p' for the DCDF): what QUARRY reads, before it
+//              reads it.
+//   Blocks     Stage 5, QUARRY: its charts tinted over the model, a chart that
+//              made no block in red, and the blocks drawn as every mode draws
+//              its blocks -- light-blue sides, green macrovertices ('p' puts
+//              the CDF under them instead of the charts).
+//   Mesh       BlockQuadMesh on the blocks, on the dialog every block mode
+//              shares ('e' re-opens it).
+//   Smoothed   mesh::TMOP with ZIPLINE's settings, the shared dialog ('c'
+//              re-opens it).
+//
+// 'n' draws another sample from the Noise phase on: the next seed, back to
+// Noise, Stage 1's tokens kept. Generating is not judged here: generate and
+// TestSQUADGEN keep the best of several seeds, and here the next one is a key.
+enum class SQUADGENPhase {
+    MeshOnly  = 1,
+    Tokens    = 2,
+    Noise     = 3,
+    Diffusion = 4,
+    Fields    = 5,
+    Blocks    = 6,
+    Mesh      = 7,
+    Smoothed  = 8,
+};
+
 // OASIS is a one-shot solve driven by a parameter dialog rather than a
 // sequence of stages, so it has only "before" and "after".
 enum class OASISPhase {
@@ -454,7 +513,9 @@ class CrossGenWidget : public QOpenGLWidget {
 
 public:
     explicit CrossGenWidget(const std::string &meshPath, QWidget *parent = nullptr);
-    ~CrossGenWidget() override = default;
+    // Stops SQuadGen's sampling thread, if one is running, before anything it
+    // reads goes away.
+    ~CrossGenWidget() override;
 
 protected:
     // QOpenGLWidget interface
@@ -468,6 +529,9 @@ protected:
     void mouseReleaseEvent(QMouseEvent *event) override;
     void mouseMoveEvent(QMouseEvent   *event) override;
     void wheelEvent(QWheelEvent *event)        override;
+    // Stops SQuadGen's sampling thread: ViewerMain never deletes the widget,
+    // so the destructor is not reached when the window closes.
+    void closeEvent(QCloseEvent *event)        override;
 
 private slots:
     void onTimer();
@@ -751,6 +815,34 @@ private:
     bool promptORACLEMesh();
     void runORACLEMesh();
     void renderORACLE();
+
+    // SQuadGen (mode 0), stage by stage. Stage 1 loads the networks the first
+    // time (a quarter of a gigabyte of graphs, kept across resets) and is
+    // announced a frame ahead; Stage 2 is milliseconds. Stage 3 runs on
+    // squadgenWorker_, which writes how far it has come into squadgenLive_
+    // under its mutex -- the latent, the step, and the decoded prediction --
+    // and the paint draws from there: nothing on the GUI thread touches
+    // squadgen_ while the worker does. Stages 4 and 5 block, announced a frame
+    // ahead.
+    void runSQUADGENCondition();
+    bool promptSQUADGENSampling();
+    void runSQUADGENNoise();
+    void startSQUADGENSampling();
+    // Joins the worker once it has finished, and says what it reached. Called
+    // every frame of the Diffusion phase.
+    void pollSQUADGENSampling();
+    // Asks the worker to stop and waits for it: at most one function
+    // evaluation, about half a second.
+    void stopSQUADGENWorker();
+    void runSQUADGENDecode();
+    void runSQUADGENQuarry();
+    // 'n': the next seed, back to the Noise phase.
+    void nextSQUADGENSample();
+    bool promptSQUADGENMesh();
+    void runSQUADGENMesh();
+    void renderSQUADGEN();
+    // Frame points of the tokens in the model's units, for drawing.
+    std::vector<Point> squadgenModelPoints(const std::vector<Point> &framePoints) const;
 
     // The mesh Stage 12 smooths: ATLAS's TFI mesh in ATLAS mode, Stage 11's
     // merged mesh where there is one, Stage 10's otherwise. mesh::QuadMesh
@@ -1065,6 +1157,56 @@ private:
     // As atlasMultiMaterial_, for the 'm' key.
     bool oracleMultiMaterial_ = false;
 
+    // SQuadGen. The networks outlive a reset: reading them takes seconds, and
+    // a model is no part of them. squadgen_ holds every stage of one model.
+    std::shared_ptr<const squadgen::Networks> squadgenNets_;
+    std::unique_ptr<SQUADGEN>                 squadgen_;
+    // What the sampling thread has reached, for the paint. Shared with the
+    // worker, so that it is the worker's own object it writes to whatever the
+    // widget does meanwhile; the widget joins it before letting go of it.
+    struct SquadgenLive {
+        std::mutex m;
+        double t = 0.0, h = 0.0, seconds = 0.0;
+        int steps = 0, rejected = 0, evaluations = 0;
+        std::vector<float> x, predicted;   // normalised latents at the tokens
+        std::vector<float> previewCDF;     // the prediction decoded per preview triangle
+        double previewT = -1.0;
+        bool done = false, finished = false;
+        std::string error;
+    };
+    std::shared_ptr<SquadgenLive>      squadgenLive_;
+    std::shared_ptr<std::atomic<bool>> squadgenStop_;
+    std::thread                        squadgenWorker_;
+    // The triangles the live prediction is decoded on (the model's own), and
+    // their centroids in the frame.
+    squadgen::Model                    squadgenPreview_;
+    std::vector<float>                 squadgenPreviewPoints_;
+    // The tokens and key/value points in the model's units, and the disk
+    // radius they are drawn at; QUARRY's charts' colours, and which made no
+    // block.
+    std::vector<Point>                 squadgenTokens_, squadgenContext_;
+    double                             squadgenDiskRadius_ = 0.0;
+    std::vector<int>                   squadgenChartColour_;
+    std::vector<char>                  squadgenChartFailed_;
+    std::optional<BlockQuadMesh>       squadgenMesh_;
+    int  squadgenChannel_       = 0;
+    bool squadgenShowPredicted_ = false;   // 'p' at Diffusion
+    bool squadgenShowDCDF_      = false;   // 'p' at Fields
+    bool squadgenShowCDFUnder_  = false;   // 'p' at Blocks
+    // The sampling dialog's settings, surviving a reset like every other
+    // judgement in this widget.
+    struct SquadgenSettings {
+        unsigned seed    = 0;
+        bool     taubin  = true;
+        int      method  = 0;       // squadgen::Sampler::Method: 0 dopri5, 1 heun, 2 euler
+        int      steps   = 12;
+        int      atolExp = -6;      // dopri5's tolerances, as powers of ten
+        int      rtolExp = -3;
+        double   hRel    = 0.002;   // Stage 4's extraction mesh
+        bool     preview = true;    // decode the prediction after every step
+    };
+    SquadgenSettings squadgenSettings_;
+
     // Guiding field for the OASIS orientation term. Held by shared_ptr because
     // OASIS keeps a reference to it for as long as it lives; separate from
     // ZIPLINE's field (zipline_), which follows its own state machine.
@@ -1080,6 +1222,7 @@ private:
     PipelinePhase  pipePhase_ = PipelinePhase::MeshOnly;
     ATLASPhase     atlasPhase_ = ATLASPhase::MeshOnly;
     ORACLEPhase    oraclePhase_ = ORACLEPhase::MeshOnly;
+    SQUADGENPhase  squadgenPhase_ = SQUADGENPhase::MeshOnly;
 
     // OASIS parameters and derived display range.
     double oasisLambda_  = 0.0;   // set by the dialog on first use
@@ -1184,6 +1327,18 @@ private:
     bool oracleAnnounced_       = false;
     bool oracleAttempted_       = false;
     bool oracleMeshAttempted_   = false;
+    // SQuadGen's, the same way: Stages 1, 4 and 5 announced a frame ahead and
+    // attempted once, Stage 3 started once, its mesh dialog counted as asked
+    // once it has opened.
+    bool squadgenAnnounced_          = false;
+    bool squadgenAttempted_          = false;
+    bool squadgenNoiseAttempted_     = false;
+    bool squadgenSamplingStarted_    = false;
+    bool squadgenDecodeAnnounced_    = false;
+    bool squadgenDecodeAttempted_    = false;
+    bool squadgenQuarryAnnounced_    = false;
+    bool squadgenQuarryAttempted_    = false;
+    bool squadgenMeshAttempted_      = false;
 
     // Why the last phases have nothing to show, in one clause, or empty when
     // nothing is wrong. Kept on screen rather than only in the console: the
@@ -1330,6 +1485,9 @@ private:
     TMOPSettings ziplineTmopSettings_ = [] { TMOPSettings t; t.corners = true; return t; }();
     // And SKELETON's: BlockQuadMesh's grid on the Step 10 mesh's base complex.
     TMOPSettings skeletonTmopSettings_ = [] { TMOPSettings t; t.corners = true; return t; }();
+    // And SQuadGen's: BlockQuadMesh's grid on QUARRY's blocks, which quarry.py
+    // smooths with ZIPLINE's settings.
+    TMOPSettings squadgenTmopSettings_ = [] { TMOPSettings t; t.corners = true; return t; }();
     // The copy above that the current mode's TMOP dialog and solve both use.
     TMOPSettings &tmopSettingsForMode();
 
