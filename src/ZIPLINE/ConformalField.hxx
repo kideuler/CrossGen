@@ -8,6 +8,8 @@
 #include "crossfield/CrossField.hxx"
 #include "mesh/Mesh.hxx"
 
+class Interfaces;
+
 // ---------------------------------------------------------------------------
 // The corrected cross field of docs/quad_layout_pipeline.md Sec. 6: the second,
 // *linear* field solve of Jezdimirovic, Chemin, Reberol, Henrotte and Remacle
@@ -112,13 +114,44 @@
 // per-vertex CrossField, u_v = exp(4 i theta(x_v)), for drawing and for
 // anything that reads the old representation.
 //
+// ### Material interfaces
+//
+// With an interface network (MERIDIAN's Stage 0b Interfaces) the field has to
+// be tangent to every interface from both sides, which decouples the
+// materials exactly as the first field's interface pins do
+// (CrossField::setAlignedInteriorEdges): each region -- a component of the
+// model cut along the interfaces -- is a domain of its own, bounded by its
+// share of dS and by interface curves, and gets its own Neumann problem, its
+// own anchor and its own Poincare-Hopf count. That is done literally: the
+// mesh is cut along the interface edges (every vertex duplicated once per
+// wedge of triangles the interface edges separate at it), and everything
+// above runs unchanged on the cut mesh, whose components are the regions.
+// A node of the network (a junction, a landing on dS, a kink) is a corner of
+// every region it touches, one per sector, and its quarter counts are not
+// Table 1's: they are the node's, the fan's own count (4 inside, Table 1's
+// reading of the whole dS corner at a landing) less the index of the first
+// field's singular triangles the node absorbed, shared out over the sectors
+// by largest remainder -- the rule SeparatrixTrace launches from the nodes
+// by, so the field turns at a node exactly as the separatrices leave it
+// (nodeQuarters()).
+//
+// The singular part stays global (every singularity, every region), so the
+// field is still one value per vertex of the uncut mesh plus one analytic
+// term, and FieldTracer crosses an interface without knowing it is there: the
+// regions' regular parts are then each harmonic in their own region, the
+// solvability condition of each region's problem is still that region's
+// Poincare-Hopf (the global term's change round a region's boundary is 2 pi
+// times the index inside it), and at an interface vertex the copies the
+// regions solved for agree mod pi/2, both being tangent to the interface.
+// They are joined by their mean mod pi/2, and the largest disagreement is
+// reported (Report::interfaceMismatch).
+//
 // What it does not do: the mesh adaptation of Sec. 5.5 (made unnecessary by
-// step 3), multi-material domains (each material region would need its own
-// Neumann problem; ZIPLINE traces those on the first field), and the
-// interactive pattern edits of Sec. 5.4 beyond two automatic ones -- an
-// opposite pair closer than a mesh edge or two is a dipole the MBO left behind
-// and cancels (Options::cancelDipoles), and two singularities in one triangle
-// are one singularity of their summed index.
+// step 3), and the interactive pattern edits of Sec. 5.4 beyond two automatic
+// ones -- an opposite pair closer than a mesh edge or two is a dipole the MBO
+// left behind and cancels (Options::cancelDipoles), and two singularities in
+// one triangle are one singularity of their summed index. Stage 5b
+// (PatternRepair) makes the rest.
 // ---------------------------------------------------------------------------
 class ConformalField {
 public:
@@ -175,6 +208,17 @@ public:
         int corners = 0;               // Table 1 corners (q != 2)
         int cornersReread = 0;         // re-read off the first field (see the constructor)
         bool poincareHopf = false;
+        // When Poincare-Hopf fails with Table 1's corners: by how many quarter
+        // turns the pattern falls short of chi, sum over the components of
+        // 4 chi - 4 sum k. Positive is the usual case -- a corner the first
+        // field turned as valence 2, so a valence-3 point too few (P2 Sec.
+        // 6.3) -- and PatternRepair reads it to know how many to add. Zero
+        // when the field built.
+        int indexDeficit4 = 0;
+        // The same per region (component of the model, cut along the
+        // interfaces when there are any; regionOf() says which triangle is
+        // in which), when Poincare-Hopf fails; empty when the field built.
+        std::vector<int> regionDeficit4;
         // Sec. 6.3: the assembled right-hand side of h sums to zero exactly
         // when the pattern is valid. Its sum, relative to the largest entry or
     // to one radian, whichever is larger.
@@ -200,6 +244,19 @@ public:
         // The regular part's variation, the largest |grad theta_h| times the
         // mean edge: a reading of how steep the part left to the mesh is.
         double maxRegularTurnPerEdge = 0.0;
+        // With interfaces: the material regions solved for (components of
+        // the cut mesh), the interface nodes whose sectors were prescribed,
+        // the first field's singular index those nodes absorbed (quarters),
+        // and the largest disagreement mod pi/2 between two regions' regular
+        // parts at a vertex of an interface that is no node.
+        int regions = 0;
+        int interfaceNodes = 0;
+        int absorbed4 = 0;
+        // Quarter turns added to node sectors the first field turned as no
+        // quad at all (valence 2), each a valence-3 point the region is then
+        // short of (see the constructor); they show in indexDeficit4.
+        int splitSectors = 0;
+        double interfaceMismatch = 0.0;
     };
 
     // `pattern` is the first field's singularities (positions inside their
@@ -218,6 +275,14 @@ public:
     // corners).
     ConformalField(std::shared_ptr<Mesh> mesh, std::vector<Singular> pattern,
                    const Options &opts, const CrossField *first = nullptr);
+    // On a multi-material model: `interfaces` is the network the field is to
+    // be tangent to (see the header), and absorbed4 the index, per vertex of
+    // the mesh in quarters, of the first field's singular triangles absorbed
+    // at an interface node (FieldTracer::absorbedIndexAt) -- it is part of
+    // the node's corners, since `pattern` no longer holds it. Null interfaces
+    // or a single-material network is the constructor above.
+    ConformalField(std::shared_ptr<Mesh> mesh, std::vector<Singular> pattern, const Options &opts,
+                   const CrossField *first, const Interfaces *interfaces, std::vector<int> absorbed4);
     ConformalField(std::shared_ptr<Mesh> mesh, std::vector<Singular> pattern)
         : ConformalField(std::move(mesh), std::move(pattern), Options()) {}
 
@@ -226,6 +291,19 @@ public:
     // re-read -- 2 at a vertex that is no corner and at every interior one.
     // The tracing launches from the corners by these.
     const std::vector<int> &cornerQuarters() const { return quarters_; }
+    // With interfaces, per node of the network (Interfaces::nodes() order),
+    // the quarter turns of each of its sectors as this field turns there;
+    // empty for a node it did not use (a dangling one) and without interfaces.
+    const std::vector<std::vector<int>> &nodeQuarters() const { return nodeQuarters_; }
+    const Interfaces *getInterfaces() const { return interfaces_; }
+    // Per triangle, the region it is in: a component of the mesh, cut along
+    // the interfaces when there are any (set whether or not the field built).
+    const std::vector<int> &regionOf() const { return regionOf_; }
+    // The node sectors given a quad the first field did not turn there (see
+    // Report::splitSectors): the node's vertex and a triangle of the sector,
+    // whose region (regionOf()) is the one left a valence-3 point short.
+    struct SplitCorner { int vertex = -1; int triangle = -1; };
+    const std::vector<SplitCorner> &splitCorners() const { return splitCorners_; }
 
     bool valid() const { return report_.built; }
     const Report &getReport() const { return report_; }
@@ -264,6 +342,13 @@ private:
     Options opts_;
     Report report_;
     const CrossField *first_ = nullptr;
+    // The interface network and the absorbed indices (read during
+    // construction), and the per-node sector quarters it settled on.
+    const Interfaces *interfaces_ = nullptr;
+    std::vector<int> absorbed4_;
+    std::vector<std::vector<int>> nodeQuarters_;
+    std::vector<int> regionOf_;
+    std::vector<SplitCorner> splitCorners_;
     std::vector<int> quarters_;
     std::vector<Singular> sing_;
     std::vector<double> regular_;

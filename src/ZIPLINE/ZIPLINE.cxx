@@ -1,5 +1,7 @@
 #include "ZIPLINE/ZIPLINE.hxx"
 
+#include <algorithm>
+#include <cmath>
 #include <limits>
 #include <utility>
 
@@ -36,7 +38,14 @@ void ZIPLINE::discardFrom(Stage from) {
     // Latest first: each stage holds on to the one before it.
     if (from <= Stage::Smoothed) { smoothedMesh.reset(); tmopReport = mesh::TMOP::Report(); }
     if (from <= Stage::Mesh) blockMesh.reset();
-    if (from <= Stage::Blocks) blocks.reset();
+    if (from <= Stage::Blocks) {
+        blocks.reset();
+        status.coverageBeforeRepair = 0.0;
+        status.repairRounds = 0;
+        status.repairCandidates = 0;
+        status.repairEdits.clear();
+        status.repairLeftFirstField = false;
+    }
     if (from <= Stage::Simplified) simplification.reset();
     if (from <= Stage::Layout) layout.reset();
     if (from <= Stage::Trace) {
@@ -45,6 +54,9 @@ void ZIPLINE::discardFrom(Stage from) {
     }
     if (from <= Stage::Conformal) {
         conformal.reset();
+        pattern.clear();
+        absorbed4.clear();
+        patternRead = false;
         conformalTried = false;
         status.conformalFailure.clear();
     }
@@ -175,19 +187,31 @@ void ZIPLINE::buildConformalField() {
     discardFrom(Stage::Conformal);
     conformalTried = true;
     if (!options.secondField) return;
-    if (interfaces) {
-        status.conformalFailure = "multi-material model: traced on the first field";
-        return;
+    // With interfaces the pattern is read as the trace of the first field
+    // reads it there: a singular triangle at a node of the network is the
+    // node's (FieldTracer's absorbAt), and goes to the field as part of that
+    // node's corners (ConformalField's header, "Material interfaces").
+    const Interfaces *network = (interfaces && options.trace.respectInterfaces) ? interfaces.get() : nullptr;
+    std::vector<char> absorbAt;
+    if (network) {
+        absorbAt.assign(mesh->vertices.size(), 0);
+        for (const Interfaces::Node &n : network->nodes())
+            if (n.kind != Interfaces::NodeKind::Dangling && n.vertex >= 0) absorbAt[n.vertex] = 1;
     }
-    const FieldTracer first(field, true, options.trace.singularitiesAtBoundary);
-    std::vector<ConformalField::Singular> pattern;
+    const FieldTracer first(field, true, options.trace.singularitiesAtBoundary, absorbAt);
     for (const Singularity &s : first.getSingularities())
         pattern.push_back(ConformalField::Singular{s.coordinates, s.triangleIndex, s.d});
     if (first.droppedSingularityCount() > 0) {
+        pattern.clear();
         status.conformalFailure = "the first field has singular triangles with no ports";
         return;
     }
-    conformal = std::make_shared<ConformalField>(mesh, std::move(pattern), options.conformal, field.get());
+    absorbed4.assign(mesh->vertices.size(), 0);
+    if (network)
+        for (const Interfaces::Node &n : network->nodes())
+            if (n.kind != Interfaces::NodeKind::Dangling && n.vertex >= 0) absorbed4[n.vertex] = first.absorbedIndexAt(n.vertex);
+    patternRead = true;
+    conformal = std::make_shared<ConformalField>(mesh, pattern, options.conformal, field.get(), network, absorbed4);
     if (!conformal->valid()) status.conformalFailure = conformal->getReport().failure;
 }
 
@@ -220,6 +244,7 @@ void ZIPLINE::buildBlocks() {
     if (!simplification) simplifyLayout();
     discardFrom(Stage::Blocks);
     blocks = std::make_unique<LayoutBlocks>(simplification->getLayout(), *mesh);
+    repairPattern();
 }
 
 bool ZIPLINE::buildMesh(const BlockQuadMesh::Options &opts) {
@@ -255,4 +280,233 @@ bool ZIPLINE::smooth() {
     smoother.run();
     tmopReport = smoother.getReport();
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Stage 5b, PatternRepair's search (its header has the edits, and what P2
+// does instead). Each candidate edit is taken through Stages 1b to 5 apart
+// from the stages above -- an Attempt -- and the best is kept by soundness,
+// then coverage, then refused faces, then blocks, once its mesh passes.
+//
+// Two states are tracked: the one adopted (the stages above, the best seen)
+// and the one the search stands at. They differ only after a round that left
+// the first field for the second at a loss: on a model whose pattern failed
+// Poincare-Hopf the first round's job is to make the corrected field exist at
+// all, and what it covers right then is less than what the rounds after it
+// make of it (M7_20: 99.98% on the first field, 97.5% once the two valence-3
+// points are in, 100% one move later).
+// ---------------------------------------------------------------------------
+namespace {
+
+struct Score {
+    bool sound = false;
+    double coverage = 0.0;
+    int refused = 0;
+    int blocks = 0;
+};
+
+// TestZIPLINE's soundness, of a layout and of its simplification: no loose
+// end, no separatrix stuck or cycling, no arcs crossing off a node, and the
+// faces tiling the model exactly.
+Score scoreOf(const SeparatrixTrace &trace, const QuadLayout &layout, const PartitionSimplify &simp,
+              const LayoutBlocks &blocks) {
+    Score s;
+    const QuadLayout::Report &r = layout.getReport();
+    const QuadLayout::Report &q = simp.getLayout().getReport();
+    int stuck = 0;
+    for (const Separatrix &sp : trace.separatrices)
+        if (sp.termination_reason == TerminationReason::STUCK ||
+            sp.termination_reason == TerminationReason::LIMIT_CYCLE) ++stuck;
+    const double area = r.meshArea;
+    auto tiles = [&](const QuadLayout::Report &x) {
+        return area > 0.0 && std::fabs(x.totalArea / area - 1.0) < 1e-9 && x.faces > 0 &&
+               x.danglingEnds == 0 && x.arcCrossings == 0;
+    };
+    s.sound = stuck == 0 && tiles(r) && tiles(q);
+    s.coverage = blocks.coverage();
+    const LayoutBlocks::Report &b = blocks.getReport();
+    s.refused = b.faces - b.blocks;
+    s.blocks = b.blocks;
+    return s;
+}
+
+// A real gain: more than minGain of the model covered, or as much with fewer
+// refused faces.
+bool improves(const Score &a, const Score &b, double minGain) {
+    if (!a.sound) return false;
+    if (!b.sound) return true;
+    if (a.coverage > b.coverage + minGain) return true;
+    if (a.coverage < b.coverage - minGain) return false;
+    return a.refused < b.refused;
+}
+
+// The order the candidates of a round are tried in for the mesh check.
+bool better(const Score &a, const Score &b) {
+    if (a.sound != b.sound) return a.sound;
+    if (std::fabs(a.coverage - b.coverage) > 1e-9) return a.coverage > b.coverage;
+    if (a.refused != b.refused) return a.refused < b.refused;
+    return a.blocks < b.blocks;
+}
+
+} // namespace
+
+struct ZIPLINE::Attempt {
+    std::vector<ConformalField::Singular> pattern;
+    std::shared_ptr<ConformalField> conformal;
+    bool second = false;   // traced on the corrected field
+    std::unique_ptr<SeparatrixTrace> trace;
+    std::unique_ptr<QuadLayout> layout;
+    std::unique_ptr<PartitionSimplify> simplification;
+    std::unique_ptr<LayoutBlocks> blocks;
+    Score score;
+    std::vector<std::string> edits;   // every edit that led here
+    bool meshed = false;
+    double worst = 0.0;    // after checkSweeps of TMOP
+    int inverted = 0;
+};
+
+ZIPLINE::Attempt ZIPLINE::attempt(std::vector<ConformalField::Singular> p) const {
+    Attempt a;
+    a.pattern = std::move(p);
+    const Interfaces *network = (interfaces && options.trace.respectInterfaces) ? interfaces.get() : nullptr;
+    a.conformal = std::make_shared<ConformalField>(mesh, a.pattern, options.conformal, field.get(), network,
+                                                   absorbed4);
+    a.second = a.conformal->valid();
+    // An edit is kept only on the corrected field (repairPattern), so one
+    // that leaves the pattern without it is not traced at all.
+    if (!a.second) return a;
+    a.trace = std::make_unique<SeparatrixTrace>(a.conformal->crossField(), true, options.trace, interfaces.get(),
+                                                a.conformal);
+    a.trace->run();
+    a.layout = std::make_unique<QuadLayout>(*a.trace);
+    a.layout->build();
+    a.simplification = std::make_unique<PartitionSimplify>(*a.layout, options.simplification);
+    if (options.simplify) a.simplification->run();
+    a.blocks = std::make_unique<LayoutBlocks>(a.simplification->getLayout(), *mesh);
+    a.score = scoreOf(*a.trace, *a.layout, *a.simplification, *a.blocks);
+    return a;
+}
+
+// The mesh Stages 6 and 7 would make of the attempt's blocks, smoothed for
+// PatternRepair::Options::checkSweeps sweeps only: enough to tell an element
+// TMOP can open from one it cannot.
+void ZIPLINE::checkMesh(const LayoutBlocks &b, double &worst, int &inverted) const {
+    worst = 0.0;
+    inverted = 0;
+    if (b.blocks().empty()) return;
+    const BlockQuadMesh grid(b.decomposition(), options.mesh);
+    if (grid.getReport().quads <= 0) return;
+    mesh::QuadMesh q = mesh::QuadMesh::from(grid);
+    mesh::TMOP::Options t = options.tmop;
+    t.maxSweeps = std::min(t.maxSweeps, options.repair.checkSweeps);
+    mesh::TMOP smoother(q, t);
+    smoother.run();
+    worst = smoother.getReport().minScaledJacobianAfter;
+    inverted = smoother.getReport().invertedAfter;
+}
+
+void ZIPLINE::adopt(Attempt &a) {
+    // Latest first: each stage holds on to the one before it.
+    blocks.reset();
+    simplification.reset();
+    layout.reset();
+    trace.reset();
+    conformal.reset();
+    pattern = std::move(a.pattern);
+    conformal = std::move(a.conformal);
+    trace = std::move(a.trace);
+    layout = std::move(a.layout);
+    simplification = std::move(a.simplification);
+    blocks = std::move(a.blocks);
+    status.conformalTraced = a.second;
+    status.conformalFailure = a.second ? std::string() : conformal->getReport().failure;
+    status.repairEdits = a.edits;
+}
+
+void ZIPLINE::repairPattern() {
+    const PatternRepair::Options &R = options.repair;
+    if (R.rounds <= 0 || !blocks || !trace || !layout || !simplification) return;
+    // Every edit is an edit of the corrected field's pattern.
+    if (!options.secondField || !patternRead) return;
+    if (blocks->coverage() >= 1.0 - 1e-12) return;
+    status.coverageBeforeRepair = blocks->coverage();
+    const bool startedOnFirst = !status.conformalTraced;
+
+    Score adopted = scoreOf(*trace, *layout, *simplification, *blocks);
+    // The unrepaired blocks' mesh, for the quality floor; made when first needed.
+    double floor = -1.0;
+    auto passes = [&](Attempt &a) {
+        if (!R.checkMesh) return true;
+        if (floor < 0.0) {
+            double worst = 0.0;
+            int inverted = 0;
+            checkMesh(*blocks, worst, inverted);
+            floor = std::min(R.qualityFloor, 0.5 * std::max(0.0, worst));
+        }
+        a.meshed = true;
+        checkMesh(*a.blocks, a.worst, a.inverted);
+        return a.inverted == 0 && a.worst > floor;
+    };
+
+    std::unique_ptr<Attempt> at;   // where the search stands, when not at the adopted state
+    for (int r = 0; r < R.rounds; ++r) {
+        const std::vector<ConformalField::Singular> &P = at ? at->pattern : pattern;
+        const bool second = at ? at->second : status.conformalTraced;
+        const ConformalField *cf = at ? at->conformal.get() : conformal.get();
+        const ConformalField *declined = (!second && cf && !cf->valid()) ? cf : nullptr;
+        const Score from = at ? at->score : adopted;
+        if (from.coverage >= 1.0 - 1e-12) break;
+        std::vector<PatternRepair::Edit> edits =
+            PatternRepair::propose(*mesh, P, declined, at ? at->simplification->getLayout() : simplification->getLayout(),
+                                   at ? *at->blocks : *blocks, at ? *at->trace : *trace, R);
+        // The budget (PatternRepair::Options::maxCandidates*): the most
+        // promising first, the order of propose() kept among equals.
+        std::stable_sort(edits.begin(), edits.end(), [](const PatternRepair::Edit &x, const PatternRepair::Edit &y) {
+            return x.priority > y.priority;
+        });
+        const int left = std::min(R.maxCandidatesPerRound, R.maxCandidates - status.repairCandidates);
+        if (left <= 0) break;
+        if (static_cast<int>(edits.size()) > left) edits.resize(left);
+        if (edits.empty()) break;
+        ++status.repairRounds;
+        status.repairCandidates += static_cast<int>(edits.size());
+
+        // Every candidate through Stages 1b-5, independently: each Attempt
+        // owns all it builds and reads only the mesh and the first field, so
+        // they run in parallel, and the choice below is made serially from
+        // results indexed by candidate -- the same for any thread count.
+        // Sec. 4's simplification is most of the cost of one (geom026: 133 of
+        // 180 ms; geom012: 720 of 810).
+        std::vector<Attempt> tried(edits.size());
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 1)
+#endif
+        for (int e = 0; e < static_cast<int>(edits.size()); ++e)
+            tried[e] = attempt(PatternRepair::apply(P, edits[e]));
+        // On the corrected field an edit must gain; off it, it must reach it.
+        std::vector<std::pair<size_t, Attempt>> kept;
+        for (size_t e = 0; e < edits.size(); ++e) {
+            Attempt &a = tried[e];
+            if (!a.second) continue;
+            if (second ? !improves(a.score, from, R.minGain) : !a.score.sound) continue;
+            kept.emplace_back(e, std::move(a));
+        }
+        std::stable_sort(kept.begin(), kept.end(),
+                         [](const auto &x, const auto &y) { return better(x.second.score, y.second.score); });
+        Attempt *chosen = nullptr;
+        size_t pick = 0;
+        for (auto &k : kept)
+            if (passes(k.second)) { chosen = &k.second; pick = k.first; break; }
+        if (!chosen) break;
+        chosen->edits = at ? at->edits : status.repairEdits;
+        chosen->edits.push_back(edits[pick].what);
+        if (improves(chosen->score, adopted, R.minGain)) {
+            adopted = chosen->score;
+            adopt(*chosen);
+            at.reset();
+        } else {
+            at = std::make_unique<Attempt>(std::move(*chosen));
+        }
+    }
+    status.repairLeftFirstField = startedOnFirst && status.conformalTraced;
 }

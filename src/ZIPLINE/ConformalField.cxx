@@ -1,9 +1,12 @@
 #include "ZIPLINE/ConformalField.hxx"
 
+#include "MERIDIAN/Interfaces.hxx"
+
 #include <Eigen/Sparse>
 #include <Eigen/SparseCholesky>
 
 #include <algorithm>
+#include <functional>
 #include <array>
 #include <cmath>
 #include <complex>
@@ -43,6 +46,19 @@ ConformalField::ConformalField(std::shared_ptr<Mesh> mesh, std::vector<Singular>
     first_ = nullptr;   // read during construction only
 }
 
+ConformalField::ConformalField(std::shared_ptr<Mesh> mesh, std::vector<Singular> pattern,
+                               const Options &opts, const CrossField *first, const Interfaces *interfaces,
+                               std::vector<int> absorbed4)
+    : mesh_(std::move(mesh)), opts_(opts), first_(first), sing_(std::move(pattern)) {
+    if (interfaces && interfaces->multiMaterial()) {
+        interfaces_ = interfaces;
+        absorbed4_ = std::move(absorbed4);
+    }
+    build();
+    first_ = nullptr;
+    absorbed4_.clear();
+}
+
 double ConformalField::singularPart(const Point &x) const {
     double s = 0.0;
     for (const Singular &q : sing_) s += 0.25 * q.d * std::atan2(x[1] - q.pos[1], x[0] - q.pos[0]);
@@ -69,12 +85,205 @@ double ConformalField::angleAt(int t, const Point &x, double ref) const {
 // build()
 // ---------------------------------------------------------------------------
 void ConformalField::build() {
-    const Mesh &M = *mesh_;
+    report_ = Report{};
+    nodeQuarters_.clear();
+    splitCorners_.clear();
+    auto fail = [&](const std::string &why) { report_.built = false; report_.failure = why; };
+    if (mesh_->triangles.empty()) return fail("no triangles");
+
+    // ---- with interfaces: the mesh cut along them (see the header) ---------
+    //
+    // Every corner of every triangle is joined to the same vertex's corner in
+    // the neighbour across each of its two edges at that vertex, unless the
+    // edge is an interface edge; each class is one vertex of the cut mesh.
+    // Triangles keep their indices, so a singularity's triangle is the same in
+    // both. fixedQ holds, per cut vertex, the quarter count an interface node
+    // prescribes for its sector, -1 where Table 1 decides.
+    std::shared_ptr<Mesh> cutMesh;
+    std::vector<int> origOf;
+    std::vector<int> fixedQ;
+    std::vector<int> landingFan;   // per uncut vertex: Table 1's quarters of a landing node's whole corner
+    const int nVo = static_cast<int>(mesh_->vertices.size());
+    if (interfaces_) {
+        const Mesh &O = *mesh_;
+        const int nTo = static_cast<int>(O.triangles.size());
+        std::vector<char> onInterface(O.edges.size(), 0);
+        for (const int e : interfaces_->interfaceEdges())
+            if (e >= 0 && e < static_cast<int>(O.edges.size())) onInterface[e] = 1;
+        std::vector<int> parent(3 * static_cast<size_t>(nTo));
+        for (size_t i = 0; i < parent.size(); ++i) parent[i] = static_cast<int>(i);
+        std::function<int(int)> find = [&](int x) {
+            while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; }
+            return x;
+        };
+        for (int t = 0; t < nTo; ++t)
+            for (int k = 0; k < 3; ++k) {
+                const int v = O.triangles[t][k];
+                // Local edge i runs from corner i to corner i + 1: the two at
+                // corner k are k and k + 2.
+                for (const int le : {k, (k + 2) % 3}) {
+                    const int e = O.triangleEdges[t][le];
+                    const int n = O.triangleAdjacency[t][le];
+                    if (n < 0 || (e >= 0 && onInterface[e])) continue;
+                    for (int kk = 0; kk < 3; ++kk)
+                        if (O.triangles[n][kk] == v) {
+                            const int a = find(3 * t + k), b = find(3 * n + kk);
+                            if (a != b) parent[a] = b;
+                        }
+                }
+            }
+        std::vector<int> idOfRoot(parent.size(), -1);
+        std::vector<Point> V;
+        std::vector<Triangle> T(nTo);
+        for (int t = 0; t < nTo; ++t)
+            for (int k = 0; k < 3; ++k) {
+                int &id = idOfRoot[find(3 * t + k)];
+                if (id < 0) {
+                    id = static_cast<int>(V.size());
+                    V.push_back(O.vertices[O.triangles[t][k]]);
+                    origOf.push_back(O.triangles[t][k]);
+                }
+                T[t][k] = id;
+            }
+        cutMesh = std::make_shared<Mesh>(V, T, O.triangleMatId);
+
+        // Each node's sector quarters. The node's total is the fan's own count
+        // -- 4 inside, Table 1's reading of the whole corner on dS -- less what
+        // the node absorbed, as SeparatrixTrace::launchFromInterfaceNodes has
+        // it. How the total is shared among the sectors is read off the first
+        // field, sector by sector, since each sector is a corner of a
+        // different region and each region's Poincare-Hopf count is the first
+        // field's: a sector of angle s across which the field turns by Delta,
+        // counter-clockwise round the node, is a corner of
+        //
+        //     q = round((s - Delta) / (pi/2))
+        //
+        // quarter turns (the corner model z^(q pi / 2s), whose cross turns by
+        // s - q pi/2 from one side of the corner to the other). Delta is read
+        // on the ring of vertices round the node, never at the node, whose
+        // value is the first field's compromise between the branches pinned
+        // there. Shared out by the sectors' angles alone, the way the first
+        // field's trace does it, a 270-degree corner an interface bisects
+        // reads 2 + 1 where the field turned 1 + 2, and the two regions then
+        // fail Poincare-Hopf by a quarter each, in opposite directions (ten
+        // of the 31 multi-material models). Where the readings do not add up
+        // to the total they are adjusted by largest remainder.
+        fixedQ.assign(V.size(), -1);
+        std::vector<double> fullAngle(nVo, 0.0);
+        for (const Triangle &tri : O.triangles)
+            for (int k = 0; k < 3; ++k) {
+                const Point a = O.vertices[tri[(k + 1) % 3]] - O.vertices[tri[k]];
+                const Point b = O.vertices[tri[(k + 2) % 3]] - O.vertices[tri[k]];
+                const double na = normP(a), nb = normP(b);
+                if (na > 1e-300 && nb > 1e-300)
+                    fullAngle[tri[k]] += std::acos(std::max(-1.0, std::min(1.0, dotP(a, b) / (na * nb))));
+            }
+        // The first field's turn across sector k of node n, counter-clockwise
+        // from ray k to ray k + 1 on the ring of the node's neighbours; NaN
+        // when the walk does not close the sector.
+        auto sectorTurn = [&](const Interfaces::Node &n, size_t k) {
+            const double nan = std::numeric_limits<double>::quiet_NaN();
+            if (!first_ || static_cast<int>(first_->u_k.size()) != nVo) return nan;
+            const size_t R = n.rays.size();
+            const int v = n.vertex;
+            const int endAt = n.rays[(k + 1) % R].neighbour;
+            auto th = [&](int u) { return 0.25 * std::arg(first_->u_k[u]); };
+            int t = n.rays[k].faceCCW;
+            double turn = 0.0;
+            for (size_t guard = 0; guard < 64 && t >= 0; ++guard) {
+                int x = -1, y = -1;
+                for (int kk = 0; kk < 3; ++kk) {
+                    if (O.triangles[t][kk] != v) continue;
+                    x = O.triangles[t][(kk + 1) % 3];
+                    y = O.triangles[t][(kk + 2) % 3];
+                }
+                if (x < 0) return nan;
+                if (cross2(O.vertices[x] - O.vertices[v], O.vertices[y] - O.vertices[v]) < 0.0) std::swap(x, y);
+                turn += wrapQuarter(th(y) - th(x));
+                if (y == endAt) return turn;
+                // On round the node, across the edge v-y, unless the sector
+                // ends there.
+                int next = -1;
+                for (int le = 0; le < 3; ++le) {
+                    const int a = O.triangles[t][le], b = O.triangles[t][(le + 1) % 3];
+                    if (!((a == v && b == y) || (a == y && b == v))) continue;
+                    const int e = O.triangleEdges[t][le];
+                    if (e >= 0 && onInterface[e]) return nan;
+                    next = O.triangleAdjacency[t][le];
+                }
+                t = next;
+            }
+            return nan;
+        };
+        const auto &nodes = interfaces_->nodes();
+        nodeQuarters_.assign(nodes.size(), {});
+        landingFan.assign(nVo, 2);
+        for (size_t ni = 0; ni < nodes.size(); ++ni) {
+            const Interfaces::Node &n = nodes[ni];
+            if (n.kind == Interfaces::NodeKind::Dangling || n.vertex < 0 || n.sector.empty()) continue;
+            const int fan = n.onBoundary ? quartersOf(fullAngle[n.vertex]) : 4;
+            if (n.onBoundary) landingFan[n.vertex] = fan;
+            const int absorbed = n.vertex < static_cast<int>(absorbed4_.size()) ? absorbed4_[n.vertex] : 0;
+            report_.absorbed4 += absorbed;
+            const int total = std::max(static_cast<int>(n.sector.size()), fan - absorbed);
+            // The reading, or the sector's own quarter turns where there is none.
+            std::vector<double> want(n.sector.size());
+            for (size_t k = 0; k < n.sector.size(); ++k) {
+                const double turn = (k < n.rays.size()) ? sectorTurn(n, k) : std::numeric_limits<double>::quiet_NaN();
+                want[k] = std::isfinite(turn) ? (n.sector[k] - turn) / M_PI_2 : n.sector[k] / M_PI_2;
+            }
+            // Rounded, then made to add up to the node's total by largest
+            // remainder; then a sector read as no quad at all (a valence-2
+            // corner: a sharp sector the first field did not turn, the
+            // interface version of a cusp) is given one, P2's split (Sec.
+            // 6.3), *without* taking it from the next sector: that region is
+            // then a valence-3 point short, which Stage 5b supplies, and the
+            // others are left exactly as the first field turned them.
+            std::vector<int> r(n.sector.size(), 0);
+            int used = 0;
+            for (size_t k = 0; k < r.size(); ++k) {
+                r[k] = static_cast<int>(std::lround(want[k]));
+                used += r[k];
+            }
+            const int nodeTotal = fan - absorbed;
+            while (used < nodeTotal) {
+                size_t best = 0;
+                double bestGap = -1e300;
+                for (size_t k = 0; k < r.size(); ++k)
+                    if (want[k] - r[k] > bestGap) { bestGap = want[k] - r[k]; best = k; }
+                ++r[best];
+                ++used;
+            }
+            while (used > nodeTotal) {
+                size_t best = 0;
+                double bestGap = 1e300;
+                for (size_t k = 0; k < r.size(); ++k)
+                    if (want[k] - r[k] < bestGap) { bestGap = want[k] - r[k]; best = k; }
+                --r[best];
+                --used;
+            }
+            std::vector<int> q(r.size(), 1);
+            for (size_t k = 0; k < r.size(); ++k) {
+                q[k] = std::max(1, r[k]);
+                if (r[k] < 1) {
+                    report_.splitSectors += 1 - r[k];
+                    if (k < n.rays.size()) splitCorners_.push_back(SplitCorner{n.vertex, n.rays[k].faceCCW});
+                }
+            }
+            for (size_t k = 0; k < n.sector.size() && k < n.rays.size(); ++k) {
+                const int t = n.rays[k].faceCCW;
+                if (t < 0 || t >= nTo) continue;
+                for (int kk = 0; kk < 3; ++kk)
+                    if (O.triangles[t][kk] == n.vertex) fixedQ[T[t][kk]] = q[k];
+            }
+            nodeQuarters_[ni] = std::move(q);
+            ++report_.interfaceNodes;
+        }
+    }
+    const Mesh &M = cutMesh ? *cutMesh : *mesh_;
     const int nV = static_cast<int>(M.vertices.size());
     const int nT = static_cast<int>(M.triangles.size());
-    report_ = Report{};
-    auto fail = [&](const std::string &why) { report_.built = false; report_.failure = why; };
-    if (nT == 0) return fail("no triangles");
+    auto orig = [&](int v) { return cutMesh ? origOf[v] : v; };
 
     double meanEdge = 0.0;
     for (const auto &e : M.edges) meanEdge += normP(M.vertices[e[1]] - M.vertices[e[0]]);
@@ -137,7 +346,7 @@ void ConformalField::build() {
     std::vector<double> loopTurning(loops.size(), 0.0);
     for (size_t l = 0; l < loops.size(); ++l)
         for (const int b : loops[l]) {
-            quarters[b] = quartersOf(interior[b]);
+            quarters[b] = (!fixedQ.empty() && fixedQ[b] >= 0) ? fixedQ[b] : quartersOf(interior[b]);
             if (quarters[b] != 2) ++report_.corners;
             loopTurning[l] += M_PI - interior[b];
         }
@@ -161,6 +370,7 @@ void ConformalField::build() {
         ++nComp;
     }
     report_.components = nComp;
+    regionOf_ = compOf;
     std::vector<int> compOfVertex(nV, -1);
     for (int t = 0; t < nT; ++t)
         for (int k = 0; k < 3; ++k) compOfVertex[M.triangles[t][k]] = compOf[t];
@@ -224,6 +434,12 @@ void ConformalField::build() {
         for (size_t i = 0; i < sing_.size(); ++i)
             for (size_t j = i + 1; j < sing_.size(); ++j) {
                 if (sing_[i].d + sing_[j].d != 0) continue;
+                // Across an interface a +- pair is not a dipole: each point is
+                // in its own region's index count (concrete: an aggregate's two
+                // valence-5 points facing two valence-3 points of the ring
+                // round it, cancelled, left both regions failing
+                // Poincare-Hopf by two).
+                if (compOf[sing_[i].triangle] != compOf[sing_[j].triangle]) continue;
                 const double d = normP(sing_[i].pos - sing_[j].pos);
                 if (d < R) pairs.push_back({d, static_cast<int>(i), static_cast<int>(j)});
             }
@@ -305,6 +521,8 @@ void ConformalField::build() {
             for (int tries = 0; tries < 8 && D > 0.25 * best; ++tries, D *= 0.5) {
                 x = c + bis * D;
                 t = locate(x, q.triangle);
+                // Never into another region (one across an interface).
+                if (t >= 0 && compOf[t] != compOf[q.triangle]) t = -1;
                 if (t >= 0 && !holds[t]) {
                     const auto l = bary(t, x);
                     if (std::min({l[0], l[1], l[2]}) > 0.05) break;
@@ -330,10 +548,23 @@ void ConformalField::build() {
         for (const Singular &s : sing_) sum4[compOf[s.triangle]] += s.d;
         for (size_t l = 0; l < loops.size(); ++l)
             for (const int b : loops[l]) sum4[compOfVertex[b]] += 2 - quarters[b];
+        // The shortfall over all components, for Report::indexDeficit4; set
+        // by the checks that report (why != null), so it is the last such
+        // check's -- Table 1's corners, or the re-read ones that made it hold.
+        int deficit = 0;
+        for (int c = 0; c < nComp; ++c) deficit += 4 * (2 - static_cast<int>(loopsOfComp[c].size())) - sum4[c];
+        if (why) {
+            report_.indexDeficit4 = 0;
+            report_.regionDeficit4.clear();
+        }
         for (int c = 0; c < nComp; ++c) {
             const int chi = 2 - static_cast<int>(loopsOfComp[c].size());
             if (sum4[c] != 4 * chi) {
                 if (why) {
+                    report_.indexDeficit4 = deficit;
+                    report_.regionDeficit4.assign(nComp, 0);
+                    for (int cc = 0; cc < nComp; ++cc)
+                        report_.regionDeficit4[cc] = 4 * (2 - static_cast<int>(loopsOfComp[cc].size())) - sum4[cc];
                     std::ostringstream os;
                     os << "Poincare-Hopf fails: indices add to " << sum4[c] << "/4 against chi = " << chi;
                     *why = os.str();
@@ -345,7 +576,7 @@ void ConformalField::build() {
     };
     {
         std::string why;
-        if (!poincareHopf(&why) && first_ && first_->u_k.size() == nV) {
+        if (!poincareHopf(&why) && first_ && static_cast<int>(first_->u_k.size()) == nVo) {
             // Re-read the corners off the first field (see the constructor):
             // the cross turns by the principal matchings along the boundary
             // edges, and across a stretch of boundary the turn Delta and the
@@ -361,7 +592,10 @@ void ConformalField::build() {
             // until it adds up.
             std::vector<int> reread = quarters;
             int changed = 0;
-            auto th = [&](int v) { return 0.25 * std::arg(first_->u_k[v]); };
+            auto th = [&](int v) { return 0.25 * std::arg(first_->u_k[orig(v)]); };
+            // A node's sector is prescribed, and the first field has one value
+            // at the node for all its sectors: no run is read across one.
+            auto prescribed = [&](int v) { return !fixedQ.empty() && fixedQ[v] >= 0; };
             auto isCorner = [&](int v) {
                 if (quarters[v] != 2) return true;
                 const double delta = wrapQuarter(th(v) - th(prevOf[v])) + wrapQuarter(th(nextOf[v]) - th(v));
@@ -388,6 +622,9 @@ void ConformalField::build() {
                     std::vector<int> run;
                     while (i < m && isCorner(loop[(start + i) % m])) { run.push_back(loop[(start + i) % m]); ++i; }
                     const int before = prevOf[run.front()], after = nextOf[run.back()];
+                    bool touches = prescribed(before) || prescribed(after);
+                    for (const int v : run) touches = touches || prescribed(v);
+                    if (touches) continue;
                     double delta = wrapQuarter(th(run.front()) - th(before));
                     double tau = 0.0;
                     for (size_t r = 0; r < run.size(); ++r) {
@@ -429,7 +666,6 @@ void ConformalField::build() {
         if (!poincareHopf(&why)) return fail(why);
         report_.poincareHopf = true;
     }
-    quarters_ = quarters;
 
     // ---- the right-hand side of h (Sec. 6.3, with the singular part out) -----
     //
@@ -713,11 +949,55 @@ void ConformalField::build() {
         }
     }
 
+    // ---- with interfaces: back onto the uncut mesh ----------------------------
+    //
+    // A vertex of an interface has one copy per region at it; the copies agree
+    // mod pi/2 up to the discretisation (both regions are tangent to the
+    // interface), and are joined by their mean mod pi/2, lifted to the first.
+    // A node's sectors are corners and may honestly differ; only the other
+    // interface vertices are measured.
+    if (cutMesh) {
+        std::vector<std::complex<double>> acc(nVo, std::complex<double>(0.0, 0.0));
+        std::vector<int> copies(nVo, 0), firstCopy(nVo, -1);
+        for (int c = 0; c < nV; ++c) {
+            const int o = origOf[c];
+            acc[o] += std::polar(1.0, 4.0 * regular_[c]);
+            if (copies[o]++ == 0) firstCopy[o] = c;
+        }
+        std::vector<char> isNode(nVo, 0);
+        for (const auto &n : interfaces_->nodes())
+            if (n.vertex >= 0 && n.vertex < nVo) isNode[n.vertex] = 1;
+        std::vector<double> regular(nVo, 0.0), h(nVo, 0.0);
+        std::vector<int> q(nVo, 2);
+        for (int o = 0; o < nVo; ++o) {
+            if (firstCopy[o] < 0) continue;
+            const double ref = regular_[firstCopy[o]];
+            regular[o] = (copies[o] == 1) ? ref : liftNear(ref, 0.25 * std::arg(acc[o]));
+            h[o] = h_[firstCopy[o]];
+            q[o] = quarters[firstCopy[o]];
+        }
+        for (int c = 0; c < nV; ++c) {
+            const int o = origOf[c];
+            if (copies[o] > 1 && !isNode[o])
+                report_.interfaceMismatch =
+                    std::max(report_.interfaceMismatch, std::fabs(wrapQuarter(regular_[c] - regular[o])));
+        }
+        // dS corners as the uncut fan turns: Table 1's reading of the whole
+        // corner at a landing (SeparatrixTrace reads it as the node's fan).
+        for (const auto &n : interfaces_->nodes())
+            if (n.vertex >= 0 && n.vertex < nVo) q[n.vertex] = n.onBoundary ? landingFan[n.vertex] : 2;
+        regular_.swap(regular);
+        h_.swap(h);
+        quarters.swap(q);
+        report_.regions = nComp;
+    }
+    quarters_ = quarters;
+
     // ---- the field as a CrossField -------------------------------------------
     cross_ = std::make_shared<CrossField>(mesh_);
-    cross_->u_k.resize(nV);
-    for (int v = 0; v < nV; ++v)
-        cross_->u_k[v] = std::polar(1.0, 4.0 * (regular_[v] + singularPart(M.vertices[v])));
+    cross_->u_k.resize(nVo);
+    for (int v = 0; v < nVo; ++v)
+        cross_->u_k[v] = std::polar(1.0, 4.0 * (regular_[v] + singularPart(mesh_->vertices[v])));
     cross_->u_k_prev = cross_->u_k;
     cross_->error = 0.0;
 

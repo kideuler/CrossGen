@@ -461,8 +461,10 @@ public:
     // `conformal`, when given, is the corrected field of docs/
     // quad_layout_pipeline.md Sec. 6 (ConformalField) and is what is traced:
     // its singularities, its closed-form ports, its exact singular part. `cf`
-    // is then that field as a CrossField. Ignored with interfaces, which the
-    // corrected field does not know.
+    // is then that field as a CrossField. With interfaces it is traced too, as
+    // long as it was solved for the same network (ConformalField's multi-
+    // material constructor: region by region, tangent to the interfaces, the
+    // nodes' sector quarters its own, and launched from by those).
     SeparatrixTrace(std::shared_ptr<CrossField> cf, bool useActualSingularityCoordinates,
                     const Settings &settings, const Interfaces *interfaces = nullptr,
                     std::shared_ptr<const ConformalField> conformal = nullptr);

@@ -6749,6 +6749,25 @@ void CrossGenWidget::buildZIPLINEBlocks() {
     }
     auto t1 = Clock::now();
 
+    // Stage 5b may have replaced the trace, the layout and the simplification
+    // with those of an edited pattern (ZIPLINE::buildBlocks), and the
+    // quantization read the old layout's arcs by index: it is stale.
+    {
+        const ZIPLINE::Status &st = zipline_->getStatus();
+        if (!st.repairEdits.empty()) {
+            ziplineQuant_.reset();
+            ziplineQuantReport_ = TMeshQuantizer::Report{};
+            std::ostringstream oss;
+            oss << std::fixed << std::setprecision(2) << "[Stage 5b] pattern repaired: coverage "
+                << 100.0 * st.coverageBeforeRepair << "% -> " << 100.0 * ziplineBlocks()->coverage() << "% with "
+                << st.repairEdits.size() << " edit(s) of " << st.repairCandidates << " tried"
+                << (st.repairLeftFirstField ? " (they are what built the second field)" : "")
+                << "; the trace and layout shown are now the repaired ones";
+            console_.log(oss.str());
+            for (const std::string &e : st.repairEdits) console_.log("[Stage 5b]   " + e);
+        }
+    }
+
     // The uncovered area as triangles of the model, by centroid: what the
     // picture fills so that it reads as a region rather than as an outline.
     {

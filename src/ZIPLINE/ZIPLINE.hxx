@@ -3,11 +3,13 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "MERIDIAN/Interfaces.hxx"
 #include "ZIPLINE/ConformalField.hxx"
 #include "ZIPLINE/LayoutBlocks.hxx"
 #include "ZIPLINE/PartitionSimplify.hxx"
+#include "ZIPLINE/PatternRepair.hxx"
 #include "ZIPLINE/QuadLayout.hxx"
 #include "ZIPLINE/SeparatrixTrace.hxx"
 #include "crossfield/CrossField.hxx"
@@ -42,6 +44,14 @@
 //                                 (spec Sec. 12), then Sec. 4 again
 //   Stage 5   LayoutBlocks        the four-sided components as the shared
 //                                 BlockDecomposition on spline geometry
+//   Stage 5b  PatternRepair       when the blocks leave part of the model
+//                                 uncovered: the singularity pattern edited
+//                                 (P2's valence-2 split, 3-5 pairs at
+//                                 T-junctions, P2's T-junction merge as a
+//                                 move of the stem's singular point) and
+//                                 Stages 1b-5 run again on it, the best kept
+//                                 (docs/quad_layout_pipeline.md Secs. 9.4,
+//                                 12.2-12.3); part of buildBlocks()
 //   Stage 6   BlockQuadMesh       a transfinite grid on the blocks
 //   Stage 7   mesh::TMOP          the grid smoothed, mu sampled at the corners
 //
@@ -105,10 +115,11 @@ public:
         // ---- Stage 1b ----
         // Trace the corrected field (ConformalField) instead of the MBO one:
         // the MBO's singularity pattern, its field rebuilt as the conformal
-        // field with exactly those singularities. Falls back to the MBO field,
-        // with the reason in Status::conformalFailure, on a multi-material
-        // model (the corrected field knows no interfaces) and wherever the
-        // pattern fails Poincare-Hopf (the Neumann problem has no solution).
+        // field with exactly those singularities -- on a multi-material model
+        // region by region, tangent to the interfaces (ConformalField's
+        // header). Falls back to the MBO field, with the reason in
+        // Status::conformalFailure, wherever the pattern fails Poincare-Hopf
+        // (the Neumann problem has no solution) and Stage 5b cannot mend it.
         bool secondField = true;
         ConformalField::Options conformal;
 
@@ -121,7 +132,8 @@ public:
         // a port when it arrives at all, which the first field's cores do not
         // let it do -- on the multi-material corpus, traced on the first
         // field, it took T-junctions left from 43 to 151 and three layouts
-        // unsound.
+        // unsound. Since the corrected field is solved on multi-material
+        // models too, that is now every model whose pattern holds.
         SeparatrixTrace::Settings trace = [] {
             SeparatrixTrace::Settings t;
             t.captureAtSingularities = true;
@@ -130,6 +142,15 @@ public:
         // Off: the layout goes on to the blocks exactly as it was traced.
         bool simplify = true;
         PartitionSimplify::Settings simplification;
+
+        // ---- Stage 5b ----
+        // Rounds of pattern edits when the blocks do not cover the model
+        // (PatternRepair's header has the edits and the measurements;
+        // repair.rounds = 0 turns it off), on every model with secondField
+        // on: every edit is an edit of the corrected field's pattern, and on a
+        // multi-material model the field it re-solves is the per-region one.
+        // Its mesh check meshes at `mesh` and smooths with `tmop`.
+        PatternRepair::Options repair;
 
         // ---- Stage 6 ----
         BlockQuadMesh::Options mesh;
@@ -165,6 +186,16 @@ public:
         // was asked for and does not, why not.
         bool conformalTraced = false;
         std::string conformalFailure;
+        // Stage 5b: the coverage before it, the rounds it ran, how many
+        // candidate edits it tried, and the edits kept, in order (each
+        // PatternRepair::Edit::what). Edits kept can be fewer than rounds
+        // that ended on one: a round may leave the first field for the second
+        // at a loss, and the result is the best state any round reached.
+        double coverageBeforeRepair = 0.0;
+        int repairRounds = 0;
+        int repairCandidates = 0;
+        std::vector<std::string> repairEdits;
+        bool repairLeftFirstField = false;   // the repair is what built the second field
     };
 
     explicit ZIPLINE(std::shared_ptr<Mesh> mesh);
@@ -189,7 +220,11 @@ public:
     void finishTrace();
     void buildLayout();                       // Stage 3
     void simplifyLayout();                    // Stage 4
-    void buildBlocks();                       // Stage 5
+    // Stage 5, and Stage 5b when its blocks do not cover the model: that may
+    // replace the corrected field, the trace, the layout and the
+    // simplification with those of an edited pattern, so read them again
+    // after this (getTrace() and the rest return the repaired ones).
+    void buildBlocks();
     // Stage 6. False when there is no block to mesh.
     bool buildMesh();
     bool buildMesh(const BlockQuadMesh::Options &opts);
@@ -246,6 +281,16 @@ private:
     // once, stepField() after every call.
     void advanceField(int steps);
 
+    // Stage 5b (ZIPLINE.cxx). An Attempt is Stages 1b to 5 run on one edited
+    // pattern, held apart from the stages above until it is kept.
+    struct Attempt;
+    Attempt attempt(std::vector<ConformalField::Singular> pattern) const;
+    // The worst scaled Jacobian, and the inverted elements, of the blocks
+    // meshed and briefly smoothed (PatternRepair::Options::checkSweeps).
+    void checkMesh(const LayoutBlocks &b, double &worst, int &inverted) const;
+    void adopt(Attempt &a);
+    void repairPattern();
+
     std::shared_ptr<Mesh> mesh;
     Options options;
     Status status;
@@ -257,6 +302,15 @@ private:
     // and destroyed in reverse.
     std::unique_ptr<Interfaces> interfaces;
     std::shared_ptr<CrossField> field;
+    // Stage 1b's input: the first field's pattern as read, then as Stage 5b
+    // edited it (ConformalField's own dipole and corner edits not applied),
+    // and whether there is one to edit.
+    std::vector<ConformalField::Singular> pattern;
+    bool patternRead = false;
+    // With interfaces, per vertex: the first field's singular index absorbed
+    // at a node of the network as the pattern was read (ConformalField's
+    // multi-material constructor). Kept for Stage 5b's re-solves.
+    std::vector<int> absorbed4;
     std::shared_ptr<ConformalField> conformal;
     std::unique_ptr<SeparatrixTrace> trace;
     std::unique_ptr<QuadLayout> layout;

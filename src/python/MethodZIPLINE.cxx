@@ -64,6 +64,17 @@ const Table<ZIPLINE::Options> &optionsTable() {
         OPT(trace.orthogonalTolerance),
         OPT(trace.maxLengthDiagonals),
         OPT(trace.seedUntouchedHoles),
+        OPT(repair.rounds),
+        OPT(repair.deficit),
+        OPT(repair.pairsAtTJunctions),
+        OPT(repair.moveStems),
+        OPT(repair.moveIntoFaces),
+        OPT(repair.minGain),
+        OPT(repair.checkMesh),
+        OPT(repair.checkSweeps),
+        OPT(repair.qualityFloor),
+        OPT(repair.maxCandidatesPerRound),
+        OPT(repair.maxCandidates),
         OPT(simplify),
         OPT(simplification.zipAngle),
         OPT(simplification.zipLengthOfPatch),
@@ -90,7 +101,9 @@ const Table<ZIPLINE::Options> &optionsTable() {
 const Table<ZIPLINE::Status> &statusTable() {
     using O = ZIPLINE::Status;
     static const Table<O> t{REP(fieldSteps), REP(fieldConverged), REP(fieldError),
-                            REP(conformalTraced), REP(conformalFailure)};
+                            REP(conformalTraced), REP(conformalFailure),
+                            REP(coverageBeforeRepair), REP(repairRounds), REP(repairCandidates),
+                            REP(repairEdits), REP(repairLeftFirstField)};
     return t;
 }
 

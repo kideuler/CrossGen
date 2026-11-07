@@ -56,6 +56,13 @@
 //                           cancellation or its valence-2 corner repair, or
 //                           with the repair moving the singularity f of the way
 //                           in (ConformalField::Options)
+//   --no-repair             no Stage 5b: the blocks as Stages 1b-5 left them
+//                           (ZIPLINE::Options::repair, PatternRepair.hxx)
+//   --repair-rounds n, --no-repair-mesh-check, --repair-floor q, --repair-candidates n,
+//   --repair-only deficit,pairs,stems,moves
+//                           Stage 5b's rounds, its mesh check and quality floor,
+//                           and which of its edits it may make
+//   --min-coverage pct      fail the exit code too for a model covered less
 //   --dump <prefix>         <prefix>_<model>_{layout,blocks,mesh}.obj and
 //                           _tj.txt: the simplified layout, the blocks, the mesh
 //                           and the T-junctions, for looking at
@@ -65,6 +72,7 @@
 // runs between the block's own corners, every Coons patch on its own corners,
 // and -- with --mesh -- every mesh conforming. How much of the model is covered
 // is what the method achieves on the model and is printed, not asserted.
+#include <algorithm>
 #include <cmath>
 #include <complex>
 #include <cstdlib>
@@ -123,6 +131,8 @@ struct Flags {
     std::string dump;          // prefix for the debugging dumps
 };
 static Flags gFlags;
+// --min-coverage: the exit code also fails a model covered less than this.
+static double gMinCoverage = -1.0;
 
 struct Outcome {
     std::string name;
@@ -160,6 +170,9 @@ struct Outcome {
     bool meshConforming = true;
     bool smoothed = false;
     double tmopWorst = 0.0;
+    // Stage 5b
+    int repairEdits = 0;
+    double coverageBeforeRepair = 0.0;
 };
 
 // The raw traced curves, before the layout splits them, as one poly-line each.
@@ -299,6 +312,8 @@ static Outcome processMesh(const std::string &path, bool writeVtu, bool verbose,
     out.blocks = br.blocks;
     out.straddling = br.straddlingBlocks;
     out.coverage = blocks.coverage();
+    out.repairEdits = static_cast<int>(zipline.getStatus().repairEdits.size());
+    out.coverageBeforeRepair = zipline.getStatus().coverageBeforeRepair;
     const std::vector<std::string> blockFailures = checkBlocks(blocks);
     out.blocksSound = blockFailures.empty();
 
@@ -318,6 +333,10 @@ static Outcome processMesh(const std::string &path, bool writeVtu, bool verbose,
                           << ", anchor tangency " << c.anchorTangency << std::defaultfloat
                           << std::setprecision(3) << "; vertex spread " << c.vertexSpread * 180.0 / M_PI
                           << " deg, regular turn " << c.maxRegularTurnPerEdge * 180.0 / M_PI << " deg/edge";
+                if (c.regions > 0)
+                    std::cout << "; " << c.regions << " material region(s) solved apart, " << c.interfaceNodes
+                              << " interface node(s) as their corners (" << c.absorbed4
+                              << "/4 absorbed), interface mismatch " << c.interfaceMismatch * 180.0 / M_PI << " deg";
                 if (c.holes) {
                     std::cout << "; hole offsets";
                     for (const double d : c.holeOffsets) std::cout << " " << d * 180.0 / M_PI;
@@ -330,6 +349,18 @@ static Outcome processMesh(const std::string &path, bool writeVtu, bool verbose,
             }
         } else if (!zipline.getStatus().conformalFailure.empty()) {
             std::cout << "  second field  not used: " << zipline.getStatus().conformalFailure << "\n";
+        }
+        {
+            const ZIPLINE::Status &st = zipline.getStatus();
+            if (st.repairRounds > 0) {
+                std::cout << std::fixed << std::setprecision(2) << "  repair (5b)   coverage "
+                          << 100.0 * st.coverageBeforeRepair << "% -> " << 100.0 * blocks.coverage() << "%, "
+                          << st.repairEdits.size() << " edit(s) kept of " << st.repairCandidates
+                          << " tried over " << st.repairRounds << " round(s)"
+                          << (st.repairLeftFirstField ? "; the edits are what built the second field" : "")
+                          << std::defaultfloat << std::setprecision(6) << "\n";
+                for (const std::string &e : st.repairEdits) std::cout << "                " << e << "\n";
+            }
         }
         std::cout << "  Poincare-Hopf sum d " << tr.interiorIndexSum4 << " + sum(2 - q) "
                   << tr.boundaryIndexSum4 << " = " << (tr.interiorIndexSum4 + tr.boundaryIndexSum4)
@@ -893,6 +924,82 @@ void interfaces() {
           "four blocks, none in two materials, covering the model (" + std::to_string(blocks) + ")");
 }
 
+// The corrected field on a multi-material model (ConformalField's header,
+// "Material interfaces"): solved region by region on the mesh cut along the
+// interfaces, the nodes' sectors as the regions' corners, and traced and
+// blocked through the ZIPLINE class exactly as a corpus model is. Each case
+// has an aligned constant cross as its answer, so every count is exact.
+void multiMaterialField() {
+    struct Out {
+        bool second = false, ph = false;
+        int regions = 0, nodes = 0, blocks = 0, straddling = 0, singularities = 0;
+        double coverage = 0.0, mismatch = 1.0;
+        std::vector<std::vector<int>> nodeQuarters;
+    };
+    auto run = [](const std::shared_ptr<Mesh> &m) {
+        ZIPLINE::Options o;
+        o.fieldMaxSteps = 200;
+        ZIPLINE z(m, o);
+        z.run(ZIPLINE::Stage::Blocks);
+        Out out;
+        out.second = z.getStatus().conformalTraced;
+        if (const ConformalField *cf = z.getConformalField()) {
+            const ConformalField::Report &r = cf->getReport();
+            out.ph = r.poincareHopf;
+            out.regions = r.regions;
+            out.nodes = r.interfaceNodes;
+            out.mismatch = r.interfaceMismatch;
+            out.singularities = static_cast<int>(cf->singularities().size());
+            out.nodeQuarters = cf->nodeQuarters();
+        }
+        const LayoutBlocks &lb = z.getBlocks();
+        out.blocks = lb.getReport().blocks;
+        out.straddling = lb.getReport().straddlingBlocks;
+        out.coverage = lb.coverage();
+        return out;
+    };
+
+    std::cout << "the corrected field across a straight interface: two regions, two blocks\n";
+    {
+        const Out o = run(grid(8, [](double, double) { return true; }, [](double x, double) { return x < 0.5 ? 1 : 2; }));
+        check(o.second && o.ph && o.regions == 2 && o.nodes == 2 && o.singularities == 0 && o.mismatch < 1e-6,
+              "traced on the corrected field: two regions solved apart, the two landings their corners, no "
+              "singularity, the regions agreeing on the interface (" + std::to_string(o.regions) + " regions)");
+        check(o.blocks == 2 && o.coverage > 1.0 - 1e-12 && o.straddling == 0,
+              "two blocks, one per material (" + std::to_string(o.blocks) + ")");
+    }
+
+    std::cout << "a square inclusion: four kinks of a quarter and three quarters\n";
+    {
+        const Out o = run(grid(10, [](double, double) { return true; }, [](double x, double y) {
+            return (x > 0.3 && x < 0.7 && y > 0.3 && y < 0.7) ? 2 : 1;
+        }));
+        int kinks = 0;
+        for (const auto &q : o.nodeQuarters) {
+            if (q.empty()) continue;
+            std::vector<int> s = q;
+            std::sort(s.begin(), s.end());
+            if (s == std::vector<int>{1, 3}) ++kinks;
+        }
+        check(o.second && o.ph && o.regions == 2 && o.nodes == 4 && kinks == 4 && o.singularities == 0,
+              "two regions; each corner of the inclusion one quad inside and three outside (" +
+                  std::to_string(kinks) + " of 4 nodes)");
+        check(o.blocks == 9 && o.coverage > 1.0 - 1e-12 && o.straddling == 0,
+              "the inclusion and the eight blocks its corners' separatrices cut the frame into (" +
+                  std::to_string(o.blocks) + ")");
+    }
+
+    std::cout << "an orthogonal T of three materials on the corrected field\n";
+    {
+        const Out o = run(grid(8, [](double, double) { return true; },
+                               [](double x, double y) { return x < 0.5 ? 1 : (y < 0.5 ? 2 : 3); }));
+        check(o.second && o.ph && o.regions == 3 && o.nodes == 4,
+              "three regions, the junction and three landings as their corners (" + std::to_string(o.nodes) + " nodes)");
+        check(o.blocks == 4 && o.coverage > 1.0 - 1e-12 && o.straddling == 0,
+              "four blocks, none in two materials (" + std::to_string(o.blocks) + ")");
+    }
+}
+
 // Sec. 4's zip: two singularities whose separatrices pass each other a
 // fiftieth of the model apart, leaving one thin strip with the singularities on
 // opposite corners. The collapse has to join the two with a blend of the two
@@ -1168,6 +1275,35 @@ void conformalField() {
     check(tracer.getSingularities().size() == 4 && worst < 0.02,
           "the field is radial along every closed-form port (worst " + std::to_string(worst * 180.0 / M_PI) + " deg)");
 
+    // Stage 5b reads how far a pattern is from Poincare-Hopf off the field
+    // that declined it, and edits patterns by index.
+    std::cout << "Stage 5b's inputs: the Poincare-Hopf deficit, and an edit applied\n";
+    {
+        const auto sq = grid(12, [](double, double) { return true; });
+        const ConformalField fine(sq, patternAt(*sq, {}));
+        const ConformalField short1(sq, patternAt(*sq, {{Point{0.43, 0.41}, -1}}));
+        const ConformalField over1(sq, patternAt(*sq, {{Point{0.43, 0.41}, +1}}));
+        check(fine.valid() && fine.getReport().indexDeficit4 == 0 && !short1.valid() &&
+                  short1.getReport().indexDeficit4 == 1 && !over1.valid() && over1.getReport().indexDeficit4 == -1,
+              "the unit square's corners add to chi alone: no deficit; a valence-5 too many is one quarter "
+              "short (" + std::to_string(short1.getReport().indexDeficit4) + "), a valence-3 one over (" +
+                  std::to_string(over1.getReport().indexDeficit4) + ")");
+        // A dipole, moved (one point removed, one added) and then given a
+        // 3-5 pair: neither changes the index sum.
+        const auto dipole = patternAt(*sq, {{Point{0.43, 0.41}, -1}, {Point{0.7, 0.7}, +1}});
+        PatternRepair::Edit move, pair;
+        move.remove = {0};
+        move.add = patternAt(*sq, {{Point{0.27, 0.66}, -1}});
+        pair.add = patternAt(*sq, {{Point{0.61, 0.37}, +1}, {Point{0.2, 0.2}, -1}});
+        const auto moved = PatternRepair::apply(dipole, move);
+        const auto paired = PatternRepair::apply(moved, pair);
+        check(moved.size() == 2 && moved[0].d == +1 && std::fabs(moved[0].pos[0] - 0.7) < 1e-12 &&
+                  moved[1].d == -1 && std::fabs(moved[1].pos[0] - 0.27) < 1e-12 && paired.size() == 4 &&
+                  ConformalField(sq, moved).getReport().indexDeficit4 == 0 &&
+                  ConformalField(sq, paired).getReport().indexDeficit4 == 0,
+              "an edit removes by index and appends; a move and a 3-5 pair leave the index sum as it was");
+    }
+
     std::cout << "Sec. 8.1's example: a disk with four valence-3 -- 12 traced, 8 kept, 5 patches\n";
     {
         const auto d = polarDisk(16, 64, 1.0);
@@ -1231,6 +1367,7 @@ int run() {
     constantField();
     layouts();
     interfaces();
+    multiMaterialField();
     std::cout << (failures ? "\n" + std::to_string(failures) + " check(s) FAILED\n" : "\nall checks passed\n");
     return failures ? 1 : 0;
 }
@@ -1290,6 +1427,21 @@ int main(int argc, char **argv) {
         else if (a == "--no-align-holes") gFlags.zipline.conformal.alignHoles = false;
         else if (a == "--no-dipoles") gFlags.zipline.conformal.cancelDipoles = false;
         else if (a == "--no-relocate") gFlags.zipline.conformal.relocateCornerSingularities = false;
+        else if (a == "--no-repair") gFlags.zipline.repair.rounds = 0;
+        else if (a == "--repair-rounds") gFlags.zipline.repair.rounds = std::atoi(next());
+        else if (a == "--no-repair-mesh-check") gFlags.zipline.repair.checkMesh = false;
+        else if (a == "--repair-floor") gFlags.zipline.repair.qualityFloor = std::atof(next());
+        else if (a == "--repair-candidates") gFlags.zipline.repair.maxCandidates = std::atoi(next());
+        else if (a == "--repair-only") {
+            // A comma-separated subset of deficit, pairs, stems, moves.
+            const std::string kinds = std::string(",") + next() + ",";
+            auto has = [&](const char *k) { return kinds.find(std::string(",") + k + ",") != std::string::npos; };
+            gFlags.zipline.repair.deficit = has("deficit");
+            gFlags.zipline.repair.pairsAtTJunctions = has("pairs");
+            gFlags.zipline.repair.moveStems = has("stems");
+            gFlags.zipline.repair.moveIntoFaces = has("moves");
+        }
+        else if (a == "--min-coverage") gMinCoverage = std::atof(next()) / 100.0;
         else if (a == "--relocate") gFlags.zipline.conformal.cornerRelocation = std::atof(next());
         else if (a == "--seed") gFlags.zipline.fieldSeed = static_cast<unsigned>(std::atol(next()));
         else if (a == "--field-tol") gFlags.zipline.fieldTolerance = std::atof(next());
@@ -1334,8 +1486,8 @@ int main(int argc, char **argv) {
     std::cout << "  sound\n";
     int sound = 0, allQuads = 0, faces = 0, quads = 0, sSound = 0, sFaces = 0, sQuads = 0;
     int collapses = 0, rolled = 0, blocks = 0, tAfter = 0, ph = 0, full = 0;
-    int straddling = 0, straddlingModels = 0;
-    double coverSum = 0.0;
+    int straddling = 0, straddlingModels = 0, repaired = 0, underCovered = 0;
+    double coverSum = 0.0, coverBeforeSum = 0.0;
     for (const auto &o : all) {
         const bool ok = o.sound && o.sSound && o.blocksSound && o.meshConforming;
         std::cout << std::left << std::setw(12) << o.name << std::right << std::setw(5)
@@ -1366,6 +1518,12 @@ int main(int argc, char **argv) {
         blocks += o.blocks;
         tAfter += o.sTJunctions;
         coverSum += o.coverage;
+        coverBeforeSum += o.repairEdits > 0 ? o.coverageBeforeRepair : o.coverage;
+        if (o.repairEdits > 0) ++repaired;
+        if (gMinCoverage >= 0.0 && o.coverage < gMinCoverage - 1e-12) {
+            ++underCovered;
+            std::cout << "  [FAIL] " << o.name << " covers " << 100.0 * o.coverage << "%, under --min-coverage\n";
+        }
         straddling += o.straddling;
         if (o.straddling > 0) ++straddlingModels;
     }
@@ -1381,11 +1539,14 @@ int main(int argc, char **argv) {
               << " T-junction(s) left\n"
               << blocks << " blocks; mean coverage " << (n ? 100.0 * coverSum / n : 0.0) << "%, "
               << full << "/" << n << " models covered completely\n";
+    if (repaired > 0)
+        std::cout << "Stage 5b edited the pattern of " << repaired << "/" << n << " model(s): mean coverage "
+                  << (n ? 100.0 * coverBeforeSum / n : 0.0) << "% without it\n";
     // A block in two materials is an element no analysis code can integrate.
     // Said here because the table cannot show it and the coverage does not
     // count it; with the interfaces honoured it should be zero.
     if (straddling > 0)
         std::cout << straddling << " block(s) on " << straddlingModels
                   << " model(s) sit in more than one material\n";
-    return (sSound == n) ? 0 : 1;
+    return (sSound == n && underCovered == 0) ? 0 : 1;
 }

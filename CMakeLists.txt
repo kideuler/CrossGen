@@ -249,6 +249,8 @@ add_library(PolyVector SHARED
     src/ZIPLINE/LayoutBlocks.cxx
     src/ZIPLINE/StemExtension.hxx
     src/ZIPLINE/StemExtension.cxx
+    src/ZIPLINE/PatternRepair.hxx
+    src/ZIPLINE/PatternRepair.cxx
     src/ZIPLINE/TriangleLocator.hxx
     src/ZIPLINE/ZIPLINE.hxx
     src/ZIPLINE/ZIPLINE.cxx
@@ -571,6 +573,22 @@ add_test(NAME TriangleMesher_ConcentricShells COMMAND TestTriangleMesher 6)
 # asserted: that is what the method achieves on a model, not a defect.
 add_test(NAME ZIPLINE_LayoutsOnAllMeshes
          COMMAND TestZIPLINE --no-vtu --mesh 0.05 ${MESH_OBJ_FILES})
+
+# Stage 5b (src/ZIPLINE/PatternRepair.hxx) on one model per kind of edit it
+# makes, each of which it takes to full coverage, sound: B59_0 and S9_5 (cusps
+# the first field turned as valence 2, so a pattern short of one and of two
+# valence-3 points and no corrected field without the edit), M7_20 (the same,
+# then a move), S24_4 (a 3-5 pair at a T-junction), S22_9 (P2's T-junction
+# merge as a move of the stem's point), geom033 (a point moved into a
+# three-sided face).
+add_test(NAME ZIPLINE_PatternRepair
+         COMMAND TestZIPLINE --no-vtu --mesh 0.05 --min-coverage 100
+                 ${CMAKE_CURRENT_BINARY_DIR}/data/meshes/mambo/B59_0.obj
+                 ${CMAKE_CURRENT_BINARY_DIR}/data/meshes/mambo/S9_5.obj
+                 ${CMAKE_CURRENT_BINARY_DIR}/data/meshes/mambo/M7_20.obj
+                 ${CMAKE_CURRENT_BINARY_DIR}/data/meshes/mambo/S24_4.obj
+                 ${CMAKE_CURRENT_BINARY_DIR}/data/meshes/mambo/S22_9.obj
+                 ${CMAKE_CURRENT_BINARY_DIR}/data/meshes/singlemat/geom033.obj)
 
 # docs/viertel_2019.md Sec. 11 on closed-form fields: the index, the ports and
 # the hyperbola of a singularity, straight streamlines in a constant field, and

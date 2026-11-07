@@ -67,7 +67,13 @@ SeparatrixTrace::SeparatrixTrace(std::shared_ptr<CrossField> cf,
         }
         absorbAt = interfaceNodeVertex;
     }
-    if (conformal && !interfaces)
+    // The corrected field knows the interfaces itself (it is solved region by
+    // region, tangent to them, its pattern read with the nodes' singular
+    // triangles already absorbed): it is traced as it is, with or without
+    // them. Built without interfaces it cannot honour a network it was not
+    // given, so a network then falls back to the field's own reading.
+    const bool conformalHere = conformal && (!interfaces || conformal->getInterfaces() == interfaces);
+    if (conformalHere)
         tracer = std::make_unique<FieldTracer>(cf, std::move(conformal));
     else
         tracer = std::make_unique<FieldTracer>(cf, useActualSingularityCoordinates,
@@ -362,7 +368,16 @@ void SeparatrixTrace::launchFromInterfaceNodes() {
         // bisecting a 270-degree corner leaves two 135-degree sectors that
         // round to two apiece, four in a corner of three. MERIDIAN settles
         // that region by region (Interfaces::balance); here the field does.
-        if (!n.sector.empty()) {
+        // On the corrected field the count is the one the field was solved
+        // with at this node (ConformalField::nodeQuarters, the same rule from
+        // the first field's absorbed index), so the separatrices leave the
+        // node as the field turns there.
+        const ConformalField *cfield = tracer->getConformal();
+        const bool fromField = cfield && ni < static_cast<int>(cfield->nodeQuarters().size()) &&
+                               cfield->nodeQuarters()[ni].size() == n.sector.size() && !n.sector.empty();
+        if (fromField) {
+            info.quarters = cfield->nodeQuarters()[ni];
+        } else if (!n.sector.empty()) {
             int fan = 4;
             if (n.onBoundary) {
                 auto it = cornerQuarters.find(n.vertex);
