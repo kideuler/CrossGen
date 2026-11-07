@@ -40,6 +40,7 @@ void ZIPLINE::discardFrom(Stage from) {
     if (from <= Stage::Mesh) blockMesh.reset();
     if (from <= Stage::Blocks) {
         blocks.reset();
+        status.weakChosen = -1;
         status.coverageBeforeRepair = 0.0;
         status.repairRounds = 0;
         status.repairCandidates = 0;
@@ -56,6 +57,7 @@ void ZIPLINE::discardFrom(Stage from) {
         conformal.reset();
         pattern.clear();
         absorbed4.clear();
+        absorbedTriangles.clear();
         patternRead = false;
         conformalTried = false;
         status.conformalFailure.clear();
@@ -102,7 +104,9 @@ void ZIPLINE::startField() {
     if (interfaces) {
         field->setAlignedInteriorEdges(interfaces->interfaceEdges());
         field->setPinDiskCenters(options.pinDiskCenters);
+        field->setWeakInterfaces(options.weakInterfaces);
     }
+    field->setWeakBoundary(options.weakBoundary);
     field->initialize(1, options.fieldSeed);
 }
 
@@ -197,6 +201,19 @@ void ZIPLINE::buildConformalField() {
         absorbAt.assign(mesh->vertices.size(), 0);
         for (const Interfaces::Node &n : network->nodes())
             if (n.kind != Interfaces::NodeKind::Dangling && n.vertex >= 0) absorbAt[n.vertex] = 1;
+        // Held to the interfaces only weakly (Options::weakInterfaces), the
+        // first field moves singularities onto them, and a singular triangle
+        // with a vertex on an interface is on it as far as the mesh can say:
+        // it is taken there, as a node takes one, and that vertex becomes a
+        // node below -- a valence-5 point only (FieldTracer's flag 2). A
+        // valence-3 point on a smooth interface would be a corner of one
+        // quarter on a straight side, and it stays a point of its region
+        // (honeycomb: fourteen of them a mesh edge off its junctions, each a
+        // flat corner, and the layout unsound).
+        if (field->weakInterfaces())
+            for (const int e : network->interfaceEdges())
+                for (const int v : {mesh->edges[e][0], mesh->edges[e][1]})
+                    if (!mesh->isBoundaryVertex[v] && !absorbAt[v]) absorbAt[v] = 2;
     }
     const FieldTracer first(field, true, options.trace.singularitiesAtBoundary, absorbAt);
     for (const Singularity &s : first.getSingularities())
@@ -210,9 +227,27 @@ void ZIPLINE::buildConformalField() {
     if (network)
         for (const Interfaces::Node &n : network->nodes())
             if (n.kind != Interfaces::NodeKind::Dangling && n.vertex >= 0) absorbed4[n.vertex] = first.absorbedIndexAt(n.vertex);
+    absorbedTriangles = first.absorbedTriangles();
     patternRead = true;
-    conformal = std::make_shared<ConformalField>(mesh, pattern, options.conformal, field.get(), network, absorbed4);
+    conformal = std::make_shared<ConformalField>(mesh, pattern, conformalOptions(), field.get(), network, absorbed4,
+                                                 absorbedTriangles);
+    // A weak first field may turn a region's corner where the network has
+    // no node (ConformalField::Options::readWeakBoundary): the nodes are
+    // made, once -- they stay in the network for every stage after this,
+    // Stage 5b's re-solves included -- and the field is built again.
+    if (!conformal->valid() && !conformal->offNetworkCorners().empty() && interfaces) {
+        status.weakNodesAdded = interfaces->addNodes(conformal->offNetworkCorners());
+        if (status.weakNodesAdded > 0)
+            conformal = std::make_shared<ConformalField>(mesh, pattern, conformalOptions(), field.get(), network,
+                                                         absorbed4, absorbedTriangles);
+    }
     if (!conformal->valid()) status.conformalFailure = conformal->getReport().failure;
+}
+
+ConformalField::Options ZIPLINE::conformalOptions() const {
+    ConformalField::Options o = options.conformal;
+    if (field && (field->weakBoundary() || (interfaces && field->weakInterfaces()))) o.readWeakBoundary = true;
+    return o;
 }
 
 bool ZIPLINE::stepTrace() {
@@ -245,6 +280,7 @@ void ZIPLINE::buildBlocks() {
     discardFrom(Stage::Blocks);
     blocks = std::make_unique<LayoutBlocks>(simplification->getLayout(), *mesh);
     repairPattern();
+    chooseCondition();
 }
 
 bool ZIPLINE::buildMesh(const BlockQuadMesh::Options &opts) {
@@ -369,8 +405,8 @@ ZIPLINE::Attempt ZIPLINE::attempt(std::vector<ConformalField::Singular> p) const
     Attempt a;
     a.pattern = std::move(p);
     const Interfaces *network = (interfaces && options.trace.respectInterfaces) ? interfaces.get() : nullptr;
-    a.conformal = std::make_shared<ConformalField>(mesh, a.pattern, options.conformal, field.get(), network,
-                                                   absorbed4);
+    a.conformal = std::make_shared<ConformalField>(mesh, a.pattern, conformalOptions(), field.get(), network,
+                                                   absorbed4, absorbedTriangles);
     a.second = a.conformal->valid();
     // An edit is kept only on the corrected field (repairPattern), so one
     // that leaves the pattern without it is not traced at all.
@@ -382,7 +418,11 @@ ZIPLINE::Attempt ZIPLINE::attempt(std::vector<ConformalField::Singular> p) const
     a.layout->build();
     a.simplification = std::make_unique<PartitionSimplify>(*a.layout, options.simplification);
     if (options.simplify) a.simplification->run();
-    a.blocks = std::make_unique<LayoutBlocks>(a.simplification->getLayout(), *mesh);
+    // Judged on the counts alone (scoreOf); the geometry is built for the
+    // few that are meshed or kept (repairPattern).
+    LayoutBlocks::Options lb;
+    lb.deferGeometry = true;
+    a.blocks = std::make_unique<LayoutBlocks>(a.simplification->getLayout(), *mesh, lb);
     a.score = scoreOf(*a.trace, *a.layout, *a.simplification, *a.blocks);
     return a;
 }
@@ -423,6 +463,91 @@ void ZIPLINE::adopt(Attempt &a) {
     status.repairEdits = a.edits;
 }
 
+// ---------------------------------------------------------------------------
+// Options::weakChoices: the first field's condition, chosen per model.
+//
+// The weak conditions (CrossField::setWeakBoundary) are not better or worse
+// than the strong ones everywhere -- the ring a strong condition holds round
+// an inclusion is a layer of thin blocks on one model and the right O-grid on
+// the next (docs/viertel_2019.md, Eighth pass) -- so each pair is taken through
+// Stages 1 to 5b on its own, in a ZIPLINE of its own, and the finished runs,
+// this one's included, are scored as Stage 5b scores a candidate edit; the
+// best replaces this one's stages wholesale, the network it may have added
+// nodes to included. Finished, because what a run covers before Stage 5b
+// says little about what it covers after: artery's strong run goes from 88%
+// to 100% and its weak one from 99.4% to 99.9%, salt_dome's strong one stays
+// at 99.3% and its weak one goes from 97.2% to 99.98%, and chosen before the
+// repair both came out the wrong way round. Everything a stage holds is
+// swapped, not copied, so the pointers each holds into the stage before stay
+// good, and the run that lost takes this one's old stages with it.
+// ---------------------------------------------------------------------------
+void ZIPLINE::chooseCondition() {
+    if (options.weakChoices.empty() || !blocks || !trace || !layout || !simplification) return;
+    blocks->completeGeometry();   // Stage 5b may have kept a candidate's, built without it
+    Score best = scoreOf(*trace, *layout, *simplification, *blocks);
+    double bestWorst = 0.0;
+    int bestInverted = 0;
+    checkMesh(*blocks, bestWorst, bestInverted);
+    const double minGain = options.repair.minGain;
+    auto beats = [&](const Score &a, double wa, int ia) {
+        if (improves(a, best, minGain)) return true;
+        if (improves(best, a, minGain) || !a.sound) return false;
+        if (ia != bestInverted) return ia < bestInverted;
+        return wa > bestWorst + options.chooseMargin;
+    };
+    std::unique_ptr<ZIPLINE> winner;
+    int chosen = -1;
+    for (size_t i = 0; i < options.weakChoices.size(); ++i) {
+        const auto &c = options.weakChoices[i];
+        // A weak interface means nothing without interfaces.
+        if (!(c[0] > 0.0) && !(c[1] > 0.0 && interfaces)) continue;
+        Options o = options;
+        o.weakChoices.clear();
+        o.weakBoundary = c[0];
+        o.weakInterfaces = c[1];
+        auto alt = std::make_unique<ZIPLINE>(mesh, o);
+        alt->run(Stage::Blocks);
+        if (!alt->blocks || !alt->trace || !alt->layout || !alt->simplification) continue;
+        alt->blocks->completeGeometry();
+        const Score s = scoreOf(*alt->trace, *alt->layout, *alt->simplification, *alt->blocks);
+        double w = 0.0;
+        int inv = 0;
+        alt->checkMesh(*alt->blocks, w, inv);
+        if (!beats(s, w, inv)) continue;
+        best = s;
+        bestWorst = w;
+        bestInverted = inv;
+        winner = std::move(alt);
+        chosen = static_cast<int>(i);
+    }
+    if (!winner) return;
+    std::swap(interfaces, winner->interfaces);
+    std::swap(field, winner->field);
+    std::swap(pattern, winner->pattern);
+    std::swap(patternRead, winner->patternRead);
+    std::swap(absorbed4, winner->absorbed4);
+    std::swap(absorbedTriangles, winner->absorbedTriangles);
+    std::swap(conformal, winner->conformal);
+    std::swap(trace, winner->trace);
+    std::swap(layout, winner->layout);
+    std::swap(simplification, winner->simplification);
+    std::swap(blocks, winner->blocks);
+    options.weakBoundary = winner->options.weakBoundary;
+    options.weakInterfaces = winner->options.weakInterfaces;
+    status.fieldSteps = winner->status.fieldSteps;
+    status.fieldConverged = winner->status.fieldConverged;
+    status.fieldError = winner->status.fieldError;
+    status.conformalTraced = winner->status.conformalTraced;
+    status.conformalFailure = winner->status.conformalFailure;
+    status.weakNodesAdded = winner->status.weakNodesAdded;
+    status.coverageBeforeRepair = winner->status.coverageBeforeRepair;
+    status.repairRounds = winner->status.repairRounds;
+    status.repairCandidates = winner->status.repairCandidates;
+    status.repairEdits = winner->status.repairEdits;
+    status.repairLeftFirstField = winner->status.repairLeftFirstField;
+    status.weakChosen = chosen;
+}
+
 void ZIPLINE::repairPattern() {
     const PatternRepair::Options &R = options.repair;
     if (R.rounds <= 0 || !blocks || !trace || !layout || !simplification) return;
@@ -436,6 +561,7 @@ void ZIPLINE::repairPattern() {
     // The unrepaired blocks' mesh, for the quality floor; made when first needed.
     double floor = -1.0;
     auto passes = [&](Attempt &a) {
+        a.blocks->completeGeometry();
         if (!R.checkMesh) return true;
         if (floor < 0.0) {
             double worst = 0.0;

@@ -110,6 +110,17 @@ public:
         int samplesPerSegment = 24;
         // Grid for the fold check of each Coons patch.
         int patchSamples = 8;
+        // Build only the combinatorial part -- the macro arcs, which faces
+        // are blocks, the T-junctions, the coverage and the counts -- and
+        // leave the spline fit, the Coons patches, the B-rep and the
+        // decomposition to completeGeometry(). Stage 5b judges its candidates
+        // on those counts alone and throws most of them away, and the fit
+        // and the kernel were over a quarter of what a candidate cost
+        // (multimat/bubbles). Until completeGeometry() runs, the geometry
+        // members (MacroArc::spline/poly/edge, Block::surface/brepFace/
+        // minCellRatio/material, decomposition(), shape()) are empty and the
+        // report's geometry counts zero.
+        bool deferGeometry = false;
     };
 
     // A maximal chain of layout arcs joined at pass-through nodes.
@@ -195,6 +206,12 @@ public:
     const Report &getReport() const { return report_; }
     const Options &getOptions() const { return opts_; }
 
+    // Options::deferGeometry: build what was left out, on the mesh the
+    // constructor was given (which must still be alive). Exactly what the
+    // constructor would have built; nothing when it is already there.
+    void completeGeometry();
+    bool hasGeometry() const { return geometryBuilt_; }
+
     // The fraction of the model the blocks cover, 0 to 1.
     double coverage() const {
         return report_.totalArea > 0.0 ? report_.coveredArea / report_.totalArea : 1.0;
@@ -232,6 +249,8 @@ private:
     Options opts_;
     Report report_;
     double meanEdge_ = 1.0;
+    const Mesh *mesh_ = nullptr;          // for completeGeometry()
+    bool geometryBuilt_ = false;
 
     std::vector<Point> nodePos_;          // per layout node
     std::vector<char> nodeOnBoundary_;

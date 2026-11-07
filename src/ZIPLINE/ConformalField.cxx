@@ -48,20 +48,31 @@ ConformalField::ConformalField(std::shared_ptr<Mesh> mesh, std::vector<Singular>
 
 ConformalField::ConformalField(std::shared_ptr<Mesh> mesh, std::vector<Singular> pattern,
                                const Options &opts, const CrossField *first, const Interfaces *interfaces,
-                               std::vector<int> absorbed4)
+                               std::vector<int> absorbed4, std::vector<std::array<int, 3>> absorbedTriangles)
     : mesh_(std::move(mesh)), opts_(opts), first_(first), sing_(std::move(pattern)) {
     if (interfaces && interfaces->multiMaterial()) {
         interfaces_ = interfaces;
         absorbed4_ = std::move(absorbed4);
+        absorbedTriangles_ = std::move(absorbedTriangles);
     }
     build();
     first_ = nullptr;
     absorbed4_.clear();
+    absorbedTriangles_.clear();
 }
 
 double ConformalField::singularPart(const Point &x) const {
     double s = 0.0;
     for (const Singular &q : sing_) s += 0.25 * q.d * std::atan2(x[1] - q.pos[1], x[0] - q.pos[0]);
+    for (const BoundarySingular &q : bsing_) s += 0.5 * q.d * std::atan2(x[1] - q.pos[1], x[0] - q.pos[0]);
+    return s;
+}
+
+double ConformalField::singularPart(const Point &x, int region) const {
+    double s = 0.0;
+    for (const Singular &q : sing_) s += 0.25 * q.d * std::atan2(x[1] - q.pos[1], x[0] - q.pos[0]);
+    for (const BoundarySingular &q : bsing_)
+        if (q.region < 0 || q.region == region) s += 0.5 * q.d * std::atan2(x[1] - q.pos[1], x[0] - q.pos[0]);
     return s;
 }
 
@@ -74,6 +85,12 @@ double ConformalField::angleAt(int t, const Point &x, double ref) const {
     if (std::fabs(den) > 1e-300) {
         l1 = cross2(x - a, c - a) / den;
         l2 = cross2(b - a, x - a) / den;
+    }
+    if (regionTerms_) {
+        const double r0 = regularCorner_[t][0];
+        const double r1 = liftNear(r0, regularCorner_[t][1]);
+        const double r2 = liftNear(r0, regularCorner_[t][2]);
+        return liftNear(ref, (1.0 - l1 - l2) * r0 + l1 * r1 + l2 * r2 + singularPart(x, regionOf_[t]));
     }
     const double r0 = regular_[tri[0]];
     const double r1 = liftNear(r0, regular_[tri[1]]);
@@ -88,6 +105,7 @@ void ConformalField::build() {
     report_ = Report{};
     nodeQuarters_.clear();
     splitCorners_.clear();
+    offNetwork_.clear();
     auto fail = [&](const std::string &why) { report_.built = false; report_.failure = why; };
     if (mesh_->triangles.empty()) return fail("no triangles");
 
@@ -351,6 +369,161 @@ void ConformalField::build() {
             loopTurning[l] += M_PI - interior[b];
         }
 
+    // ---- Options::readWeakBoundary: every boundary quarter off the first field
+    //
+    // The vertex reading, the quarters a misalignment adds inside an edge,
+    // and the absorbed triangles, as the option has them. An interface edge
+    // is on two loops, once each way: both see the same misalignment with
+    // the opposite sign and give it to the same end (the nearer, the one
+    // of the lower vertex number on a tie), so the two sides of a vertex
+    // still add up to what the uncut fan turns.
+    const bool weak = opts_.readWeakBoundary && first_ && static_cast<int>(first_->u_k.size()) == nVo;
+    if (weak) {
+        auto th = [&](int v) { return 0.25 * std::arg(first_->u_k[orig(v)]); };
+        std::vector<int> wq(nV, 2);
+        for (const auto &loop : loops)
+            for (const int b : loop) {
+                const double phIn = computeAngle(M.vertices[b] - M.vertices[prevOf[b]]);
+                const double phOut = computeAngle(M.vertices[nextOf[b]] - M.vertices[b]);
+                const double mIn = wrapQuarter(th(b) - phIn), mOut = wrapQuarter(th(b) - phOut);
+                wq[b] = static_cast<int>(std::lround((interior[b] + mIn - mOut) / M_PI_2));
+            }
+        for (const auto &loop : loops)
+            for (const int a : loop) {
+                const int b = nextOf[a];
+                const double ph = computeAngle(M.vertices[b] - M.vertices[a]);
+                const double ma = wrapQuarter(th(a) - ph), mb = wrapQuarter(th(b) - ph);
+                const double D = wrapQuarter(th(b) - th(a));
+                const int j = static_cast<int>(std::lround((ma + D - mb) / M_PI_2));
+                if (j == 0) continue;
+                // Where along a -> b the misalignment passes +-45 degrees.
+                const double t = std::fabs(D) > 1e-12 ? ((j > 0 ? M_PI_4 : -M_PI_4) - ma) / D : 0.5;
+                const bool toA = std::fabs(t - 0.5) < 1e-9 ? orig(a) < orig(b) : t < 0.5;
+                wq[toA ? a : b] += j;
+                ++report_.weakWraps;
+            }
+        for (const auto &ab : absorbedTriangles_) {
+            const int t = ab[0], v = ab[1], d = ab[2];
+            if (t < 0 || t >= nT) continue;
+            for (int k = 0; k < 3; ++k)
+                if (orig(M.triangles[t][k]) == v) {
+                    wq[M.triangles[t][k]] -= d;
+                    break;
+                }
+        }
+        std::vector<char> isNodeVertex(nVo, 0);
+        if (interfaces_)
+            for (const auto &n : interfaces_->nodes())
+                if (n.kind != Interfaces::NodeKind::Dangling && n.vertex >= 0 && n.vertex < nVo)
+                    isNodeVertex[n.vertex] = 1;
+        std::vector<int> aTriangle(nV, -1);
+        for (int t = 0; t < nT; ++t)
+            for (int k = 0; k < 3; ++k) aTriangle[M.triangles[t][k]] = t;
+        report_.splitSectors = 0;
+        splitCorners_.clear();
+        std::vector<char> listed(nVo, 0);
+        for (const auto &loop : loops)
+            for (const int b : loop) {
+                const int o = orig(b);
+                const bool onDS = mesh_->isBoundaryVertex[o];
+                const int strong = (!fixedQ.empty() && fixedQ[b] >= 0) ? fixedQ[b] : quartersOf(interior[b]);
+                if (wq[b] != strong) ++report_.weakCorners;
+                // No corner flatter than a quad can have. A corner of q
+                // quarters over an angle of more than q times 135 degrees --
+                // Table 1's own boundary between one quarter and two -- is a
+                // valence-3 point the weak field let out: through a convex
+                // corner, read as no quarter at all (P2's valence-2 corner,
+                // Sec. 6.3), or through a smooth stretch, read as a corner of
+                // one on a straight side (cruciform, dam: a worst element of
+                // 0 after smoothing). Each is put back in and the corner given
+                // its quarter, which leaves the region's index sum as it was:
+                // at a convex corner in a triangle of its fan, which Sec.
+                // 12.3's relocation below moves into the patch; elsewhere a
+                // slip length (two local edges at least) inside, along the
+                // inward normal, where the strong condition would have held
+                // it off -- nearer if that is out of the region.
+                const int qMin = std::max(1, static_cast<int>(std::ceil(interior[b] / (0.75 * M_PI) - 1e-9)));
+                if (wq[b] < qMin) {
+                    const int k = qMin - wq[b];
+                    int t = aTriangle[b];
+                    Point x{0.0, 0.0};
+                    if (t >= 0) {
+                        const Triangle &tr = M.triangles[t];
+                        x = (M.vertices[tr[0]] + M.vertices[tr[1]] + M.vertices[tr[2]]) / 3.0;
+                    }
+                    if (t >= 0 && qMin > 1) {
+                        const Point &X = M.vertices[b];
+                        const Point eIn = normalizeP(X - M.vertices[prevOf[b]]);
+                        const Point eOut = normalizeP(M.vertices[nextOf[b]] - X);
+                        // Left of travel is inside (the loops keep the region on their left).
+                        const Point n = normalizeP(Point{-(eIn[1] + eOut[1]), eIn[0] + eOut[0]});
+                        const double local = 0.5 * (normP(M.vertices[nextOf[b]] - X) + normP(M.vertices[prevOf[b]] - X));
+                        const double slip = onDS ? first_->weakBoundaryLength() : first_->weakInterfaceLength();
+                        for (double dist = std::max(slip, 2.0 * local); dist > 0.25 * local; dist *= 0.5) {
+                            const Point y = X + n * dist;
+                            // A walk from the fan towards y; the cut mesh has no
+                            // neighbour across an interface, so it stays in the region.
+                            int u = aTriangle[b];
+                            for (int guard = 0; guard < 4096 && u >= 0; ++guard) {
+                                const Triangle &tu = M.triangles[u];
+                                const Point &p0 = M.vertices[tu[0]], &p1 = M.vertices[tu[1]], &p2 = M.vertices[tu[2]];
+                                const double den = cross2(p1 - p0, p2 - p0);
+                                const double l1 = cross2(y - p0, p2 - p0) / den, l2 = cross2(p1 - p0, y - p0) / den;
+                                const double lb[3] = {1.0 - l1 - l2, l1, l2};
+                                int worst = -1;
+                                double w = -1e-12;
+                                for (int kk = 0; kk < 3; ++kk) if (lb[kk] < w) { w = lb[kk]; worst = kk; }
+                                if (worst < 0) break;
+                                u = M.triangleAdjacency[u][(worst + 1) % 3];
+                            }
+                            if (u >= 0) { t = u; x = y; break; }
+                        }
+                    }
+                    if (t >= 0) {
+                        for (int kk = 0; kk < k; ++kk) sing_.push_back(Singular{x, t, 1});
+                        report_.weakReinserted += k;
+                    } else {
+                        report_.splitSectors += k;
+                        splitCorners_.push_back(SplitCorner{o, t});
+                    }
+                    wq[b] = qMin;
+                }
+                if (onDS && !isNodeVertex[o] && first_->weakBoundary() && wq[b] != quartersOf(interior[b])) {
+                    bsing_.push_back(BoundarySingular{M.vertices[b], b, quartersOf(interior[b]) - wq[b]});
+                    ++report_.weakBoundaryPoints;
+                }
+                if (!onDS && !isNodeVertex[o] && wq[b] != 2 && !listed[o]) {
+                    listed[o] = 1;
+                    offNetwork_.push_back(o);
+                }
+                quarters[b] = wq[b];
+            }
+        report_.offNetwork = static_cast<int>(offNetwork_.size());
+        // The node sectors are these readings too (a sector is a corner of
+        // its region), and a landing's fan their sum.
+        if (interfaces_) {
+            const auto &nodes = interfaces_->nodes();
+            for (size_t ni = 0; ni < nodes.size() && ni < nodeQuarters_.size(); ++ni) {
+                const Interfaces::Node &n = nodes[ni];
+                if (nodeQuarters_[ni].empty()) continue;
+                int fan = 0;
+                for (size_t k = 0; k < nodeQuarters_[ni].size() && k < n.rays.size(); ++k) {
+                    const int t = n.rays[k].faceCCW;
+                    if (t < 0 || t >= nT) continue;
+                    for (int kk = 0; kk < 3; ++kk)
+                        if (orig(M.triangles[t][kk]) == n.vertex) nodeQuarters_[ni][k] = wq[M.triangles[t][kk]];
+                    fan += nodeQuarters_[ni][k];
+                }
+                if (n.onBoundary && n.vertex >= 0 && n.vertex < static_cast<int>(landingFan.size()))
+                    landingFan[n.vertex] = fan;
+            }
+        }
+        report_.corners = 0;
+        for (const auto &loop : loops)
+            for (const int b : loop) if (quarters[b] != 2) ++report_.corners;
+        if (!offNetwork_.empty()) return fail("interface corners off the network");
+    }
+
     // ---- components, and the outer loop of each -----------------------------
     std::vector<int> compOf(nT, -1);
     int nComp = 0;
@@ -374,6 +547,24 @@ void ConformalField::build() {
     std::vector<int> compOfVertex(nV, -1);
     for (int t = 0; t < nT; ++t)
         for (int k = 0; k < 3; ++k) compOfVertex[M.triangles[t][k]] = compOf[t];
+    // ---- Options::interfaceCornerTerms: a node sector's own term --------------
+    //
+    // At every sector of an interface node (a boundary vertex of a region
+    // whose original is no vertex of dS) turned by a quarter count other than
+    // Table 1's reading of its angle, the BoundarySingular term of that
+    // difference, in that region only.
+    if (interfaces_ && (weak || opts_.interfaceCornerTerms)) {
+        for (const auto &loop : loops)
+            for (const int b : loop) {
+                const int o = orig(b);
+                if (mesh_->isBoundaryVertex[o]) continue;
+                const int d = quartersOf(interior[b]) - quarters[b];
+                if (d == 0) continue;
+                bsing_.push_back(BoundarySingular{M.vertices[b], b, d, compOfVertex[b]});
+                ++report_.cornerTerms;
+            }
+        regionTerms_ = report_.cornerTerms > 0;
+    }
     std::vector<std::vector<int>> loopsOfComp(nComp);
     for (size_t l = 0; l < loops.size(); ++l) loopsOfComp[compOfVertex[loops[l][0]]].push_back(static_cast<int>(l));
     std::vector<int> outerOf(nComp, -1);
@@ -576,7 +767,7 @@ void ConformalField::build() {
     };
     {
         std::string why;
-        if (!poincareHopf(&why) && first_ && static_cast<int>(first_->u_k.size()) == nVo) {
+        if (!poincareHopf(&why) && !weak && first_ && static_cast<int>(first_->u_k.size()) == nVo) {
             // Re-read the corners off the first field (see the constructor):
             // the cross turns by the principal matchings along the boundary
             // edges, and across a stretch of boundary the turn Delta and the
@@ -667,6 +858,67 @@ void ConformalField::build() {
         report_.poincareHopf = true;
     }
 
+    // ---- weak boundary conditions (Options::boundarySnap) ---------------------
+    //
+    // After the Poincare-Hopf check, so that the corners it may have re-read
+    // are settled and a snapped vertex is never re-read: the edit moves a
+    // quarter from the pattern to a vertex of the same component and leaves
+    // every component's sum as it was.
+    if (opts_.boundarySnap > 0.0 && !sing_.empty()) {
+        std::vector<char> nodeVertex(nVo, 0);
+        if (interfaces_)
+            for (const auto &n : interfaces_->nodes())
+                if (n.vertex >= 0 && n.vertex < nVo) nodeVertex[n.vertex] = 1;
+        // dS proper: not an interface (a cut vertex whose original is no
+        // boundary vertex), and not a node, whose sectors are prescribed.
+        auto onDS = [&](int v) {
+            const int o = orig(v);
+            return o >= 0 && o < nVo && mesh_->isBoundaryVertex[o] && !nodeVertex[o] &&
+                   (fixedQ.empty() || fixedQ[v] < 0);
+        };
+        std::vector<char> gone(sing_.size(), 0);
+        for (size_t i = 0; i < sing_.size(); ++i) {
+            const Singular &s = sing_[i];
+            if (s.d >= 0) continue;
+            const int comp = compOf[s.triangle];
+            double best = 1e300;
+            int bv = -1;
+            for (const auto &loop : loops) {
+                if (compOfVertex[loop[0]] != comp) continue;
+                for (const int a : loop) {
+                    const int b = nextOf[a];
+                    const Point &pa = M.vertices[a], &pb = M.vertices[b];
+                    const Point d = pb - pa;
+                    const double dd = dotP(d, d);
+                    const double t = dd > 0.0 ? std::min(1.0, std::max(0.0, dotP(s.pos - pa, d) / dd)) : 0.0;
+                    const double dist = normP(s.pos - (pa + d * t));
+                    if (dist < best) { best = dist; bv = (t < 0.5) ? a : b; }
+                }
+            }
+            if (bv < 0 || !onDS(bv)) continue;
+            const double local = 0.5 * (normP(M.vertices[nextOf[bv]] - M.vertices[bv]) +
+                                        normP(M.vertices[prevOf[bv]] - M.vertices[bv]));
+            if (best > opts_.boundarySnap * local) continue;
+            const int q = quarters[bv] - s.d;
+            if (q <= 0 || interior[bv] / q < opts_.snapMinAngle) continue;
+            quarters[bv] = q;
+            gone[i] = 1;
+            bsing_.push_back(BoundarySingular{M.vertices[bv], bv, s.d});
+            ++report_.snapped;
+        }
+        if (report_.snapped > 0) {
+            std::vector<Singular> kept;
+            for (size_t i = 0; i < sing_.size(); ++i)
+                if (!gone[i]) kept.push_back(sing_[i]);
+            sing_.swap(kept);
+            report_.singularities = static_cast<int>(sing_.size());
+            report_.corners = 0;
+            for (const auto &loop : loops)
+                for (const int b : loop) if (quarters[b] != 2) ++report_.corners;
+            if (!poincareHopf(nullptr)) return fail("Poincare-Hopf fails after the boundary snap");
+        }
+    }
+
     // ---- the right-hand side of h (Sec. 6.3, with the singular part out) -----
     //
     // The change of the singular part along a straight segment that misses
@@ -690,7 +942,20 @@ void ConformalField::build() {
             const Point mOut = (xb + M.vertices[c]) * 0.5;
             const double tau = M_PI - interior[b];
             const double cornerTurn = M_PI_2 * (2 - quarters[b]);   // 2 pi k_b
-            load[b] = tau - cornerTurn - (singularChange(mIn, xb) + singularChange(xb, mOut));
+            // The points on dS: from mIn to mOut a term turns by the angle
+            // the two half-edges subtend at it, and at its own vertex, where
+            // both half-edges end on it, by the sweep through the model from
+            // the one to the other, -alpha (the model is on the left).
+            double onBoundary = 0.0;
+            for (const BoundarySingular &j : bsing_) {
+                if (j.region >= 0 && j.region != compOfVertex[b]) continue;
+                if (j.vertex == b) { onBoundary += 0.5 * j.d * -interior[b]; continue; }
+                const double a0 = std::atan2(mIn[1] - j.pos[1], mIn[0] - j.pos[0]);
+                const double a1 = std::atan2(xb[1] - j.pos[1], xb[0] - j.pos[0]);
+                const double a2 = std::atan2(mOut[1] - j.pos[1], mOut[0] - j.pos[0]);
+                onBoundary += 0.5 * j.d * (wrap_pi(a1 - a0) + wrap_pi(a2 - a1));
+            }
+            load[b] = tau - cornerTurn - (singularChange(mIn, xb) + singularChange(xb, mOut)) - onBoundary;
             loadScale = std::max(loadScale, std::fabs(load[b]));
         }
     }
@@ -777,7 +1042,7 @@ void ConformalField::build() {
         // The anchor: the cross at the midpoint of the first edge of the outer
         // loop has a branch along it (P2 eq. 15's theta(P) = theta_P).
         const double phi0 = computeAngle(M.vertices[v1] - M.vertices[v0]);
-        fill(t0, k0, phi0 - singularPart(m0));
+        fill(t0, k0, phi0 - singularPart(m0, c));
         seen[t0] = 1;
         std::queue<int> q;
         q.push(t0);
@@ -816,7 +1081,7 @@ void ConformalField::build() {
             const int k = localEdgeOf(t, e);
             const Point m = (M.vertices[a] + M.vertices[b]) * 0.5;
             const double phi = computeAngle(M.vertices[b] - M.vertices[a]);
-            const double off = wrapQuarter(cr[t][k] + singularPart(m) - phi);
+            const double off = wrapQuarter(cr[t][k] + singularPart(m, compOf[t]) - phi);
             d.push_back(off);
             acc += std::polar(1.0, 4.0 * off);
         }
@@ -943,7 +1208,7 @@ void ConformalField::build() {
             const int b = nextOf[a];
             const Point m = (M.vertices[a] + M.vertices[b]) * 0.5;
             const double ra = regular_[a], rb = liftNear(ra, regular_[b]);
-            const double th = 0.5 * (ra + rb) + singularPart(m);
+            const double th = 0.5 * (ra + rb) + singularPart(m, compOfVertex[a]);
             report_.holeTangency = std::max(
                 report_.holeTangency, std::fabs(wrapQuarter(th - computeAngle(M.vertices[b] - M.vertices[a]))));
         }
@@ -957,11 +1222,30 @@ void ConformalField::build() {
     // A node's sectors are corners and may honestly differ; only the other
     // interface vertices are measured.
     if (cutMesh) {
+        // With a term of one region (BoundarySingular::region) the copies'
+        // regular parts no longer agree mod pi/2 at an interface vertex --
+        // their fields do -- so they are kept per triangle corner, and what
+        // is joined is the field itself, the regular part handed on per
+        // vertex being that less singularPart(x).
+        auto copyValue = [&](int c) {
+            return regionTerms_ ? regular_[c] + singularPart(M.vertices[c], compOfVertex[c]) : regular_[c];
+        };
+        if (regionTerms_) {
+            const Mesh &O = *mesh_;
+            regularCorner_.assign(O.triangles.size(), std::array<double, 3>{{0.0, 0.0, 0.0}});
+            for (int t = 0; t < static_cast<int>(O.triangles.size()); ++t)
+                for (int k = 0; k < 3; ++k)
+                    for (int kk = 0; kk < 3; ++kk)
+                        if (origOf[M.triangles[t][kk]] == O.triangles[t][k]) {
+                            regularCorner_[t][k] = regular_[M.triangles[t][kk]];
+                            break;
+                        }
+        }
         std::vector<std::complex<double>> acc(nVo, std::complex<double>(0.0, 0.0));
         std::vector<int> copies(nVo, 0), firstCopy(nVo, -1);
         for (int c = 0; c < nV; ++c) {
             const int o = origOf[c];
-            acc[o] += std::polar(1.0, 4.0 * regular_[c]);
+            acc[o] += std::polar(1.0, 4.0 * copyValue(c));
             if (copies[o]++ == 0) firstCopy[o] = c;
         }
         std::vector<char> isNode(nVo, 0);
@@ -971,16 +1255,19 @@ void ConformalField::build() {
         std::vector<int> q(nVo, 2);
         for (int o = 0; o < nVo; ++o) {
             if (firstCopy[o] < 0) continue;
-            const double ref = regular_[firstCopy[o]];
+            const double ref = copyValue(firstCopy[o]);
             regular[o] = (copies[o] == 1) ? ref : liftNear(ref, 0.25 * std::arg(acc[o]));
+            if (regionTerms_) regular[o] -= singularPart(mesh_->vertices[o]);
             h[o] = h_[firstCopy[o]];
             q[o] = quarters[firstCopy[o]];
         }
         for (int c = 0; c < nV; ++c) {
             const int o = origOf[c];
-            if (copies[o] > 1 && !isNode[o])
+            if (copies[o] > 1 && !isNode[o]) {
+                const double mine = regionTerms_ ? copyValue(c) - singularPart(mesh_->vertices[o]) : regular_[c];
                 report_.interfaceMismatch =
-                    std::max(report_.interfaceMismatch, std::fabs(wrapQuarter(regular_[c] - regular[o])));
+                    std::max(report_.interfaceMismatch, std::fabs(wrapQuarter(mine - regular[o])));
+            }
         }
         // dS corners as the uncut fan turns: Table 1's reading of the whole
         // corner at a landing (SeparatrixTrace reads it as the node's fan).

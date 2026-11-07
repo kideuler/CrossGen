@@ -364,6 +364,16 @@ public:
         return (v >= 0 && v < static_cast<int>(vertDegree.size())) ? vertDegree[v] : 0;
     }
 
+    // Put a node on each of these vertices of a smooth stretch of interface
+    // (two interface edges, not on dS, no node yet) -- NodeKind::Balance, a
+    // corner on a smooth interface, as balance() puts one -- and rebuild the
+    // branches, the regions and the sector readings once, as insertCorner()
+    // does for one. Any other vertex is passed over. ZIPLINE puts them where
+    // a first field held to the interfaces only weakly turned a region's
+    // corner on a smooth interface (CrossField::setWeakInterfaces,
+    // ConformalField::Options::readWeakBoundary). Returns how many were added.
+    int addNodes(const std::vector<int> &vertices);
+
     // (vertex, I(v)) for every node this stage asks Stage 1 to prescribe --
     // that is, every node whose kind Options allows and whose sectors are
     // determined. Nodes with I = 0 are included: a node the field reads as a

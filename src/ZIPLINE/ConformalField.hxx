@@ -1,6 +1,8 @@
 #ifndef __CONFORMAL_FIELD_HXX__
 #define __CONFORMAL_FIELD_HXX__
 
+#include <array>
+#include <cmath>
 #include <memory>
 #include <string>
 #include <vector>
@@ -162,6 +164,32 @@ public:
         int triangle = -1;
         int d = 0;
     };
+    // A point of the pattern put on dS (Options::boundarySnap): where it is,
+    // the vertex (of the mesh the field was solved on) and its d. Its term in
+    // the singular part is (d/2) arg(z - X): the half-plane model, the image
+    // of an interior point of the same index merged with it, which turns by
+    // -(d/2) alpha across the vertex through the model (alpha its interior
+    // angle) and so carries all but (1 - d/2)(pi - alpha) of the quarter the
+    // corner turns. Without it the regular part has that quarter to make
+    // within one ring of triangles, and a separatrix leaving the corner
+    // reads a field rotated by up to 45 degrees (geom006: one of the four
+    // ran round the hole). The weight is d/2, so the term is multivalued by
+    // d pi, a multiple of pi/2: no branch cut shows in the cross.
+    //
+    // On an interface (Options::readWeakBoundary, interfaceCornerTerms) the
+    // point is a corner of one region only -- a sector of a node -- and its
+    // term is that region's alone: `region` is the region (regionOf()), -1
+    // for a term every region has, which a point of dS can be, its term being
+    // smooth in every region it is not a corner of. A term of one region
+    // makes the regular parts of the regions at a vertex of an interface
+    // differ by more than a multiple of pi/2, so they are then handed on per
+    // triangle corner (regularCorners()) instead of per vertex.
+    struct BoundarySingular {
+        Point pos{0.0, 0.0};
+        int vertex = -1;
+        int d = 0;
+        int region = -1;
+    };
 
     struct Options {
         // Sec. 6.8: remove each hole's tangency offset delta_m with that hole's
@@ -193,6 +221,76 @@ public:
         bool relocateCornerSingularities = true;
         double cornerRelocation = 0.25;
         double relocationRadius = 1.5;
+        // Weak boundary conditions (Jezdimirovic et al. IMR 2019, Figs.
+        // 21-22; docs/quad_layout_pipeline.md Sec. 4.3). The first field is
+        // held tangent to dS strongly, and a strong condition keeps a
+        // singularity off the boundary: the valence-5 points it puts against
+        // a concave stretch of dS -- round a hole, mostly -- sit a few edges
+        // inside it, and each sends two separatrices along the boundary at
+        // that distance, a thin layer of blocks round the hole that Sec. 4's
+        // chord collapse then has to take out again, or cannot. With the
+        // condition weak the same points sit *on* dS, and the layer is not
+        // there. Here that is an edit of the pattern: a valence-5 point within
+        // boundarySnap local boundary edges of dS (a stretch of it that is no
+        // interface node) is taken off the pattern and its quarter added to
+        // the nearest boundary vertex, which becomes a corner of one quarter
+        // more -- three at a smooth vertex, a boundary singularity with two
+        // separatrices into the interior -- provided each quarter of it keeps
+        // at least snapMinAngle of the interior angle. The index sum is
+        // unchanged, so Poincare-Hopf still holds. The point's term stays in
+        // the singular part, on dS (BoundarySingular), and FieldTracer reads
+        // a separatrix leaving it a hair along its ray. Zero: off (strong,
+        // P2), and off it stays: measured at 4 edges (h 0.05, TMOP 200),
+        // singlemat goes from 1340 blocks to 1142 and from 147 raw
+        // T-junctions to 48 at the same mean worst element (0.814), geom012
+        // to 100% with no Stage 5b, but on MAMBO (NP 50) 62 of the 98 models
+        // it changes lose quality: where the ring the strong condition makes
+        // is thick (geom006's hole, most of MAMBO's) it is the better layout.
+        // A radius in mesh edges is the wrong test for "thin"; docs/
+        // viertel_2019.md, Seventh pass.
+        double boundarySnap = 0.0;
+        double snapMinAngle = 50.0 * M_PI / 180.0;
+        // The pattern's boundary half, read off a first field held to dS and
+        // the interfaces only weakly (CrossField::setWeakBoundary; ZIPLINE
+        // sets this whenever its field is weak). A weak field lets a
+        // singularity leave through dS and across an interface, and what it
+        // leaves behind is a quarter turn of the cross against the tangent:
+        // a boundary singularity, or a corner of a different quarter count,
+        // where Table 1 and the node readings assume there is none. So every
+        // boundary vertex of every region (cut along the interfaces, a node
+        // sector being a corner of its region) is a corner of
+        //
+        //     q = (alpha + m_in - m_out) / (pi/2)
+        //
+        // quarter turns, alpha its interior angle and m_in, m_out the
+        // first field's cross at the vertex against the edges before and
+        // after it (each in (-pi/4, pi/4]: the arm nearest the edge); where
+        // the misalignment passes 45 degrees inside an edge, a quarter is
+        // added to the nearer end of it; and a singular triangle a node
+        // absorbed goes to the sector it is in. That reading adds up: per
+        // region, sum (2 - q) plus the index of the singular triangles in it
+        // is 4 chi exactly, the principal matchings along its boundary being
+        // the sum of its triangles' windings. A vertex of dS whose reading is
+        // not Table 1's gets the analytic term of a BoundarySingular (when dS
+        // itself was weak); a vertex of an interface that reads as a corner
+        // on either side and is no node is reported (offNetworkCorners())
+        // and the field is not built, since the trace launches from nodes
+        // only -- ZIPLINE makes those nodes (Interfaces::addNodes) and builds
+        // again. A corner flatter than 135 degrees a quarter -- none at a
+        // convex corner, one on a straight side -- is a valence-3 point the
+        // weak field let out, which no quad layout can follow: the corner
+        // is given its quarter and the point put back (Report::
+        // weakReinserted; the constructor says where). Measured in docs/
+        // viertel_2019.md, Eighth pass.
+        bool readWeakBoundary = false;
+        // The analytic term of a BoundarySingular at every sector of an
+        // interface node whose quarter count is not Table 1's reading of its
+        // angle -- a corner the regular part would otherwise have to turn
+        // within one ring of triangles, the inaccuracy the term removes from
+        // a point of dS -- each its own region's. Always on with
+        // readWeakBoundary, whose nodes on smooth interfaces are all such
+        // corners; this switches it on for the nodes of a strong field too.
+        bool interfaceCornerTerms = false;
     };
 
     struct Report {
@@ -205,6 +303,7 @@ public:
         int dipolesCancelled = 0;      // pairs
         int merged = 0;                // singularities merged into another in its triangle
         int relocated = 0;             // moved off a convex corner (Options::relocateCornerSingularities)
+        int snapped = 0;               // put on dS as a boundary singularity (Options::boundarySnap)
         int corners = 0;               // Table 1 corners (q != 2)
         int cornersReread = 0;         // re-read off the first field (see the constructor)
         bool poincareHopf = false;
@@ -257,6 +356,22 @@ public:
         // short of (see the constructor); they show in indexDeficit4.
         int splitSectors = 0;
         double interfaceMismatch = 0.0;
+        // Options::readWeakBoundary: boundary vertices whose reading is not
+        // what Table 1 and the strong node readings would give (counted
+        // before a node is made of one), the points of dS that became
+        // BoundarySingulars, the quarters added by misalignments passing 45
+        // degrees inside an edge, and the interface vertices that read as a
+        // corner without being a node (offNetworkCorners()).
+        int weakCorners = 0;
+        int weakBoundaryPoints = 0;
+        int weakWraps = 0;
+        int offNetwork = 0;
+        // Valence-3 points put back inside a corner the weak field turned as
+        // no quarter at all (see the option).
+        int weakReinserted = 0;
+        // Node sectors given a term of their own region (Options::
+        // interfaceCornerTerms).
+        int cornerTerms = 0;
     };
 
     // `pattern` is the first field's singularities (positions inside their
@@ -281,8 +396,13 @@ public:
     // at an interface node (FieldTracer::absorbedIndexAt) -- it is part of
     // the node's corners, since `pattern` no longer holds it. Null interfaces
     // or a single-material network is the constructor above.
+    //
+    // `absorbedTriangles` (FieldTracer::absorbedTriangles: triangle, vertex,
+    // d) is read only with Options::readWeakBoundary, which gives each to
+    // the sector of its triangle rather than sharing absorbed4 out.
     ConformalField(std::shared_ptr<Mesh> mesh, std::vector<Singular> pattern, const Options &opts,
-                   const CrossField *first, const Interfaces *interfaces, std::vector<int> absorbed4);
+                   const CrossField *first, const Interfaces *interfaces, std::vector<int> absorbed4,
+                   std::vector<std::array<int, 3>> absorbedTriangles = {});
     ConformalField(std::shared_ptr<Mesh> mesh, std::vector<Singular> pattern)
         : ConformalField(std::move(mesh), std::move(pattern), Options()) {}
 
@@ -304,6 +424,10 @@ public:
     // whose region (regionOf()) is the one left a valence-3 point short.
     struct SplitCorner { int vertex = -1; int triangle = -1; };
     const std::vector<SplitCorner> &splitCorners() const { return splitCorners_; }
+    // Options::readWeakBoundary: vertices of the uncut mesh on a smooth
+    // interface that the first field turned as a corner of a region -- they
+    // have to be nodes before the field can be built (see the option).
+    const std::vector<int> &offNetworkCorners() const { return offNetwork_; }
 
     bool valid() const { return report_.built; }
     const Report &getReport() const { return report_; }
@@ -313,6 +437,9 @@ public:
 
     // The pattern after the edits: what the field has, and all it has.
     const std::vector<Singular> &singularities() const { return sing_; }
+    // The points of it put on dS (Options::boundarySnap), each now a corner
+    // of cornerQuarters() and a term of singularPart().
+    const std::vector<BoundarySingular> &boundarySingularities() const { return bsing_; }
 
     // theta_h at each vertex, in radians, on an arbitrary branch per vertex
     // (it is a cross angle: only its value mod pi/2 means anything, and the
@@ -323,6 +450,16 @@ public:
     // multivalued by 2 pi k_j, a multiple of pi/2, so the sum of principal
     // arguments is a fine representative).
     double singularPart(const Point &x) const;
+    // The same in region `region` (regionOf()): the terms every region has
+    // and that region's own (BoundarySingular::region).
+    double singularPart(const Point &x, int region) const;
+    // Whether any term is one region's only. Then the regular part is per
+    // triangle corner, regularCorners()[t][k] at corner k of triangle t
+    // (regularAngles() is the field less singularPart(x), for drawing), and
+    // the field in triangle t is that interpolated plus singularPart(x,
+    // regionOf()[t]).
+    bool hasRegionTerms() const { return regionTerms_; }
+    const std::vector<std::array<double, 3>> &regularCorners() const { return regularCorner_; }
 
     // The cross angle at x in triangle t, mod pi/2: the P1 interpolant of the
     // regular part plus the singular part. On the branch nearest `ref`.
@@ -346,11 +483,16 @@ private:
     // construction), and the per-node sector quarters it settled on.
     const Interfaces *interfaces_ = nullptr;
     std::vector<int> absorbed4_;
+    std::vector<std::array<int, 3>> absorbedTriangles_;
+    std::vector<int> offNetwork_;
+    bool regionTerms_ = false;
+    std::vector<std::array<double, 3>> regularCorner_;
     std::vector<std::vector<int>> nodeQuarters_;
     std::vector<int> regionOf_;
     std::vector<SplitCorner> splitCorners_;
     std::vector<int> quarters_;
     std::vector<Singular> sing_;
+    std::vector<BoundarySingular> bsing_;
     std::vector<double> regular_;
     std::vector<double> h_;
     std::shared_ptr<CrossField> cross_;

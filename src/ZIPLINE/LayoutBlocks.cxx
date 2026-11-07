@@ -40,10 +40,17 @@ LayoutBlocks::LayoutBlocks(const QuadLayout &layout, const Mesh &mesh, const Opt
     buildMacroArcs(layout);
     classifyFaces(layout);
     buildBlocks(layout);
+    mesh_ = &mesh;
+    if (!opts_.deferGeometry) completeGeometry();
+}
+
+void LayoutBlocks::completeGeometry() {
+    if (geometryBuilt_ || !mesh_) return;
+    geometryBuilt_ = true;
     fitArcs();
     buildPatches();
     buildShape();
-    buildDecomposition(mesh);
+    buildDecomposition(*mesh_);
 }
 
 // ---------------------------------------------------------------------------

@@ -242,9 +242,43 @@ void CrossField::initialize(int method, unsigned seed) {
     }
     double D = std::sqrt((maxX - minX) * (maxX - minX) + (maxY - minY) * (maxY - minY));
     tau = tauScale * D * D / 10.0;
+    diagonal = D;
 
     // Compute system matrix A = M + tau * K
     A = M + tau * K;
+
+    // The weak conditions (setWeakBoundary): each edge of dS, and of the
+    // interfaces when those are weak, adds (tau / l) times its edge mass
+    // matrix to A and (tau / l) g_e |e| / 2 to the load of each of its two
+    // vertices, g_e the edge's own tangent as a cross. The edges are mesh
+    // edges, so A's pattern already has every entry this touches.
+    weakLoad.resize(0);
+    if (weakBoundarySlip > 0.0 || (weakInterfaceSlip > 0.0 && !edgeAligned.empty())) {
+        weakLoad = Eigen::VectorXcd::Zero(numVertices);
+        std::vector<Eigen::Triplet<std::complex<double>>> penTrips;
+        auto addEdge = [&](int e, double slip) {
+            const int a = mesh->edges[e][0], b = mesh->edges[e][1];
+            const Point d = mesh->vertices[b] - mesh->vertices[a];
+            const double len = normP(d);
+            if (len < 1e-14) return;
+            const double w = tau / (slip * D);
+            const std::complex<double> g = std::polar(1.0, 4.0 * std::atan2(d[1], d[0]));
+            penTrips.emplace_back(a, a, std::complex<double>(w * len / 3.0, 0.0));
+            penTrips.emplace_back(b, b, std::complex<double>(w * len / 3.0, 0.0));
+            penTrips.emplace_back(a, b, std::complex<double>(w * len / 6.0, 0.0));
+            penTrips.emplace_back(b, a, std::complex<double>(w * len / 6.0, 0.0));
+            weakLoad[a] += w * 0.5 * len * g;
+            weakLoad[b] += w * 0.5 * len * g;
+        };
+        if (weakBoundarySlip > 0.0)
+            for (const int e : mesh->boundaryEdges) addEdge(e, weakBoundarySlip);
+        if (weakInterfaceSlip > 0.0)
+            for (int e = 0; e < static_cast<int>(edgeAligned.size()); ++e)
+                if (edgeAligned[e]) addEdge(e, weakInterfaceSlip);
+        Eigen::SparseMatrix<std::complex<double>> P(numVertices, numVertices);
+        P.setFromTriplets(penTrips.begin(), penTrips.end());
+        A = A + P;
+    }
 
     // Apply Dirichlet boundary conditions to M and A:
     // For each boundary vertex, set diagonal to 1 and zero out the rest of the row
@@ -252,13 +286,19 @@ void CrossField::initialize(int method, unsigned seed) {
     std::complex<double> one(1.0, 0.0);
     std::complex<double> zero(0.0, 0.0);
     
-    // Create a set for fast boundary lookup
-    std::unordered_set<int> boundarySet(mesh->boundaryVertices.begin(), mesh->boundaryVertices.end());
+    // Create a set for fast boundary lookup. boundarySet is what the solve
+    // pins; startData is what strong conditions would pin, which is what the
+    // start is made of (setWeakBoundary: a weak run starts where a strong one
+    // does), and the two are the same set unless a condition is weak.
+    std::unordered_set<int> boundarySet;
+    if (!(weakBoundarySlip > 0.0)) boundarySet.insert(mesh->boundaryVertices.begin(), mesh->boundaryVertices.end());
+    std::unordered_set<int> startData(mesh->boundaryVertices.begin(), mesh->boundaryVertices.end());
 
     // The unreferenced vertices, pinned (see the mass assembly above).
     for (int v = 0; v < numVertices; ++v) {
         if (usedVertex[v]) continue;
         boundarySet.insert(v);
+        startData.insert(v);
         u_k_prev[v] = one;
     }
 
@@ -284,9 +324,11 @@ void CrossField::initialize(int method, unsigned seed) {
         // mean is a direction no incident interface has.
         constexpr double kCoherenceMin = 0.2;
         for (int v = 0; v < numVertices; ++v) {
-            if (!(weight[v] > 0.0) || mesh->isBoundaryVertex[v] || boundarySet.count(v)) continue;
+            if (!(weight[v] > 0.0) || mesh->isBoundaryVertex[v] || startData.count(v)) continue;
             if (std::abs(sum[v]) < kCoherenceMin * weight[v]) { ++freeInterface; continue; }
-            boundarySet.insert(v);
+            // Weak: held by the edges' penalty instead, from the same start.
+            if (!(weakInterfaceSlip > 0.0)) boundarySet.insert(v);
+            startData.insert(v);
             u_k_prev[v] = sum[v] / std::abs(sum[v]);
             ++alignedInterface;
         }
@@ -305,8 +347,9 @@ void CrossField::initialize(int method, unsigned seed) {
                 const double d = normP(mesh->vertices[t[k]] - comp.circle.center);
                 if (d < bestD) { bestD = d; best = t[k]; }
             }
-            if (best < 0 || boundarySet.count(best)) continue;
+            if (best < 0 || startData.count(best)) continue;
             boundarySet.insert(best);
+            startData.insert(best);
             u_k_prev[best] = one;
             ++pinnedDisks;
         }
@@ -336,6 +379,8 @@ void CrossField::initialize(int method, unsigned seed) {
     // Prune zeros from the matrices
     M.prune(zero);
     A.prune(zero);
+    if (weakLoad.size() > 0)
+        for (const int v : boundarySet) weakLoad[v] = zero;
 
     // Factorize the system matrix for efficient solves
     // Try SparseLU first (direct solver), fall back to BiCGSTAB (iterative) if it fails
@@ -360,7 +405,7 @@ void CrossField::initialize(int method, unsigned seed) {
         // Set non-boundary vertices to random normalized complex numbers
         std::srand(seed ? seed : static_cast<unsigned>(std::time(nullptr)));
         for (int v = 0; v < numVertices; ++v) {
-            if (boundarySet.find(v) == boundarySet.end()) {
+            if (startData.find(v) == startData.end()) {
                 // Generate random angle and create unit complex number
                 double theta = 2.0 * M_PI * (static_cast<double>(std::rand()) / RAND_MAX);
                 u_k_prev[v] = std::complex<double>(std::cos(theta), std::sin(theta));
@@ -374,6 +419,7 @@ void CrossField::step() {
     // Solve (M + tau*K) u^{k+1} = M u^k
     // Compute RHS = M * u_k_prev
     Eigen::VectorXcd rhs = M * u_k_prev;
+    if (weakLoad.size() > 0) rhs += weakLoad;   // setWeakBoundary
     
     // Solve A * u_k = rhs using the appropriate solver
     if (useBiCGSTAB) {

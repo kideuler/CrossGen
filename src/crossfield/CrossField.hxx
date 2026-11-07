@@ -84,6 +84,47 @@ public:
     void setTauScale(double s) { tauScale = s; }
     double getTau() const { return tau; }
 
+    // Weak boundary conditions (Jezdimirovic, Chemin and Remacle, IMR 2019,
+    // Figs. 21-22: "we can add (remove) a boundary layer by imposing weak or
+    // strong boundary conditions"). Strong is the Dirichlet data above: every
+    // vertex of dS, and with setAlignedInteriorEdges every interface vertex,
+    // is fixed to its tangent, so a singularity cannot come nearer the curve
+    // than the field's own repulsion lets it -- the image of a point under a
+    // Dirichlet condition on the angle has the point's own sign -- and the
+    // valence-5 points round a hole sit a few edges inside it, ringing it
+    // with a thin layer of blocks.
+    //
+    // Weak is the condition as a penalty instead of a constraint: each edge
+    // of the curve asks for its own tangent through
+    //
+    //     E(u) = 1/2 int |grad u|^2 + 1/(2 l) sum_e int_e |u - g_e|^2 ds,
+    //
+    // g_e = exp(4 i phi_e), and the MBO's implicit step becomes the heat step
+    // of that energy, (M + tau K + (tau / l) B) u = M u_prev + (tau / l) b,
+    // with B the edge mass matrix and b_i the sum of g_e |e| / 2 over the
+    // edges at i: a Robin condition, du/dn = (g - u) / l. l is a slip length
+    // -- the field behaves as if held strongly a distance l beyond the curve
+    // -- so a singularity nearer the curve than about l is no longer held
+    // off it and leaves through it, its index left behind as a quarter turn
+    // of the cross against the curve's tangent (a boundary singularity,
+    // which ConformalField reads back; Options::readWeakBoundary there). No
+    // corner data either: each edge asks for its own tangent, so at a corner
+    // the field settles the corner's quarter count itself instead of having
+    // Table 1's imposed.
+    //
+    // `slip` is l as a fraction of the bounding-box diagonal (the length
+    // tau's D^2/10 is measured in), 0 meaning strong, the default. Both are
+    // set before initialize(), and the start is the same either way: the
+    // vertices strong data would fix start at that data and draw no random
+    // number, so a weak run differs from a strong one in its condition only.
+    void setWeakBoundary(double slip) { weakBoundarySlip = slip; }
+    void setWeakInterfaces(double slip) { weakInterfaceSlip = slip; }
+    bool weakBoundary() const { return weakBoundarySlip > 0.0; }
+    bool weakInterfaces() const { return weakInterfaceSlip > 0.0; }
+    // The slip lengths l themselves, in model units (after initialize()).
+    double weakBoundaryLength() const { return weakBoundarySlip * diagonal; }
+    double weakInterfaceLength() const { return weakInterfaceSlip * diagonal; }
+
     void step();
 
     void computeSingularities();
@@ -109,6 +150,9 @@ private:
     int pinnedDisks = 0;
     double tau; // time step size
     double tauScale = 1.0; // multiplier on the D^2/10 heuristic, see setTauScale
+    double weakBoundarySlip = 0.0, weakInterfaceSlip = 0.0; // see setWeakBoundary
+    double diagonal = 0.0; // the bounding-box diagonal D, set by initialize()
+    Eigen::VectorXcd weakLoad; // (tau / l) b, zero on the pinned rows; empty when both are strong
     int maxIterations; // maximum number of iterations
 };
 

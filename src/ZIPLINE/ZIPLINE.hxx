@@ -1,6 +1,7 @@
 #ifndef __ZIPLINE_HXX__
 #define __ZIPLINE_HXX__
 
+#include <array>
 #include <memory>
 #include <string>
 #include <vector>
@@ -111,6 +112,35 @@ public:
         // CrossField::initialize(1, seed) starts from a random cross per
         // vertex. Never 0: initialize() takes 0 to mean "seed from the clock".
         unsigned fieldSeed = 12345;
+        // Weak boundary conditions on dS and on the interfaces
+        // (CrossField::setWeakBoundary: a Robin condition with slip length
+        // this fraction of the bounding-box diagonal); 0 is strong, the
+        // Dirichlet data. Stage 1b then reads what the weak field did at dS
+        // and the interfaces (ConformalField::Options::readWeakBoundary is
+        // set to match). At dS the weak field lets a singularity near it go
+        // onto it, as Jezdimirovic et al. show; at an interface it lets a
+        // valence-3 point on one side and a valence-5 point on the other
+        // meet and annihilate across it, so only slips below a mesh edge
+        // (0.0025-0.01 here) are any use there. One slip for every model
+        // gains as much as it loses (docs/viertel_2019.md, Eighth pass);
+        // chosen per model (weakChoices) it is better on every corpus.
+        double weakBoundary = 0.0;
+        double weakInterfaces = 0.0;
+        // The condition chosen per model instead (chooseCondition): each
+        // (weakBoundary, weakInterfaces) pair here is run through Stages 1 to
+        // 5b as well, and the finished run that Stage 5b's order puts first
+        // -- sound, then coverage, then fewer refused faces, then, all of
+        // those equal, fewer inverted elements and a worst one better by
+        // more than chooseMargin after Stage 5b's mesh check -- is the one
+        // kept. Empty: the condition above, as configured. It costs a whole
+        // run per pair. Measured (h 0.05, TMOP 200): multimat with interfaces
+        // 0.0025/0.005/0.01 to choose from, mean worst scaled Jacobian 0.613
+        // -> 0.668, 29 -> 31 of 31 fully covered, T-junctions left 18 -> 5,
+        // no model worse, 124 -> 290 s; singlemat with dS 0.03/0.1, 0.814 ->
+        // 0.834 and 33 -> 35 of 35, 11 -> 28 s; MAMBO 0.864 -> 0.867, 40 ->
+        // 140 s. Off for the cost.
+        std::vector<std::array<double, 2>> weakChoices;
+        double chooseMargin = 0.02;
 
         // ---- Stage 1b ----
         // Trace the corrected field (ConformalField) instead of the MBO one:
@@ -186,6 +216,12 @@ public:
         // was asked for and does not, why not.
         bool conformalTraced = false;
         std::string conformalFailure;
+        // Options::weakInterfaces: nodes added to the network where the
+        // weak first field turned a corner on a smooth interface.
+        int weakNodesAdded = 0;
+        // Options::weakChoices: the pair kept, -1 for the condition the
+        // options were run with.
+        int weakChosen = -1;
         // Stage 5b: the coverage before it, the rounds it ran, how many
         // candidate edits it tried, and the edits kept, in order (each
         // PatternRepair::Edit::what). Edits kept can be fewer than rounds
@@ -290,6 +326,8 @@ private:
     void checkMesh(const LayoutBlocks &b, double &worst, int &inverted) const;
     void adopt(Attempt &a);
     void repairPattern();
+    // Options::weakChoices, between Stage 5 and Stage 5b.
+    void chooseCondition();
 
     std::shared_ptr<Mesh> mesh;
     Options options;
@@ -311,6 +349,12 @@ private:
     // at a node of the network as the pattern was read (ConformalField's
     // multi-material constructor). Kept for Stage 5b's re-solves.
     std::vector<int> absorbed4;
+    // The same triangle by triangle (FieldTracer::absorbedTriangles), which
+    // ConformalField reads when the first field was weak.
+    std::vector<std::array<int, 3>> absorbedTriangles;
+    // Options::conformal, with readWeakBoundary on when the first field is
+    // weak at dS or, on a multi-material model, at the interfaces.
+    ConformalField::Options conformalOptions() const;
     std::shared_ptr<ConformalField> conformal;
     std::unique_ptr<SeparatrixTrace> trace;
     std::unique_ptr<QuadLayout> layout;

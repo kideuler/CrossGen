@@ -868,6 +868,34 @@ bool Interfaces::insertCorner(int branch, int region, const std::vector<int> &co
 }
 
 // ---------------------------------------------------------------------------
+// addNodes()
+// ---------------------------------------------------------------------------
+int Interfaces::addNodes(const std::vector<int> &vertices) {
+    int added = 0;
+    for (const int v : vertices) {
+        if (v < 0 || v >= static_cast<int>(vertDegree.size()) || vertDegree[v] != 2 || vertNode[v] >= 0 ||
+            mesh->isBoundaryVertex[v])
+            continue;
+        Node nd;
+        nd.vertex = v;
+        nd.kind = NodeKind::Balance;
+        nd.onBoundary = false;
+        vertNode[v] = static_cast<int>(nodeList.size());
+        nodeList.push_back(nd);
+        ++added;
+    }
+    if (added == 0) return 0;
+    buildBranches();
+    buildRegions();
+    measureNodes();
+    report.nodes = static_cast<int>(nodeList.size());
+    report.branches = static_cast<int>(branchList.size());
+    report.closedLoops = 0;
+    for (const Branch &b : branchList) if (b.closed) ++report.closedLoops;
+    return added;
+}
+
+// ---------------------------------------------------------------------------
 // balance()
 // ---------------------------------------------------------------------------
 void Interfaces::balance(const std::vector<int> &coneIndex) {

@@ -327,12 +327,24 @@ static Outcome processMesh(const std::string &path, bool writeVtu, bool verbose,
             if (c.built) {
                 std::cout << std::setprecision(3) << "  second field  traced on: " << c.singularities
                           << " singularities (" << c.dipolesCancelled << " dipole(s) cancelled, " << c.merged
-                          << " merged, " << c.relocated << " moved off a corner), " << c.corners << " corners (" << c.cornersReread
+                          << " merged, " << c.relocated << " moved off a corner, " << c.snapped
+                          << " put on dS), " << c.corners << " corners (" << c.cornersReread
                           << " re-read off the first field), " << c.holes << " hole(s); load sum "
                           << std::scientific << c.loadSum << ", CR mismatch " << c.maxMidpointMismatch
                           << ", anchor tangency " << c.anchorTangency << std::defaultfloat
                           << std::setprecision(3) << "; vertex spread " << c.vertexSpread * 180.0 / M_PI
                           << " deg, regular turn " << c.maxRegularTurnPerEdge * 180.0 / M_PI << " deg/edge";
+                if (zipline.getOptions().weakBoundary > 0.0 || zipline.getOptions().weakInterfaces > 0.0 ||
+                    zipline.getOptions().conformal.readWeakBoundary)
+                    std::cout << "; weak first field: " << c.weakCorners << " corner(s) read off it, "
+                              << c.weakWraps << " quarter(s) inside an edge, " << c.weakBoundaryPoints
+                              << " point(s) on dS, " << zipline.getStatus().weakNodesAdded << " interface node(s) added, "
+                              << c.weakReinserted << " valence-3 point(s) put back off a corner";
+                if (c.cornerTerms > 0) std::cout << "; " << c.cornerTerms << " node sector(s) with a term of their own";
+                if (!zipline.getOptions().weakChoices.empty())
+                    std::cout << "; condition chosen: "
+                              << (zipline.getStatus().weakChosen < 0 ? std::string("as configured")
+                                                                     : "pair " + std::to_string(zipline.getStatus().weakChosen));
                 if (c.regions > 0)
                     std::cout << "; " << c.regions << " material region(s) solved apart, " << c.interfaceNodes
                               << " interface node(s) as their corners (" << c.absorbed4
@@ -400,7 +412,8 @@ static Outcome processMesh(const std::string &path, bool writeVtu, bool verbose,
                       << " interface edges in " << ir.branches << " branch(es) (" << ir.closedLoops
                       << " closed), " << ir.nodes << " node(s): " << ir.junctions << " junction, "
                       << ir.landings << " landing, " << ir.kinks << " kink, " << ir.illPosedNodes
-                      << " ill-posed; field pinned at " << crossField.alignedInterfaceVertices()
+                      << " ill-posed; field " << (crossField.weakInterfaces() ? "held weakly" : "pinned")
+                      << " at " << crossField.alignedInterfaceVertices()
                       << " interface vertices, free at " << crossField.freeInterfaceVertices()
                       << ", " << crossField.pinnedDiskCenters() << " disk centre(s) pinned"
                       << "\n                " << tr.interfaceEmitted << " separatrice(s) from the nodes, "
@@ -1443,6 +1456,23 @@ int main(int argc, char **argv) {
         }
         else if (a == "--min-coverage") gMinCoverage = std::atof(next()) / 100.0;
         else if (a == "--relocate") gFlags.zipline.conformal.cornerRelocation = std::atof(next());
+        else if (a == "--snap") gFlags.zipline.conformal.boundarySnap = std::atof(next());
+        else if (a == "--snap-angle") gFlags.zipline.conformal.snapMinAngle = std::atof(next()) * M_PI / 180.0;
+        else if (a == "--weak-bc") gFlags.zipline.weakBoundary = std::atof(next());
+        else if (a == "--corner-terms") gFlags.zipline.conformal.interfaceCornerTerms = true;
+        else if (a == "--read-weak") gFlags.zipline.conformal.readWeakBoundary = true;
+        else if (a == "--weak-choose-if" || a == "--weak-choose-bc") {
+            // a list of slips separated by ',' or '/', each one more pair to choose from
+            const bool bc = (a == "--weak-choose-bc");
+            std::string list = next();
+            for (size_t p0 = 0; p0 <= list.size();) {
+                const size_t p1 = std::min(list.find_first_of(",/", p0), list.size());
+                const double slip = std::atof(list.substr(p0, p1 - p0).c_str());
+                if (slip > 0.0) gFlags.zipline.weakChoices.push_back({{bc ? slip : 0.0, bc ? 0.0 : slip}});
+                p0 = p1 + 1;
+            }
+        }
+        else if (a == "--weak-if") gFlags.zipline.weakInterfaces = std::atof(next());
         else if (a == "--seed") gFlags.zipline.fieldSeed = static_cast<unsigned>(std::atol(next()));
         else if (a == "--field-tol") gFlags.zipline.fieldTolerance = std::atof(next());
         else if (a == "--mesh") gFlags.meshTarget = std::atof(next());

@@ -7,6 +7,7 @@
 #include <fstream>
 #include <limits>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace {
 
@@ -549,10 +550,14 @@ void QuadLayout::traceFaces() {
     const int nDarts = 2 * static_cast<int>(arcs.size());
     if (nDarts == 0) return;
 
-    std::unordered_map<int, int> slotOfDart;
-    slotOfDart.reserve(nDarts * 2);
+    // Where each dart sits in its node's cyclic order (-1: in none). A vector,
+    // not a map: this runs after every chord collapse of Sec. 4, and with the
+    // point copies pointOf() replaced it was a tenth of Stage 5b's cost on the
+    // larger multi-material models (concrete).
+    std::vector<int> slotOfDart(static_cast<size_t>(nDarts), -1);
     for (const auto &n : nodes)
-        for (size_t i = 0; i < n.darts.size(); ++i) slotOfDart[n.darts[i]] = static_cast<int>(i);
+        for (size_t i = 0; i < n.darts.size(); ++i)
+            if (n.darts[i] >= 0 && n.darts[i] < nDarts) slotOfDart[static_cast<size_t>(n.darts[i])] = static_cast<int>(i);
 
     auto originOf = [&](int dart) {
         const Arc &arc = arcs[dart >> 1];
@@ -562,17 +567,19 @@ void QuadLayout::traceFaces() {
         const int twin = dart ^ 1;
         const int at = originOf(twin);
         const Node &n = nodes[at];
-        auto it = slotOfDart.find(twin);
-        if (it == slotOfDart.end() || n.darts.empty()) return -1;
+        const int slot = slotOfDart[static_cast<size_t>(twin)];
+        if (slot < 0 || n.darts.empty()) return -1;
         const int k = static_cast<int>(n.darts.size());
-        return n.darts[(it->second - 1 + k) % k];
+        return n.darts[(slot - 1 + k) % k];
     };
-    auto pointsOf = [&](int dart) {
-        const Arc &arc = arcs[dart >> 1];
-        if (!(dart & 1)) return arc.pts;
-        std::vector<Point> r(arc.pts.rbegin(), arc.pts.rend());
-        return r;
+    // The k-th point of a dart's arc in the dart's own direction, read in
+    // place rather than copied out (reversed) as it once was for every dart of
+    // every face.
+    auto pointOf = [&](int dart, size_t k) -> const Point & {
+        const std::vector<Point> &p = arcs[dart >> 1].pts;
+        return (dart & 1) ? p[p.size() - 1 - k] : p[k];
     };
+    auto sizeOf = [&](int dart) { return arcs[dart >> 1].pts.size(); };
 
     std::vector<char> used(nDarts, 0);
     for (int d0 = 0; d0 < nDarts; ++d0) {
@@ -604,8 +611,8 @@ void QuadLayout::traceFaces() {
 
         std::vector<Point> poly;
         for (const int dd : cycle) {
-            const auto pts = pointsOf(dd);
-            for (size_t i = 0; i + 1 < pts.size(); ++i) poly.push_back(pts[i]);
+            const size_t n = sizeOf(dd);
+            for (size_t i = 0; i + 1 < n; ++i) poly.push_back(pointOf(dd, i));
         }
         const double area = polylineArea(poly);
         if (area <= 0.0) { ++report_.unboundedCycles; continue; }
@@ -621,10 +628,9 @@ void QuadLayout::traceFaces() {
             const int at = originOf(cycle[i]);
             face.nodes[i] = at;
             const int prev = cycle[(i + cycle.size() - 1) % cycle.size()];
-            const auto pin = pointsOf(prev);
-            const auto pout = pointsOf(cycle[i]);
-            const double in = computeAngle(pin.back() - pin[pin.size() - 2]);
-            const double out = computeAngle(pout[1] - pout[0]);
+            const size_t nin = sizeOf(prev);
+            const double in = computeAngle(pointOf(prev, nin - 1) - pointOf(prev, nin - 2));
+            const double out = computeAngle(pointOf(cycle[i], 1) - pointOf(cycle[i], 0));
             face.turn[i] = wrap_pi(out - in);
 
             // Whether the face turns a corner here is a question about the
@@ -665,8 +671,8 @@ void QuadLayout::traceFaces() {
                     const double w = wrapTwoPi(nd.angles[(k + 1) % nd.darts.size()] - nd.angles[k]);
                     if (w > best) { best = w; widest = static_cast<int>(k); }
                 }
-                auto it = slotOfDart.find(cycle[i]);
-                corner = (it == slotOfDart.end()) || (it->second != widest);
+                const int slot = slotOfDart[static_cast<size_t>(cycle[i])];
+                corner = (slot < 0) || (slot != widest);
             }
             if (corner) {
                 face.isCorner[i] = 1;
@@ -702,88 +708,136 @@ void QuadLayout::traceFaces() {
 // more than the model, which is the cheap symptom; this is the direct test.
 // ---------------------------------------------------------------------------
 void QuadLayout::checkEmbedding() {
-    struct Box { Point lo, hi; };
-    std::vector<Box> boxes(arcs.size());
+    // Whether segment x of arc i (ending at its point x) and segment y of arc
+    // j meet anywhere but at a node the two share. Always asked with i < j, so
+    // a pair is judged on the same operands in the same order however it was
+    // found, and the count below is the one the all-pairs loop this replaced
+    // arrived at, to the bit.
+    auto meet = [&](size_t i, size_t x, size_t j, size_t y) {
+        const Arc &A = arcs[i], &B = arcs[j];
+        const size_t ni = A.pts.size(), nj = B.pts.size();
+        // Two arcs that share a node meet there, and the segments on either
+        // side of that meeting are collinear to within the rounding of the
+        // node's own position, so a segment-segment test on them reports a
+        // crossing a hair from the node. Those two segments are skipped
+        // against each other; every other pair still counts, so an arc
+        // genuinely doubling back over its neighbour is not missed.
+        const bool xAtA = (x == 1), xAtB = (x == ni - 1);
+        const bool yAtA = (y == 1), yAtB = (y == nj - 1);
+        if ((A.a == B.a && xAtA && yAtA) || (A.a == B.b && xAtA && yAtB) || (A.b == B.a && xAtB && yAtA) ||
+            (A.b == B.b && xAtB && yAtB))
+            return false;
+
+        const Point &p0 = A.pts[x - 1], &p1 = A.pts[x];
+        const Point &q0 = B.pts[y - 1], &q1 = B.pts[y];
+        const Point r = p1 - p0, s = q1 - q0;
+        const double den = cross2(r, s);
+        // Parallel to within rounding: relative to the two lengths, not
+        // absolute. Two collinear pieces of one straight edge either side of
+        // a node have a cross product of ~1e-19, which an absolute 1e-30 lets
+        // through, and the parameters that come out of it are noise that can
+        // land inside both -- a crossing that is not there.
+        // Two arcs touching at a point with no node there: an interior point
+        // of one on the other. The crossing test below takes open segments and
+        // cannot see it, and the face walk then runs through it as if the two
+        // were apart -- which is how a crossing the tracing missed at a mesh
+        // vertex came out as one twelve-cornered face that was not a disc and
+        // no complaint (geom027 on the corrected field).
+        auto onSegment = [&](const Point &p, const Point &a, const Point &b) {
+            const Point d = b - a;
+            const double dd = dotP(d, d);
+            const double t = dd > 0.0 ? std::min(1.0, std::max(0.0, dotP(p - a, d) / dd)) : 0.0;
+            return normP(p - (a + d * t)) <= tol;
+        };
+        // A point within the tolerance of its own arc's end node is that node
+        // -- a separatrix's last two points can straddle the node a hair apart
+        // (geom017) -- and is where the arcs meeting there are allowed to be.
+        auto interiorOf = [&](const Arc &arc, size_t k) {
+            return k + 1 < arc.pts.size() && normP(arc.pts[k] - arc.pts.front()) > tol &&
+                   normP(arc.pts[k] - arc.pts.back()) > tol;
+        };
+        if ((interiorOf(A, x) && onSegment(p1, q0, q1)) || (interiorOf(B, y) && onSegment(q1, p0, p1)))
+            return true;
+        if (std::fabs(den) <= 1e-12 * normP(r) * normP(s)) return false;
+        const Point w = q0 - p0;
+        const double t = cross2(w, s) / den;
+        const double u = cross2(w, r) / den;
+        return !(t <= 0.0 || t >= 1.0 || u <= 0.0 || u >= 1.0);
+    };
+
+    // Only segments near each other can meet, and testing every segment of
+    // every arc against every segment of every other arc whose box overlaps
+    // its own was most of the cost of Stage 5b: partition simplification
+    // rebuilds the layout after each chord collapse, the layout's long arcs
+    // (dS, the interfaces, separatrices across the model) overlap nearly
+    // everything, and on the larger multi-material models that loop was more
+    // than half of the run (concrete). So each segment goes into a uniform
+    // grid, under every cell its box touches, the box grown by the tolerance
+    // so that two segments the test can find meeting always share a cell, and
+    // only segments sharing a cell are tested. A pair of arcs counts once, at
+    // the first meeting found, as before.
+    struct Seg { double lo0, lo1, hi0, hi1; int arc, x; };
+    std::vector<Seg> segs;
+    double LO0 = std::numeric_limits<double>::max(), LO1 = LO0, HI0 = -LO0, HI1 = -LO0, extent = 0.0;
     for (size_t i = 0; i < arcs.size(); ++i) {
-        Box b{arcs[i].pts[0], arcs[i].pts[0]};
-        for (const Point &p : arcs[i].pts) {
-            b.lo[0] = std::min(b.lo[0], p[0]); b.lo[1] = std::min(b.lo[1], p[1]);
-            b.hi[0] = std::max(b.hi[0], p[0]); b.hi[1] = std::max(b.hi[1], p[1]);
+        const std::vector<Point> &P = arcs[i].pts;
+        for (size_t x = 1; x < P.size(); ++x) {
+            Seg g;
+            g.lo0 = std::min(P[x - 1][0], P[x][0]) - tol;
+            g.hi0 = std::max(P[x - 1][0], P[x][0]) + tol;
+            g.lo1 = std::min(P[x - 1][1], P[x][1]) - tol;
+            g.hi1 = std::max(P[x - 1][1], P[x][1]) + tol;
+            g.arc = static_cast<int>(i);
+            g.x = static_cast<int>(x);
+            LO0 = std::min(LO0, g.lo0); LO1 = std::min(LO1, g.lo1);
+            HI0 = std::max(HI0, g.hi0); HI1 = std::max(HI1, g.hi1);
+            extent += std::max(g.hi0 - g.lo0, g.hi1 - g.lo1);
+            segs.push_back(g);
         }
-        boxes[i] = b;
     }
+    if (segs.size() < 2) return;
+    // A cell about a segment long, and no more cells than segments.
+    const double W = HI0 - LO0, Hh = HI1 - LO1;
+    const double cell = std::max({extent / static_cast<double>(segs.size()),
+                                  std::sqrt(W * Hh / static_cast<double>(segs.size())), 1e-300});
+    const long long nx = std::max(1LL, std::min(4096LL, static_cast<long long>(W / cell) + 1));
+    const long long ny = std::max(1LL, std::min(4096LL, static_cast<long long>(Hh / cell) + 1));
+    auto cellOf = [&](double v, double lo, long long n) {
+        return std::min(n - 1, std::max(0LL, static_cast<long long>((v - lo) / cell)));
+    };
+    std::vector<int> start(static_cast<size_t>(nx * ny) + 1, 0);
+    auto eachCell = [&](const Seg &g, auto &&f) {
+        const long long a0 = cellOf(g.lo0, LO0, nx), b0 = cellOf(g.hi0, LO0, nx);
+        const long long a1 = cellOf(g.lo1, LO1, ny), b1 = cellOf(g.hi1, LO1, ny);
+        for (long long cy = a1; cy <= b1; ++cy)
+            for (long long cx = a0; cx <= b0; ++cx) f(static_cast<size_t>(cy * nx + cx));
+    };
+    for (const Seg &g : segs) eachCell(g, [&](size_t c) { ++start[c + 1]; });
+    for (size_t c = 1; c < start.size(); ++c) start[c] += start[c - 1];
+    std::vector<int> members(static_cast<size_t>(start.back()));
+    std::vector<int> fill(start.begin(), start.end() - 1);
+    for (size_t g = 0; g < segs.size(); ++g)
+        eachCell(segs[g], [&](size_t c) { members[static_cast<size_t>(fill[c]++)] = static_cast<int>(g); });
 
-    for (size_t i = 0; i < arcs.size(); ++i) {
-        for (size_t j = i + 1; j < arcs.size(); ++j) {
-            if (boxes[i].hi[0] < boxes[j].lo[0] - tol || boxes[j].hi[0] < boxes[i].lo[0] - tol ||
-                boxes[i].hi[1] < boxes[j].lo[1] - tol || boxes[j].hi[1] < boxes[i].lo[1] - tol)
-                continue;
-            // Two arcs that share a node meet there, and the segments on either
-            // side of that meeting are collinear to within the rounding of the
-            // node's own position, so a segment-segment test on them reports a
-            // crossing a hair from the node. Those two segments are skipped
-            // against each other; every other pair still counts, so an arc
-            // genuinely doubling back over its neighbour is not missed.
-            const bool shareIaJa = arcs[i].a == arcs[j].a, shareIaJb = arcs[i].a == arcs[j].b;
-            const bool shareIbJa = arcs[i].b == arcs[j].a, shareIbJb = arcs[i].b == arcs[j].b;
-            const size_t ni = arcs[i].pts.size(), nj = arcs[j].pts.size();
-            for (size_t x = 1; x < ni; ++x) {
-                const bool xAtA = (x == 1), xAtB = (x == ni - 1);
-                for (size_t y = 1; y < nj; ++y) {
-                    const bool yAtA = (y == 1), yAtB = (y == nj - 1);
-                    if ((shareIaJa && xAtA && yAtA) || (shareIaJb && xAtA && yAtB) ||
-                        (shareIbJa && xAtB && yAtA) || (shareIbJb && xAtB && yAtB))
-                        continue;
-
-                    const Point &p0 = arcs[i].pts[x - 1], &p1 = arcs[i].pts[x];
-                    const Point &q0 = arcs[j].pts[y - 1], &q1 = arcs[j].pts[y];
-                    const Point r = p1 - p0, s = q1 - q0;
-                    const double den = cross2(r, s);
-                    // Parallel to within rounding: relative to the two
-                    // lengths, not absolute. Two collinear pieces of one
-                    // straight edge either side of a node have a cross
-                    // product of ~1e-19, which an absolute 1e-30 lets through,
-                    // and the parameters that come out of it are noise that
-                    // can land inside both -- a crossing that is not there.
-                    // Two arcs touching at a point with no node there: an
-                    // interior point of one on the other. The crossing test
-                    // below takes open segments and cannot see it, and the
-                    // face walk then runs through it as if the two were apart
-                    // -- which is how a crossing the tracing missed at a mesh
-                    // vertex came out as one twelve-cornered face that was not
-                    // a disc and no complaint (geom027 on the corrected field).
-                    auto onSegment = [&](const Point &p, const Point &a, const Point &b) {
-                        const Point d = b - a;
-                        const double dd = dotP(d, d);
-                        const double t = dd > 0.0 ? std::min(1.0, std::max(0.0, dotP(p - a, d) / dd)) : 0.0;
-                        return normP(p - (a + d * t)) <= tol;
-                    };
-                    // A point within the tolerance of its own arc's end node
-                    // is that node -- a separatrix's last two points can
-                    // straddle the node a hair apart (geom017) -- and is where
-                    // the arcs meeting there are allowed to be.
-                    auto interiorOf = [&](const Arc &arc, size_t k) {
-                        return k + 1 < arc.pts.size() && normP(arc.pts[k] - arc.pts.front()) > tol &&
-                               normP(arc.pts[k] - arc.pts.back()) > tol;
-                    };
-                    if ((interiorOf(arcs[i], x) && onSegment(p1, q0, q1)) ||
-                        (interiorOf(arcs[j], y) && onSegment(q1, p0, p1))) {
-                        ++report_.arcCrossings;
-                        x = ni;
-                        break;
-                    }
-                    if (std::fabs(den) <= 1e-12 * normP(r) * normP(s)) continue;
-                    const Point w = q0 - p0;
-                    const double t = cross2(w, s) / den;
-                    const double u = cross2(w, r) / den;
-                    if (t <= 0.0 || t >= 1.0 || u <= 0.0 || u >= 1.0) continue;
-                    ++report_.arcCrossings;
-                    x = ni;
-                    break;
-                }
+    std::unordered_set<long long> met;   // arc pairs i < j found meeting, as i * arcs + j
+    const long long nArcs = static_cast<long long>(arcs.size());
+    for (size_t c = 0; c + 1 < start.size(); ++c) {
+        for (int u = start[c]; u < start[c + 1]; ++u) {
+            const Seg &S = segs[static_cast<size_t>(members[static_cast<size_t>(u)])];
+            for (int v = u + 1; v < start[c + 1]; ++v) {
+                const Seg &T = segs[static_cast<size_t>(members[static_cast<size_t>(v)])];
+                if (S.arc == T.arc) continue;
+                if (S.hi0 < T.lo0 || T.hi0 < S.lo0 || S.hi1 < T.lo1 || T.hi1 < S.lo1) continue;
+                const Seg &L = S.arc < T.arc ? S : T, &R = S.arc < T.arc ? T : S;
+                const long long key = L.arc * nArcs + R.arc;
+                if (met.count(key)) continue;
+                if (meet(static_cast<size_t>(L.arc), static_cast<size_t>(L.x), static_cast<size_t>(R.arc),
+                         static_cast<size_t>(R.x)))
+                    met.insert(key);
             }
         }
     }
+    report_.arcCrossings += static_cast<int>(met.size());
 }
 
 // ---------------------------------------------------------------------------

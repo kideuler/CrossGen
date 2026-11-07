@@ -35,6 +35,8 @@ const Table<ZIPLINE::Options> &optionsTable() {
         OPT(fieldMaxSteps),
         OPT(fieldTolerance),
         OPT(fieldSeed),
+        OPT(weakBoundary),
+        OPT(weakInterfaces),
         OPT(secondField),
         OPT(conformal.alignHoles),
         OPT(conformal.cancelDipoles),

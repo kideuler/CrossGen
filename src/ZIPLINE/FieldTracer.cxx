@@ -63,8 +63,21 @@ FieldTracer::FieldTracer(std::shared_ptr<CrossField> cf,
     vertexSnap = 1e-9 * avgEdge;
 
     centres_.clear();
-    for (const auto &s : conformal_->singularities())
+    centreRegion_.clear();
+    for (const auto &s : conformal_->singularities()) {
         centres_.push_back({{s.pos[0], s.pos[1], 0.25 * s.d}});
+        centreRegion_.push_back(-1);
+    }
+    // The points ConformalField put on dS: their half-plane terms, at twice
+    // an interior point's weight (ConformalField::BoundarySingular) -- and
+    // the corners it gave a term of one region only.
+    for (const auto &s : conformal_->boundarySingularities()) {
+        centres_.push_back({{s.pos[0], s.pos[1], 0.5 * s.d}});
+        centreRegion_.push_back(s.region);
+    }
+    perCorner_ = conformal_->hasRegionTerms() &&
+                 conformal_->regularCorners().size() == mesh->triangles.size() &&
+                 conformal_->regionOf().size() == mesh->triangles.size();
     buildConformalSingularities();
 }
 
@@ -74,6 +87,21 @@ double FieldTracer::singularPart(const Point &p) const {
     return s;
 }
 
+double FieldTracer::singularPart(const Point &p, int region) const {
+    if (!perCorner_) return singularPart(p);
+    double s = 0.0;
+    for (size_t i = 0; i < centres_.size(); ++i)
+        if (centreRegion_[i] < 0 || centreRegion_[i] == region)
+            s += centres_[i][2] * std::atan2(p[1] - centres_[i][1], p[0] - centres_[i][0]);
+    return s;
+}
+
+double FieldTracer::regularAt(int f, int k) const {
+    return perCorner_ ? conformal_->regularCorners()[f][k] : vertexTheta[mesh->triangles[f][k]];
+}
+
+int FieldTracer::regionOfFace(int f) const { return perCorner_ ? conformal_->regionOf()[f] : -1; }
+
 double FieldTracer::nearestSingularity(const Point &p) const {
     double best = std::numeric_limits<double>::max();
     for (const auto &c : centres_) best = std::min(best, std::hypot(p[0] - c[0], p[1] - c[1]));
@@ -81,13 +109,12 @@ double FieldTracer::nearestSingularity(const Point &p) const {
 }
 
 double FieldTracer::angleAt(int f, const Point &p, double ref) const {
-    const Triangle &tri = mesh->triangles[f];
     const std::array<double, 3> b = barycentric(f, p);
-    const double t0 = vertexTheta[tri[0]];
-    const double t1 = liftNear(t0, vertexTheta[tri[1]]);
-    const double t2 = liftNear(t0, vertexTheta[tri[2]]);
+    const double t0 = regularAt(f, 0);
+    const double t1 = liftNear(t0, regularAt(f, 1));
+    const double t2 = liftNear(t0, regularAt(f, 2));
     double a = b[0] * t0 + b[1] * t1 + b[2] * t2;
-    if (conformal_) a += singularPart(p);
+    if (conformal_) a += singularPart(p, regionOfFace(f));
     return liftNear(ref, a);
 }
 
@@ -110,6 +137,7 @@ void FieldTracer::buildConformalSingularities() {
     absorbedSingularities = 0;
     absorbedIndex4 = 0;
     absorbedAt.clear();
+    absorbedList.clear();
 
     const auto &pattern = conformal_->singularities();
     for (size_t j = 0; j < pattern.size(); ++j) {
@@ -128,13 +156,14 @@ void FieldTracer::buildConformalSingularities() {
         s.coordinates = q.pos;
         s.barycentric = barycentric(q.triangle, q.pos);
 
-        const Triangle &tri = mesh->triangles[q.triangle];
-        const double r0 = vertexTheta[tri[0]];
-        const double r1 = liftNear(r0, vertexTheta[tri[1]]);
-        const double r2 = liftNear(r0, vertexTheta[tri[2]]);
+        const double r0 = regularAt(q.triangle, 0);
+        const double r1 = liftNear(r0, regularAt(q.triangle, 1));
+        const double r2 = liftNear(r0, regularAt(q.triangle, 2));
         double C = s.barycentric[0] * r0 + s.barycentric[1] * r1 + s.barycentric[2] * r2;
+        const int region = regionOfFace(q.triangle);
         for (size_t i = 0; i < centres_.size(); ++i) {
             if (i == j) continue;
+            if (perCorner_ && centreRegion_[i] >= 0 && centreRegion_[i] != region) continue;
             C += centres_[i][2] * std::atan2(q.pos[1] - centres_[i][1], q.pos[0] - centres_[i][0]);
         }
         s.portResidual = 0.0;
@@ -215,9 +244,11 @@ void FieldTracer::buildSingularities(bool useExactCenters, bool boundaryTriangle
     absorbedSingularities = 0;
     absorbedIndex4 = 0;
     absorbedAt.assign(absorbAt.empty() ? 0 : mesh->vertices.size(), 0);
-    auto absorbedBy = [&](const Triangle &t) {
+    absorbedList.clear();
+    auto absorbedBy = [&](const Triangle &t, int d) {
         for (int k = 0; k < 3; ++k)
-            if (t[k] < static_cast<int>(absorbAt.size()) && absorbAt[t[k]]) return t[k];
+            if (t[k] < static_cast<int>(absorbAt.size()) && absorbAt[t[k]] && (absorbAt[t[k]] != 2 || d < 0))
+                return t[k];
         return -1;
     };
 
@@ -233,10 +264,11 @@ void FieldTracer::buildSingularities(bool useExactCenters, bool boundaryTriangle
         }
         const int d = static_cast<int>(std::lround(sum / M_PI_2));
         if (d == 0) continue;
-        if (const int at = absorbedBy(t); at >= 0) {
+        if (const int at = absorbedBy(t, d); at >= 0) {
             ++absorbedSingularities;
             absorbedIndex4 += d;
             absorbedAt[at] += d;
+            absorbedList.push_back({{triIdx, at, d}});
             continue;
         }
         indexSum4 += d;
@@ -318,14 +350,33 @@ void FieldTracer::buildSingularities(bool useExactCenters, bool boundaryTriangle
 // ---------------------------------------------------------------------------
 // Field readings
 // ---------------------------------------------------------------------------
-double FieldTracer::vertexAngle(int v, double ref) const {
+double FieldTracer::vertexAngle(int v, double ref, int face) const {
+    if (perCorner_ && face >= 0) {
+        const Triangle &tri = mesh->triangles[face];
+        for (int k = 0; k < 3; ++k)
+            if (tri[k] == v) return liftNear(ref, regularAt(face, k) + singularPart(mesh->vertices[v], regionOfFace(face)));
+    }
     if (conformal_) return liftNear(ref, vertexTheta[v] + singularPart(mesh->vertices[v]));
     return liftNear(ref, vertexTheta[v]);
 }
 
-double FieldTracer::edgeAngle(int e, double t, double ref) const {
+double FieldTracer::edgeAngle(int e, double t, double ref, int face) const {
     const int a = mesh->edges[e][0];
     const int b = mesh->edges[e][1];
+    if (perCorner_ && face >= 0) {
+        const Triangle &tri = mesh->triangles[face];
+        int ka = -1, kb = -1;
+        for (int k = 0; k < 3; ++k) {
+            if (tri[k] == a) ka = k;
+            if (tri[k] == b) kb = k;
+        }
+        if (ka >= 0 && kb >= 0) {
+            const double ta = regularAt(face, ka);
+            const double tb = liftNear(ta, regularAt(face, kb));
+            const Point p = mesh->vertices[a] * (1.0 - t) + mesh->vertices[b] * t;
+            return liftNear(ref, ta * (1.0 - t) + tb * t + singularPart(p, regionOfFace(face)));
+        }
+    }
     const double ta = vertexTheta[a];
     const double tb = liftNear(ta, vertexTheta[b]);  // the principal matching of this edge
     if (conformal_) {
@@ -337,10 +388,9 @@ double FieldTracer::edgeAngle(int e, double t, double ref) const {
 
 void FieldTracer::triangleAngles(int f, const std::array<double, 3> &at, double ref,
                                  std::array<double, 3> &theta) const {
-    const Triangle &tri = mesh->triangles[f];
-    theta[0] = vertexTheta[tri[0]];
-    theta[1] = liftNear(theta[0], vertexTheta[tri[1]]);
-    theta[2] = liftNear(theta[0], vertexTheta[tri[2]]);
+    theta[0] = regularAt(f, 0);
+    theta[1] = liftNear(theta[0], regularAt(f, 1));
+    theta[2] = liftNear(theta[0], regularAt(f, 2));
 
     // Shift the whole triple -- which leaves the interpolant affine -- until its
     // value at the entry point is the branch the walk arrived on.
@@ -435,7 +485,7 @@ FieldTracer::Status FieldTracer::crossEdge(Walker &w, int f, int edge, double al
     if (along * edgeLen < vertexSnap || (1.0 - along) * edgeLen < vertexSnap) {
         w.atVertex = (along * edgeLen < vertexSnap) ? va : vb;
         w.pos = mesh->vertices[w.atVertex];
-        w.dir = wrap_pi(vertexAngle(w.atVertex, outTheta));
+        w.dir = wrap_pi(vertexAngle(w.atVertex, outTheta, f));
         w.crossDir = w.dir;
         w.entryEdge = -1;
         w.tri = f;
@@ -476,7 +526,7 @@ FieldTracer::Status FieldTracer::crossEdge(Walker &w, int f, int edge, double al
     // two triangles' interpolants differ by, which is what keeps the branch
     // from drifting.
     const double tOnEdge = (mesh->edges[ge][0] == nt[ne]) ? t : 1.0 - t;
-    w.dir = wrap_pi(edgeAngle(ge, tOnEdge, outTheta));
+    w.dir = wrap_pi(edgeAngle(ge, tOnEdge, outTheta, nb));
     w.crossDir = wrap_pi(chordDir);
     return Status::Ok;
 }
@@ -649,7 +699,13 @@ FieldTracer::Status FieldTracer::advanceConformal(Walker &w, std::vector<TracePo
     const int f = w.tri;
     Point P = w.pos;
     int exclude = w.entryEdge;
-    double theta = angleAt(f, P, w.dir);
+    // At a point ConformalField put on dS the field has no value -- its term
+    // turns with the direction the point is left in -- so a separatrix
+    // launched from it reads its first direction a hair along its ray.
+    Point read = P;
+    for (const auto &c : conformal_->boundarySingularities())
+        if (normP(P - c.pos) <= vertexSnap) { read = P + dirOf(w.dir) * (1e-6 * avgEdge); break; }
+    double theta = angleAt(f, read, w.dir);
     bool first = true;
 
     for (int sub = 0; sub < 256; ++sub) {

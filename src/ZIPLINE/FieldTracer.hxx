@@ -169,7 +169,11 @@ public:
     // interface network, which the layout turns at by their sectors
     // (SeparatrixTrace) and where a field that could not be aligned to every
     // incident interface turns instead. Their index is kept in
-    // absorbedIndexSum4() and they emit nothing.
+    // absorbedIndexSum4() and they emit nothing. A flag of 2 takes only a
+    // triangle of negative index: a vertex of a smooth interface, where a
+    // valence-5 point is a corner of three quarters on one side and a
+    // valence-3 point would be a corner of one on a straight side, which no
+    // quad has (ZIPLINE::Options::weakInterfaces).
     explicit FieldTracer(std::shared_ptr<CrossField> cf, bool useExactCenters = true,
                          bool boundaryTriangles = true, std::vector<char> absorbAt = {});
 
@@ -208,6 +212,10 @@ public:
     int droppedSingularityCount() const { return droppedSingularities; }
     // Singular triangles at an `absorbAt` vertex, and four times their index.
     int absorbedSingularityCount() const { return absorbedSingularities; }
+    // Each absorbed singular triangle: the triangle, the vertex that took it
+    // and its d. ConformalField::Options::readWeakBoundary gives each to the
+    // sector its triangle is in, where absorbedIndexAt() has only the sum.
+    const std::vector<std::array<int, 3>> &absorbedTriangles() const { return absorbedList; }
     int absorbedIndexSum4() const { return absorbedIndex4; }
     // Per vertex: four times the index absorbed there -- the field's own
     // winding round an `absorbAt` vertex, where it is not a singularity to
@@ -220,13 +228,22 @@ public:
     double averageEdgeLength() const { return avgEdge; }
 
     // Cross-field angle at a vertex, on the branch nearest `ref`.
-    double vertexAngle(int v, double ref) const;
+    //
+    // `face`, a triangle at the vertex (or on the edge, below), says which
+    // region's field is meant where the corrected field has terms of one
+    // region only (ConformalField::hasRegionTerms): the regular part is then
+    // that triangle's corner values and the singular part that region's. At
+    // a vertex of an interface that is no node the regions agree mod pi/2,
+    // both being tangent to it, so the hand-off across an interface edge
+    // keeps its margin; elsewhere, and with face -1, the reading is the
+    // vertex's own.
+    double vertexAngle(int v, double ref, int face = -1) const;
 
     // Cross-field angle at the point (1-t) * a + t * b of mesh edge e = (a, b),
     // on the branch nearest `ref`. This is the canonical reading of the field
     // on an edge: it uses the two endpoint angles and nothing else, so both
     // triangles sharing the edge agree on it exactly.
-    double edgeAngle(int e, double t, double ref) const;
+    double edgeAngle(int e, double t, double ref, int face = -1) const;
 
     // Advance across one triangle, appending the points traversed to `path`
     // (one point for a regular triangle, several for a singular one). The
@@ -265,7 +282,14 @@ private:
     // sum_j k_j arg(p - X_j) over the corrected field's singularities, and
     // the distance from p to the nearest one.
     double singularPart(const Point &p) const;
+    // The same with only the terms region `region` has (every one with
+    // region -1, which is all of them unless hasRegionTerms()).
+    double singularPart(const Point &p, int region) const;
     double nearestSingularity(const Point &p) const;
+    // The regular part at corner k of triangle f: the corner's own value with
+    // region terms, the vertex's otherwise; and the region of f (-1 without).
+    double regularAt(int f, int k) const;
+    int regionOfFace(int f) const;
 
     // The three vertex angles of a non-singular triangle, lifted to agree
     // pairwise to within pi/4 and then shifted as a block so that the
@@ -301,14 +325,19 @@ private:
     int droppedSingularities = 0;
     int absorbedSingularities = 0;
     int absorbedIndex4 = 0;
+    std::vector<std::array<int, 3>> absorbedList;
     std::vector<int> absorbedAt;
 
     double avgEdge = 1.0;
     double vertexSnap = 1e-9;          // distance below which a point is taken to be a vertex
 
     std::shared_ptr<const ConformalField> conformal_;
-    // The corrected field's singularities as (x, y, k), for the sums.
+    // The corrected field's singularities as (x, y, k), for the sums, and
+    // the region each term belongs to (-1: every region).
     std::vector<std::array<double, 3>> centres_;
+    std::vector<int> centreRegion_;
+    // ConformalField::hasRegionTerms(): the regular part per triangle corner.
+    bool perCorner_ = false;
 };
 
 #endif // __FIELD_TRACER_HXX__
